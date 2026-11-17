@@ -91,7 +91,7 @@ export function App() {
       });
       return;
     }
-    controller.current.answer(base).catch(() => {});
+    controller.current.answer(base).catch(() => board.current?.clearInput());
   }
   function onChoose(origin, role) {
     const snapshot = controller.current.getState();
@@ -111,7 +111,9 @@ export function App() {
       return;
     choiceRef.current = null;
     setChoice(null);
-    controller.current.answer(origin.base + role).catch(() => {});
+    controller.current
+      .answer(origin.base + role)
+      .catch(() => board.current?.clearInput());
   }
   return (
     <TacticsPage
