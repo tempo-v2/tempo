@@ -1,4 +1,5 @@
 //! The three reply shapes a presentation client must handle.
+use super::attempt_view::AttemptFeedback;
 use crate::views::{AttemptView, EmptyView, ErrorView};
 use crate::{AppError, wire::STUDY_WIRE_VERSION};
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,11 @@ impl From<AppError> for StudyView {
     }
 }
 impl StudyView {
-    pub(crate) fn attempt(value: AnswerResult, board: PositionDisplay) -> Self {
+    pub(crate) fn attempt(
+        value: AnswerResult,
+        board: PositionDisplay,
+        correction_uci: Option<String>,
+    ) -> Self {
         let attempt = value.attempt;
         let status = match attempt.status {
             AttemptStatus::Active => "ready",
@@ -51,7 +56,10 @@ impl StudyView {
             legal_moves: board.legal_moves,
             in_check: board.in_check,
             prompt: attempt.prompt,
-            feedback: value.feedback,
+            feedback: value.feedback.map(|result| AttemptFeedback {
+                result,
+                correction_uci,
+            }),
             assessment: attempt.terminal,
         }))
     }

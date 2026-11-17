@@ -139,18 +139,17 @@ fn a_legal_miss_keeps_the_board_and_only_the_original_again_through_abandon() {
             .unwrap()
             .contains(&Value::from("a6b7"))
     );
-    let miss = reply(
-        &mut app,
-        StudyCommand::Answer(SubmitCommand {
-            dataset_id: issued.dataset.clone(),
-            attempt_id: issued.id.clone(),
-            expected_revision: issued.revision,
-            submission_id: "legal-miss".into(),
-            answer: "a6b7".into(),
-        }),
-    );
+    let missed_move = StudyCommand::Answer(SubmitCommand {
+        dataset_id: issued.dataset.clone(),
+        attempt_id: issued.id.clone(),
+        expected_revision: issued.revision,
+        submission_id: "legal-miss".into(),
+        answer: "a6b7".into(),
+    });
+    let miss = reply(&mut app, missed_move.clone());
     assert_eq!(miss["display_fen"], ready["display_fen"]);
     assert_eq!(miss["assessment"], "again");
+    assert_eq!(miss["feedback"]["correction_uci"], "a6c8");
     let abandoned = reply(
         &mut app,
         StudyCommand::Abandon(AbandonCommand {
@@ -168,6 +167,13 @@ fn a_legal_miss_keeps_the_board_and_only_the_original_again_through_abandon() {
     let saved = app.snapshot().unwrap();
     assert_eq!(saved.assessments.len(), 1);
     assert_eq!(saved.assessments[0].input.grade, Grade::Again);
+
+    let mut edited = white_mate_in_two();
+    edited.solution = vec!["a6b7".into()];
+    import(&mut app, &edited);
+    let before_replay = app.snapshot().unwrap();
+    assert_eq!(reply(&mut app, missed_move), miss);
+    assert_eq!(app.snapshot().unwrap(), before_replay);
 }
 
 #[test]

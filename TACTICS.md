@@ -3,8 +3,9 @@
 The local Tactics page uses the shared Tempo Board, orthodox chess legality in
 Rust, and a separate SQLite practice database. Select or drag a piece to a
 highlighted square. The board shows each accepted move and its reply. A legal
-move outside the source solution records Again and leaves the same position
-available for correction. A clean solve records Good at completion.
+move outside the source solution records Again and shows a correction arrow
+on the same position. A clean solve records Good. When a puzzle is complete,
+a check mark appears briefly before the next puzzle loads.
 
 ## Build and open
 
@@ -13,9 +14,16 @@ From the assembled workspace root, using Rust 1.85+ and Node 22.13+:
 ```sh
 (cd tempo-core-components && npm ci && npm run build)
 (cd tempo/ui && npm ci --install-links && npm run build)
-cargo build -p tempo
-target/debug/tempo serve .local/tactics-mvp/personal-practice.sqlite tempo/ui/dist 41821
+make start
 ```
+
+If your existing root Makefile lacks the target, add `include tempo/tools/local.mk`
+after your existing targets or run `make -f tempo/tools/local.mk start` from the
+workspace root.
+
+Set `TEMPO_DB` or `TEMPO_PORT` on the make command to use another existing
+practice database or port. `make start` replaces an existing Tempo server
+from this checkout on the selected port. Press Ctrl+C to stop the server.
 
 Open [Tempo Tactics](http://127.0.0.1:41821). Use the exact URL the server
 prints. The server binds to IPv4 loopback and opens the existing practice

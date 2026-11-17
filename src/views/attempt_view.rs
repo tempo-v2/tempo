@@ -6,10 +6,10 @@ use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision, TargetI
 /// Render an issued attempt and copy its identity/revision into the next intent.
 ///
 /// The application creates this from a persisted attempt result. The UI consumes
-/// the prompt and feedback; it receives neither expected moves nor scheduler state.
+/// the prompt and per-answer feedback. Only a miss reveals a correction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttemptView {
-    /// Wire schema version, currently 2.
+    /// Wire schema version, currently 3.
     pub schema_version: u32,
     /// `ready`, `complete`, or `abandoned`.
     pub status: String,
@@ -34,9 +34,18 @@ pub struct AttemptView {
     /// Present only while the attempt is ready for learner input.
     pub prompt: Option<ChessPrompt>,
     /// Feedback for this response; resume does not replay the last message.
-    pub feedback: Option<ChessFeedback>,
+    pub feedback: Option<AttemptFeedback>,
     /// The attempt's lifetime grade, including an earlier miss during correction.
     pub assessment: Option<Grade>,
+}
+
+/// Presentation-only feedback. Stored submission receipts use ChessFeedback.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttemptFeedback {
+    #[serde(flatten)]
+    pub result: ChessFeedback,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correction_uci: Option<String>,
 }
 
 #[cfg(test)]

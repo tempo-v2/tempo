@@ -11,7 +11,7 @@ The longer cross-component journeys stay in [tests/contracts.rs](tests/contracts
 The [local tactics guide](TACTICS.md) covers building the React page, importing
 existing Tempo puzzles into a fresh SQLite practice dataset, and launching the
 loopback host. Browser session logic lives in [ui/](ui/README.md) and uses the
-version 2 Study views.
+version 3 Study views.
 
 ## Choose the entry point
 

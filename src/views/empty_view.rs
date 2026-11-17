@@ -38,7 +38,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(view).unwrap(),
             serde_json::json!({
-                "schema_version": 2, "status": "empty", "dataset_id": "empty"
+                "schema_version": 3, "status": "empty", "dataset_id": "empty"
             })
         );
         assert!(app.snapshot().unwrap().attempts.is_empty());

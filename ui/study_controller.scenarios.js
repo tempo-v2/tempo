@@ -131,14 +131,14 @@ test("retryable application errors retain the command; final errors release it",
   const commands = [];
   const responses = [
     {
-      schema_version: 2,
+      schema_version: 3,
       status: "error",
       code: "busy",
       message: "Try again",
       retryable: true,
     },
     {
-      schema_version: 2,
+      schema_version: 3,
       status: "error",
       code: "stale",
       message: "Request is stale",

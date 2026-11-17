@@ -1,8 +1,9 @@
-/** Validate version 2 replies without making grading or scheduling decisions. */
+/** Validate version 3 replies without making grading or scheduling decisions. */
 import { freeze, string } from "./wire_values.js";
 
 const ASSESSMENTS = new Set([null, "good", "again"]);
 const ATTEMPT_STATUSES = new Set(["ready", "complete", "abandoned"]);
+const UCI = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 
 function object(value, keys, name) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -43,14 +44,14 @@ export function validateStudyView(value) {
   if (
     value === null ||
     typeof value !== "object" ||
-    value.schema_version !== 2
+    value.schema_version !== 3
   ) {
-    throw new TypeError("Expected a Study wire view with schema_version 2");
+    throw new TypeError("Expected a Study wire view with schema_version 3");
   }
   if (value.status === "empty") {
     object(value, ["schema_version", "status", "dataset_id"], "empty view");
     return freeze({
-      schema_version: 2,
+      schema_version: 3,
       status: "empty",
       dataset_id: string(value.dataset_id, "dataset_id", true),
     });
@@ -62,7 +63,7 @@ export function validateStudyView(value) {
       "error view",
     );
     return freeze({
-      schema_version: 2,
+      schema_version: 3,
       status: "error",
       code: string(value.code, "code", true),
       message: string(value.message, "message"),
@@ -117,9 +118,20 @@ export function validateStudyView(value) {
       "Only a ready view may contain a prompt, and it must contain one",
     );
   }
+  if (
+    !Array.isArray(value.legal_moves) ||
+    value.legal_moves.some((move) => typeof move !== "string" || !UCI.test(move))
+  )
+    throw new TypeError("Invalid legal moves");
+  if (value.status !== "ready" && value.legal_moves.length)
+    throw new TypeError("Terminal legal moves must be empty");
+
   let feedback = null;
   if (value.feedback !== null) {
-    object(value.feedback, ["correct", "message", "autoplay"], "feedback");
+    const correct = value.feedback?.correct;
+    const keys = ["correct", "message", "autoplay"];
+    if (correct === false) keys.push("correction_uci");
+    object(value.feedback, keys, "feedback");
     if (!Array.isArray(value.feedback.autoplay))
       throw new TypeError("autoplay must be an array");
     feedback = {
@@ -130,22 +142,21 @@ export function validateStudyView(value) {
         return { uci: string(move.uci, "autoplay.uci", true) };
       }),
     };
+    if (!feedback.correct) {
+      const correction = value.feedback.correction_uci;
+      if (value.status !== "ready" || feedback.autoplay.length ||
+          typeof correction !== "string" || !UCI.test(correction) ||
+          !value.legal_moves.includes(correction))
+        throw new TypeError("Invalid correction move");
+      feedback.correction_uci = correction;
+    }
   }
   if (!["white", "black"].includes(value.learner_color))
     throw new TypeError("Invalid learner color");
-  if (
-    !Array.isArray(value.legal_moves) ||
-    value.legal_moves.some(
-      (m) => typeof m !== "string" || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(m),
-    )
-  )
-    throw new TypeError("Invalid legal moves");
-  if (value.status !== "ready" && value.legal_moves.length)
-    throw new TypeError("Terminal legal moves must be empty");
   if (prompt && prompt.fen !== value.display_fen)
     throw new TypeError("Prompt and display FEN differ");
   return freeze({
-    schema_version: 2,
+    schema_version: 3,
     display_fen: string(value.display_fen, "display_fen", true),
     learner_color: value.learner_color,
     legal_moves: [...value.legal_moves],

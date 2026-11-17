@@ -11,7 +11,7 @@ test("rendering escapes external strings and exposes intent controls without sol
       prompt: { ...ready().prompt, instruction: attack, fen: attack },
       display_fen: attack,
       feedback: {
-        correct: false,
+        correct: true,
         message: attack,
         autoplay: [{ uci: attack }],
       },
@@ -30,7 +30,7 @@ test("rendering escapes external strings and exposes intent controls without sol
   assert.ok(renderStudy(null).includes("Select Next"));
   assert.ok(
     renderStudy({
-      schema_version: 2,
+      schema_version: 3,
       status: "empty",
       dataset_id: "d",
     }).includes("No eligible"),

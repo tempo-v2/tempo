@@ -13,9 +13,9 @@ test("external replies have a strict versioned schema and become immutable copie
   original.prompt.instruction = "changed elsewhere";
   assert.equal(view.prompt.instruction, "Find the move");
   assert.deepEqual(
-    validateStudyView({ schema_version: 2, status: "empty", dataset_id: "d" }),
+    validateStudyView({ schema_version: 3, status: "empty", dataset_id: "d" }),
     {
-      schema_version: 2,
+      schema_version: 3,
       status: "empty",
       dataset_id: "d",
     },
@@ -28,7 +28,7 @@ test("external replies have a strict versioned schema and become immutable copie
   );
   assert.equal(
     validateStudyView({
-      schema_version: 2,
+      schema_version: 3,
       status: "error",
       code: "offline",
       message: "Retry",
@@ -44,6 +44,7 @@ test("malformed or unsupported replies are rejected, including extra solution fi
     [],
     {},
     ready({ schema_version: 1 }),
+    ready({ schema_version: 2 }),
     ready({ status: "unknown" }),
     ready({ dataset_id: 1 }),
     ready({ revision: -1 }),
@@ -56,9 +57,9 @@ test("malformed or unsupported replies are rejected, including extra solution fi
     ready({ assessment: "partial" }),
     ready({ solution: ["e2e4"] }),
     complete({ prompt: ready().prompt }),
-    { schema_version: 2, status: "empty" },
+    { schema_version: 3, status: "empty" },
     {
-      schema_version: 2,
+      schema_version: 3,
       status: "error",
       code: "bad",
       message: "x",
@@ -68,4 +69,17 @@ test("malformed or unsupported replies are rejected, including extra solution fi
   malformed.forEach((value) =>
     assert.throws(() => validateStudyView(value), TypeError),
   );
+});
+
+test("a correction belongs only to a legal wrong-answer reply", () => {
+  const feedback = { correct: false, message: "Incorrect", autoplay: [], correction_uci: "e2e4" };
+  const legal_moves = ["e2e4"];
+  assert.equal(validateStudyView(ready({ feedback, legal_moves })).feedback.correction_uci, "e2e4");
+  for (const invalid of [
+    { correct: false, message: "Incorrect", autoplay: [] },
+    { ...feedback, correct: true },
+    { ...feedback, correction_uci: "a1h8" },
+  ]) {
+    assert.throws(() => validateStudyView(ready({ feedback: invalid, legal_moves })), TypeError);
+  }
 });

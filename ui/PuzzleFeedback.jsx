@@ -1,16 +1,15 @@
 import React from "react";
 import { StatusNotice } from "@tempo-v2/core-components";
+import { promotionRoles } from "./promotion_roles.js";
+
 export function PuzzleFeedback({ view }) {
+  const move = view?.feedback?.correction_uci;
+  if (!move) return null;
+  const role = promotionRoles[move[4]];
   return (
-    <>
-      {view.feedback && (
-        <StatusNotice kind={view.feedback.correct ? "info" : "error"}>
-          {view.feedback.message}
-        </StatusNotice>
-      )}
-      {view.assessment && (
-        <p>Attempt result: {view.assessment === "again" ? "Again" : "Good"}</p>
-      )}
-    </>
+    <StatusNotice kind="error">
+      Incorrect. Move {move.slice(0, 2)} to {move.slice(2, 4)}
+      {role ? ` and promote to ${role.toLowerCase()}` : ""}.
+    </StatusNotice>
   );
 }

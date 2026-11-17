@@ -2,6 +2,11 @@ import React, { useEffect, useRef, useState } from "react";
 import { createStudyController } from "./study_controller.js";
 import { TacticsPage } from "./TacticsPage.jsx";
 import { identity } from "./PuzzleBoard.jsx";
+import { promotionRoles } from "./promotion_roles.js";
+
+const REPLY_DELAY_MS = 200;
+const NEXT_PUZZLE_DELAY_MS = 500;
+
 const storage = {
   load: () =>
     JSON.parse(sessionStorage.getItem("tempo-study-recovery") || "null"),
@@ -24,33 +29,74 @@ export function App() {
     [choice, setChoice] = useState(null);
   const board = useRef(null),
     controller = useRef(null),
-    choiceRef = useRef(null);
-  choiceRef.current = choice;
+    choiceRef = useRef(null),
+    preview = useRef(null),
+    replyTimer = useRef(null),
+    advanced = useRef(null);
   if (!controller.current)
     controller.current = createStudyController({
       transport,
       storage,
       makeSubmissionId: () => crypto.randomUUID(),
-      render: (view, state) => setModel({ view, state }),
+      render: (view, state) => {
+        const move = preview.current;
+        if (state.busy || !move) {
+          setModel({ view, state, keepMove: state.busy && !!move });
+          return;
+        }
+        preview.current = null;
+        if (view === move.view) board.current?.clearInput();
+        const showResult = () => {
+          replyTimer.current = null;
+          setModel({ view, state, keepMove: false });
+        };
+        // The renderer has already moved the learner's piece. Give that move
+        // time to land before reconciling with the FEN that includes the reply.
+        const elapsed = performance.now() - move.startedAt;
+        if (view !== move.view && view?.feedback?.correct &&
+            view.feedback.autoplay.length && elapsed < REPLY_DELAY_MS) {
+          replyTimer.current = setTimeout(showResult, REPLY_DELAY_MS - elapsed);
+        } else {
+          showResult();
+        }
+      },
     });
   useEffect(() => {
     controller.current.start().catch(() => {});
+    return () => clearTimeout(replyTimer.current);
   }, []);
   useEffect(() => {
     const v = model.view;
     if (
       choiceRef.current &&
       (!v ||
-        !["ready"].includes(v.status) ||
+        v.status !== "ready" ||
         model.state.busy ||
         model.state.canRetry ||
         identity(v) !== choiceRef.current.id ||
         v.revision !== choiceRef.current.revision)
-    )
+    ) {
+      choiceRef.current = null;
       setChoice(null);
-    board.current?.clearInput();
+    }
   }, [model.view, model.state.canRetry, model.state.busy]);
+
+  const { view, state } = model;
+  const showSuccess = view?.status === "complete" && view.feedback?.correct &&
+    !state.busy && !state.canRetry && !state.issue && advanced.current !== view;
+  useEffect(() => {
+    if (!showSuccess) return;
+    const timer = setTimeout(() => {
+      const current = controller.current.getState();
+      if (current.view !== view || current.busy || current.canRetry || current.issue) return;
+      advanced.current = view;
+      controller.current.next().catch(() => {});
+    }, NEXT_PUZZLE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [showSuccess, view]);
+
   const run = (fn) => () => {
+    if (replyTimer.current !== null) return;
     choiceRef.current = null;
     setChoice(null);
     fn().catch(() => {});
@@ -61,6 +107,10 @@ export function App() {
     retry: run(() => controller.current.retry()),
     refresh: run(() => controller.current.refresh()),
   };
+  function submit(view, uci) {
+    preview.current = { view, startedAt: performance.now() };
+    controller.current.answer(uci).catch(() => {});
+  }
   function onMove(event) {
     const snapshot = controller.current.getState();
     const v = snapshot.view,
@@ -71,6 +121,8 @@ export function App() {
       state.busy ||
       state.canRetry ||
       state.issue === "refresh" ||
+      choiceRef.current ||
+      replyTimer.current !== null ||
       event.positionIdentity !== identity(v) ||
       event.positionRevision !== v.revision
     )
@@ -83,15 +135,17 @@ export function App() {
     }
     const promotions = moves.filter((m) => m.length === 5);
     if (promotions.length) {
-      setChoice({
+      const origin = {
         id: identity(v),
         revision: v.revision,
         base,
         moves: promotions.map((m) => m[4]),
-      });
+      };
+      choiceRef.current = origin;
+      setChoice(origin);
       return;
     }
-    controller.current.answer(base).catch(() => board.current?.clearInput());
+    submit(v, base);
   }
   function onChoose(origin, role) {
     const snapshot = controller.current.getState();
@@ -111,13 +165,14 @@ export function App() {
       return;
     choiceRef.current = null;
     setChoice(null);
-    controller.current
-      .answer(origin.base + role)
-      .catch(() => board.current?.clearInput());
+    board.current?.previewPromotion(origin.base.slice(2), promotionRoles[role].toLowerCase());
+    submit(v, origin.base + role);
   }
   return (
     <TacticsPage
       {...model}
+      showSuccess={showSuccess}
+      advancing={state.busy && advanced.current === view}
       actions={actions}
       boardRef={board}
       choice={choice}
