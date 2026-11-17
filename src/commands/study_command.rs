@@ -1,4 +1,4 @@
-//! The version 1 transport envelope around the supported study intents.
+//! The transport envelope around the supported study intents.
 use crate::{AbandonCommand, SubmitCommand};
 use serde::{Deserialize, Serialize};
 use tempo_types::AttemptId;

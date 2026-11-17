@@ -1,6 +1,7 @@
 //! Application failures translated into stable codes for callers and wire views.
 use std::{error::Error, fmt};
 use tempo_store::StoreError;
+use tempo_study::{GradingError, StudyError};
 
 /// A failed application operation, with a code callers can branch on.
 ///
@@ -44,6 +45,18 @@ impl From<StoreError> for AppError {
 }
 pub(crate) fn domain(code: &str, error: impl fmt::Display) -> AppError {
     AppError::new(code, error.to_string())
+}
+
+pub(crate) fn study_input(error: StudyError) -> AppError {
+    match error {
+        StudyError::Grading(GradingError::InvalidAnswer(_)) => {
+            AppError::new("invalid_move", "That move is illegal in this position.")
+        }
+        StudyError::RevisionConflict { .. } => {
+            AppError::new("stale_revision", "The attempt changed. Reload to continue.")
+        }
+        _ => domain("invalid_submission", error),
+    }
 }
 
 #[cfg(test)]
