@@ -3,7 +3,10 @@ use super::{
     Tempo,
     receipts::{replay, study_result},
 };
-use crate::{AbandonCommand, AppError, app_error::domain};
+use crate::{
+    AbandonCommand, AppError,
+    app_error::{domain, study_input},
+};
 use tempo_store::{AnswerResult, Receipt, ReceiptResult, StoredAttempt, Write};
 
 impl Tempo {
@@ -19,8 +22,8 @@ impl Tempo {
             return study_result(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
-        let attempt = tempo_study::abandon(&old.attempt, command.expected_revision)
-            .map_err(|e| domain("invalid_submission", e))?;
+        let attempt =
+            tempo_study::abandon(&old.attempt, command.expected_revision).map_err(study_input)?;
         let result = AnswerResult {
             attempt: attempt.clone(),
             feedback: None,

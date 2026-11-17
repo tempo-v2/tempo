@@ -6,6 +6,13 @@ the concept you need. A file contains its purpose, usage guidance, implementatio
 and a `#[cfg(test)] mod tests` example where the concept has its own public behavior.
 The longer cross-component journeys stay in [tests/contracts.rs](tests/contracts.rs).
 
+## Run local tactics
+
+The [local tactics guide](TACTICS.md) covers building the React page, importing
+existing Tempo puzzles into a fresh SQLite practice dataset, and launching the
+loopback host. Browser session logic lives in [ui/](ui/README.md) and uses the
+version 2 Study views.
+
 ## Choose the entry point
 
 | When you need to… | Reach for | Source and nearby example |
@@ -16,7 +23,7 @@ The longer cross-component journeys stay in [tests/contracts.rs](tests/contracts
 | Answer the displayed learner decision | `SubmitCommand` → `Tempo::submit` | [submit_command.rs](src/commands/submit_command.rs) constructs a retryable action; [submit.rs](src/application/submit.rs) shows progress, learning, assessment and receipt saved together. |
 | Stop an attempt | `AbandonCommand` → `Tempo::abandon` | [abandon_command.rs](src/commands/abandon_command.rs) supplies revision/identity without an answer; [abandon.rs](src/application/abandon.rs) clears the active pointer. |
 | Report an externally observed miss | `AgainCommand` → `Tempo::again` | [again_command.rs](src/commands/again_command.rs) rejects analysis against the wrong definition; [again.rs](src/application/again.rs) updates learning without fabricating a human attempt. |
-| Update repertoire or tactics content | `Tempo::import_pgn` | [import_pgn.rs](src/application/import_pgn.rs) preserves progress for an unchanged repertoire. Metadata and semantic-change journeys live in `tests/contracts.rs`. |
+| Update repertoire or tactics content | `Tempo::import_pgn` or `Tempo::apply_catalog` | [import_pgn.rs](src/application/import_pgn.rs) applies both through one atomic content-change operation. |
 | Process games already fetched by a refresh job | `Tempo::ingest_games` | [ingest_games.rs](src/application/ingest_games.rs) demonstrates replay-aware ingestion. The count includes processed deviations that were already committed. |
 | Transfer content and learning to an empty dataset | `Tempo::export`, `Tempo::restore` | [export.rs](src/application/export.rs) shows a read-only export; [restore.rs](src/application/restore.rs) restores under a new dataset identity. |
 | Dispatch one decoded UI intent | `wire::StudyCommand` → `Tempo::handle` | [study_command.rs](src/commands/study_command.rs) decodes the versioned envelope; [handle.rs](src/application/handle.rs) returns typed replies even on application failure. |
@@ -124,13 +131,8 @@ content-update journeys. Shared explicit clock/store setup lives in
 
 ## Current scope
 
-Implemented: typed composition, attempt/learning rules, content-change
-coordination, in-memory transaction invariants, replay, stale checks and UI
-serialization. Fixture implementations cover parsing/canonicalization/comparison
-inputs, interval scheduling, ordering, counter IDs, fixed time and process-local
-storage. The JSON codec proves interchange; enriched PGN is a replacement codec.
-There is no production HTTP server, SQL store or chess engine here yet.
-
-Replace counter IDs before durable storage. Store snapshots currently read the
-complete dataset; a future bounded-read interface should follow a measured need.
-Cross-repository ownership lives in `.planning/INTERFACES.md`.
+The loopback host uses the real Chess rules, SQLite Store, UTC clock, and
+restart-safe identities. The stdio demonstration still uses its fixed fixture
+policies and in-memory store. Provider game comparison remains fixture-backed.
+Store snapshots currently read the complete dataset. Cross-repository ownership
+lives in `.planning/INTERFACES.md`.

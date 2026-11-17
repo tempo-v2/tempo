@@ -3,7 +3,10 @@ use super::{
     Tempo,
     receipts::{replay, study_result},
 };
-use crate::{AppError, SubmitCommand, app_error::domain};
+use crate::{
+    AppError, SubmitCommand,
+    app_error::{domain, study_input},
+};
 use tempo_learning::{AssessmentInput, AssessmentSource};
 use tempo_queue::OrderEvent;
 use tempo_store::{
@@ -33,7 +36,7 @@ impl Tempo {
             command.expected_revision,
             &command.answer,
         )
-        .map_err(|e| domain("invalid_submission", e))?;
+        .map_err(study_input)?;
         let updated = StoredAttempt {
             attempt: progress.attempt.clone(),
             ..old.clone()

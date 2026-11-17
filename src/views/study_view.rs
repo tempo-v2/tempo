@@ -1,19 +1,20 @@
 //! The three reply shapes a presentation client must handle.
-use crate::AppError;
 use crate::views::{AttemptView, EmptyView, ErrorView};
+use crate::{AppError, wire::STUDY_WIRE_VERSION};
 use serde::{Deserialize, Serialize};
+use tempo_chess::PositionDisplay;
 use tempo_store::AnswerResult;
 use tempo_study::AttemptStatus;
 
 /// A versioned reply carrying a displayable attempt, an empty queue, or an error.
 ///
 /// [`crate::Tempo::handle`] produces this; transports serialize it and clients
-/// branch on `status`. The conversion from an answer result carries the attempt's
+/// branch on `status`. The projection carries the attempt's
 /// lifetime terminal grade, even when a corrective move emits no *new* assessment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StudyView {
-    Attempt(AttemptView),
+    Attempt(Box<AttemptView>),
     Empty(EmptyView),
     Error(ErrorView),
 }
@@ -21,7 +22,7 @@ pub enum StudyView {
 impl From<AppError> for StudyView {
     fn from(error: AppError) -> Self {
         Self::Error(ErrorView {
-            schema_version: 1,
+            schema_version: STUDY_WIRE_VERSION,
             status: "error".into(),
             code: error.code,
             message: error.message,
@@ -29,33 +30,37 @@ impl From<AppError> for StudyView {
         })
     }
 }
-impl From<AnswerResult> for StudyView {
-    fn from(value: AnswerResult) -> Self {
+impl StudyView {
+    pub(crate) fn attempt(value: AnswerResult, board: PositionDisplay) -> Self {
         let attempt = value.attempt;
         let status = match attempt.status {
             AttemptStatus::Active => "ready",
             AttemptStatus::Complete => "complete",
             AttemptStatus::Abandoned => "abandoned",
         };
-        Self::Attempt(AttemptView {
-            schema_version: 1,
+        Self::Attempt(Box::new(AttemptView {
+            schema_version: STUDY_WIRE_VERSION,
             status: status.into(),
             dataset_id: attempt.dataset,
             attempt_id: attempt.id,
             target_id: attempt.target,
             content_version: attempt.content_version,
             revision: attempt.revision,
+            display_fen: board.display_fen,
+            learner_color: board.learner_color,
+            legal_moves: board.legal_moves,
+            in_check: board.in_check,
             prompt: attempt.prompt,
             feedback: value.feedback,
             assessment: attempt.terminal,
-        })
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::StudyView;
-    use crate::{SubmitCommand, Tempo};
+    use crate::{SubmitCommand, Tempo, wire::StudyCommand};
     use tempo_types::Grade;
 
     #[test]
@@ -72,7 +77,9 @@ mod tests {
         .unwrap();
         let resumed = app.resume(&issued.attempt.id).unwrap();
         assert_eq!(resumed.assessment, None); // no new assessment from a read
-        let StudyView::Attempt(view) = StudyView::from(resumed) else {
+        let StudyView::Attempt(view) = app.handle(StudyCommand::Resume {
+            attempt_id: issued.attempt.id,
+        }) else {
             panic!("attempt view")
         };
         assert_eq!(view.status, "ready");

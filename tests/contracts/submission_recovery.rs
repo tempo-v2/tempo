@@ -25,7 +25,7 @@ fn active_resume_replay_and_revision_checks_prevent_double_answers() {
     stale_question.submission_id = "different-command-old-question".into();
     assert_eq!(
         h.app.submit(stale_question).unwrap_err().code,
-        "invalid_submission"
+        "stale_revision"
     );
     let completed = answer(&mut h, &first, "finish", "g1f3");
     assert_eq!(

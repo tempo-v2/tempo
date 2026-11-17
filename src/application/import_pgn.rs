@@ -1,9 +1,9 @@
 //! Parse content and commit its semantic change plan with affected learning state.
 use super::Tempo;
 use crate::{AppError, app_error::domain};
-use tempo_chess::{ChangeKind, ImportRequest};
+use tempo_chess::{Catalog, ChangeKind, ContentPlan, ImportRequest};
 use tempo_learning::LearningState;
-use tempo_store::Write;
+use tempo_store::{Snapshot, Write};
 use tempo_types::DatasetId;
 
 impl Tempo {
@@ -17,6 +17,27 @@ impl Tempo {
         dataset: &DatasetId,
         request: &ImportRequest,
     ) -> Result<Vec<tempo_chess::ContentChange>, AppError> {
+        let snapshot = self.import_snapshot(dataset)?;
+        let parsed = self
+            .components
+            .parser
+            .parse(request)
+            .map_err(|e| domain("content_parse_error", e))?;
+        Ok(self.apply_catalog_to(&snapshot, &parsed)?.changes)
+    }
+
+    /// Apply validated content via the same semantic versioning and atomic
+    /// learning transition used for PGN import.
+    pub fn apply_catalog(
+        &mut self,
+        dataset: &DatasetId,
+        catalog: &Catalog,
+    ) -> Result<ContentPlan, AppError> {
+        let snapshot = self.import_snapshot(dataset)?;
+        self.apply_catalog_to(&snapshot, catalog)
+    }
+
+    fn import_snapshot(&self, dataset: &DatasetId) -> Result<Snapshot, AppError> {
         let snapshot = self.store.snapshot()?;
         if dataset != &snapshot.dataset {
             return Err(AppError::new(
@@ -24,13 +45,19 @@ impl Tempo {
                 "import belongs to a different dataset",
             ));
         }
-        let parsed = self
-            .components
-            .parser
-            .parse(request)
-            .map_err(|e| domain("content_parse_error", e))?;
-        let plan = tempo_chess::plan_import(&snapshot.catalog, &parsed)
+        Ok(snapshot)
+    }
+
+    fn apply_catalog_to(
+        &mut self,
+        snapshot: &Snapshot,
+        catalog: &Catalog,
+    ) -> Result<ContentPlan, AppError> {
+        let plan = tempo_chess::plan_import(&snapshot.catalog, catalog)
             .map_err(|e| domain("content_change_error", e))?;
+        if plan.catalog == snapshot.catalog {
+            return Ok(plan);
+        }
         let mut writes = vec![Write::Catalog(plan.catalog.clone())];
         for change in &plan.changes {
             if matches!(change.kind, ChangeKind::Added | ChangeKind::Semantic) {
@@ -51,9 +78,9 @@ impl Tempo {
                 writes.push(Write::Active(None));
             }
         }
-        self.commit(&snapshot, writes)?;
+        self.commit(snapshot, writes)?;
         self.remaining_block.clear();
-        Ok(plan.changes)
+        Ok(plan)
     }
 }
 

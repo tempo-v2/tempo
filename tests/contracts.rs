@@ -18,3 +18,5 @@ mod study_journeys;
 mod submission_recovery;
 #[path = "contracts/support.rs"]
 mod support;
+#[path = "contracts/tactics_mvp.rs"]
+mod tactics_mvp;

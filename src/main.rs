@@ -1,17 +1,36 @@
-use std::io::{self, BufRead, Write};
+mod local_runtime;
+
+use std::{
+    error::Error,
+    io::{self, BufRead, Write},
+    path::Path,
+};
 use tempo::{
     AppError, Tempo,
     wire::{StudyCommand, StudyView},
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().nth(1).as_deref() != Some("stdio") {
-        eprintln!("Tempo interface demo: cargo run -p tempo -- stdio");
-        eprintln!(
-            "One JSON command per line; begin with {{\"command\":\"next\"}}. State is in memory."
-        );
-        return Ok(());
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match args.as_slice() {
+        [mode] if mode == "stdio" => stdio(),
+        [mode, database] if mode == "init-practice" => {
+            local_runtime::init(Path::new(database))
+        }
+        [mode, database, normalized] if mode == "import-tactics" => {
+            local_runtime::import(Path::new(database), Path::new(normalized))
+        }
+        [mode, database, ui, port] if mode == "serve" => {
+            local_runtime::serve(Path::new(database), Path::new(ui), port.parse()?)
+        }
+        _ => Err(
+            "Usage: tempo stdio | init-practice DATABASE | import-tactics DATABASE NORMALIZED.json | serve DATABASE UI_DIST PORT"
+                .into(),
+        ),
     }
+}
+
+fn stdio() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut app = Tempo::demo()?;
     let mut output = io::stdout().lock();
     for line in io::stdin().lock().lines() {

@@ -1,6 +1,6 @@
 //! The current attempt as presentation data, with private grading state removed.
 use serde::{Deserialize, Serialize};
-use tempo_chess::{ChessFeedback, ChessPrompt};
+use tempo_chess::{ChessFeedback, ChessPrompt, LearnerColor};
 use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision, TargetId};
 
 /// Render an issued attempt and copy its identity/revision into the next intent.
@@ -9,9 +9,9 @@ use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision, TargetI
 /// the prompt and feedback; it receives neither expected moves nor scheduler state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttemptView {
-    /// Wire schema version, currently 1.
+    /// Wire schema version, currently 2.
     pub schema_version: u32,
-    /// `ready`, `complete`, or `abandoned` in version 1.
+    /// `ready`, `complete`, or `abandoned`.
     pub status: String,
     /// Dataset identity that invalidates commands after a portable restore.
     pub dataset_id: DatasetId,
@@ -23,6 +23,14 @@ pub struct AttemptView {
     pub content_version: ContentVersion,
     /// Copy into `expected_revision` on the next answer or abandonment.
     pub revision: Revision,
+    /// Authoritative board, including any replies already played.
+    pub display_fen: String,
+    /// Fixed from the exercise's solver-start position.
+    pub learner_color: LearnerColor,
+    /// All legal moves on a ready board. Terminal boards accept no moves.
+    pub legal_moves: Vec<String>,
+    /// Whether the active side is in check on this board.
+    pub in_check: bool,
     /// Present only while the attempt is ready for learner input.
     pub prompt: Option<ChessPrompt>,
     /// Feedback for this response; resume does not replay the last message.
