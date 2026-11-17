@@ -73,6 +73,7 @@ mod tests {
                 pgn: REPERTOIRE_PGN.into(),
                 source: "example-import".into(),
                 repertoire: None,
+                learner_color: None,
             },
         )
         .unwrap();
