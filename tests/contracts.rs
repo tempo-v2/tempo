@@ -4,6 +4,8 @@
 //! filter to read/run a specific journey, e.g. `--test contracts content_updates`.
 #[path = "contracts/content_updates.rs"]
 mod content_updates;
+#[path = "contracts/durable_repertoire.rs"]
+mod durable_repertoire;
 #[path = "contracts/external_feedback.rs"]
 mod external_feedback;
 #[path = "contracts/portable_restore.rs"]

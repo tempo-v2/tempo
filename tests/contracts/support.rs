@@ -95,6 +95,7 @@ pub(super) fn import_request(pgn: &str) -> ImportRequest {
         pgn: pgn.into(),
         source: "integration-fixture".into(),
         repertoire: None,
+        learner_color: None,
     }
 }
 pub(super) fn seed_due(h: &mut Harness, ids: &[&str]) {
