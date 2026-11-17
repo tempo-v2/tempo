@@ -1,4 +1,5 @@
 //! Application composition: domain decisions in, atomic persistence and views out.
+pub mod views;
 pub mod wire;
 
 use serde::{Deserialize, Serialize};
@@ -257,7 +258,7 @@ impl Tempo {
             remaining: self.remaining_block.clone(),
         };
         let id = self.components.ids.next_id();
-        let result = tempo_study::next(
+        let result = tempo_study::next_available_exercise_if_any(
             &mut source,
             self.components.grader.as_ref(),
             snapshot.dataset.clone(),

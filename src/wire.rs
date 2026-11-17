@@ -1,4 +1,5 @@
 //! Versioned UI contract. This is the only boundary that serializes view/intent messages.
+use crate::views::StudyView;
 use crate::{AbandonCommand, AppError, SubmitCommand, Tempo};
 use serde::{Deserialize, Serialize};
 use tempo_chess::{ChessFeedback, ChessPrompt};
@@ -15,40 +16,6 @@ pub enum StudyCommand {
     Abandon(AbandonCommand),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum StudyView {
-    Attempt(AttemptView),
-    Empty(EmptyView),
-    Error(ErrorView),
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AttemptView {
-    pub schema_version: u32,
-    pub status: String,
-    pub dataset_id: DatasetId,
-    pub attempt_id: AttemptId,
-    pub target_id: TargetId,
-    pub content_version: ContentVersion,
-    pub revision: Revision,
-    pub prompt: Option<ChessPrompt>,
-    pub feedback: Option<ChessFeedback>,
-    pub assessment: Option<Grade>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EmptyView {
-    pub schema_version: u32,
-    pub status: String,
-    pub dataset_id: DatasetId,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ErrorView {
-    pub schema_version: u32,
-    pub status: String,
-    pub code: String,
-    pub message: String,
-    pub retryable: bool,
-}
 impl From<AppError> for StudyView {
     fn from(error: AppError) -> Self {
         Self::Error(ErrorView {
