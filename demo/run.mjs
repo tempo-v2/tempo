@@ -1,9 +1,14 @@
-import { createStudyController } from '../../tempo-core-components/src/index.js';
+import { createStudyController } from '../ui/index.js';
 import { stdioTransport } from './stdio-transport.mjs';
 
 const transport = stdioTransport();
 let number = 0;
-const ui = createStudyController({ transport, render() {}, makeSubmissionId: () => `demo-input-${++number}` });
+const ui = createStudyController({
+  transport,
+  render() {},
+  storage: { load: () => null, save() {} },
+  makeSubmissionId: () => `demo-input-${++number}`,
+});
 const show = view => console.log(`${view.target_id ?? 'queue'}: ${view.status}; assessment=${view.assessment ?? 'none'}${view.feedback ? `; ${view.feedback.message}` : ''}`);
 try {
   console.log('Tempo interface demo — real application, in-memory store, fixture chess/scheduler policies');

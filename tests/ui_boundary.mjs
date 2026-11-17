@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createStudyController, renderStudy, validateStudyView } from '../../tempo-core-components/src/index.js';
+import { createStudyController, renderStudy, validateStudyView } from '../ui/index.js';
 import { stdioTransport } from '../demo/stdio-transport.mjs';
 
 test('actual Rust application replies satisfy UI contract through a complete study journey', async t => {
@@ -8,7 +8,7 @@ test('actual Rust application replies satisfy UI contract through a complete stu
   t.after(() => transport.close());
   const rendered = [];
   let sequence = 0;
-  const ui = createStudyController({ transport, render: view => rendered.push(renderStudy(view)), makeSubmissionId: () => `ui-${++sequence}` });
+  const ui = createStudyController({ transport, render: view => rendered.push(renderStudy(view)), storage: { load: () => null, save() {} }, makeSubmissionId: () => `ui-${++sequence}` });
   let view = await ui.next();
   assert.equal(view.target_id, 'r1:p1');
   assert.equal(view.status, 'ready');
@@ -43,7 +43,7 @@ test('lost reply retries the exact intent against the real persisted receipt', a
     return result;
   } };
   let sequence = 0;
-  const ui = createStudyController({ transport, render() {}, makeSubmissionId: () => `retry-${++sequence}` });
+  const ui = createStudyController({ transport, render() {}, storage: { load: () => null, save() {} }, makeSubmissionId: () => `retry-${++sequence}` });
   await ui.next();
   await assert.rejects(ui.answer('e2e4'), /reply loss/);
   assert.equal(ui.getState().canRetry, true);
