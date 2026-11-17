@@ -56,7 +56,22 @@ impl Tempo {
             attempt.status == AttemptStatus::Active,
         )
         .map_err(|error| domain("invalid_content", error))?;
-        Ok(StudyView::attempt(result, board))
+        let correction_uci = if result.feedback.as_ref().is_some_and(|f| !f.correct) {
+            // A miss leaves the cursor on the same decision, including on replay
+            // of a receipt whose pinned definition has since been replaced.
+            let decision = issued
+                .item
+                .definition
+                .decisions
+                .get(attempt.state.decision_index)
+                .ok_or_else(|| {
+                    AppError::new("invalid_content", "correction decision is missing")
+                })?;
+            Some(decision.expected.uci.clone())
+        } else {
+            None
+        };
+        Ok(StudyView::attempt(result, board, correction_uci))
     }
 }
 

@@ -8,14 +8,16 @@ export interface Prompt {
   readonly decision_count: number;
 }
 /** Feedback and automatic replies produced by the server-side grader. */
-export interface Feedback {
-  readonly correct: boolean;
+export type Feedback = {
   readonly message: string;
   readonly autoplay: readonly { readonly uci: string }[];
-}
+} & (
+  | { readonly correct: true }
+  | { readonly correct: false; readonly correction_uci: string }
+);
 /** Server identities copied into later answer/abandon commands. */
 export interface AttemptViewBase {
-  readonly schema_version: 2;
+  readonly schema_version: 3;
   readonly display_fen: string;
   readonly learner_color: "white" | "black";
   readonly legal_moves: readonly string[];
@@ -40,13 +42,13 @@ export interface FinishedView extends AttemptViewBase {
 }
 /** Nothing eligible now; Next can be requested again after conditions change. */
 export interface EmptyView {
-  readonly schema_version: 2;
+  readonly schema_version: 3;
   readonly status: "empty";
   readonly dataset_id: string;
 }
 /** Whether to retain a command for retry is supplied by the application. */
 export interface ErrorView {
-  readonly schema_version: 2;
+  readonly schema_version: 3;
   readonly status: "error";
   readonly code: string;
   readonly message: string;

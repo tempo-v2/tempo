@@ -126,6 +126,8 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     assert.equal(issued.display_fen, issued.prompt.fen);
     assert.ok(issued.legal_moves.includes('a6b7'));
     assert.ok(!JSON.stringify(issued).includes('"expected"'));
+    assert.equal(issued.feedback, null);
+    assert.ok(!JSON.stringify(issued).includes('correction_uci'));
 
     const before = persisted(database);
     const illegal = await client.answer('a6a6');
@@ -151,12 +153,14 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     assert.equal(replay.attempt_id, lostResult.attempt_id);
     assert.equal(replay.revision, lostResult.revision);
     assert.deepEqual(replay.feedback, lostResult.feedback);
+    assert.equal(replay.feedback.correction_uci, 'a6c8');
     assert.equal(replay.display_fen, issued.display_fen);
     assert.deepEqual(persisted(database), lost);
     assert.equal(JSON.parse(stored).pending, null);
 
     const middle = await client.answer('a6c8');
     assert.equal(middle.status, 'ready');
+    assert.ok(!Object.hasOwn(middle.feedback, 'correction_uci'));
     const complete = await client.answer('e1e8');
     assert.equal(complete.status, 'complete');
     assert.equal(complete.assessment, 'again');
