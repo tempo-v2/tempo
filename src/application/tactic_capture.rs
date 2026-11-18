@@ -1,9 +1,7 @@
 //! Preview user-supplied legal PGN segments and accept an explicitly selected batch.
 use super::{
     Tempo,
-    content_preview::{
-        check_dataset, preview_id, read_preview, source_id, stale_preview, validate_pgn,
-    },
+    content_preview::{check_dataset, preview_id, read_preview, source_id, stale_preview},
 };
 use crate::{
     AppError, app_error::domain, commands::TacticCaptureCommand, views::StudyView,
@@ -30,7 +28,6 @@ impl Tempo {
         match command {
             TacticCaptureCommand::Preview(input) => {
                 check_dataset(&snapshot, &input.dataset_id)?;
-                validate_pgn(&input.pgn)?;
                 let source = source_id(&input.pgn);
                 let preview = preview_tactic_pgn(&input.pgn, &input.selections, &source)
                     .map_err(|error| domain("invalid_pgn", error))?;
@@ -46,7 +43,6 @@ impl Tempo {
                 mut selected,
             } => {
                 check_dataset(&snapshot, &input.dataset_id)?;
-                validate_pgn(&input.pgn)?;
                 let (seen_revision, purpose) = read_preview(&key, &token, &input)?;
                 if purpose != "tactics" {
                     return Err(stale_preview());

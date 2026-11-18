@@ -2,7 +2,7 @@
 use super::{
     Tempo,
     content_preview::{
-        check_dataset, preview_id, read_preview, signature, source_id, stale_preview, validate_pgn,
+        check_dataset, preview_id, read_preview, signature, source_id, stale_preview,
     },
 };
 use crate::{
@@ -149,7 +149,6 @@ fn prepare(
 ) -> Result<(String, Catalog, ContentPlan), AppError> {
     check_dataset(snapshot, &input.dataset_id)?;
     let name = validate_name(&input.name)?;
-    validate_pgn(&input.pgn)?;
     if let Some(replacement) = &input.repertoire_id {
         let metadata = summaries(&snapshot.catalog)
             .remove(replacement)

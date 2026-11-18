@@ -106,13 +106,3 @@ pub(super) fn read_preview<'a>(
 pub(super) fn source_id(pgn: &str) -> String {
     format!("pgn:{}", blake3::hash(pgn.as_bytes()).to_hex())
 }
-
-pub(super) fn validate_pgn(pgn: &str) -> Result<(), AppError> {
-    if pgn.len() > 256 * 1024 {
-        return Err(AppError::new(
-            "pgn_too_large",
-            "The PGN must be at most 256 KiB.",
-        ));
-    }
-    Ok(())
-}
