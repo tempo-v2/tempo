@@ -1252,6 +1252,20 @@ fn completed_lichess_pgn_requests_an_ordinary_test_and_replays_after_repertoire_
         "command_id":"verified-public-game", "dataset_id":"opening-proof",
         "pgn":include_str!("../fixtures/lichess-LhL9TRJY.pgn"),
     });
+    let mut initial = command.clone();
+    initial["command_id"] = json!("game-without-end");
+    let without_end = include_str!("../fixtures/lichess-LhL9TRJY.pgn")
+        .lines()
+        .filter(|line| !line.starts_with("[UTCEnd"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    initial["pgn"] = json!(&without_end);
+    let original = app
+        .import_game_pgn(serde_json::from_value(initial.clone()).unwrap())
+        .unwrap();
+    assert_eq!(original.results[0].summary.occurrence_end_ms, None);
+    assert_eq!(app.study_progress(None).unwrap().unwrap().due, 0);
+
     let report = app
         .import_game_pgn(serde_json::from_value(command.clone()).unwrap())
         .unwrap();
@@ -1270,6 +1284,19 @@ fn completed_lichess_pgn_requests_an_ordinary_test_and_replays_after_repertoire_
         "already_addressed"
     );
 
+    let mut omission = initial.clone();
+    omission["command_id"] = json!("new-command-without-end");
+    let omission = app
+        .import_game_pgn(serde_json::from_value(omission).unwrap())
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&omission).unwrap()["results"][0]["effect"],
+        "already_addressed"
+    );
+    assert_eq!(
+        omission.results[0].summary.occurrence_end_ms,
+        report.results[0].summary.occurrence_end_ms
+    );
     preview_and_save(&mut app, "1. h3 *", "Public game proof", Some(repertoire));
     drop(app);
     let mut app = open(&db, today, limits, 1);
@@ -1294,4 +1321,134 @@ fn completed_lichess_pgn_requests_an_ordinary_test_and_replays_after_repertoire_
         (1, 1, 0)
     );
     assert_eq!(app.snapshot().unwrap().assessments.len(), 3);
+    let history = app.game_history().unwrap();
+    let rows = history["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["game_id"], rows[1]["game_id"]);
+    assert!(rows[0]["comparison_id"].is_string());
+    assert_ne!(rows[0]["comparison_id"], rows[1]["comparison_id"]);
+    let original_replay = app
+        .import_game_pgn(serde_json::from_value(initial).unwrap())
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&original).unwrap(),
+        serde_json::to_vec(&original_replay).unwrap()
+    );
+}
+
+#[test]
+fn pgn_batch_resolves_timing_in_either_order_and_rejects_conflicting_end_atomically() {
+    let without_end = r#"[White "Learner"]
+[Black "Other"]
+[UTCDate "2024.10.05"]
+[UTCTime "12:00:00"]
+
+1. d4 d5 1-0"#;
+    let with_end = without_end.replace(
+        "[UTCTime \"12:00:00\"]",
+        "[UTCTime \"12:00:00\"]\n[UTCEndDate \"2024.10.05\"]\n[UTCEndTime \"12:10:00\"]",
+    );
+    for reverse in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("pgn-timing.sqlite");
+        let today = Arc::new(AtomicI32::new(20_000));
+        let mut app = open(&db, today.clone(), IntroductionLimits::default(), 0);
+        let (_, saved) = preview_and_save(&mut app, "1. e4 *", "White", None);
+        let repertoire = saved["repertoires"][0]["id"].as_str().unwrap();
+        let lesson = study(&mut app, json!({"command":"next"}));
+        let mut teach = activity_command("acknowledge", &lesson, "teach-before-pgn");
+        teach["answer"] = json!({"uci":"e2e4"});
+        assert_eq!(study(&mut app, teach)["assessment"], Value::Null);
+        today.store(20_001, Ordering::Relaxed);
+        let ordinary = study(&mut app, json!({"command":"next"}));
+        let mut answer = activity_command("answer", &ordinary, "test-before-pgn");
+        answer["answer"] = json!({"uci":"e2e4"});
+        assert_eq!(study(&mut app, answer)["assessment"], "good");
+        today.store(20_002, Ordering::Relaxed);
+
+        let request = |command_id: &str, pgn: &str| {
+            serde_json::from_value(json!({
+                "repertoire_id": repertoire, "learner":"learner", "dataset_id":"opening-proof",
+                "command_id":command_id, "pgn":pgn,
+            }))
+            .unwrap()
+        };
+        let pgn = if reverse {
+            format!("{with_end}\n\n{without_end}")
+        } else {
+            format!("{without_end}\n\n{with_end}")
+        };
+        let report = app.import_game_pgn(request("batch", &pgn)).unwrap();
+        assert_eq!(
+            (report.new_games, report.duplicates, report.results.len()),
+            (1, 1, 2)
+        );
+        let rows = serde_json::to_value(report).unwrap();
+        let end = &rows["results"][0]["occurrence_end_ms"];
+        assert!(end.is_number());
+        assert_eq!(*end, rows["results"][1]["occurrence_end_ms"]);
+        assert_eq!(
+            rows["results"][0]["comparison_id"],
+            rows["results"][1]["comparison_id"]
+        );
+        for row in rows["results"].as_array().unwrap() {
+            assert_eq!(row["effect"], "requested_review");
+        }
+
+        let snapshot = app.snapshot().unwrap();
+        let history = app.game_history().unwrap();
+        let contradictory = with_end.replace("12:10:00", "12:11:00");
+        let unrelated = with_end.replace("1. d4 d5", "1. c4 e5");
+        let conflict = format!("{unrelated}\n\n{contradictory}");
+        let error = app
+            .import_game_pgn(request("conflict", &conflict))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "store_conflict");
+        assert_eq!(app.snapshot().unwrap(), snapshot);
+        assert_eq!(app.game_history().unwrap(), history);
+
+        // Omission keeps the known value, and the failed batch accepted no receipt.
+        let omission = serde_json::to_value(
+            app.import_game_pgn(request("conflict", without_end))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(omission["results"][0]["occurrence_end_ms"], *end);
+        assert_eq!(omission["duplicates"], 1);
+        assert_eq!(app.snapshot().unwrap(), snapshot);
+        assert_eq!(app.game_history().unwrap(), history);
+
+        let invalid = with_end.replace("12:10:00", "11:59:59");
+        let invalid = app.import_game_pgn(request("reversed", &invalid)).unwrap();
+        assert!(invalid.results.is_empty());
+        assert_eq!(
+            invalid.errors,
+            ["Game 1: PGN has an invalid occurrence interval."]
+        );
+
+        // First enrich a different game only after an ordinary assessment
+        // already covers its occurrence. This must not reopen the request.
+        let later_identity = without_end.replace("1. d4 d5", "1. c4 e5");
+        let undecided = app
+            .import_game_pgn(request("other-unknown", &later_identity))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(undecided).unwrap()["results"][0]["effect"],
+            "recorded_only"
+        );
+        let test = study(&mut app, json!({"command":"next"}));
+        let mut answer = activity_command("answer", &test, "cover-both-games");
+        answer["answer"] = json!({"uci":"e2e4"});
+        assert_eq!(study(&mut app, answer)["assessment"], "good");
+        let after_test = app.snapshot().unwrap();
+        let resolved = app
+            .import_game_pgn(request("other-enriched", &unrelated))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(resolved).unwrap()["results"][0]["effect"],
+            "already_addressed"
+        );
+        assert_eq!(app.snapshot().unwrap(), after_test);
+    }
 }
