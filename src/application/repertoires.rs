@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempo_chess::{
-    Catalog, ChangeKind, ContentKind, ContentPlan, LearnerColor, compile_repertoire,
+    Catalog, ChangeKind, ContentItem, ContentKind, ContentPlan, LearnerColor, compile_repertoire,
     plan_repertoire_replacement,
 };
 use tempo_learning::{DailyLearning, LearningState};
@@ -44,8 +44,30 @@ impl Tempo {
             .as_ref()
             .ok_or_else(|| AppError::new("unsupported", "Use the local study release."))?
             .preview_key;
+        if let RepertoireCommand::ReadDocument {
+            dataset_id,
+            repertoire_id,
+        } = &command
+        {
+            let document = self.store.repertoire_document(repertoire_id)?;
+            if &document.dataset != dataset_id {
+                return Err(super::content_preview::stale_dataset());
+            }
+            let item = document.item.ok_or_else(unknown_repertoire)?;
+            let availability = match document.pgn {
+                Some(pgn) => json!({ "status": "available", "pgn": pgn }),
+                None => json!({ "status": "unavailable" }),
+            };
+            return Ok(json!({
+                "schema_version": CONTENT_WIRE_VERSION, "status": "document",
+                "dataset_id": document.dataset, "repertoire_id": repertoire_id,
+                "name": item.label, "learner_color": learner_color(&item),
+                "revision": document.revision, "document": availability,
+            }));
+        }
         let (snapshot, revision) = self.store.content_state()?;
         match command {
+            RepertoireCommand::ReadDocument { .. } => unreachable!("handled as a bounded read"),
             RepertoireCommand::List => Ok(list(&snapshot.dataset, &snapshot.catalog)),
             RepertoireCommand::Rename {
                 dataset_id,
@@ -63,10 +85,7 @@ impl Tempo {
                     item.label = name.to_owned();
                 }
                 if !found {
-                    return Err(AppError::new(
-                        "unknown_repertoire",
-                        "Choose an existing repertoire.",
-                    ));
+                    return Err(unknown_repertoire());
                 }
                 if catalog != snapshot.catalog {
                     self.commit_catalog(&snapshot, &catalog, vec![], None, None)?;
@@ -78,12 +97,46 @@ impl Tempo {
                     let digest = signature(&key, revision, "", &input);
                     format!("repertoire-{}", &digest[..32])
                 });
-                let token = preview_id(&key, revision, &id, &input);
+                let token = document_preview(&key, revision, &id, &input);
                 let (_, incoming, plan) = prepare(&snapshot, &input, &id)?;
                 Ok(preview(&snapshot, &incoming, &plan, token))
             }
+            RepertoireCommand::EditPreview {
+                base_revision,
+                input,
+            } => {
+                check_dataset(&snapshot, &input.dataset_id)?;
+                if base_revision != revision {
+                    return Err(stale_draft());
+                }
+                let id = input
+                    .repertoire_id
+                    .as_deref()
+                    .ok_or_else(unknown_repertoire)?;
+                let document = self.store.repertoire_document(id)?;
+                if document.dataset != input.dataset_id || document.revision != base_revision {
+                    return Err(stale_draft());
+                }
+                if document.item.is_none() {
+                    return Err(unknown_repertoire());
+                }
+                if document.pgn.is_none() {
+                    return Err(AppError::new(
+                        "document_unavailable",
+                        "Upload a complete replacement to establish the current PGN.",
+                    ));
+                }
+                let (_, incoming, plan) = prepare(&snapshot, &input, id)?;
+                let token = document_preview(&key, revision, id, &input);
+                Ok(preview(&snapshot, &incoming, &plan, token))
+            }
             RepertoireCommand::Save { input, token } => {
-                let (revision_in_token, id) = read_preview(&key, &token, &input)?;
+                let (revision_in_token, id) =
+                    if let Some(versioned) = token.strip_prefix(DOCUMENT_PREVIEW) {
+                        read_preview(&key, versioned, &(DOCUMENT_PREVIEW, &input))?
+                    } else {
+                        read_preview(&key, &token, &input)?
+                    };
                 check_dataset(&snapshot, &input.dataset_id)?;
                 if let Some(saved) = self.store.content_receipt(&token)? {
                     return serde_json::from_str(&saved).map_err(|e| domain("invalid_receipt", e));
@@ -119,9 +172,10 @@ impl Tempo {
                     &snapshot,
                     &plan.catalog,
                     learning,
-                    Some(ContentSource {
+                    Some(ContentSource::RepertoireDocument {
                         id: &source,
                         pgn: &input.pgn,
+                        repertoire_id: id,
                     }),
                     Some(receipt),
                 )?;
@@ -129,6 +183,31 @@ impl Tempo {
             }
         }
     }
+}
+
+// Separate new Preview authority from any legacy receipt-only Save issued at
+// the same content revision. The version is bound into the MAC.
+const DOCUMENT_PREVIEW: &str = "document-v1:";
+
+fn document_preview(
+    key: &[u8; 32],
+    revision: tempo_types::Revision,
+    id: &str,
+    input: &RepertoireInput,
+) -> String {
+    let signed = preview_id(key, revision, id, &(DOCUMENT_PREVIEW, input));
+    format!("{DOCUMENT_PREVIEW}{signed}")
+}
+
+fn stale_draft() -> AppError {
+    AppError::new(
+        "stale_draft",
+        "The repertoire changed after you opened it. Reload the current PGN before previewing again.",
+    )
+}
+
+fn unknown_repertoire() -> AppError {
+    AppError::new("unknown_repertoire", "Choose an existing repertoire.")
 }
 
 fn validate_name(name: &str) -> Result<&str, AppError> {
@@ -152,7 +231,7 @@ fn prepare(
     if let Some(replacement) = &input.repertoire_id {
         let metadata = summaries(&snapshot.catalog)
             .remove(replacement)
-            .ok_or_else(|| AppError::new("unknown_repertoire", "Choose an existing repertoire."))?;
+            .ok_or_else(unknown_repertoire)?;
         if id != replacement
             || input.learner_color != metadata.learner_color
             || name != metadata.name
@@ -177,23 +256,25 @@ fn summaries(catalog: &Catalog) -> BTreeMap<String, Summary> {
         let ContentKind::Repertoire { repertoire, .. } = &item.definition.kind else {
             continue;
         };
-        let learner_color =
-            if item.definition.decisions[0].fen.split_whitespace().nth(1) == Some("b") {
-                LearnerColor::Black
-            } else {
-                LearnerColor::White
-            };
         let summary = summaries
             .entry(repertoire.clone())
             .or_insert_with(|| Summary {
                 id: repertoire.clone(),
                 name: item.label.clone(),
-                learner_color,
+                learner_color: learner_color(item),
                 positions: 0,
             });
         summary.positions += usize::from(item.active());
     }
     summaries
+}
+
+fn learner_color(item: &ContentItem) -> LearnerColor {
+    if item.definition.decisions[0].fen.split_whitespace().nth(1) == Some("b") {
+        LearnerColor::Black
+    } else {
+        LearnerColor::White
+    }
 }
 
 fn list(dataset: &DatasetId, catalog: &Catalog) -> Value {

@@ -1,7 +1,7 @@
 //! Bounded original PGN data travels with both preview and save.
 use serde::{Deserialize, Serialize};
 use tempo_chess::LearnerColor;
-use tempo_types::DatasetId;
+use tempo_types::{DatasetId, Revision};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +18,15 @@ pub struct RepertoireInput {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum RepertoireCommand {
     List,
+    ReadDocument {
+        dataset_id: DatasetId,
+        repertoire_id: String,
+    },
+    EditPreview {
+        base_revision: Revision,
+        #[serde(flatten)]
+        input: RepertoireInput,
+    },
     Preview(RepertoireInput),
     Save {
         #[serde(flatten)]

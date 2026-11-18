@@ -3,7 +3,12 @@
 Open the installed [Tempo](http://127.0.0.1:41822) for ordinary study. Its Mac
 LaunchAgent serves the qualified checkpoint on the retained study dataset.
 
-Use **Repertoires** to upload or paste standard-start PGN, choose your learner color, preview the routes and save. To edit a repertoire, upload its complete intended PGN as a replacement. An unchanged answer keeps its learning. A changed answer needs a new lesson.
+Use **Repertoires** to import standard-start PGN or open **Edit** on a saved
+repertoire. Edit the complete document, choose **Preview changes** to see
+effects on the repertoire, then choose **Save repertoire**. **Download PGN**
+fetches the current accepted document. If Tempo has no verified current PGN
+for an older repertoire, upload a complete replacement to establish it.
+An unchanged answer keeps its learning. A changed answer needs a new lesson.
 
 Create a new repertoire by leaving the destination unselected. Rename an existing
 repertoire by its current selection. A rename preserves its targets and learning.

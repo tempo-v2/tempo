@@ -906,3 +906,82 @@ fn captures_interrupt_only_the_next_selection_and_cost_no_introductions() {
     );
     assert_eq!(app.snapshot().unwrap(), graded);
 }
+
+#[test]
+fn current_pgn_read_and_edit_keep_the_full_document_and_its_content_fence() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("current-pgn.sqlite");
+    let day = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits::default();
+    let mut app = open(&db, day.clone(), limits, 0);
+    let original = "1. e4 e5 2. Nf3 *\n";
+    let authored = "[Event \"Annotated\"]\n\n1. e4 e5 2. Nf3 *\n";
+    let (_, created) = preview_and_save(&mut app, original, "Repertoire", None);
+    let id = created["repertoires"][0]["id"].as_str().unwrap();
+    let read = json!({"command":"read_document", "dataset_id":"opening-proof", "repertoire_id":id});
+    let before = app.snapshot().unwrap();
+    let loaded = content(&mut app, read.clone());
+    assert_eq!(
+        loaded["document"],
+        json!({"status":"available","pgn": original})
+    );
+    assert_eq!(app.snapshot().unwrap(), before);
+    assert!(created["repertoires"][0].get("pgn").is_none());
+
+    let mut edit = book_request("edit_preview", authored, "Repertoire", Some(id));
+    edit["base_revision"] = loaded["revision"].clone();
+    let preview = content(&mut app, edit.clone());
+    assert_eq!(preview["status"], "preview", "{preview}");
+    assert_eq!(preview["changed"], 0);
+    assert_eq!(preview["removed"], 0);
+    let activity = study(&mut app, json!({"command":"next"}));
+    let before_read = app.snapshot().unwrap();
+    assert_eq!(content(&mut app, read.clone()), loaded);
+    assert_eq!(app.snapshot().unwrap(), before_read);
+    let mut ack = activity_command("acknowledge", &activity, "learn-between-preview-and-save");
+    ack["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, ack)["status"], "complete");
+    let learned = app.snapshot().unwrap();
+
+    let mut save = book_request("save", authored, "Repertoire", Some(id));
+    save["token"] = preview["token"].clone();
+    let receipt = content(&mut app, save.clone());
+    assert_eq!(receipt["status"], "repertoires", "{receipt}");
+    assert_eq!(app.snapshot().unwrap().learning, learned.learning);
+    assert_eq!(content(&mut app, edit)["code"], "stale_draft");
+    let annotated = content(&mut app, read.clone());
+    assert_eq!(annotated["document"]["pgn"], authored);
+    let mut stale = book_request("edit_preview", "1. d4 d5 *", "Repertoire", Some(id));
+    stale["base_revision"] = annotated["revision"].clone();
+    let stale_preview = content(&mut app, stale);
+    let mut stale_save = book_request("save", "1. d4 d5 *", "Repertoire", Some(id));
+    stale_save["token"] = stale_preview["token"].clone();
+
+    let annotated_catalog = app.snapshot().unwrap().catalog;
+    preview_and_save(&mut app, original, "Repertoire", Some(id));
+    let restored = app.snapshot().unwrap();
+    assert_eq!(restored.catalog, annotated_catalog);
+    assert_eq!(restored.learning, learned.learning);
+    let returned = content(&mut app, read.clone());
+    assert_eq!(returned["document"]["pgn"], original);
+    assert_eq!(
+        returned["revision"].as_u64().unwrap(),
+        annotated["revision"].as_u64().unwrap() + 1
+    );
+    assert_eq!(content(&mut app, stale_save)["code"], "stale_preview");
+    assert_eq!(app.snapshot().unwrap(), restored);
+
+    content(
+        &mut app,
+        json!({"command":"rename","dataset_id":"opening-proof","repertoire_id":id,"name":"Renamed"}),
+    );
+    drop(app);
+    let mut app = open(&db, day, limits, 1);
+    let latest = content(&mut app, read.clone());
+    assert_eq!(latest["name"], "Renamed");
+    assert_eq!(latest["document"]["pgn"], original);
+    let before_replay = app.snapshot().unwrap();
+    assert_eq!(content(&mut app, save), receipt);
+    assert_eq!(content(&mut app, read), latest);
+    assert_eq!(app.snapshot().unwrap(), before_replay);
+}

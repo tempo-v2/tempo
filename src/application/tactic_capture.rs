@@ -106,7 +106,7 @@ impl Tempo {
                     &snapshot,
                     &plan.content.catalog,
                     writes,
-                    Some(ContentSource {
+                    Some(ContentSource::Archive {
                         id: &source,
                         pgn: &input.pgn,
                     }),
