@@ -269,7 +269,7 @@ fn summaries(catalog: &Catalog) -> BTreeMap<String, Summary> {
     summaries
 }
 
-fn learner_color(item: &ContentItem) -> LearnerColor {
+pub(super) fn learner_color(item: &ContentItem) -> LearnerColor {
     if item.definition.decisions[0].fen.split_whitespace().nth(1) == Some("b") {
         LearnerColor::Black
     } else {

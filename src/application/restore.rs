@@ -23,7 +23,9 @@ impl Tempo {
             ));
         }
         let portable = codec.decode(data)?;
-        if portable.schema_version != 1 || portable.policy != self.components.learning.settings() {
+        if !matches!(portable.schema_version, 1 | 2)
+            || portable.policy != self.components.learning.settings()
+        {
             return Err(AppError::new(
                 "incompatible_snapshot",
                 "schema or scheduling policy differs",
@@ -35,7 +37,19 @@ impl Tempo {
                 "dataset identity is required",
             ));
         }
-        for state in portable.learning.values() {
+        for (target, state) in &portable.learning {
+            if state.game_review.is_some_and(|review| {
+                portable
+                    .catalog
+                    .items
+                    .get(target)
+                    .is_none_or(|item| review.answer_version != item.version)
+            }) {
+                return Err(AppError::new(
+                    "invalid_learning",
+                    "Game review refers to a different answer version.",
+                ));
+            }
             self.components
                 .learning
                 .validate_state(state)

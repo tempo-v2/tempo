@@ -985,3 +985,313 @@ fn current_pgn_read_and_edit_keep_the_full_document_and_its_content_fence() {
     assert_eq!(content(&mut app, read), latest);
     assert_eq!(app.snapshot().unwrap(), before_replay);
 }
+
+#[test]
+fn game_import_is_answer_safe_and_preserves_active_work_across_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("games.sqlite");
+    let today = Arc::new(AtomicI32::new(20_000));
+    let mut app = open(&db, today.clone(), IntroductionLimits::default(), 0);
+    let (_, saved) = preview_and_save(&mut app, SHORT, "White", None);
+    let repertoire = saved["repertoires"][0]["id"].as_str().unwrap();
+    let command = json!({
+        "repertoire_id": repertoire, "learner":"learner", "command_id":"first-import", "dataset_id":"opening-proof",
+        "pgn":"[White \"Learner\"]\n[Black \"Other\"]\n1. d4 (1. e4 e5) d5 1-0\n\n[White \"Learner\"]\n[Black \"Other\"]\n1. e9 1-0",
+    });
+    let active = study(&mut app, json!({"command":"next"}));
+    let before = app.snapshot().unwrap();
+    let report = app
+        .import_game_pgn(serde_json::from_value(command.clone()).unwrap())
+        .unwrap();
+    assert_eq!(
+        (report.fetched, report.new_games, report.deviations),
+        (2, 1, 1)
+    );
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.results[0].summary.first_deviation_ply, Some(1));
+    let public = serde_json::to_string(&report).unwrap();
+    for secret in ["e2e4", "d2d4", "prescribed", "played"] {
+        assert!(!public.contains(secret), "{public}");
+    }
+    let after = app.snapshot().unwrap();
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.assessments, before.assessments);
+    assert!(
+        after
+            .learning
+            .values()
+            .any(|state| state.game_teaching_relevance)
+    );
+    assert!(
+        after
+            .learning
+            .values()
+            .all(|state| state.scheduler_memory.is_none())
+    );
+    drop(app);
+    let mut app = open(&db, today, IntroductionLimits::default(), 1);
+    let replay = app
+        .import_game_pgn(serde_json::from_value(command.clone()).unwrap())
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&replay).unwrap(),
+        serde_json::to_value(&report).unwrap()
+    );
+    let mut command = command;
+    command["command_id"] = json!("duplicate-import");
+    let report = app
+        .import_game_pgn(serde_json::from_value(command).unwrap())
+        .unwrap();
+    assert_eq!((report.new_games, report.duplicates), (0, 1));
+    assert_eq!(
+        app.game_history().unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(study(&mut app, json!({"command":"next"})), active);
+    assert_eq!(app.snapshot().unwrap(), after);
+}
+
+fn dated_game(app: &mut Tempo, repertoire: &str, date: &str, play: &str, time: &str) -> Value {
+    let pgn = format!(
+        "[White \"Learner\"]\n[Black \"Other\"]\n[UTCDate \"{date}\"]\n[UTCTime \"{time}\"]\n[UTCEndDate \"{date}\"]\n[UTCEndTime \"23:00:00\"]\n{play} 1-0"
+    );
+    static IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let request = json!({"repertoire_id":repertoire,"learner":"learner","pgn":pgn,
+        "dataset_id":app.snapshot().unwrap().dataset,
+        "command_id":format!("fixture-{}", IDS.fetch_add(1, Ordering::Relaxed))});
+    serde_json::to_value(
+        app.import_game_pgn(serde_json::from_value(request).unwrap())
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn real_daily_tests_address_covered_game_misses_and_preserve_newer_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("daily-games.sqlite");
+    let today = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits::default();
+    let mut app = open(&db, today.clone(), limits, 0);
+    let (_, saved) = preview_and_save(&mut app, "1. e4 *", "White", None);
+    let repertoire = saved["repertoires"][0]["id"].as_str().unwrap();
+    let lesson = study(&mut app, json!({"command":"next"}));
+    let target = TargetId::from(lesson["target_id"].as_str().unwrap());
+    let mut ack = activity_command("acknowledge", &lesson, "teach-game-target");
+    ack["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, ack)["assessment"], Value::Null);
+    today.store(20_001, Ordering::Relaxed);
+    let first = study(&mut app, json!({"command":"next"}));
+    let mut answer = activity_command("answer", &first, "original-scheduled-test");
+    answer["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, answer)["assessment"], "good");
+
+    today.store(20_002, Ordering::Relaxed);
+    let before = app.snapshot().unwrap();
+    assert!(before.learning[&target].due.unwrap() > StudyDay(20_002));
+    assert_eq!(app.study_progress(None).unwrap().unwrap().due, 0);
+    let report = dated_game(&mut app, repertoire, "2024.10.05", "1. d4 d5", "12:00:00");
+    assert_eq!(
+        report["results"][0]["effect"], "requested_review",
+        "{report}"
+    );
+    let staged = app.snapshot().unwrap();
+    assert_eq!(staged.assessments, before.assessments);
+    assert_eq!(
+        staged.learning[&target].scheduler_memory,
+        before.learning[&target].scheduler_memory
+    );
+    assert_eq!(staged.learning[&target].due, before.learning[&target].due);
+    assert_eq!(app.study_progress(None).unwrap().unwrap().due, 1);
+    drop(app);
+    let mut app = open(&db, today.clone(), limits, 1);
+    let requested = study(&mut app, json!({"command":"next"}));
+    assert_eq!(requested["activity"], "test");
+    assert_eq!(requested["target_id"], target.0);
+    assert!(requested.get("lesson").is_none());
+    assert!(requested.get("revealed_line").is_none());
+    assert!(!requested.to_string().contains("expected"));
+
+    // This game happened after issuance. Importing during the active Test
+    // must leave the Test visible and preserve the newer obligation afterward.
+    today.store(20_003, Ordering::Relaxed);
+    let later = dated_game(&mut app, repertoire, "2024.10.06", "1. c4 c5", "12:00:00");
+    assert_eq!(later["results"][0]["effect"], "requested_review");
+    assert_eq!(
+        study(&mut app, json!({"command":"next"}))["attempt_id"],
+        requested["attempt_id"]
+    );
+    let mut miss = activity_command("answer", &requested, "requested-test-miss");
+    miss["answer"] = json!({"uci":"d2d4"});
+    let result = study(&mut app, miss.clone());
+    assert_eq!(result["assessment"], "again");
+    assert_eq!(study(&mut app, miss), result);
+    let mut correct = activity_command("answer", &result, "finish-correction");
+    correct["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, correct)["status"], "complete");
+    let after = app.snapshot().unwrap();
+    assert_eq!(after.assessments.len(), 2);
+    assert_eq!(
+        after.learning[&target].game_review.unwrap().actionable_day,
+        StudyDay(20_004)
+    );
+    assert_eq!(app.study_progress(None).unwrap().unwrap().due, 0);
+    assert_eq!(study(&mut app, json!({"command":"next"}))["done"], true);
+    let replay = dated_game(&mut app, repertoire, "2024.10.05", "1. d4 d5", "12:00:00");
+    assert_eq!(replay["duplicates"], 1);
+    assert_eq!(replay["results"][0]["effect"], "already_addressed");
+    assert_eq!(app.snapshot().unwrap(), after);
+
+    today.store(20_004, Ordering::Relaxed);
+    let test = study(&mut app, json!({"command":"next"}));
+    let mut answer = activity_command("answer", &test, "requested-test-good");
+    answer["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, answer)["assessment"], "good");
+    assert!(
+        app.snapshot().unwrap().learning[&target]
+            .game_review
+            .is_none()
+    );
+    assert_eq!(
+        app.game_history().unwrap()["results"][0]["effect"],
+        "already_addressed"
+    );
+    let package = app.export(&tempo::JsonSnapshotCodec).unwrap();
+    let mut restored = open(&directory.path().join("restored.sqlite"), today, limits, 0);
+    restored
+        .restore("new-dataset".into(), &package, &tempo::JsonSnapshotCodec)
+        .unwrap();
+    let replay = dated_game(
+        &mut restored,
+        repertoire,
+        "2024.10.06",
+        "1. c4 c5",
+        "12:00:00",
+    );
+    assert_eq!(replay["results"][0]["effect"], "already_addressed");
+    assert!(
+        restored.snapshot().unwrap().learning[&target]
+            .game_review
+            .is_none()
+    );
+}
+
+#[test]
+fn a_deeper_game_miss_prioritizes_only_the_current_frontier_and_keeps_teaching_ungraded() {
+    let directory = tempfile::tempdir().unwrap();
+    let today = Arc::new(AtomicI32::new(20_004));
+    let mut app = open(
+        &directory.path().join("frontier.sqlite"),
+        today,
+        IntroductionLimits {
+            repertoire: 1,
+            tactics: 0,
+        },
+        0,
+    );
+    preview_and_save(&mut app, "1. c4 *", "A neutral route", None);
+    let (_, saved) = preview_and_save(&mut app, "1. e4 e5 2. Nf3 *", "Relevant route", None);
+    let repertoire = saved["repertoires"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Relevant route")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let report = dated_game(
+        &mut app,
+        repertoire,
+        "2024.10.06",
+        "1. e4 e5 2. Bc4",
+        "12:00:00",
+    );
+    assert_eq!(report["results"][0]["effect"], "prioritized_teaching");
+    let frontier = study(&mut app, json!({"command":"next"}));
+    assert_eq!(frontier["activity"], "teach");
+    assert_eq!(frontier["lesson"]["move_uci"], "e2e4");
+    let mut acknowledge = activity_command("acknowledge", &frontier, "frontier-introduction");
+    acknowledge["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, acknowledge)["assessment"], Value::Null);
+    assert_eq!(study(&mut app, json!({"command":"next"}))["done"], true);
+    assert!(app.snapshot().unwrap().assessments.is_empty());
+}
+
+#[test]
+fn completed_lichess_pgn_requests_an_ordinary_test_and_replays_after_repertoire_edit() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("public-game.sqlite");
+    let today = Arc::new(AtomicI32::new(20_647));
+    let limits = IntroductionLimits::default();
+    let mut app = open(&db, today.clone(), limits, 0);
+    let (_, saved) = preview_and_save(&mut app, "1. e4 *", "Public game proof", None);
+    let repertoire = saved["repertoires"][0]["id"].as_str().unwrap();
+    let lesson = study(&mut app, json!({"command":"next"}));
+    let mut teach = activity_command("acknowledge", &lesson, "teach-before-real-game");
+    teach["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, teach)["assessment"], Value::Null);
+    today.store(20_648, Ordering::Relaxed);
+    let ordinary = study(&mut app, json!({"command":"next"}));
+    let mut answer = activity_command("answer", &ordinary, "test-before-real-game");
+    answer["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, answer)["assessment"], "good");
+    today.store(20_650, Ordering::Relaxed);
+    let ordinary = study(&mut app, json!({"command":"next"}));
+    let mut answer = activity_command("answer", &ordinary, "second-test-before-real-game");
+    answer["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, answer)["assessment"], "good");
+    today.store(20_652, Ordering::Relaxed);
+    assert_eq!(app.study_progress(None).unwrap().unwrap().due, 0);
+
+    // The provider archive supplies the occurrence bounds included in this upload.
+    let command = json!({
+        "repertoire_id": repertoire, "learner":"LeelaAlien",
+        "command_id":"verified-public-game", "dataset_id":"opening-proof",
+        "pgn":include_str!("../fixtures/lichess-LhL9TRJY.pgn"),
+    });
+    let report = app
+        .import_game_pgn(serde_json::from_value(command.clone()).unwrap())
+        .unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.results[0].summary.first_deviation_ply, Some(1));
+    assert_eq!(
+        serde_json::to_value(&report).unwrap()["results"][0]["effect"],
+        "requested_review"
+    );
+    let requested = study(&mut app, json!({"command":"next"}));
+    let mut test = activity_command("answer", &requested, "real-game-resolved");
+    test["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, test)["assessment"], "good");
+    assert_eq!(
+        app.game_history().unwrap()["results"][0]["effect"],
+        "already_addressed"
+    );
+
+    preview_and_save(&mut app, "1. h3 *", "Public game proof", Some(repertoire));
+    drop(app);
+    let mut app = open(&db, today, limits, 1);
+    let replay = app
+        .import_game_pgn(serde_json::from_value(command.clone()).unwrap())
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(report).unwrap(),
+        serde_json::to_value(replay).unwrap()
+    );
+    assert_eq!(
+        app.game_history().unwrap()["results"][0]["effect"],
+        "stale_content"
+    );
+    let mut reanalyze = command;
+    reanalyze["command_id"] = json!("reanalyze-after-edit");
+    let report = app
+        .import_game_pgn(serde_json::from_value(reanalyze).unwrap())
+        .unwrap();
+    assert_eq!(
+        (report.duplicates, report.matches, report.deviations),
+        (1, 1, 0)
+    );
+    assert_eq!(app.snapshot().unwrap().assessments.len(), 3);
+}

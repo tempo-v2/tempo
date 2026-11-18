@@ -10,3 +10,5 @@ pub use fixed_clock::FixedClock;
 pub use fixture_games::FixtureGames;
 pub use json_snapshot_codec::JsonSnapshotCodec;
 pub use unavailable_games::UnavailableGames;
+
+pub(crate) mod public_games;

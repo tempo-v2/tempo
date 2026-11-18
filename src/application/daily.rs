@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tempo_chess::ContentItem;
 use tempo_queue::{
-    DailyActivity, DailyCandidate, DailyChoice, DailyContext, DailyKind, DailySelection,
-    DailySession, Line,
+    DailyActivity, DailyCandidate, DailyChoice, DailyContext, DailyEvidence, DailyKind,
+    DailySelection, DailySession, Line,
 };
 use tempo_store::{ActivityMode, AnswerResult, Snapshot, Store, StoredAttempt, StudyScope, Write};
 use tempo_study::{Attempt, AttemptStatus};
@@ -73,6 +73,7 @@ impl Tempo {
     ) -> DailySelection {
         let daily = self.daily.as_ref().expect("daily release");
         let mut admitted = (0, 0);
+        let mut evidence = DailyEvidence::default();
         let mut capture_priority = BTreeMap::new();
         let candidates = snapshot
             .catalog
@@ -102,6 +103,19 @@ impl Tempo {
                 {
                     capture_priority.insert(item.target.clone(), introduced.unix_ms);
                 }
+                let may_test = state.can_accept_daily_test(at.day);
+                if item.active() {
+                    if may_test
+                        && state.game_review.is_some_and(|review| {
+                            review.answer_version == item.version && review.actionable_day <= at.day
+                        })
+                    {
+                        evidence.requested_tests.insert(item.target.clone());
+                    }
+                    if state.game_teaching_relevance {
+                        evidence.teaching_targets.insert(item.target.clone());
+                    }
+                }
                 item.active().then(|| {
                     (
                         item.target.clone(),
@@ -109,7 +123,7 @@ impl Tempo {
                             kind,
                             introduced_this_version: state.introduced,
                             first_introduced: state.first_introduced,
-                            due: state.due,
+                            due: state.due.filter(|_| may_test),
                         },
                     )
                 })
@@ -132,7 +146,7 @@ impl Tempo {
             daily.tactic_themes.as_ref(),
             daily.starter_themes,
         );
-        daily.queue.select_with_capture_priority(
+        daily.queue.select_with_evidence(
             DailyContext {
                 seed,
                 today: at.day,
@@ -150,6 +164,7 @@ impl Tempo {
                 .map(|record| &record.attempt.target),
             order.as_ref(),
             &capture_priority,
+            &evidence,
         )
     }
 

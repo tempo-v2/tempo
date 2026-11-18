@@ -2,9 +2,10 @@
 use super::{LocalResult, tactic_settings};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
+use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path, time::Duration};
 use tempo::{
     AppError, Tempo,
+    game_evidence::{GameImport, GameJobs, GameRefresh},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use tempo_store::SqliteStore;
@@ -24,12 +25,24 @@ pub(super) fn serve(
     let address = server.server_addr().to_string();
     let origin = format!("http://{address}");
     println!("Tempo study at {origin}");
-    for request in server.incoming_requests() {
-        if let Err(error) = respond(app, profile_store, request, &public, &address, &origin) {
+    let mut games = GameJobs::start()?;
+    loop {
+        games.poll(app);
+        let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
+            continue;
+        };
+        if let Err(error) = respond(
+            app,
+            profile_store,
+            &mut games,
+            request,
+            &public,
+            &address,
+            &origin,
+        ) {
             eprintln!("Tempo HTTP: {error}");
         }
     }
-    Ok(())
 }
 
 struct Asset {
@@ -90,6 +103,7 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
 fn respond(
     app: &mut Tempo,
     profile_store: &SqliteStore,
+    games: &mut GameJobs,
     mut request: Request,
     public: &BTreeMap<String, Asset>,
     address: &str,
@@ -99,6 +113,47 @@ fn respond(
         || header(&request, "Origin").is_some_and(|value| value != origin)
     {
         request.respond(Response::empty(StatusCode(403)))?;
+    } else if matches!(
+        request.url(),
+        "/api/games" | "/api/games/job" | "/api/games/import" | "/api/games/refresh"
+    ) {
+        let (status, reply) = match (request.method(), request.url()) {
+            (&Method::Get, "/api/games") => (200, app.game_history()),
+            (&Method::Get, "/api/games/job") => (200, Ok(games.poll(app))),
+            (&Method::Post, "/api/games/import") => (
+                200,
+                command::<GameImport>(&mut request, MAX_CONTENT_COMMAND_BYTES)
+                    .and_then(|intent| app.import_game_pgn(intent))
+                    .map(|report| serde_json::json!(report)),
+            ),
+            (&Method::Post, "/api/games/refresh") => (
+                202,
+                command::<GameRefresh>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.refresh(app, intent)),
+            ),
+            _ => (
+                405,
+                Err(AppError::new(
+                    "method_not_allowed",
+                    "Invalid Games request.",
+                )),
+            ),
+        };
+        let (status, reply) = match reply {
+            Ok(reply) => (status, reply),
+            Err(error) => (
+                if status == 405 { 405 } else { 400 },
+                serde_json::json!(ErrorView::for_content(error)),
+            ),
+        };
+        request.respond(
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            )
+            .with_status_code(StatusCode(status))
+            .with_header(field("Cache-Control", "no-store")),
+        )?;
     } else if request.method() == &Method::Post && request.url() == "/api/tactic-settings" {
         let reply = command(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
