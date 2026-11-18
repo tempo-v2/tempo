@@ -8,8 +8,11 @@ use crate::{
     wire::STUDY_WIRE_VERSION,
 };
 use serde_json::{Value, json};
-use tempo_chess::{ChangeKind, plan_tactic_capture, preview_tactic_pgn};
-use tempo_learning::LearningState;
+use std::collections::BTreeSet;
+use tempo_chess::{plan_tactic_capture, preview_tactic_pgn};
+use tempo_learning::DailyLearning;
+
+pub(super) const PERSONAL_CAPTURE: &str = "tempo:capture-save";
 use tempo_store::{ContentReceipt, ContentSource, Write};
 
 impl Tempo {
@@ -64,20 +67,40 @@ impl Tempo {
                 let catalog = preview
                     .selected_catalog(&selected)
                     .map_err(|error| domain("invalid_selection", error))?;
-                let plan = plan_tactic_capture(&snapshot.catalog, &catalog)
+                let mut plan = plan_tactic_capture(&snapshot.catalog, &catalog)
                     .map_err(|error| domain("content_change_error", error))?;
-                let writes = plan
+                let at = self.components.clock.now();
+                let targets: BTreeSet<_> = plan
                     .content
                     .changes
                     .iter()
-                    .filter(|entry| entry.kind == ChangeKind::Added)
-                    .map(|entry| Write::Learning {
-                        target: entry.target.clone(),
-                        state: LearningState::default(),
-                    })
+                    .map(|entry| entry.target.clone())
                     .collect();
+                let mut writes = Vec::new();
+                for target in targets {
+                    let item = plan
+                        .content
+                        .catalog
+                        .items
+                        .get_mut(&target)
+                        .expect("planned target");
+                    let prior = snapshot.learning.get(&target).cloned().unwrap_or_default();
+                    if item.active() && !prior.introduced {
+                        let state = DailyLearning::introduce_capture(&prior, at)
+                            .map_err(|error| domain("learning_error", error))?;
+                        if !item
+                            .provenance
+                            .iter()
+                            .any(|value| value == PERSONAL_CAPTURE)
+                        {
+                            item.provenance.push(PERSONAL_CAPTURE.into());
+                            item.provenance.sort();
+                        }
+                        writes.push(Write::Learning { target, state });
+                    }
+                }
                 let reply = json!({ "schema_version": STUDY_WIRE_VERSION, "status": "tactics_saved",
-                    "count": selected.len(), "alternate_solutions": plan.alternate_solutions });
+                    "count": selected.len(), "ready_for_review": writes.len(), "alternate_solutions": plan.alternate_solutions });
                 let payload = reply.to_string();
                 self.commit_catalog(
                     &snapshot,

@@ -26,11 +26,17 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         [mode, database, normalized] if mode == "import-tactics" => {
             local_runtime::import(Path::new(database), Path::new(normalized))
         }
+        [mode, database] if mode == "backfill-personal-tactics" => {
+            local_runtime::backfill_personal_tactics(Path::new(database), false)
+        }
+        [mode, database, apply] if mode == "backfill-personal-tactics" && apply == "--apply" => {
+            local_runtime::backfill_personal_tactics(Path::new(database), true)
+        }
         [mode, database, ui, port] if mode == "serve" => {
             local_runtime::serve(Path::new(database), Path::new(ui), port.parse()?)
         }
         _ => Err(
-            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | serve DATABASE UI_DIST PORT"
+            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-personal-tactics DATABASE [--apply] | serve DATABASE UI_DIST PORT"
                 .into(),
         ),
     }

@@ -144,12 +144,17 @@ impl Tempo {
                     previous_move: lesson.and_then(|lesson| lesson.previous_move.clone()),
                 }
             });
+        let history = (attempt.state.decision_index > 0)
+            .then(|| tempo_chess::revealed_line(&issued.definition, attempt.state.decision_index))
+            .transpose()
+            .map_err(|error| domain("invalid_content", error))?;
         Ok(StudyView::attempt(
             result,
             board,
             correction_uci,
             &record,
             lesson,
+            history,
         ))
     }
 }

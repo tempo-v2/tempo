@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -85,6 +85,13 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
         assert.equal(response.status, 200);
         assert.ok((await response.arrayBuffer()).byteLength > 0);
     }
+    for (const clip of ['move-self', 'move-opponent', 'capture', 'check', 'castle', 'promote', 'illegal']) {
+        const response = await fetch(`${host.url}/assets/${clip}.mp3`);
+        assert.equal(response.status, 200, clip);
+        assert.equal(response.headers.get('content-type'), 'audio/mpeg', clip);
+        const original = await readFile(new URL(`../../tempo-ui/sounds/${clip}.mp3`, import.meta.url));
+        assert.deepEqual(Buffer.from(await response.arrayBuffer()), original, clip);
+    }
     for (const resource of ['/normalized.json', '/assets/normalized.json', '/practice.sqlite']) {
         assert.equal((await fetch(host.url + resource)).status, 404);
     }
@@ -129,7 +136,26 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     assert.equal(issued.feedback, null);
     assert.ok(!JSON.stringify(issued).includes('correction_uci'));
 
+    const post = async (route, command) => {
+        const response = await fetch(`${host.url}/api/${route}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(command),
+        });
+        assert.equal(response.status, 200);
+        return response.json();
+    };
     const before = persisted(database);
+    const page = await post('tactics-collection', { command: 'list', search: 'Lichess CC0' });
+    assert.equal(page.dataset_id, issued.dataset_id);
+    assert.deepEqual(page.rows, [{ target: issued.target_id, label: tactic.label, introduced: false, due: false }]);
+    const detail = { command: 'detail', dataset_id: page.dataset_id, target: issued.target_id, show_solution: true };
+    const blocked = await post('tactics-collection', detail);
+    assert.equal(blocked.solution_blocked, true);
+    assert.ok(!Object.hasOwn(blocked, 'solution'));
+    assert.equal(blocked.fen, issued.display_fen);
+    const progress = await post('study-progress', null);
+    assert.equal(progress.tactics_introduced, 0);
+    assert.equal(await post('study-progress', progress.stamp), null);
+    assert.deepEqual(persisted(database), before);
     const illegal = await client.answer('a6a6');
     assert.equal(illegal.code, 'invalid_move');
     assert.equal(illegal.retryable, false);
@@ -158,15 +184,32 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     assert.deepEqual(persisted(database), lost);
     assert.equal(JSON.parse(stored).pending, null);
 
+    const correction = await post('study-progress', progress.stamp);
+    assert.equal(correction.active_correction, true);
+    assert.equal(correction.tactics_introduced, 1);
     const middle = await client.answer('a6c8');
+    const middleCommand = sent.at(-1);
     assert.equal(middle.status, 'ready');
     assert.ok(!Object.hasOwn(middle.feedback, 'correction_uci'));
+    assert.equal(middle.history.moves.length, 2);
+    assert.match(middle.history.moves[0].notation, /Qxc8/);
+    assert.match(middle.history.moves[1].notation, /Bxc8/);
+    assert.ok(!JSON.stringify(middle.history).includes('Re8'));
     const complete = await client.answer('e1e8');
     assert.equal(complete.status, 'complete');
     assert.equal(complete.assessment, 'again');
     assert.deepEqual(persisted(database).grades, ['again']);
     assert.deepEqual(complete.legal_moves, []);
     assert.notEqual(complete.display_fen, middle.display_fen);
+    assert.equal(complete.history.moves.length, 3);
+    const after = persisted(database);
+    assert.deepEqual((await post('study', middleCommand)).history, middle.history);
+    const metadata = await post('tactics-collection', { ...detail, show_solution: false });
+    assert.ok(!Object.hasOwn(metadata, 'solution'));
+    const inspected = await post('tactics-collection', detail);
+    assert.equal(inspected.solution_blocked, false);
+    assert.equal(inspected.solution.moves.length, 3);
+    assert.deepEqual(persisted(database), after);
 
     client = controller();
     const reloaded = await client.start();

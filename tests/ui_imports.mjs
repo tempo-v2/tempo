@@ -42,6 +42,7 @@ test('Tempo UI consumes the Core artifact through its declared public imports', 
     const appImport = specifier =>
         reactImport(specifier)
         || specifier === 'react-dom/client'
+        || specifier === 'chess.js'
         || specifier === corePackage && '.' in exports
         || specifier === corePackage + '/styles.css' && './styles.css' in exports;
     checkImports(ui, ui, appImport);

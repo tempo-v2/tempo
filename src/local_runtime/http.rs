@@ -1,5 +1,5 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
-use super::LocalResult;
+use super::{LocalResult, tactic_settings};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
@@ -7,19 +7,25 @@ use tempo::{
     AppError, Tempo,
     wire::{RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
+use tempo_store::SqliteStore;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 
-pub(super) fn serve(app: &mut Tempo, ui: &Path, port: u16) -> LocalResult<()> {
+pub(super) fn serve(
+    app: &mut Tempo,
+    profile_store: &SqliteStore,
+    ui: &Path,
+    port: u16,
+) -> LocalResult<()> {
     let public = build_files(ui)?;
     let server = Server::http((Ipv4Addr::LOCALHOST, port))?;
     let address = server.server_addr().to_string();
     let origin = format!("http://{address}");
     println!("Tempo study at {origin}");
     for request in server.incoming_requests() {
-        if let Err(error) = respond(app, request, &public, &address, &origin) {
+        if let Err(error) = respond(app, profile_store, request, &public, &address, &origin) {
             eprintln!("Tempo HTTP: {error}");
         }
     }
@@ -66,6 +72,7 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
             "css" => "text/css; charset=utf-8",
             "svg" => "image/svg+xml",
             "png" => "image/png",
+            "mp3" => "audio/mpeg",
             "woff2" => "font/woff2",
             _ => continue,
         };
@@ -82,6 +89,7 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
 
 fn respond(
     app: &mut Tempo,
+    profile_store: &SqliteStore,
     mut request: Request,
     public: &BTreeMap<String, Asset>,
     address: &str,
@@ -91,6 +99,32 @@ fn respond(
         || header(&request, "Origin").is_some_and(|value| value != origin)
     {
         request.respond(Response::empty(StatusCode(403)))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/tactic-settings" {
+        let reply = command(&mut request, MAX_COMMAND_BYTES)
+            .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
+            .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/tactics-collection" {
+        let reply = command::<tempo::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
+            .and_then(|intent| app.read_tactics(intent))
+            .map(|content| serde_json::json!(content))
+            .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
+        let reply = command::<Option<tempo::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
+            .and_then(|known| app.study_progress(known.as_ref()))
+            .map(|progress| serde_json::json!(progress))
+            .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
     } else if request.method() == &Method::Post && request.url() == "/api/study" {
         let reply = command::<StudyCommand>(&mut request, MAX_COMMAND_BYTES)
             .map(|intent| app.handle(intent))

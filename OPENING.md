@@ -28,7 +28,7 @@ The same start command resumes retained lessons and tests from `.local/usable-re
 
 ## Running and checking Tempo on the Mac
 
-Run these commands from `/Users/andy/Developer/tempo-v2`. `make start` builds with the workspace Cargo lock and the UI npm lock. It serves `target/debug/tempo` with `tempo-ui/dist` in the foreground and logs to that terminal. Ctrl+C stops it. It can replace an existing listener only after matching both the workspace executable and the selected database.
+Run these commands from `/Users/andy/Developer/tempo-v2`. `make start` builds with the workspace Cargo lock and the UI npm lock. After both builds succeed, it stops this checkout’s Tempo servers across ports, including archived checkpoint builds. It then serves the selected database in the foreground and logs to the terminal. Ctrl+C stops it. If another application is using the requested port, the launcher reports the conflict before stopping any server.
 
 Use this read-only status request. It reports today's remaining work without issuing an activity.
 
@@ -38,7 +38,7 @@ curl -fsS http://127.0.0.1:41822/api/study \
   --data '{"command":"study_status"}'
 ```
 
-The Mac checkpoint installation also has a session LaunchAgent at `.local/usable-release/com.tempo-v2.usable-release.plist`. It serves the archived `checkpoints/04/tempo` and `checkpoints/04/ui` pair with the same database. Its logs are `.local/usable-release/server-04.log` and `.local/usable-release/server-04.err`. To check or stop that managed instance, use the corresponding command below.
+The Mac checkpoint installation also has a session LaunchAgent at `.local/usable-release/com.tempo-v2.usable-release.plist`. The active profile points at a matching binary and UI under `checkpoints/` with the same database. The launch agent specifies the release log paths. To check or stop that managed instance, use the corresponding command below.
 
 ```sh
 launchctl print "gui/$(id -u)/com.tempo-v2.usable-release"
@@ -56,11 +56,38 @@ launchctl kickstart "gui/$(id -u)/com.tempo-v2.usable-release"
 
 The runtime uses the upstream Rust FSRS crate pinned at `6.6.2` with its default parameter vector and 0.90 desired retention. The versioned policy and calendar settings are in SQLite. Actual reviews use the elapsed study days since the last accepted review. The scheduler rounds its returned intervals to whole study days, bounded from 1 to 36,500 days. A teaching acknowledgement schedules tomorrow's first blind review without creating FSRS memory.
 
+Open **Tactics settings** from Study to change the daily introduction limit and
+the themes used for new tactics. The saved selection takes effect on the next
+new puzzle. Tempo rotates across selected themes and works through the original
+easy, medium, and hard packs for each theme. **Any tactic** includes the full
+catalog and personal captures. Existing attempts and due reviews retain their
+Study state.
+
+When rolling back to checkpoint 04 after saving a theme selection, stop Tempo
+and make a current SQLite backup first. Checkpoint 04 can read the current
+database after removing only the new profile field with
+`UPDATE store_state SET local_profile=json_remove(local_profile,'$.tactic_themes') WHERE singleton=1;`.
+Keep the current database for the rollback so it includes later Study progress.
+
 Run the archive's executable for configuration if you have not built the debug executable. For example, the following sets 10 opening introductions, 20 tactics introductions, and a 10-tactic extra increment. Restart the same instance to apply the new allowances.
 
 ```sh
-.local/usable-release/checkpoints/04/tempo configure .local/usable-release/study.sqlite 10 20 10
+.local/usable-release/checkpoints/06/tempo configure .local/usable-release/study.sqlite 10 20 10
 ```
+
+## Personal captures
+
+Successfully saved captures are introduced immediately and due for a first
+review. Study resumes any exercise already on the board, then prioritizes
+fresh personal captures over the regular review queue. Captures use no daily
+new-tactic slots. Recapturing an already introduced puzzle preserves its
+current review schedule.
+
+For a dataset imported before this behavior was added, run
+`tempo backfill-personal-tactics DATABASE` to check the counts and add
+`--apply` to schedule the verified captures. Back up the dataset before
+applying. The command records one receipt per dataset and leaves actual
+grades to Study. Repeating the command returns the saved receipt.
 
 ## Backup and recovery
 
@@ -81,6 +108,6 @@ cp -n "$recovery_dir/backup.sqlite" "$recovery_dir/recovered.sqlite"
   "$recovery_dir/recovered.sqlite" .local/usable-release/checkpoints/04/ui 41823
 ```
 
-Open [the recovered copy](http://127.0.0.1:41823). Confirm the expected study state before choosing a recovery file for routine use. Keep the original database and backup intact. To use the recovered copy on port 41822, first stop the regular listener using the matching stop command above, then run `make start TEMPO_DB="$recovery_dir/recovered.sqlite"`. An older backup contains only the learning present at the time it was made.
+Open [the recovered copy](http://127.0.0.1:41823). Confirm the expected study state before choosing a recovery file for routine use. Keep the original database and backup intact. To use the recovered copy on port 41822, run `make start TEMPO_DB="$recovery_dir/recovered.sqlite"`. An older backup contains only the learning present at the time it was made.
 
 Opening imports support standard-start orthodox games. Tactic capture accepts explicit setup instructions and selected game segments. It checks move legality and does not evaluate the solution with an engine.
