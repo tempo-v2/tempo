@@ -11,6 +11,7 @@ UI = WORKSPACE / "tempo-ui"
 sys.path.insert(0, str(UI / "tools"))
 
 from development_guard import Installation, check_ui, contains, database_files, identity
+from stop_local_server import find_server, stop_server
 
 DEFAULT_DB = ".local/development/study.sqlite"
 
@@ -40,7 +41,6 @@ def main(operation):
     database = Path(DEFAULT_DB if explicit_db is None else explicit_db).resolve()
     if operation == "start":
         port = int(os.environ["TEMPO_PORT"])
-        installation.check_port(port)
     for path in database_files(database):
         installation.check(path)
         if any(contains(output, path) for output in (target, UI / "dist", UI / "node_modules")):
@@ -56,6 +56,7 @@ def main(operation):
         raise ValueError("Selected database not found. Use make init-dev TEMPO_DB=PATH to create it.")
 
     if operation == "start":
+        existing_server = find_server(port, installation)
         build_ui()
     cargo_env = dict(os.environ)
     cargo_env.pop("MAKEFLAGS", None)
@@ -70,6 +71,7 @@ def main(operation):
         database.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([executable, "init", database], check=True)
     if operation == "start":
+        stop_server(port, Installation(WORKSPACE), existing_server)
         os.execv(executable, [str(executable), "serve", str(database), str((UI / "dist").resolve()), str(port)])
 
 

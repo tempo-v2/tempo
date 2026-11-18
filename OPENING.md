@@ -40,7 +40,10 @@ Use **Tactic capture** to paste or upload a PGN. A single-line FEN snippet start
 `make start` builds the locked backend and UI and runs them in the foreground
 on [41823](http://127.0.0.1:41823). It initializes
 `.local/development/study.sqlite` on the first run when `TEMPO_DB` is unset.
-Ctrl+C stops the foreground server. If the port is occupied, choose a free port.
+Running `make start` again builds the application, stops the
+verified Tempo development server on that port, and starts a new foreground
+server. Ctrl+C stops it. If another application holds the port, choose a free
+port with `TEMPO_PORT`.
 
 ```sh
 make init-dev TEMPO_DB=/path/to/disposable.sqlite
