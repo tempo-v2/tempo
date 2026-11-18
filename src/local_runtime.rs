@@ -1,6 +1,7 @@
 //! File-backed composition for the matched local study release.
 mod http;
 mod import;
+mod tactic_settings;
 
 use chrono::{DateTime, NaiveDate};
 use chrono_tz::Tz;
@@ -11,7 +12,7 @@ use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tempo::{AttemptIds, Clock, Components, IntroductionLimits, Tempo};
+use tempo::{AttemptIds, Clock, Components, IntroductionLimits, TacticThemes, Tempo};
 use tempo_chess::{
     Catalog, ChessError, Deviation, GameComparator, LegalSequenceGrader, RepertoirePgnParser,
 };
@@ -30,6 +31,8 @@ struct Profile {
     preview_key: [u8; 32],
     #[serde(default = "default_more_tactics")]
     more_tactics: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tactic_themes: Option<TacticThemes>,
 }
 
 fn default_more_tactics() -> usize {
@@ -43,6 +46,7 @@ impl Default for Profile {
             introductions: IntroductionLimits::default(),
             preview_key: [0; 32],
             more_tactics: default_more_tactics(),
+            tactic_themes: None,
         }
     }
 }
@@ -93,12 +97,19 @@ pub fn import(path: &Path, puzzles: &Path) -> LocalResult<()> {
     import::run(&mut app, batch)
 }
 
+pub fn backfill_personal_tactics(path: &Path, apply: bool) -> LocalResult<()> {
+    let sources = SqliteStore::open(path)?.content_source_ids()?;
+    let result = open(path)?.backfill_personal_tactics(&sources, apply)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
 pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
     if fs::canonicalize(database)?.starts_with(fs::canonicalize(ui)?) {
         return Err("place the study database outside the public UI build".into());
     }
     let mut app = open(database)?;
-    http::serve(&mut app, ui, port)
+    http::serve(&mut app, &SqliteStore::open(database)?, ui, port)
 }
 
 fn stored_profile(store: &SqliteStore) -> LocalResult<String> {
@@ -110,13 +121,15 @@ fn stored_profile(store: &SqliteStore) -> LocalResult<String> {
 fn open(path: &Path) -> LocalResult<Tempo> {
     let store = SqliteStore::open(path)?;
     let profile: Profile = serde_json::from_str(&stored_profile(&store)?)?;
-    Ok(Tempo::daily(
+    let mut app = Tempo::daily(
         Box::new(store),
         components(profile.study_timezone.parse()?)?,
         profile.introductions,
         profile.preview_key,
         profile.more_tactics,
-    )?)
+    )?;
+    app.set_local_tactic_preferences(profile.introductions.tactics, profile.tactic_themes);
+    Ok(app)
 }
 
 fn random_id() -> LocalResult<String> {

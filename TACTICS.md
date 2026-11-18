@@ -22,8 +22,9 @@ after your existing targets or run `make -f tempo/tools/local.mk start` from the
 workspace root.
 
 Set `TEMPO_DB` or `TEMPO_PORT` on the make command to use another existing
-practice database or port. `make start` replaces an existing Tempo server
-from this checkout on the selected port. Press Ctrl+C to stop the server.
+practice database or port. `make start` rebuilds Tempo and replaces this
+checkout’s running Tempo servers across all ports. Press Ctrl+C to stop the
+new server.
 
 Open [Tempo Tactics](http://127.0.0.1:41821). Use the exact URL the server
 prints. The server binds to IPv4 loopback and opens the existing practice

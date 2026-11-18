@@ -4,6 +4,7 @@
 //! exposed publicly merely to organize an operation into its own source file.
 mod abandon;
 mod again;
+mod backfill_captures;
 mod content_preview;
 mod current_attempt;
 
@@ -22,10 +23,12 @@ mod restore;
 mod resume;
 mod submit;
 mod tactic_capture;
+mod tactic_preferences;
 
 mod teach;
 
 pub use daily::IntroductionLimits;
+pub use tactic_preferences::{TacticThemes, tactic_themes};
 
 use crate::{AppError, Components, app_error::domain};
 use tempo_queue::OrderEvent;

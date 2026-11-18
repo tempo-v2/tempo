@@ -1,5 +1,7 @@
 //! Compose today's admissions and durable activity issuance.
-use super::Tempo;
+use super::{
+    TacticThemes, Tempo, tactic_capture::PERSONAL_CAPTURE, tactic_preferences::new_tactic_order,
+};
 use crate::{
     AppError, Components,
     app_error::domain,
@@ -35,6 +37,8 @@ impl Default for IntroductionLimits {
 
 pub(super) struct DailyStudy {
     pub(super) limits: IntroductionLimits,
+    pub(super) tactic_themes: Option<TacticThemes>,
+    pub(super) starter_themes: bool,
     pub(super) queue: DailySession,
     pub(super) preview_key: [u8; 32],
     pub(super) more_tactics: usize,
@@ -52,6 +56,8 @@ impl Tempo {
         let mut app = Self::new(store, components)?;
         app.daily = Some(DailyStudy {
             limits,
+            tactic_themes: None,
+            starter_themes: false,
             queue: DailySession::default(),
             preview_key,
             more_tactics,
@@ -67,6 +73,7 @@ impl Tempo {
     ) -> DailySelection {
         let daily = self.daily.as_ref().expect("daily release");
         let mut admitted = (0, 0);
+        let mut capture_priority = BTreeMap::new();
         let candidates = snapshot
             .catalog
             .items
@@ -81,8 +88,19 @@ impl Tempo {
                 if state.first_introduced == Some(at.day) {
                     match kind {
                         DailyKind::Repertoire => admitted.0 += 1,
-                        DailyKind::Tactic => admitted.1 += 1,
+                        DailyKind::Tactic if state.taught_at.is_none() => admitted.1 += 1,
+                        DailyKind::Tactic => {}
                     }
+                }
+                if kind == DailyKind::Tactic
+                    && state.last_review_at.is_none()
+                    && let Some(introduced) = state.taught_at
+                    && item
+                        .provenance
+                        .iter()
+                        .any(|value| value == PERSONAL_CAPTURE)
+                {
+                    capture_priority.insert(item.target.clone(), introduced.unix_ms);
                 }
                 item.active().then(|| {
                     (
@@ -108,7 +126,13 @@ impl Tempo {
             .collect::<Vec<_>>();
         let hash = blake3::hash(snapshot.dataset.0.as_bytes());
         let seed = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("fixed hash width"));
-        daily.queue.select(
+        let order = new_tactic_order(
+            snapshot,
+            at.day,
+            daily.tactic_themes.as_ref(),
+            daily.starter_themes,
+        );
+        daily.queue.select_with_capture_priority(
             DailyContext {
                 seed,
                 today: at.day,
@@ -124,6 +148,8 @@ impl Tempo {
                 .and_then(|id| snapshot.attempts.get(id))
                 .filter(|record| record.mode != ActivityMode::Practice)
                 .map(|record| &record.attempt.target),
+            order.as_ref(),
+            &capture_priority,
         )
     }
 

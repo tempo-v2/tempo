@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -84,6 +84,13 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
         const response = await fetch(host.url + resource);
         assert.equal(response.status, 200);
         assert.ok((await response.arrayBuffer()).byteLength > 0);
+    }
+    for (const clip of ['move-self', 'move-opponent', 'capture', 'check', 'castle', 'promote', 'illegal']) {
+        const response = await fetch(`${host.url}/assets/${clip}.mp3`);
+        assert.equal(response.status, 200, clip);
+        assert.equal(response.headers.get('content-type'), 'audio/mpeg', clip);
+        const original = await readFile(new URL(`../../tempo-ui/sounds/${clip}.mp3`, import.meta.url));
+        assert.deepEqual(Buffer.from(await response.arrayBuffer()), original, clip);
     }
     for (const resource of ['/normalized.json', '/assets/normalized.json', '/practice.sqlite']) {
         assert.equal((await fetch(host.url + resource)).status, 404);
