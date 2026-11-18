@@ -11,6 +11,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tempo_chess::ContentItem;
+use tempo_learning::RestoredGameObligation;
 use tempo_queue::{
     DailyActivity, DailyCandidate, DailyChoice, DailyContext, DailyEvidence, DailyKind,
     DailySelection, DailySession, Line,
@@ -113,7 +114,7 @@ impl Tempo {
                     && let Some(correction) = correction
                 {
                     evidence.corrective_recalls_remaining +=
-                        usize::from(3 - correction.clean_recalls);
+                        usize::from(correction.remaining_recalls());
                     match correction.next_recall_day {
                         None => {
                             evidence.repair_targets.insert(item.target.clone());
@@ -122,6 +123,18 @@ impl Tempo {
                             evidence.requested_tests.insert(item.target.clone());
                         }
                         Some(_) => {}
+                    }
+                } else if item.active() {
+                    match state.restored_game_obligation {
+                        Some(RestoredGameObligation::Review(review))
+                            if may_test && review.actionable_day <= at.day =>
+                        {
+                            evidence.requested_tests.insert(item.target.clone());
+                        }
+                        Some(RestoredGameObligation::Teaching) => {
+                            evidence.teaching_targets.insert(item.target.clone());
+                        }
+                        _ => {}
                     }
                 }
                 item.active().then(|| {

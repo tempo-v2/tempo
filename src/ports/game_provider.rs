@@ -3,9 +3,9 @@ use crate::{AppError, Game, GameRange};
 
 /// Fetch games outside the object that coordinates study.
 ///
-/// Use this port in a polling job or an explicit refresh action. The caller first
-/// fetches a time range, then passes the returned games to [`crate::Tempo::ingest_games`].
-/// A provider failure is separate from asking Tempo for the next exercise.
+/// A fixture-profile caller fetches a time range and delivers the games to
+/// [`crate::Tempo::ingest_games`] with a supplied comparator.
+/// The production loopback Games refresh runs through [`crate::game_evidence::GameJobs`].
 pub trait GameProvider {
     fn fetch(&self, range: &GameRange) -> Result<Vec<Game>, AppError>;
 }

@@ -8,10 +8,10 @@ impl Tempo {
     /// Attempts and receipts are intentionally absent from this portable format;
     /// callers pass the encoded payload to a fresh destination's `restore` method.
     pub fn export(&self, codec: &dyn SnapshotCodec) -> Result<String, AppError> {
-        let snapshot = self.store.snapshot()?;
+        let (snapshot, game_evidence) = self.store.portable_state()?;
         codec.encode(&PortableSnapshot {
-            schema_version: if self.daily.is_some() { 3 } else { 1 },
-            game_failures: self.store.game_failures(&snapshot.dataset)?,
+            schema_version: if self.daily.is_some() { 4 } else { 1 },
+            game_evidence,
             catalog: snapshot.catalog,
             learning: snapshot.learning,
             policy: snapshot.policy,
