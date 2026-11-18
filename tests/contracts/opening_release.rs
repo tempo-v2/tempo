@@ -590,6 +590,71 @@ fn an_issued_lesson_crosses_midnight_even_after_lowering_the_new_quota() {
 }
 
 #[test]
+fn a_wire_four_allowance_receipt_replays_after_rollover_without_a_write() {
+    use tempo_store::{Receipt, ReceiptResult, Store};
+
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("wire-four.sqlite");
+    let day = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits {
+        repertoire: 0,
+        tactics: 1,
+    };
+    let app = open(&db, day.clone(), limits, 0);
+    let snapshot = app.snapshot().unwrap();
+    drop(app);
+
+    let saved = json!({
+        "schema_version": 4, "status": "empty", "dataset_id": snapshot.dataset,
+        "done": false, "outstanding": 3, "repertoire_remaining": 0, "tactics_remaining": 10,
+        "can_practice_tactics": false, "can_learn_more_tactics": false, "learn_more_count": 0,
+    });
+    let extend = json!({
+        "command": "learn_more_tactics",
+        "dataset_id": snapshot.dataset,
+        "submission_id": "accepted-on-wire-four",
+    });
+    SqliteStore::open(&db)
+        .unwrap()
+        .extend_tactics_allowance(
+            &snapshot.dataset,
+            snapshot.revision,
+            StudyDay(20_000),
+            10,
+            &Receipt {
+                id: "accepted-on-wire-four".into(),
+                command: json!(["learn_more_tactics", snapshot.dataset]).to_string(),
+                result: ReceiptResult::TacticsAllowance {
+                    reply: saved.to_string(),
+                },
+            },
+        )
+        .unwrap();
+
+    day.store(20_001, Ordering::Relaxed);
+    let mut app = open(&db, day, limits, 1);
+    let before = app.snapshot().unwrap();
+    let mut expected = saved;
+    expected["schema_version"] = json!(5);
+    assert_eq!(study(&mut app, extend.clone()), expected);
+    assert_eq!(study(&mut app, extend), expected);
+    assert_eq!(app.snapshot().unwrap(), before);
+    let store = SqliteStore::open(&db).unwrap();
+    assert_eq!(
+        store
+            .tactics_extra(&snapshot.dataset, StudyDay(20_000))
+            .unwrap(),
+        10
+    );
+    assert_eq!(
+        store
+            .tactics_extra(&snapshot.dataset, StudyDay(20_001))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn practice_failure_and_cross_midnight_allowance_replay_preserve_learning() {
     use tempo_store::Store;
 
@@ -646,10 +711,20 @@ fn practice_failure_and_cross_midnight_allowance_replay_preserve_learning() {
     let extended = study(&mut app, extend.clone());
     assert_eq!(extended["tactics_remaining"], 10);
     assert_eq!(extended["outstanding"], 1);
+    let progress = app.study_progress(None).unwrap().unwrap();
+    assert_eq!(progress.tactics_introduced, 1);
+    assert_eq!(progress.tactics_limit, 11);
+    assert_eq!(progress.extra_tactics, 10);
+    assert!(app.study_progress(Some(&progress.stamp)).unwrap().is_none());
     drop(app);
     day.store(20_001, Ordering::Relaxed);
     let mut app = open(&db, day, limits, 1);
     let before_replay = app.snapshot().unwrap();
+    let today = app.study_progress(Some(&progress.stamp)).unwrap().unwrap();
+    assert_eq!(today.stamp.day, StudyDay(20_001));
+    assert_eq!(today.tactics_introduced, 0);
+    assert_eq!(today.tactics_limit, 1);
+    assert_eq!(today.extra_tactics, 0);
     assert_eq!(study(&mut app, extend), extended);
     assert_eq!(app.snapshot().unwrap(), before_replay);
     let store = SqliteStore::open(&db).unwrap();
