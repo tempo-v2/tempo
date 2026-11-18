@@ -1,12 +1,7 @@
 # Local study
 
-Run this from the assembled workspace.
-
-```sh
-make start
-```
-
-Open [Tempo](http://127.0.0.1:41822). The launcher builds the locked Rust app and matching UI, then creates `.local/usable-release/study.sqlite` if it is missing. Restart with the same command and database to continue. Stop the foreground launcher with Ctrl+C.
+Open the installed [Tempo](http://127.0.0.1:41822) for ordinary study. Its Mac
+LaunchAgent serves the qualified checkpoint on the retained study dataset.
 
 Use **Repertoires** to upload or paste standard-start PGN, choose your learner color, preview the routes and save. To edit a repertoire, upload its complete intended PGN as a replacement. An unchanged answer keeps its learning. A changed answer needs a new lesson.
 
@@ -23,23 +18,32 @@ standard profile retains additive imports, which keep omitted content present.
 
 On a lesson, reproduce the shown move, then acknowledge it. Your first blind review of that answer becomes due the next study day. Study days start at midnight in America/New_York. Tempo serves due reviews in a stable random order within that day.
 
-The default daily allowances are ten new opening positions and twenty new tactics. To set them independently, run this from the workspace, then restart Tempo.
-
-```sh
-target/debug/tempo configure .local/usable-release/study.sqlite 10 20
-```
-
-The third and fourth arguments are the opening and tactics limits. Use `make start TEMPO_PORT=41823` to select another loopback port. For a different SQLite file, create it with `target/debug/tempo init /path/to/study.sqlite` and select it with `make start TEMPO_DB=/path/to/study.sqlite`.
+The default daily allowances are ten new opening positions and twenty new tactics.
 
 Use **Tactic capture** to paste or upload a PGN. A single-line FEN snippet starts at the solver position. For a complete game, select the variation and move range. Preview the solver board and select which valid records to save. Tempo validates legality. Setup-bearing snippets can use the `TempoSetupPlies` tag or the preview's setup option.
 
 **Practice tactics** uses puzzles you have already learned and leaves their due dates alone. **Learn 10 more tactics today** adds to today's allowance. To customize that increment, pass it as the final argument to `tempo configure DATABASE OPENINGS TACTICS MORE_TACTICS`.
 
-The same start command resumes retained lessons and tests from `.local/usable-release/study.sqlite`. Keep using that path for ordinary study.
+## Development in the assembled workspace
 
-## Running and checking Tempo on the Mac
+`make start` builds the locked backend and UI and runs them in the foreground
+on [41823](http://127.0.0.1:41823). It initializes
+`.local/development/study.sqlite` on the first run when `TEMPO_DB` is unset.
+Ctrl+C stops the foreground server. If the port is occupied, choose a free port.
 
-Run these commands from `/Users/andy/Developer/tempo-v2`. `make start` builds with the workspace Cargo lock and the UI npm lock. After both builds succeed, it stops this checkout’s Tempo servers across ports, including archived checkpoint builds. It then serves the selected database in the foreground and logs to the terminal. Ctrl+C stops it. If another application is using the requested port, the launcher reports the conflict before stopping any server.
+```sh
+make init-dev TEMPO_DB=/path/to/disposable.sqlite
+make start TEMPO_DB=/path/to/disposable.sqlite TEMPO_PORT=41824
+make build-ui
+```
+
+An explicit database path must already exist for `make start`. The preflight
+checks the managed registration, database and build destinations before
+development writes. `CARGO_TARGET_DIR` selects the development Cargo output
+directory, and `tempo-ui/dist` is the development UI output. Use an assembled
+checkout with the companion UI guard when adopting this tooling.
+
+## Installed use on the Mac
 
 Use this read-only status request. It reports today's remaining work without issuing an activity.
 
@@ -56,7 +60,7 @@ launchctl print "gui/$(id -u)/com.tempo-v2.usable-release"
 launchctl bootout "gui/$(id -u)/com.tempo-v2.usable-release"
 ```
 
-To start the managed instance, stop any foreground listener first. Bootstrap the archived job if it is unloaded, or kickstart it if it is loaded and stopped.
+For explicit installed startup, bootstrap the archived job if it is unloaded, or kickstart it if it is loaded and stopped. At release cutover, back up the retained database and rehearse on a disposable copy before updating the archived job to the qualified backend and UI paths.
 
 ```sh
 launchctl bootstrap "gui/$(id -u)" "$PWD/.local/usable-release/com.tempo-v2.usable-release.plist"
@@ -80,10 +84,10 @@ database after removing only the new profile field with
 `UPDATE store_state SET local_profile=json_remove(local_profile,'$.tactic_themes') WHERE singleton=1;`.
 Keep the current database for the rollback so it includes later Study progress.
 
-Run the archive's executable for configuration if you have not built the debug executable. For example, the following sets 10 opening introductions, 20 tactics introductions, and a 10-tactic extra increment. Restart the same instance to apply the new allowances.
+For explicit installed maintenance, use the executable pinned by the LaunchAgent. This checkpoint 10 example sets 10 opening introductions, 20 tactics introductions and a 10-tactic extra increment. Apply the settings through the managed lifecycle.
 
 ```sh
-.local/usable-release/checkpoints/06/tempo configure .local/usable-release/study.sqlite 10 20 10
+.local/usable-release/checkpoints/10-repertoire-contract/tempo configure .local/usable-release/study.sqlite 10 20 10
 ```
 
 ## Personal captures
@@ -119,6 +123,6 @@ cp -n "$recovery_dir/backup.sqlite" "$recovery_dir/recovered.sqlite"
   "$recovery_dir/recovered.sqlite" .local/usable-release/checkpoints/04/ui 41823
 ```
 
-Open [the recovered copy](http://127.0.0.1:41823). Confirm the expected study state before choosing a recovery file for routine use. Keep the original database and backup intact. To use the recovered copy on port 41822, run `make start TEMPO_DB="$recovery_dir/recovered.sqlite"`. An older backup contains only the learning present at the time it was made.
+Open [the recovered copy](http://127.0.0.1:41823). Confirm the expected study state before choosing a recovery file for routine use. Keep the original database and backup intact. An older backup contains only the learning present at the time it was made.
 
 Opening imports support standard-start orthodox games. Tactic capture accepts explicit setup instructions and selected game segments. It checks move legality and does not evaluate the solution with an engine.
