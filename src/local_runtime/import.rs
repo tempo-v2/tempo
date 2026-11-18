@@ -1,9 +1,11 @@
 //! Decode the transfer format and report dispositions for one atomic import.
 use super::LocalResult;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs::File, io, path::Path};
+use std::{fs::File, io, path::Path};
 use tempo::Tempo;
-use tempo_chess::{Catalog, ContentChange, ContentStatus, TacticRecord, compile_tactics};
+use tempo_chess::{
+    Catalog, ChangeKind, ContentChange, ContentStatus, TacticRecord, compile_tactics,
+};
 use tempo_types::{ContentVersion, TargetId};
 
 #[derive(Deserialize)]
@@ -48,14 +50,15 @@ impl Batch {
             })
             .collect::<Vec<_>>();
         let catalog = compile_tactics(&records)?;
-        let identities = records
+        let mut identities = records
             .into_iter()
             .map(|row| SourceIdentity {
                 source_token: row.target_id(),
                 namespace: row.namespace,
                 source_id: row.source_id,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        identities.sort_by(|a, b| a.source_token.cmp(&b.source_token));
         Ok(Self {
             catalog,
             identities,
@@ -87,43 +90,47 @@ struct Report {
     changes: Vec<ContentChange>,
     sources: Vec<Mapping>,
     historical_learning_mapped: u32,
+    final_tactic_count: usize,
+    already_present_tactic_count: usize,
 }
 
 pub(super) fn run(app: &mut Tempo, batch: Batch) -> LocalResult<()> {
     let dataset = app.snapshot()?.dataset;
-    let plan = app.apply_catalog(&dataset, &batch.catalog)?;
-    let by_source = plan
+    let plan = app.apply_tactic_transfer(&batch.catalog)?;
+    let final_tactic_count = plan
         .catalog
         .items
         .values()
-        .flat_map(|item| {
-            item.provenance
-                .iter()
-                .map(move |source| (source.as_str(), item))
-        })
-        .collect::<BTreeMap<_, _>>();
+        .filter(|item| !item.definition.is_repertoire())
+        .count();
+    let added = plan
+        .changes
+        .iter()
+        .filter(|change| change.kind == ChangeKind::Added)
+        .count();
     let sources = batch
         .identities
         .into_iter()
-        .map(|source| {
-            let item = by_source
-                .get(source.source_token.0.as_str())
-                .ok_or("imported source is missing a retained target")?;
-            Ok(Mapping {
+        .zip(&plan.changes)
+        .map(|(source, change)| {
+            let item = &plan.catalog.items[&change.target];
+            Mapping {
                 alias: source.source_token != item.target,
                 source,
                 target: item.target.clone(),
                 version: item.version,
                 status: item.status,
-            })
+            }
         })
-        .collect::<Result<_, &str>>()?;
+        .collect();
     let report = Report {
         schema_version: 1,
         dataset: dataset.0,
         changes: plan.changes,
         sources,
         historical_learning_mapped: 0,
+        final_tactic_count,
+        already_present_tactic_count: final_tactic_count - added,
     };
     use std::io::Write;
     let mut output = io::stdout().lock();

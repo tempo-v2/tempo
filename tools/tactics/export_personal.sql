@@ -1,5 +1,9 @@
 -- Schema 65+ Tempo PostgreSQL. Stream a single JSON record with psql -XqAt
 -- -v ON_ERROR_STOP=1. Avoid a connection that can write to the source.
+\if :{?content_only}
+\else
+\set content_only false
+\endif
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
 SET LOCAL search_path TO pg_catalog, public;
 WITH RECURSIVE
@@ -49,6 +53,39 @@ raw_rows(relation, row_data) AS (
     UNION ALL
     SELECT 'card_ids', to_jsonb(t) FROM card_ids t
     UNION ALL
+\if :content_only
+    SELECT 'cards', to_jsonb(t) - ARRAY[
+        'ease', 'state', 'lapses', 'due_date', 'stability', 'repetitions',
+        'introduced_at', 'fsrs_card_json', 'interval_days', 'first_correct_at',
+        'maximum_interval', 'hard_correct_streak', 'recent_attempts_json',
+        'unlock_after_card_id', 'reinforcement_pending', 'scheduling_mode',
+        'prefix_split_rejected_after_review_id'
+    ] FROM public.cards t WHERE t.id IN (SELECT id FROM card_ids)
+    UNION ALL
+    SELECT 'deleted_cards', jsonb_build_object('card_id', t.card_id)
+    FROM public.deleted_cards t WHERE t.card_id IN (SELECT id FROM card_ids)
+    UNION ALL
+    SELECT 'tactic_captures', to_jsonb(t) - ARRAY['captured_at', 'result_json']
+    FROM public.tactic_captures t
+    UNION ALL
+    SELECT 'tactic_progress', jsonb_build_object('puzzle_id', puzzle_id, 'card_id', card_id, 'deck_id', deck_id)
+    FROM public.tactic_progress
+    UNION ALL
+    SELECT DISTINCT 'observed_puzzle_ids', jsonb_build_object('puzzle_id', puzzle_id)
+    FROM (
+        SELECT puzzle_id FROM public.tactic_discovery_attempts
+        UNION
+        SELECT puzzle_id FROM public.tactic_introductions
+    ) observed
+    UNION ALL
+    SELECT 'tactic_pack_activation', to_jsonb(t) FROM public.tactic_pack_activation t
+    UNION ALL
+    SELECT 'puzzles', to_jsonb(t) FROM public.puzzles t
+    UNION ALL
+    SELECT DISTINCT 'queue_attempt_origins', jsonb_build_object(
+        'card_id', card_id, 'start_fen', start_fen, 'moves_json', moves_json
+    ) FROM public.queue_attempt_origins WHERE card_id IN (SELECT id FROM card_ids)
+\else
     SELECT 'cards', to_jsonb(t) FROM public.cards t WHERE t.id IN (SELECT id FROM card_ids)
     UNION ALL
     SELECT 'card_revisions', to_jsonb(t) FROM public.card_revisions t WHERE t.card_id IN (SELECT id FROM card_ids)
@@ -92,6 +129,7 @@ raw_rows(relation, row_data) AS (
     UNION ALL
     SELECT 'legacy_content_historical_origins', to_jsonb(t) FROM public.legacy_content_historical_origins t
     WHERE t.legacy_target_id IN (SELECT id FROM card_ids)
+\endif
     UNION ALL
     SELECT 'tempo_schema_migrations', to_jsonb(t) FROM public.tempo_schema_migrations t
 ),
@@ -100,7 +138,7 @@ raw_tables AS (
     FROM raw_rows GROUP BY relation
 ),
 exported_tables(name) AS (
-    VALUES ('candidate_card_ids'), ('card_ids'), ('cards'), ('card_revisions'),
+    VALUES ('candidate_card_ids'), ('card_ids'), ('cards'), ('card_revisions'), ('observed_puzzle_ids'),
            ('deleted_cards'), ('repertoires'), ('repertoire_cards'), ('tactic_captures'),
            ('tactic_progress'), ('tactic_discovery_attempts'), ('tactic_introductions'),
            ('tactic_pack_activation'), ('tactic_rotation'), ('puzzles'), ('puzzle_decks'),

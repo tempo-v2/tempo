@@ -37,6 +37,26 @@ impl Tempo {
         self.apply_catalog_to(&snapshot, catalog)
     }
 
+    /// Add validated tactics while retaining existing targets byte for byte.
+    /// The changes are in incoming target order, including matches to an
+    /// existing target. The transfer report records aliases to preexisting
+    /// content without modifying its metadata.
+    pub fn apply_tactic_transfer(&mut self, catalog: &Catalog) -> Result<ContentPlan, AppError> {
+        let snapshot = self.store.snapshot()?;
+        let mut plan = tempo_chess::plan_tactic_capture(&snapshot.catalog, catalog)
+            .map_err(|error| domain("content_change_error", error))?
+            .content;
+        for change in &mut plan.changes {
+            if let Some(existing) = snapshot.catalog.items.get(&change.target) {
+                plan.catalog
+                    .items
+                    .insert(change.target.clone(), existing.clone());
+                change.kind = ChangeKind::Unchanged;
+            }
+        }
+        self.publish_import(&snapshot, plan)
+    }
+
     fn import_snapshot(&self, dataset: &DatasetId) -> Result<Snapshot, AppError> {
         let snapshot = self.store.snapshot()?;
         if dataset != &snapshot.dataset {
@@ -64,6 +84,14 @@ impl Tempo {
             tempo_chess::plan_import(&snapshot.catalog, catalog)
         }
         .map_err(|e| domain("content_change_error", e))?;
+        self.publish_import(snapshot, plan)
+    }
+
+    fn publish_import(
+        &mut self,
+        snapshot: &Snapshot,
+        plan: ContentPlan,
+    ) -> Result<ContentPlan, AppError> {
         if plan.catalog == snapshot.catalog {
             return Ok(plan);
         }

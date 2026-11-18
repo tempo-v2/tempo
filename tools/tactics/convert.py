@@ -68,14 +68,20 @@ def git_blob(repo, path):
     ).stdout
 
 
-def read_catalog(repo, selected_packs=None, observed=None):
+def read_catalog(repo, selected_packs=None, observed=None, catalog_dir=None):
+    def read(path):
+        if catalog_dir is not None:
+            return (catalog_dir / path.removeprefix("public/data/")).read_bytes()
+        return git_blob(repo, path)
+
     path = "public/data/tactics-catalog.json"
-    index = git_blob(repo, path)
+    index = read(path)
     catalog = json.loads(index)
     files = {path: index}
     candidates = []
     evidence = []
     asset_hashes = {}
+    definitions = {}
     if catalog["version"] != 1:
         raise ValueError("unsupported pinned tactics-catalog version")
     known_packs = {pack["id"] for pack in catalog["packs"]}
@@ -88,7 +94,7 @@ def read_catalog(repo, selected_packs=None, observed=None):
         if asset.parts[:2] != ("data", "tactics-packs") or ".." in asset.parts:
             raise ValueError("unexpected catalog asset path")
         path = "public/" + str(asset)
-        raw = git_blob(repo, path)
+        raw = read(path)
         rows = json.loads(raw)
         if not isinstance(rows, list) or len(rows) != pack["count"]:
             raise ValueError(f"catalog count mismatch for {pack['id']}")
@@ -102,6 +108,10 @@ def read_catalog(repo, selected_packs=None, observed=None):
             provenance = [f"tempo1:catalog:puzzle:{display_id}", f"tempo1:pack:{pack['id']}"]
             if row.get("GameUrl"):
                 provenance.append(row["GameUrl"])
+            if catalog_dir is not None:
+                definitions[display_id] = (row.get("FEN"), row.get("Moves"))
+                metadata = {key: value for key, value in row.items() if key not in {"FEN", "Moves"}}
+                provenance.append("tempo1:catalog-metadata:" + json.dumps(metadata, sort_keys=True))
             if observed is None:
                 location = f"raw-packaged/{path}#{index_in_pack}"
             else:
@@ -124,7 +134,27 @@ def read_catalog(repo, selected_packs=None, observed=None):
         }
     else:
         files = {f"raw-packaged/{name}": raw for name, raw in files.items()}
-    return candidates, files
+    lineage = []
+    if catalog_dir is not None:
+        legacy_path = "public/data/tactics-decks.json"
+        if (catalog_dir / "tactics-decks.json").is_file():
+            raw = read(legacy_path)
+            raw_path = f"raw-packaged/{legacy_path}"
+            files[raw_path] = raw
+            for offset, row in enumerate(json.loads(raw)):
+                source_id = row["PuzzleId"]
+                location = f"{raw_path}#{offset}"
+                if definitions.get(source_id) == (row["FEN"], row["Moves"]):
+                    lineage.append({"relation": "legacy_decks", "record_id": str(offset),
+                                    "namespace": PACK_NAMESPACE, "source_id": source_id,
+                                    "raw_location": location})
+                else:
+                    candidate = Candidate("lichess-legacy-deck", source_id, [location],
+                                          label=f"{row['Motif']} · {source_id}",
+                                          provenance=[f"tempo1:legacy-deck:{row['DeckId']}", row["GameUrl"]])
+                    parse_content(candidate, row["FEN"], row["Moves"], setup_first=True)
+                    candidates.append(candidate)
+    return candidates, files, lineage
 
 
 def parse_content(candidate, fen, moves, setup_first=False):
@@ -189,7 +219,13 @@ def card_candidates(rows):
     progress = {}
     captured_ids = {capture["card_id"] for capture in rows["tactic_captures"]}
     for capture in rows["tactic_captures"]:
-        links[capture["card_id"]].append(f"tempo1:capture:{capture['id']}")
+        attribution = links[capture["card_id"]]
+        attribution.append(f"tempo1:capture:{capture['id']}")
+        for key in ("source_kind", "source_ref"):
+            if capture.get(key):
+                attribution.append(f"tempo1:{key}:{capture[key]}")
+        if capture.get("source_url"):
+            attribution.append(capture["source_url"])
     for row in rows["tactic_progress"]:
         progress[row["puzzle_id"]] = row["card_id"]
         if row["card_id"]:
@@ -216,6 +252,8 @@ def card_candidates(rows):
         else:
             candidate.locations.append(f"raw-personal.json#/rows/cards/{card_offsets[card_id]}")
             parse_content(candidate, card["start_fen"], read_move_json(card["moves_json"]))
+            if card.get("source_ref"):
+                candidate.provenance.append(f"tempo1:card-source:{card['source_ref']}")
             if card_id in deletions:
                 candidate.status, candidate.reason = "held", "current card conflicts with deletion tombstone"
             elif card["archived"] or card["superseded_by"]:
@@ -226,14 +264,17 @@ def card_candidates(rows):
     return result, progress
 
 
-def personal_candidates(snapshot, repo):
+def personal_candidates(snapshot, repo, catalog_dir=None):
     raw, source, rows = read_personal(snapshot)
     cards, progress = card_candidates(rows)
     observed = set(progress)
-    for relation in ("tactic_discovery_attempts", "tactic_introductions"):
-        observed.update(row["puzzle_id"] for row in rows[relation])
+    for relation in ("tactic_discovery_attempts", "tactic_introductions", "observed_puzzle_ids"):
+        observed.update(row["puzzle_id"] for row in rows.get(relation, []))
     stored_puzzles = by_id(rows["puzzles"], "id")
-    catalog, files = read_catalog(repo, observed=observed | set(stored_puzzles))
+    catalog, files, references = read_catalog(
+        repo, observed=None if catalog_dir is not None else observed | set(stored_puzzles),
+        catalog_dir=catalog_dir,
+    )
     missing = observed - stored_puzzles.keys() - {item.source_id for item in catalog}
     for source_id in sorted(missing):
         catalog.append(Candidate(
@@ -251,15 +292,32 @@ def personal_candidates(snapshot, repo):
         parse_content(candidate, row["start_fen"], read_move_json(row["moves_json"]))
         candidate.card_id = progress.get(source_id)
         cards.append(candidate)
-    for candidate in catalog:
-        candidate.card_id = progress.get(candidate.source_id)
-        if candidate.source_id in stored_puzzles and not candidate.card_id:
-            candidate.status, candidate.reason = "reference", "personal legacy puzzle supplies its current definition"
+    if catalog_dir is not None:
+        for relation, id_field, namespace, target_field in (
+            ("tactic_captures", "id", CARD_NAMESPACE, "card_id"),
+            ("tactic_progress", "puzzle_id", PACK_NAMESPACE, "puzzle_id"),
+            ("observed_puzzle_ids", "puzzle_id", PACK_NAMESPACE, "puzzle_id"),
+        ):
+            for offset, row in enumerate(rows.get(relation, [])):
+                source_id = row[target_field]
+                target_namespace = namespace
+                if namespace == PACK_NAMESPACE and source_id in stored_puzzles:
+                    target_namespace = "tempo1-puzzle"
+                references.append({
+                    "relation": relation, "record_id": row[id_field],
+                    "namespace": target_namespace, "source_id": source_id,
+                    "raw_location": f"raw-personal.json#/rows/{relation}/{offset}",
+                })
+    else:
+        for candidate in catalog:
+            candidate.card_id = progress.get(candidate.source_id)
+            if candidate.source_id in stored_puzzles and not candidate.card_id:
+                candidate.status, candidate.reason = "reference", "personal legacy puzzle supplies its current definition"
     files["raw-personal.json"] = raw
     operation_states = defaultdict(Counter)
     for receipt in rows.get("operation_receipts", []):
         operation_states[receipt["command_name"]][receipt["state"]] += 1
-    return cards + catalog, files, {
+    inventory = {
         "snapshot": source,
         "raw_relation_counts": {table: len(content) for table, content in rows.items()},
         "operation_receipt_states": operation_states,
@@ -267,6 +325,14 @@ def personal_candidates(snapshot, repo):
         "distinct_observed_puzzles": len(observed),
         "learning_state_mapped": 0,
     }
+    if catalog_dir is not None:
+        installed_packs = {pack["id"] for pack in json.loads(
+            files["raw-packaged/public/data/tactics-catalog.json"]
+        )["packs"]}
+        active = {row["pack_id"] for row in rows["tactic_pack_activation"] if row["active"]}
+        inventory.update(installed_packs=len(installed_packs), active_packs=len(active),
+                         missing_active_packs=sorted(active - installed_packs))
+    return cards + catalog, files, inventory, references
 
 
 def check_candidates(candidates):
@@ -355,24 +421,32 @@ def main():
     sub = parser.add_subparsers(dest="mode", required=True)
     for name in ("packaged", "personal"):
         mode = sub.add_parser(name)
-        mode.add_argument("--legacy-repo", type=Path, required=True)
+        mode.add_argument("--legacy-repo", type=Path)
         mode.add_argument("--output", type=Path, required=True)
         mode.add_argument("--valid-only", action="store_true",
                           help="explicitly emit eligible rows when rejections or holds remain")
     sub.choices["packaged"].add_argument("--pack", action="append", help="select a pinned pack ID (default all)")
     sub.choices["personal"].add_argument("--snapshot", type=Path, required=True)
+    sub.choices["personal"].add_argument(
+        "--catalog-dir", type=Path,
+        help="include every puzzle from the installed Tempo 1 web data directory",
+    )
     args = parser.parse_args()
 
+    if args.legacy_repo is None and getattr(args, "catalog_dir", None) is None:
+        parser.error("provide --legacy-repo or --catalog-dir")
     os.umask(0o077)
     if args.mode == "personal":
-        candidates, files, inventory = personal_candidates(args.snapshot, args.legacy_repo)
+        candidates, files, inventory, references = personal_candidates(
+            args.snapshot, args.legacy_repo, args.catalog_dir,
+        )
     else:
-        candidates, files = read_catalog(args.legacy_repo, args.pack)
+        candidates, files, references = read_catalog(args.legacy_repo, args.pack)
         inventory = {}
     check_candidates(candidates)
     eligible = reconcile(candidates)
     counts = dict(Counter(item.status for item in candidates))
-    partial = bool(counts.get("held") or counts.get("rejected"))
+    partial = bool(counts.get("held") or counts.get("rejected") or inventory.get("missing_active_packs"))
     emit = not partial or args.valid_only
     if emit and partial:
         batch = "valid_only"
@@ -381,10 +455,11 @@ def main():
     else:
         batch = "withheld"
     manifest = {
-        "schema_version": 1, "scope": args.mode, "legacy_catalog_revision": LEGACY_REVISION,
+        "schema_version": 1, "scope": args.mode, "legacy_catalog_revision": None if getattr(args, "catalog_dir", None) else LEGACY_REVISION,
         "batch": batch, "inventory": inventory, "candidate_count": len(candidates),
-        "unique_eligible_definitions": len({(item.checked["practice_start"], tuple(item.moves)) for item in eligible}),
+        "unique_eligible_definitions": len({(item.checked["practice_start"], tuple(item.checked["solution"])) for item in eligible}),
         "disposition_counts": counts, "candidates": [item.manifest() for item in candidates],
+        "references": references,
     }
     write_bundle(args.output, files, manifest, eligible, emit)
     print(json.dumps({"batch": batch, "candidate_count": len(candidates), "dispositions": counts}))

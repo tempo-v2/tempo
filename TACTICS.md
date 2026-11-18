@@ -36,6 +36,13 @@ CSS exports. Rebuild Core and reinstall the local app dependency when changing
 Core. See [UI source and recovery](ui/README.md) and the Core README in the
 adjacent repository for usage and licensing.
 
+## Migrate an existing installation
+
+Use the [content-only transfer workflow](tools/tactics/README.md#migrate-installed-content-only)
+to import into the existing database. The
+[November 17 reconciliation](tools/tactics/MIGRATION_2026-11-17.md) records the
+first installed migration and its verification.
+
 ## Import a fresh practice database
 
 Use a private working directory outside `tempo/ui/dist`. Keep Tempo 1 exports
@@ -72,8 +79,8 @@ target/debug/tempo import-tactics .local/tactics-mvp/pack-practice.sqlite \
 Import validates the whole normalized batch before writing. Use the conversion
 manifest for invalid or excluded source records and the import report for
 retained targets and quarantines. Reimporting an unchanged batch keeps the
-dataset, content versions and learning. A semantic change retains old versions
-and receipts and applies the existing version/reset rules.
+dataset, content versions and learning. A source ID associated with different
+content fails the transfer before publication.
 
 This release uses StableQueue, StandardLearning, and the three-day Good,
 next-day Again fixed-interval scheduler with UTC study days. An eligible
