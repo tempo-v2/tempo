@@ -49,6 +49,8 @@ association is available in the reconciliation ledger.
 
 Keep the raw export, batch, backup, and per-record report private. See the
 [installed migration results](MIGRATION_2026-11-17.md) for the first run.
+Use the [offline catalog recovery tool](RECOVERED_CATALOG.md) to query
+original pack order, ratings and tags against a private Study backup.
 
 ## Pinned packs and earlier personal exports
 
