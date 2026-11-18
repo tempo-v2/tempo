@@ -9,24 +9,16 @@ a check mark appears briefly before the next puzzle loads.
 
 ## Build and open
 
-From the assembled workspace root, using Rust 1.85+ and Node 22.13+:
+From the assembled workspace root, run `make start`. The command builds the
+locked backend and the UI with the Core package from its lockfile. The
+[development instructions](OPENING.md#development-in-the-assembled-workspace)
+cover explicit disposable databases and alternate ports.
 
-```sh
-(cd tempo-core-components && npm ci && npm run build)
-(cd tempo/ui && npm ci --install-links && npm run build)
-make start
-```
-
-If your existing root Makefile lacks the target, add `include tempo/tools/local.mk`
+If your root Makefile lacks the target, add `include tempo/tools/local.mk`
 after your existing targets or run `make -f tempo/tools/local.mk start` from the
-workspace root.
+workspace root. Ctrl+C stops the foreground server.
 
-Set `TEMPO_DB` or `TEMPO_PORT` on the make command to use another existing
-practice database or port. `make start` rebuilds Tempo and replaces this
-checkout’s running Tempo servers across all ports. Press Ctrl+C to stop the
-new server.
-
-Open [Tempo Tactics](http://127.0.0.1:41821). Use the exact URL the server
+Open [Tempo Tactics](http://127.0.0.1:41823). Use the exact URL the server
 prints. The server binds to IPv4 loopback and opens the existing practice
 database without reseeding it. Reloading a tab resumes its last displayed
 attempt, including a completed board. If a move reply went missing, the same
@@ -34,8 +26,8 @@ tab replays the saved intent before it offers another action.
 
 The browser imports the built Core package through its public JavaScript and
 CSS exports. Rebuild Core and reinstall the local app dependency when changing
-Core. See [UI source and recovery](ui/README.md) and the Core README in the
-adjacent repository for usage and licensing.
+Core. See the Core README in the adjacent
+repository for usage and licensing.
 
 ## Migrate an existing installation
 
