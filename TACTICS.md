@@ -1,7 +1,7 @@
 # Tempo V2 tactics
 
 The local Tactics page uses the shared Tempo Board, orthodox chess legality in
-Rust, and a separate SQLite practice database. Select or drag a piece to a
+Rust, and the current Tempo study database. Select or drag a piece to a
 highlighted square. The board shows each accepted move and its reply. A legal
 move outside the source solution records Again and shows a correction arrow
 on the same position. A clean solve records Good. When a puzzle is complete,
@@ -16,11 +16,11 @@ cover explicit disposable databases and alternate ports.
 
 If your root Makefile lacks the target, add `include tempo/tools/local.mk`
 after your existing targets or run `make -f tempo/tools/local.mk start` from the
-workspace root. Ctrl+C stops the foreground server.
+workspace root.
 
-Open [Tempo Tactics](http://127.0.0.1:41823). Use the exact URL the server
-prints. The server binds to IPv4 loopback and opens the existing practice
-database without reseeding it. Reloading a tab resumes its last displayed
+Open [Tempo Tactics](http://127.0.0.1:41822). Use `make start-dev` for disposable
+practice in a foreground server, which Ctrl+C stops. The server binds to IPv4
+loopback. Reloading a tab resumes its last displayed
 attempt, including a completed board. If a move reply went missing, the same
 tab replays the saved intent before it offers another action.
 

@@ -1,7 +1,11 @@
 # Local study
 
-Open the installed [Tempo](http://127.0.0.1:41822) for ordinary study. Its Mac
-LaunchAgent serves the qualified checkpoint on the retained study dataset.
+On the Mac, run `make start` from the assembled workspace to build and restart
+[Tempo](http://127.0.0.1:41822) with the current checkout and your retained study
+database. The launcher replaces the registered service and closes verified
+Tempo development servers on other ports. A new build is checked on a
+disposable database copy before shutdown, and the launcher takes a separate
+backup before switching artifacts.
 
 Use **Repertoires** to import standard-start PGN or open **Edit** on a saved
 repertoire. Edit the complete document, choose **Preview changes** to see
@@ -37,21 +41,21 @@ Use **Tactic capture** to paste or upload a PGN. A single-line FEN snippet start
 
 ## Development in the assembled workspace
 
-`make start` builds the locked backend and UI and runs them in the foreground
+`make start-dev` builds the locked backend and UI and runs them in the foreground
 on [41823](http://127.0.0.1:41823). It initializes
 `.local/development/study.sqlite` on the first run when `TEMPO_DB` is unset.
-Running `make start` again builds the application, stops the
+Running `make start-dev` again builds the application, stops the
 verified Tempo development server on that port, and starts a new foreground
 server. Ctrl+C stops it. If another application holds the port, choose a free
 port with `TEMPO_PORT`.
 
 ```sh
 make init-dev TEMPO_DB=/path/to/disposable.sqlite
-make start TEMPO_DB=/path/to/disposable.sqlite TEMPO_PORT=41824
+make start-dev TEMPO_DB=/path/to/disposable.sqlite TEMPO_PORT=41824
 make build-ui
 ```
 
-An explicit database path must already exist for `make start`. The preflight
+An explicit database path must already exist for `make start-dev`. The preflight
 checks the managed registration, database and build destinations before
 development writes. `CARGO_TARGET_DIR` selects the development Cargo output
 directory, and `tempo-ui/dist` is the development UI output. Use an assembled
@@ -74,7 +78,9 @@ launchctl print "gui/$(id -u)/com.tempo-v2.usable-release"
 launchctl bootout "gui/$(id -u)/com.tempo-v2.usable-release"
 ```
 
-For explicit installed startup, bootstrap the archived job if it is unloaded, or kickstart it if it is loaded and stopped. At release cutover, back up the retained database and rehearse on a disposable copy before updating the archived job to the qualified backend and UI paths.
+Use `make start` to install or restart the workspace build. To start the
+already installed build without rebuilding, bootstrap the archived job if it
+is unloaded or kickstart it if it is loaded and stopped.
 
 ```sh
 launchctl bootstrap "gui/$(id -u)" "$PWD/.local/usable-release/com.tempo-v2.usable-release.plist"
