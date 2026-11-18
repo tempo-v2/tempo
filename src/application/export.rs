@@ -10,7 +10,7 @@ impl Tempo {
     pub fn export(&self, codec: &dyn SnapshotCodec) -> Result<String, AppError> {
         let snapshot = self.store.snapshot()?;
         codec.encode(&PortableSnapshot {
-            schema_version: 1,
+            schema_version: if self.daily.is_some() { 2 } else { 1 },
             catalog: snapshot.catalog,
             learning: snapshot.learning,
             policy: snapshot.policy,

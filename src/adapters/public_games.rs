@@ -18,7 +18,7 @@ const MAX_ERRORS: usize = MAX_GAMES;
 const CACHE_ENTRIES: usize = 4;
 const CHESS_COM_API: &str = "https://api.chess.com/pub/player/";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize, Eq, Hash, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Provider {
     Lichess,

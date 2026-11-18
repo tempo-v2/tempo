@@ -8,7 +8,7 @@ use crate::{
     app_error::{domain, study_input},
 };
 use tempo_chess::ChessFeedback;
-use tempo_learning::{AssessmentInput, AssessmentSource};
+use tempo_learning::{AssessmentInput, AssessmentSource, DailyLearning};
 use tempo_queue::OrderEvent;
 use tempo_store::{
     AcceptanceKind, ActivityAcceptance, ActivityMode, AnswerResult, AssessmentKey,
@@ -119,11 +119,20 @@ impl Tempo {
                     issued_miss_revision: old.issued_miss_revision,
                 },
             };
-            let transition = self
-                .components
-                .learning
-                .apply(&snapshot.learning[&old.attempt.target], &input)
-                .map_err(|e| domain("learning_error", e))?;
+            let prior = &snapshot.learning[&old.attempt.target];
+            let policy = self.components.learning.as_ref();
+            let transition = if self.daily.is_some() {
+                DailyLearning::assess_test(
+                    policy,
+                    prior,
+                    &input,
+                    old.attempt.content_version,
+                    old.issued_at,
+                )
+            } else {
+                policy.apply(prior, &input)
+            }
+            .map_err(|e| domain("learning_error", e))?;
             effect = Some(transition.effect);
             writes.push(Write::Learning {
                 target: old.attempt.target.clone(),

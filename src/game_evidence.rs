@@ -5,20 +5,25 @@ use crate::{AppError, GameRange, Tempo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use tempo_learning::GameReviewEffect;
 use tempo_store::GameSummary;
 use tempo_types::DatasetId;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GameImport {
+    pub command_id: String,
+    pub dataset_id: DatasetId,
     pub learner: String,
     pub repertoire_id: String,
     pub pgn: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GameRefresh {
+    command_id: String,
+    dataset_id: DatasetId,
     source: Provider,
     account: String,
     from_ms: u64,
@@ -26,55 +31,71 @@ pub struct GameRefresh {
     repertoire_id: String,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct GameReport {
     pub fetched: usize,
     pub new_games: usize,
     pub duplicates: usize,
+    pub opposite_color_skipped: usize,
     pub matches: usize,
     pub deviations: usize,
     pub errors: Vec<String>,
     pub results: Vec<GameResult>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct GameResult {
     #[serde(flatten)]
     pub summary: GameSummary,
-    pub effect: GameEffect,
+    pub effect: GameReviewEffect,
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GameEffect {
-    RecordedOnly,
+type RefreshResult = (GameRefresh, Result<FetchedGames, AppError>);
+
+pub(crate) fn fingerprint<T: Serialize>(kind: &str, request: &T) -> Result<String, AppError> {
+    let payload = serde_json::to_vec(&(kind, request))
+        .map_err(|error| AppError::new("invalid_game", error.to_string()))?;
+    Ok(blake3::hash(&payload).to_hex().to_string())
 }
 
-type RefreshResult = (DatasetId, GameRefresh, Result<FetchedGames, AppError>);
+pub(crate) fn check_id(id: &str) -> Result<(), AppError> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(AppError::new(
+            "invalid_game",
+            "An immutable game command ID is required.",
+        ));
+    }
+    Ok(())
+}
 
 /// A single serial worker keeps provider I/O off the Study request loop.
 pub struct GameJobs {
-    commands: SyncSender<(DatasetId, GameRefresh)>,
+    commands: SyncSender<GameRefresh>,
     results: Receiver<RefreshResult>,
     status: Value,
-    running: bool,
+    pending: Option<(String, String)>,
 }
 
 impl GameJobs {
     pub fn start() -> std::io::Result<Self> {
-        let (commands, requests) = sync_channel::<(DatasetId, GameRefresh)>(1);
+        let (commands, requests) = sync_channel::<GameRefresh>(1);
         let (replies, results) = sync_channel(1);
         std::thread::Builder::new()
             .name("tempo-game-refresh".into())
             .spawn(move || {
                 let mut providers = PublicGames::default();
-                while let Ok((dataset, refresh)) = requests.recv() {
+                while let Ok(refresh) = requests.recv() {
                     let range = GameRange {
                         from_ms: refresh.from_ms,
                         to_ms: refresh.to_ms,
                     };
                     let fetched = providers.fetch(refresh.source, &refresh.account, &range);
-                    if replies.send((dataset, refresh, fetched)).is_err() {
+                    if replies.send((refresh, fetched)).is_err() {
                         break;
                     }
                 }
@@ -83,51 +104,74 @@ impl GameJobs {
             commands,
             results,
             status: json!({"status":"idle"}),
-            running: false,
+            pending: None,
         })
     }
 
     pub fn refresh(&mut self, app: &mut Tempo, request: GameRefresh) -> Result<Value, AppError> {
         self.poll(app);
-        if self.running {
+        check_id(&request.command_id)?;
+        let key = fingerprint("refresh", &request)?;
+        if let Some((id, pending_key)) = &self.pending {
+            if id == &request.command_id && pending_key == &key {
+                return Ok(self.status.clone());
+            }
             return Err(AppError::new(
                 "game_refresh_busy",
                 "A game refresh is already running.",
             ));
         }
-        let dataset = app.game_repertoire_dataset(&request.repertoire_id)?;
-        self.commands.try_send((dataset, request)).map_err(|_| {
+        if let Some(report) = app.replay_game(&request.dataset_id, &request.command_id, &key)? {
+            self.status =
+                json!({"status":"complete","command_id":request.command_id,"report":report});
+            return Ok(self.status.clone());
+        }
+        if app.game_repertoire_dataset(&request.repertoire_id)? != request.dataset_id {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
+        }
+        let id = request.command_id.clone();
+        self.commands.try_send(request).map_err(|_| {
             AppError::new(
                 "game_refresh_unavailable",
                 "The background refresh worker is unavailable.",
             )
         })?;
-        self.running = true;
-        self.status = json!({"status":"running"});
+        self.status = json!({"status":"running","command_id":id});
+        self.pending = Some((id, key));
         Ok(self.status.clone())
     }
 
     /// Apply fetched records on the single application owner, after network I/O.
     pub fn poll(&mut self, app: &mut Tempo) -> Value {
-        if self.running {
+        if let Some((_, key)) = &self.pending {
             self.status = match self.results.try_recv() {
-                Ok((dataset, request, fetched)) => {
-                    self.running = false;
+                Ok((request, fetched)) => {
+                    let key = key.clone();
+                    self.pending = None;
                     match fetched.and_then(|fetched| {
                         app.ingest_provider_games(
-                            &dataset,
+                            &request.dataset_id,
+                            &request.command_id,
+                            &key,
                             &request.repertoire_id,
                             &request.account,
                             fetched,
                         )
                     }) {
-                        Ok(report) => json!({"status":"complete","report":report}),
-                        Err(error) => json!({"status":"failed","error":error.message}),
+                        Ok(report) => {
+                            json!({"status":"complete","command_id":request.command_id,"report":report})
+                        }
+                        Err(error) => {
+                            json!({"status":"failed","command_id":request.command_id,"error":error.message})
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => return self.status.clone(),
                 Err(TryRecvError::Disconnected) => {
-                    self.running = false;
+                    self.pending = None;
                     json!({"status":"failed","error":"The background refresh worker stopped."})
                 }
             };
