@@ -10,7 +10,6 @@ use tempo::{
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
-// A bounded 256 KiB PGN may expand sixfold when JSON escapes control characters.
 const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn serve(app: &mut Tempo, ui: &Path, port: u16) -> LocalResult<()> {
@@ -148,7 +147,10 @@ fn command<T: DeserializeOwned>(request: &mut Request, max_bytes: usize) -> Resu
         return Err(invalid("Use an application/json command."));
     }
     let Some(size) = request.body_length().filter(|size| *size <= max_bytes) else {
-        return Err(invalid("Expected a bounded command body."));
+        return Err(AppError::new(
+            "invalid_command",
+            format!("Send a command body of at most {} KiB.", max_bytes / 1024),
+        ));
     };
     let mut bytes = vec![0; size];
     request
