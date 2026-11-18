@@ -39,7 +39,7 @@ fn import_study_restart_and_replay() {
 
 fn run_stage(database: &Path) {
     let mut components = Components::fixtures();
-    components.parser = Box::new(RepertoirePgnParser);
+    components.parser = Box::new(RepertoirePgnParser::new("open-games", "Open Games"));
     match env::var(STAGE_ENV).as_deref() {
         Ok("import-and-answer") => import_and_answer(database, components),
         Ok("resume-and-replay") => resume_and_replay(database, components),
@@ -57,18 +57,23 @@ fn import_and_answer(database: &Path, components: Components) {
     )
     .unwrap();
     let mut app = Tempo::new(Box::new(store), components).unwrap();
-    let changes = app
-        .import_pgn(
-            &dataset,
-            &ImportRequest {
-                pgn: "[Event \"Durable repertoire\"]\n\n1.e4 e5 2.Nf3 *".into(),
-                source: "repertoire contract test".into(),
-                repertoire: Some("Open Games".into()),
-                learner_color: Some(LearnerColor::White),
-            },
-        )
-        .unwrap();
-    assert_eq!(changes.len(), 2);
+    let request = ImportRequest {
+        pgn: "[Event \"Durable repertoire\"]\n\n1.e4 e5 2.Nf3 *".into(),
+        source: "repertoire contract test".into(),
+        repertoire: Some("open-games".into()),
+        learner_color: Some(LearnerColor::White),
+    };
+    assert_eq!(app.import_pgn(&dataset, &request).unwrap().len(), 2);
+    let added = app.snapshot().unwrap().catalog.items;
+    app.import_pgn(
+        &dataset,
+        &ImportRequest {
+            pgn: "1. e4 *".into(),
+            ..request
+        },
+    )
+    .unwrap();
+    assert_eq!(app.snapshot().unwrap().catalog.items, added);
     let issued = app.next_exercise().unwrap().unwrap();
     let submission = command(&issued, "lost-answer", "d2d4");
     fs::write(
