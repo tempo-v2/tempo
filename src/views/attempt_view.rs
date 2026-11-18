@@ -19,6 +19,9 @@ pub struct AttemptView {
     pub lesson: Option<LessonView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repertoire_name: Option<String>,
+    /// Played moves only, from this response's issued version and cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<tempo_chess::RevealedLine>,
     /// Dataset identity that invalidates commands after a portable restore.
     pub dataset_id: DatasetId,
     /// This attempt, shared by all learner decisions within it.

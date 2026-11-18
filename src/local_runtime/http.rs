@@ -108,6 +108,24 @@ fn respond(
             "application/json; charset=utf-8",
             serde_json::to_vec(&reply)?,
         ))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/tactics-collection" {
+        let reply = command::<tempo::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
+            .and_then(|intent| app.read_tactics(intent))
+            .map(|content| serde_json::json!(content))
+            .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
+        let reply = command::<Option<tempo::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
+            .and_then(|known| app.study_progress(known.as_ref()))
+            .map(|progress| serde_json::json!(progress))
+            .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
     } else if request.method() == &Method::Post && request.url() == "/api/study" {
         let reply = command::<StudyCommand>(&mut request, MAX_COMMAND_BYTES)
             .map(|intent| app.handle(intent))

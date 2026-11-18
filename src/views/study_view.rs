@@ -38,6 +38,7 @@ impl StudyView {
         correction_uci: Option<String>,
         record: &StoredAttempt,
         lesson: Option<LessonView>,
+        history: Option<tempo_chess::RevealedLine>,
     ) -> Self {
         let attempt = value.attempt;
         let status = match attempt.status {
@@ -50,6 +51,7 @@ impl StudyView {
             status: status.into(),
             activity: record.mode,
             lesson,
+            history,
             repertoire_name: record.repertoire_name.clone(),
             dataset_id: attempt.dataset,
             attempt_id: attempt.id,
