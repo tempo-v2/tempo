@@ -14,7 +14,8 @@ use std::{
 };
 use tempo::{AttemptIds, Clock, Components, IntroductionLimits, TacticThemes, Tempo};
 use tempo_chess::{
-    Catalog, ChessError, Deviation, GameComparator, LegalSequenceGrader, RepertoirePgnParser,
+    Catalog, ChessError, ContentParser, Deviation, GameComparator, ImportRequest,
+    LegalSequenceGrader,
 };
 use tempo_learning::DailyLearning;
 use tempo_queue::StableQueue;
@@ -143,7 +144,7 @@ fn components(timezone: Tz) -> LocalResult<Components> {
         queue: Box::new(StableQueue),
         learning: Box::new(DailyLearning::default()),
         grader: Box::new(LegalSequenceGrader),
-        parser: Box::new(RepertoirePgnParser),
+        parser: Box::new(NoGenericImport),
         comparator: Box::new(NoGameComparison),
         clock: Box::new(LocalClock(timezone)),
         ids: Box::new(LocalIds {
@@ -151,6 +152,17 @@ fn components(timezone: Tz) -> LocalResult<Components> {
             sequence: 0,
         }),
     })
+}
+
+/// Daily PGN enters through the signed content commands.
+struct NoGenericImport;
+
+impl ContentParser for NoGenericImport {
+    fn parse(&self, _: &ImportRequest) -> Result<Catalog, ChessError> {
+        Err(ChessError::InvalidContent(
+            "Generic PGN import is unavailable in the daily runtime.".into(),
+        ))
+    }
 }
 
 struct NoGameComparison;

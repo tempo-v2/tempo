@@ -10,6 +10,17 @@ Open [Tempo](http://127.0.0.1:41822). The launcher builds the locked Rust app an
 
 Use **Repertoires** to upload or paste standard-start PGN, choose your learner color, preview the routes and save. To edit a repertoire, upload its complete intended PGN as a replacement. An unchanged answer keeps its learning. A changed answer needs a new lesson.
 
+Create a new repertoire by leaving the destination unselected. Rename an existing
+repertoire by its current selection. A rename preserves its targets and learning.
+A replacement retires omitted positions in the selected repertoire and retains
+their history. Restoring a retired position compares its answer against the
+latest retained version. A changed answer preserves its first introduction and
+requires re-teaching without another introduction slot.
+
+Daily Study accepts repertoire PGN through the signed Preview and Save commands.
+The generic daily catalog method accepts active tactics only. The separate
+standard profile retains additive imports, which keep omitted content present.
+
 On a lesson, reproduce the shown move, then acknowledge it. Your first blind review of that answer becomes due the next study day. Study days start at midnight in America/New_York. Tempo serves due reviews in a stable random order within that day.
 
 The default daily allowances are ten new opening positions and twenty new tactics. To set them independently, run this from the workspace, then restart Tempo.

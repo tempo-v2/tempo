@@ -8,7 +8,7 @@ use std::{
     },
 };
 use tempo::{Clock, Components, CounterIds, IntroductionLimits, Tempo, wire::StudyCommand};
-use tempo_chess::{Catalog, LegalSequenceGrader, RepertoirePgnParser};
+use tempo_chess::{Catalog, ImportRequest, LearnerColor, LegalSequenceGrader, compile_repertoire};
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::SqliteStore;
 use tempo_types::{StudyDay, StudyTime, TargetId};
@@ -46,7 +46,6 @@ fn open(path: &Path, day: Day, limits: IntroductionLimits, generation: u8) -> Te
     let components = Components {
         clock: Box::new(TestClock(day)),
         grader: Box::new(LegalSequenceGrader),
-        parser: Box::new(RepertoirePgnParser),
         ids: Box::new(CounterIds(u64::from(generation) * 1_000)),
         learning: Box::new(learning),
         ..Components::fixtures()
@@ -239,12 +238,85 @@ fn quota_teach_restart_due_fsrs_and_complete_replacement() {
 }
 
 #[test]
+fn daily_generic_import_rejects_repertoires_and_mixed_catalogs_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("import-boundary.sqlite");
+    let today = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits::default();
+    let mut app = open(&db, today.clone(), limits, 0);
+    let (_, saved) = preview_and_save(&mut app, "1. e4 *", "Book", None);
+    let id = saved["repertoires"][0]["id"].as_str().unwrap();
+    let lesson = study(&mut app, json!({"command":"next"}));
+    let mut ack = activity_command("acknowledge", &lesson, "initial-teaching");
+    ack["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, ack)["status"], "complete");
+
+    let before = app.snapshot().unwrap();
+    let request = ImportRequest {
+        pgn: "1. d4 *".into(),
+        source: "fixture".into(),
+        repertoire: Some(id.into()),
+        learner_color: Some(LearnerColor::White),
+    };
+    assert_eq!(
+        app.import_pgn(&before.dataset, &request).unwrap_err().code,
+        "unsupported"
+    );
+
+    let replacement = compile_repertoire(
+        &request.pgn,
+        id,
+        "Book",
+        LearnerColor::White,
+        &request.source,
+    )
+    .unwrap();
+    let tactics = tempo_chess::compile_tactics(&[tempo_chess::TacticRecord {
+        namespace: "fixture".into(),
+        source_id: "daily-tactic".into(),
+        solver_fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".into(),
+        solution: vec!["d2d4".into()],
+        label: "Book".into(),
+        provenance: vec![],
+    }])
+    .unwrap();
+    let mut mixed = replacement.clone();
+    mixed.items.extend(tactics.items.clone());
+    let mut mixed_without_routes = mixed.clone();
+    mixed_without_routes.lines.clear();
+    for incoming in [replacement, mixed, mixed_without_routes] {
+        incoming.validate().unwrap();
+        assert_eq!(
+            app.apply_catalog(&before.dataset, &incoming)
+                .unwrap_err()
+                .code,
+            "content_change_error"
+        );
+        assert_eq!(app.snapshot().unwrap(), before);
+    }
+    drop(app);
+    let mut app = open(&db, today, limits, 1);
+    assert_eq!(app.snapshot().unwrap(), before);
+
+    app.apply_catalog(&before.dataset, &tactics).unwrap();
+    let after = app.snapshot().unwrap();
+    assert_eq!(after.catalog.lines, before.catalog.lines);
+    for (id, item) in &before.catalog.items {
+        assert_eq!(&after.catalog.items[id], item);
+        assert_eq!(after.learning[id], before.learning[id]);
+    }
+    assert_eq!(after.catalog.items.len(), before.catalog.items.len() + 1);
+}
+
+#[test]
 fn skipped_frontier_is_outstanding_and_removed_activity_is_invalidated() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("skip.sqlite");
     let today = Arc::new(AtomicI32::new(20_000));
-    let mut app = open(&db, today, IntroductionLimits::default(), 0);
-    let (_, saved) = preview_and_save(&mut app, "1. e4 e5 2. Nf3 *", "Book", None);
+    let limits = IntroductionLimits::default();
+    let mut app = open(&db, today.clone(), limits, 0);
+    let pgn = "1. e4 e5 2. Nf3 *";
+    let (_, saved) = preview_and_save(&mut app, pgn, "Book", None);
     let id = saved["repertoires"][0]["id"].as_str().unwrap();
     let first = study(&mut app, json!({"command":"next"}));
     assert_eq!(
@@ -257,15 +329,35 @@ fn skipped_frontier_is_outstanding_and_removed_activity_is_invalidated() {
     let resumed = study(&mut app, json!({"command":"resume_skipped"}));
     let mut ack = activity_command("acknowledge", &resumed, "first");
     ack["answer"] = json!({"uci":"e2e4"});
-    assert_eq!(study(&mut app, ack)["status"], "complete");
+    let accepted = study(&mut app, ack.clone());
+    assert_eq!(accepted["status"], "complete");
     let next = study(&mut app, json!({"command":"next"}));
     assert_eq!(next["lesson"]["move_uci"], "g1f3");
+    let target: TargetId = next["target_id"].as_str().unwrap().into();
+    let before = app.snapshot().unwrap();
     preview_and_save(&mut app, "1. e4 *", "Book", Some(id));
     assert!(app.snapshot().unwrap().active_attempt.is_none());
     assert_eq!(study(&mut app, json!({"command":"next"}))["done"], true);
     let mut stale = activity_command("acknowledge", &next, "retired");
     stale["answer"] = json!({"uci":"g1f3"});
-    assert_eq!(study(&mut app, stale)["code"], "stale_content");
+    assert_eq!(study(&mut app, stale.clone())["code"], "stale_content");
+    drop(app);
+
+    let mut app = open(&db, today, limits, 1);
+    preview_and_save(&mut app, pgn, "Book", Some(id));
+    let restored = app.snapshot().unwrap();
+    assert_eq!(
+        restored.catalog.items[&target],
+        before.catalog.items[&target]
+    );
+    assert_eq!(restored.learning[&target], before.learning[&target]);
+    let new_lesson = study(&mut app, json!({"command":"next"}));
+    assert_eq!(new_lesson["target_id"], next["target_id"]);
+    assert_ne!(new_lesson["attempt_id"], next["attempt_id"]);
+    let before_retries = app.snapshot().unwrap();
+    assert_eq!(study(&mut app, stale)["status"], "error");
+    assert_eq!(study(&mut app, ack), accepted);
+    assert_eq!(app.snapshot().unwrap(), before_retries);
 }
 
 #[test]

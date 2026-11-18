@@ -7,16 +7,22 @@ use tempo_store::{Snapshot, Write};
 use tempo_types::DatasetId;
 
 impl Tempo {
-    /// Import content into this dataset through the selected parser.
+    /// Additively import content through the standard profile's selected parser.
     ///
-    /// Metadata-only changes retain learning. New or semantically changed targets
-    /// start with default learning; an attempt pointing at changed content is no
-    /// longer active. Portable restore is a separate operation.
+    /// Omitted content and metadata-only learning are retained. New or
+    /// semantically changed targets start with default learning. Daily Study
+    /// accepts repertoire PGN through signed Preview and Save instead.
     pub fn import_pgn(
         &mut self,
         dataset: &DatasetId,
         request: &ImportRequest,
     ) -> Result<Vec<tempo_chess::ContentChange>, AppError> {
+        if self.daily.is_some() {
+            return Err(AppError::new(
+                "unsupported",
+                "Use Repertoires to preview and save repertoire PGN.",
+            ));
+        }
         let snapshot = self.import_snapshot(dataset)?;
         let parsed = self
             .components
@@ -26,8 +32,9 @@ impl Tempo {
         Ok(self.apply_catalog_to(&snapshot, &parsed)?.changes)
     }
 
-    /// Apply validated content via the same semantic versioning and atomic
-    /// learning transition used for PGN import.
+    /// Apply validated content atomically. The standard profile uses additive
+    /// import. Daily Study accepts only active tactics with no repertoire routes
+    /// and uses the capture planner to preserve existing definitions and learning.
     pub fn apply_catalog(
         &mut self,
         dataset: &DatasetId,
@@ -73,12 +80,7 @@ impl Tempo {
         snapshot: &Snapshot,
         catalog: &Catalog,
     ) -> Result<ContentPlan, AppError> {
-        let plan = if self.daily.is_some()
-            && catalog
-                .items
-                .values()
-                .all(|item| !item.definition.is_repertoire())
-        {
+        let plan = if self.daily.is_some() {
             tempo_chess::plan_tactic_capture(&snapshot.catalog, catalog).map(|plan| plan.content)
         } else {
             tempo_chess::plan_import(&snapshot.catalog, catalog)

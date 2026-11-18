@@ -18,7 +18,7 @@ pub struct Components {
     pub learning: Box<dyn LearningPolicy>,
     /// Decides correctness and next prompt for chess exercises.
     pub grader: Box<ChessGrader>,
-    /// Converts an import request into typed catalog content.
+    /// Converts a standard-profile import request into typed catalog content.
     pub parser: Box<dyn ContentParser>,
     /// Pure comparison of fetched game text against catalog content.
     pub comparator: Box<dyn GameComparator>,
