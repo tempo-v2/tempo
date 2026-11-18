@@ -23,7 +23,7 @@ impl Tempo {
             ));
         }
         let portable = codec.decode(data)?;
-        if !matches!(portable.schema_version, 1 | 2)
+        if !matches!(portable.schema_version, 1..=3)
             || portable.policy != self.components.learning.settings()
         {
             return Err(AppError::new(
@@ -38,12 +38,17 @@ impl Tempo {
             ));
         }
         for (target, state) in &portable.learning {
-            if state.game_review.is_some_and(|review| {
+            let version = state
+                .correction
+                .as_ref()
+                .map(|correction| correction.answer_version)
+                .or_else(|| state.game_review.map(|legacy| legacy.answer_version));
+            if version.is_some_and(|version| {
                 portable
                     .catalog
                     .items
                     .get(target)
-                    .is_none_or(|item| review.answer_version != item.version)
+                    .is_none_or(|item| version != item.version)
             }) {
                 return Err(AppError::new(
                     "invalid_learning",
@@ -55,14 +60,33 @@ impl Tempo {
                 .validate_state(state)
                 .map_err(|e| domain("invalid_learning", e))?;
         }
-        self.commit(
-            &snapshot,
-            vec![Write::Restore {
-                dataset: fresh_dataset,
-                catalog: portable.catalog,
-                learning: portable.learning,
-                policy: portable.policy,
-            }],
+        for key in &portable.game_failures {
+            if key.source.is_empty()
+                || key.game_id.is_empty()
+                || portable
+                    .catalog
+                    .items
+                    .get(&key.target)
+                    .is_none_or(|item| key.version.0 == 0 || item.version.0 < key.version.0)
+            {
+                return Err(AppError::new(
+                    "invalid_learning",
+                    "Invalid game failure provenance.",
+                ));
+            }
+        }
+        self.store.restore_with_game_failures(
+            tempo_store::Commit {
+                expected_dataset: snapshot.dataset,
+                expected_revision: snapshot.revision,
+                writes: vec![Write::Restore {
+                    dataset: fresh_dataset,
+                    catalog: portable.catalog,
+                    learning: portable.learning,
+                    policy: portable.policy,
+                }],
+            },
+            &portable.game_failures,
         )?;
         self.remaining_block.clear();
         self.order_history.clear();

@@ -43,7 +43,12 @@ impl StudyView {
         Self::Attempt(Box::new(AttemptView {
             schema_version: STUDY_WIRE_VERSION,
             status: status.into(),
-            activity: record.mode,
+            activity: if record.mode == tempo_store::ActivityMode::Repair {
+                tempo_store::ActivityMode::Teach
+            } else {
+                record.mode
+            },
+            corrective_repair: (record.mode == tempo_store::ActivityMode::Repair).then_some(true),
             lesson,
             exercise_name: record.exercise_name.clone(),
             history,

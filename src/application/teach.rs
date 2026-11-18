@@ -28,7 +28,7 @@ impl Tempo {
             return study_result(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
-        if old.mode != ActivityMode::Teach {
+        if !matches!(old.mode, ActivityMode::Teach | ActivityMode::Repair) {
             return Err(AppError::new(
                 "wrong_activity",
                 "This activity is a blind test.",
@@ -43,8 +43,15 @@ impl Tempo {
             ));
         }
         let at = self.components.clock.now();
-        let state = DailyLearning::teach(&snapshot.learning[&item.target], at)
-            .map_err(|error| domain("learning_error", error))?;
+        let prior = &snapshot.learning[&item.target];
+        let state = match old.mode {
+            ActivityMode::Repair => {
+                DailyLearning::repair(prior, item.version, old.issued_miss_revision, at)
+            }
+            _ if prior.miss_revision != old.issued_miss_revision => Ok(prior.clone()),
+            _ => DailyLearning::teach(prior, at),
+        }
+        .map_err(|error| domain("learning_error", error))?;
         let mut attempt = old.attempt.clone();
         attempt.revision = revision;
         attempt.state.decision_index = 1;

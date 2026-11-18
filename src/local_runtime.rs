@@ -110,6 +110,7 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
         return Err("place the study database outside the public UI build".into());
     }
     let mut app = open(database)?;
+    app.reconcile_legacy_game_requests()?;
     http::serve(&mut app, &SqliteStore::open(database)?, ui, port)
 }
 
@@ -178,6 +179,9 @@ impl GameComparator for NoGameComparison {
 struct LocalClock(Tz);
 
 impl Clock for LocalClock {
+    fn day_at(&self, unix_ms: u64) -> StudyDay {
+        study_time(unix_ms, self.0).day
+    }
     fn now(&self) -> StudyTime {
         let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)

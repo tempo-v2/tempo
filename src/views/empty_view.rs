@@ -12,6 +12,8 @@ pub struct EmptyView {
     pub status: String,
     pub dataset_id: DatasetId,
     pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrective_recalls_remaining: Option<usize>,
     pub outstanding: usize,
     pub repertoire_remaining: usize,
     pub tactics_remaining: usize,

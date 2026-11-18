@@ -15,7 +15,8 @@ pub struct GameImport {
     pub command_id: String,
     pub dataset_id: DatasetId,
     pub learner: String,
-    pub repertoire_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repertoire_id: Option<String>,
     pub pgn: String,
 }
 
@@ -28,7 +29,31 @@ pub struct GameRefresh {
     account: String,
     from_ms: u64,
     to_ms: u64,
-    repertoire_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repertoire_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReprocessGames {
+    pub command_id: String,
+    pub dataset_id: DatasetId,
+    pub learner: String,
+    pub from_ms: u64,
+    pub to_ms: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChooseGameCorrection {
+    pub command_id: String,
+    pub dataset_id: DatasetId,
+    pub learner: String,
+    pub source: String,
+    pub game_id: String,
+    pub comparison_id: String,
+    pub ply: usize,
+    pub target_id: tempo_types::TargetId,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -129,7 +154,7 @@ impl GameJobs {
                 json!({"status":"complete","command_id":request.command_id,"report":report});
             return Ok(self.status.clone());
         }
-        if app.game_repertoire_dataset(&request.repertoire_id)? != request.dataset_id {
+        if app.game_dataset()? != request.dataset_id {
             return Err(AppError::new(
                 "stale_dataset",
                 "The active dataset changed.",
@@ -159,7 +184,6 @@ impl GameJobs {
                             &request.dataset_id,
                             &request.command_id,
                             &key,
-                            &request.repertoire_id,
                             &request.account,
                             fetched,
                         )

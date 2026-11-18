@@ -115,7 +115,12 @@ fn respond(
         request.respond(Response::empty(StatusCode(403)))?;
     } else if matches!(
         request.url(),
-        "/api/games" | "/api/games/job" | "/api/games/import" | "/api/games/refresh"
+        "/api/games"
+            | "/api/games/job"
+            | "/api/games/import"
+            | "/api/games/refresh"
+            | "/api/games/choose"
+            | "/api/games/reprocess"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
             (&Method::Get, "/api/games") => (200, app.game_history()),
@@ -124,6 +129,21 @@ fn respond(
                 200,
                 command::<GameImport>(&mut request, MAX_CONTENT_COMMAND_BYTES)
                     .and_then(|intent| app.import_game_pgn(intent))
+                    .map(|report| serde_json::json!(report)),
+            ),
+            (&Method::Post, "/api/games/choose") => (
+                200,
+                command::<tempo::game_evidence::ChooseGameCorrection>(
+                    &mut request,
+                    MAX_COMMAND_BYTES,
+                )
+                .and_then(|intent| app.choose_game_correction(intent))
+                .map(|report| serde_json::json!(report)),
+            ),
+            (&Method::Post, "/api/games/reprocess") => (
+                200,
+                command::<tempo::game_evidence::ReprocessGames>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| app.reprocess_games(intent))
                     .map(|report| serde_json::json!(report)),
             ),
             (&Method::Post, "/api/games/refresh") => (
