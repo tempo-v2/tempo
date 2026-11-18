@@ -11,6 +11,7 @@ UI = WORKSPACE / "tempo-ui"
 sys.path.insert(0, str(UI / "tools"))
 
 from development_guard import Installation, check_ui, contains, database_files, identity
+from stop_local_server import find_server, stop_server
 
 DEFAULT_DB = ".local/development/study.sqlite"
 
@@ -24,9 +25,21 @@ def build_ui():
     subprocess.run(["npm", "run", "build"], cwd=UI, check=True)
 
 
+def build_backend(target, profile="debug"):
+    cargo_env = dict(os.environ)
+    cargo_env.pop("MAKEFLAGS", None)
+    cargo_env.pop("MFLAGS", None)
+    subprocess.run(
+        ["cargo", "build", "--locked", "-p", "tempo", "--target-dir", str(target),
+         "--config", f"build.build-dir={json.dumps(str(target), ensure_ascii=False)}",
+         *(["--release"] if profile == "release" else [])],
+        env=cargo_env, check=True,
+    )
+
+
 def main(operation):
     installation = Installation(WORKSPACE)
-    if operation in ("start", "build-ui"):
+    if operation in ("start-dev", "build-ui"):
         check_ui(installation, UI)
     if operation == "build-ui":
         build_ui()
@@ -38,9 +51,8 @@ def main(operation):
     executable = target / "debug/tempo"
     explicit_db = os.environ.get("TEMPO_DB")
     database = Path(DEFAULT_DB if explicit_db is None else explicit_db).resolve()
-    if operation == "start":
-        port = int(os.environ["TEMPO_PORT"])
-        installation.check_port(port)
+    if operation == "start-dev":
+        port = int(os.environ.get("TEMPO_PORT", "41823"))
     for path in database_files(database):
         installation.check(path)
         if any(contains(output, path) for output in (target, UI / "dist", UI / "node_modules")):
@@ -55,21 +67,16 @@ def main(operation):
     elif not existing and explicit_db is not None:
         raise ValueError("Selected database not found. Use make init-dev TEMPO_DB=PATH to create it.")
 
-    if operation == "start":
+    if operation == "start-dev":
+        existing_server = find_server(port, installation)
         build_ui()
-    cargo_env = dict(os.environ)
-    cargo_env.pop("MAKEFLAGS", None)
-    cargo_env.pop("MFLAGS", None)
-    subprocess.run(
-        ["cargo", "build", "--locked", "-p", "tempo", "--target-dir", str(target),
-         "--config", f"build.build-dir={json.dumps(str(target), ensure_ascii=False)}"],
-        env=cargo_env, check=True,
-    )
+    build_backend(target)
     if not existing:
         os.umask(0o077)
         database.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([executable, "init", database], check=True)
-    if operation == "start":
+    if operation == "start-dev":
+        stop_server(port, Installation(WORKSPACE), existing_server)
         os.execv(executable, [str(executable), "serve", str(database), str((UI / "dist").resolve()), str(port)])
 
 

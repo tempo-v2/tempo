@@ -54,7 +54,7 @@ impl Tempo {
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
         let definition = &snapshot.catalog.items[&old.attempt.target].definition;
-        if old.mode == ActivityMode::Teach {
+        if matches!(old.mode, ActivityMode::Teach | ActivityMode::Repair) {
             return Err(AppError::new(
                 "wrong_activity",
                 "acknowledge this lesson after reproducing the shown move",
@@ -146,6 +146,30 @@ impl Tempo {
                 input,
                 transition,
             }));
+        }
+        if progress.assessment.is_none()
+            && progress.attempt.status == AttemptStatus::Complete
+            && let Some(record) = snapshot.assessments.iter().find(|record| {
+                record.key == AssessmentKey::Human(command.attempt_id.clone())
+                    && record.input.grade == Grade::Again
+            })
+        {
+            let prior = &snapshot.learning[&old.attempt.target];
+            if record.transition.state.correction.is_some() {
+                let state = DailyLearning::repair(
+                    prior,
+                    old.attempt.content_version,
+                    record.transition.state.miss_revision,
+                    self.components.clock.now(),
+                )
+                .map_err(|error| domain("learning_error", error))?;
+                if state != *prior {
+                    writes.push(Write::Learning {
+                        target: old.attempt.target.clone(),
+                        state,
+                    });
+                }
+            }
         }
         let result = AnswerResult {
             attempt: progress.attempt,

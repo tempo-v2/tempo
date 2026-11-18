@@ -6,59 +6,40 @@ use crate::game_evidence::{GameImport, GameReport, GameResult, check_id, fingerp
 use crate::{AppError, app_error::domain};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
-use tempo_chess::{LearnerColor, PlayedGame, compare_played_game, parse_played_games};
-use tempo_learning::{GameMiss, GameReviewEffect, LearningState};
-use tempo_store::{
-    AcceptedGames, Commit, ComparedGame, GameObservation, GameReceipt, GameRecord, GameSummary,
-    PgnTiming, Snapshot, Write,
+use std::collections::{BTreeMap, BTreeSet};
+use tempo_chess::{
+    ContentKind, DecisionAdherence, LearnerColor, PlayedGame, compare_active_repertoires,
+    parse_played_games,
 };
-use tempo_types::{ContentVersion, DatasetId, TargetId};
+use tempo_learning::{
+    AssessmentInput, AssessmentSource, DailyLearning, GameReviewEffect, LearningState,
+};
+use tempo_store::{
+    AcceptedGames, AssessmentKey, AssessmentRecord, Commit, ComparedGame, GameChoice,
+    GameChoiceTarget, GameFailureKey, GameObservation, GameReceipt, GameRecord, GameSummary,
+    PgnTiming, RepertoireDisagreement, Write,
+};
+use tempo_types::{DatasetId, EventId, Grade, TargetId};
 
 impl Tempo {
-    pub(crate) fn game_repertoire_dataset(&self, id: &str) -> Result<DatasetId, AppError> {
-        let document = self.store.repertoire_document(id)?;
-        if document.item.is_none() {
-            return Err(invalid("Choose an existing repertoire."));
-        }
-        Ok(document.dataset)
+    pub(crate) fn game_dataset(&self) -> Result<DatasetId, AppError> {
+        Ok(self.store.study_state(Default::default())?.dataset)
     }
 
     pub fn game_history(&self) -> Result<Value, AppError> {
         let history = self.store.game_history()?;
-        let (snapshot, _) = self.store.content_state()?;
-        let mut resets = BTreeMap::new();
-        let mut results = Vec::with_capacity(history.results.len());
-        for entry in history.results {
-            let reset = match resets.entry(entry.summary.repertoire_id.clone()) {
-                std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    let reset = self
-                        .store
-                        .repertoire_reset_at(&snapshot.dataset, entry.key())?;
-                    *entry.insert(reset)
-                }
-            };
-            let effect = summarize_effects(entry.deviations.into_iter().map(|deviation| {
-                if !after_reset(reset, deviation.start_ms) {
-                    return GameReviewEffect::RecordedOnly;
-                }
-                let miss = GameMiss {
-                    answer_version: deviation.version,
-                    earliest_ms: deviation.start_ms,
-                    latest_ms: deviation.end_ms,
-                };
-                game_state(&snapshot, &deviation.target, deviation.version)
-                    .map_or(GameReviewEffect::StaleContent, |prior| {
-                        prior.game_miss_effect(miss)
-                    })
-            }));
-            results.push(GameResult {
+        let results: Vec<_> = history
+            .results
+            .into_iter()
+            .map(|entry| GameResult {
                 comparison_id: Some(entry.comparison_id),
+                effect: entry
+                    .summary
+                    .correction_effect
+                    .unwrap_or(GameReviewEffect::RecordedOnly),
                 summary: entry.summary,
-                effect,
-            });
-        }
+            })
+            .collect();
         Ok(
             json!({"results":results,"last_successful_refresh_ms":history.last_successful_refresh_ms}),
         )
@@ -109,13 +90,14 @@ impl Tempo {
         self.compare_games(
             &request.dataset_id,
             (&request.command_id, &key),
-            &request.repertoire_id,
             &request.learner,
             games,
             GameReport {
                 fetched,
                 ..GameReport::default()
             },
+            None,
+            None,
             None,
         )
     }
@@ -125,7 +107,6 @@ impl Tempo {
         dataset: &DatasetId,
         command_id: &str,
         fingerprint: &str,
-        repertoire: &str,
         learner: &str,
         fetched: FetchedGames,
     ) -> Result<GameReport, AppError> {
@@ -153,6 +134,7 @@ impl Tempo {
                     start_ms: game.start_ms,
                     end_ms: Some(game.end_ms),
                     fetched_ms: at,
+                    played_date_ms: None,
                     pgn: game.pgn,
                 };
                 Ok((record, played))
@@ -161,7 +143,6 @@ impl Tempo {
         self.compare_games(
             dataset,
             (command_id, fingerprint),
-            repertoire,
             learner,
             games,
             GameReport {
@@ -170,161 +151,556 @@ impl Tempo {
                 ..GameReport::default()
             },
             Some(at),
+            None,
+            None,
         )
+    }
+
+    pub fn choose_game_correction(
+        &mut self,
+        request: crate::game_evidence::ChooseGameCorrection,
+    ) -> Result<GameReport, AppError> {
+        check_id(&request.command_id)?;
+        let fingerprint = fingerprint("choose_correction", &request)?;
+        if let Some(report) =
+            self.replay_game(&request.dataset_id, &request.command_id, &fingerprint)?
+        {
+            return Ok(report);
+        }
+        let saved = self
+            .store
+            .game_comparison(&request.dataset_id, &request.comparison_id)?
+            .filter(|result| {
+                result.source == request.source
+                    && result.game_id == request.game_id
+                    && result.learner == request.learner
+            })
+            .ok_or_else(|| invalid("The comparison was not found."))?;
+        let choice = saved
+            .choices
+            .iter()
+            .find(|choice| {
+                choice.ply == request.ply
+                    && choice
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.target_id == request.target_id)
+            })
+            .ok_or_else(|| invalid("Choose a target from the saved miss."))?;
+        if self.store.game_choice_resolved(
+            &request.dataset_id,
+            &request.source,
+            &request.game_id,
+            &choice.position,
+        )? {
+            return Err(invalid("This corrective position has already been chosen."));
+        }
+        let game = self
+            .store
+            .stored_game(&request.dataset_id, &request.source, &request.game_id)?
+            .ok_or_else(|| invalid("This game was not found."))?;
+        self.compare_games(
+            &request.dataset_id,
+            (&request.command_id, &fingerprint),
+            &request.learner,
+            vec![parse_stored_game(game)],
+            GameReport {
+                fetched: 1,
+                ..Default::default()
+            },
+            None,
+            Some(&SelectedCorrection {
+                comparison_id: request.comparison_id,
+                ply: request.ply,
+                target: request.target_id,
+                position: choice.position.clone(),
+            }),
+            None,
+        )
+    }
+
+    pub fn reprocess_games(
+        &mut self,
+        request: crate::game_evidence::ReprocessGames,
+    ) -> Result<GameReport, AppError> {
+        check_id(&request.command_id)?;
+        let fingerprint = fingerprint("reprocess", &request)?;
+        if let Some(report) =
+            self.replay_game(&request.dataset_id, &request.command_id, &fingerprint)?
+        {
+            return Ok(report);
+        }
+        if request.to_ms <= request.from_ms || request.to_ms - request.from_ms > 31 * 86_400_000 {
+            return Err(invalid("Choose a window of at most 31 days."));
+        }
+        let games =
+            self.store
+                .games_in_window(&request.dataset_id, request.from_ms, request.to_ms)?;
+        if games.len() > 500 {
+            return Err(invalid(
+                "This window contains more than 500 games. Choose a shorter window.",
+            ));
+        }
+        let learner = request.learner.trim().to_lowercase();
+        let games: Vec<_> = games
+            .into_iter()
+            .filter(|game| {
+                [&game.white, &game.black]
+                    .into_iter()
+                    .any(|player| player.to_lowercase() == learner)
+            })
+            .map(parse_stored_game)
+            .collect();
+        let fetched = games.len();
+        self.compare_games(
+            &request.dataset_id,
+            (&request.command_id, &fingerprint),
+            &request.learner,
+            games,
+            GameReport {
+                fetched,
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Upgrade only outstanding legacy obligations backed by stored evidence.
+    /// Each game transaction can safely be replayed if startup was interrupted.
+    pub fn reconcile_legacy_game_requests(&mut self) -> Result<(), AppError> {
+        let (snapshot, _) = self.store.content_state()?;
+        let mut batches = BTreeMap::<_, BTreeSet<_>>::new();
+        let mut reconciled = BTreeSet::new();
+        for (target, state) in &snapshot.learning {
+            if state.game_review.is_none() && !state.game_teaching_relevance {
+                continue;
+            }
+            let item = &snapshot.catalog.items[target];
+            let misses = self
+                .store
+                .legacy_game_misses(&snapshot.dataset, target, item.version)?;
+            if misses.is_empty() {
+                continue;
+            }
+            reconciled.insert(target.clone());
+            for miss in misses {
+                let previously_pending = state.game_teaching_relevance
+                    || state.game_review.is_some_and(|review| {
+                        review.answer_version == item.version
+                            && miss
+                                .start_ms
+                                .zip(state.taught_at)
+                                .is_some_and(|(start, taught)| start > taught.unix_ms)
+                            && miss.end_ms.is_some_and(|end| {
+                                end <= review.occurred_by_ms
+                                    && state
+                                        .last_assessed_test_issue_ms
+                                        .is_none_or(|issue| end >= issue)
+                            })
+                    });
+                if previously_pending && item.active() {
+                    batches
+                        .entry((miss.source, miss.game_id, miss.learner))
+                        .or_default()
+                        .insert(miss.ply);
+                }
+            }
+        }
+        for ((source, id, learner), plies) in batches {
+            let key = hash(&json!([
+                "legacy-game-reconciliation",
+                source,
+                id,
+                learner,
+                plies
+            ]));
+            let command_id = format!("legacy-{key}");
+            if self
+                .replay_game(&snapshot.dataset, &command_id, &key)?
+                .is_some()
+            {
+                continue;
+            }
+            let game = self
+                .store
+                .stored_game(&snapshot.dataset, &source, &id)?
+                .ok_or_else(|| invalid("A pending request refers to a missing game."))?;
+            self.compare_games(
+                &snapshot.dataset,
+                (&command_id, &key),
+                &learner,
+                vec![parse_stored_game(game)],
+                GameReport {
+                    fetched: 1,
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(&plies),
+            )?;
+        }
+        if !reconciled.is_empty() {
+            let (current, _) = self.store.content_state()?;
+            let writes = reconciled
+                .into_iter()
+                .filter_map(|target| {
+                    let mut state = current.learning[&target].clone();
+                    if state.game_review.take().is_some() || state.game_teaching_relevance {
+                        state.game_teaching_relevance = false;
+                        Some(Write::Learning { target, state })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !writes.is_empty() {
+                self.commit(&current, writes)?;
+            }
+        }
+        Ok(())
     }
 
     fn compare_games(
         &mut self,
         expected_dataset: &DatasetId,
         (command_id, fingerprint): (&str, &str),
-        repertoire: &str,
         learner: &str,
-        games: Vec<Result<(GameRecord, PlayedGame), String>>,
+        mut games: Vec<Result<(GameRecord, PlayedGame), String>>,
         mut report: GameReport,
         refresh_at: Option<u64>,
+        selection: Option<&SelectedCorrection>,
+        legacy_plies: Option<&BTreeSet<usize>>,
     ) -> Result<GameReport, AppError> {
         let learner = learner.trim().to_lowercase();
         if learner.is_empty() || learner.len() > 100 {
             return Err(invalid("Choose the learner with their exact player name."));
         }
         let (snapshot, revision) = self.store.content_state()?;
-        let document = self.store.repertoire_document(repertoire)?;
-        if expected_dataset != &snapshot.dataset
-            || document.dataset != snapshot.dataset
-            || document.revision != revision
-        {
-            return Err(invalid("The dataset or repertoire changed during refresh."));
+        if expected_dataset != &snapshot.dataset {
+            return Err(invalid("The dataset changed during refresh."));
         }
-        let item = document
-            .item
-            .as_ref()
-            .ok_or_else(|| invalid("Choose an existing repertoire."))?;
-        let color = learner_color(item);
+        let repertoires: BTreeSet<_> = snapshot
+            .catalog
+            .items
+            .values()
+            .filter(|item| item.active())
+            .filter_map(|item| match &item.definition.kind {
+                ContentKind::Repertoire { repertoire, .. } => Some(repertoire.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut books = BTreeMap::new();
+        let mut resets = BTreeMap::new();
+        for repertoire in repertoires {
+            let document = self.store.repertoire_document(&repertoire)?;
+            if document.dataset != snapshot.dataset || document.revision != revision {
+                return Err(invalid("A repertoire changed during refresh."));
+            }
+            if let Some(item) = document.item {
+                books.insert(repertoire.clone(), (learner_color(&item), document.pgn));
+            }
+            let cutoff = self
+                .store
+                .repertoire_reset_at(&snapshot.dataset, &repertoire)?;
+            resets.insert(repertoire, cutoff);
+        }
+        let documents = |color| {
+            books
+                .iter()
+                .filter_map(|(id, (side, pgn))| {
+                    (*side == color)
+                        .then(|| pgn.clone().map(|pgn| (id.clone(), pgn)))
+                        .flatten()
+                })
+                .collect()
+        };
+        let white_documents = documents(LearnerColor::White);
+        let black_documents = documents(LearnerColor::Black);
         let mut comparisons = Vec::new();
+        let mut changes = BTreeMap::<TargetId, LearningState>::new();
+        let mut accepted = BTreeSet::new();
+        let at = self.components.clock.now();
+        self.resolve_pgn_timing(&snapshot.dataset, &mut games)?;
         for (index, record) in games.into_iter().enumerate() {
-            match record.and_then(|(game, played)| {
-                let side = match (
-                    game.white.to_lowercase() == learner,
-                    game.black.to_lowercase() == learner,
-                ) {
-                    (true, false) => LearnerColor::White,
-                    (false, true) => LearnerColor::Black,
-                    _ => return Err("The learner does not identify exactly one player.".into()),
-                };
-                if side != color && refresh_at.is_some() {
-                    return Ok(None);
+            let (game, played) = match record {
+                Ok(record) => record,
+                Err(error) => {
+                    report.errors.push(format!("Game {}: {error}", index + 1));
+                    continue;
                 }
-                if side != color {
-                    return Err(
-                        "The learner played the opposite color from the selected repertoire."
-                            .into(),
-                    );
+            };
+            let side = match (
+                game.white.to_lowercase() == learner,
+                game.black.to_lowercase() == learner,
+            ) {
+                (true, false) => LearnerColor::White,
+                (false, true) => LearnerColor::Black,
+                _ => {
+                    report.errors.push(format!(
+                        "Game {}: The learner does not identify exactly one player.",
+                        index + 1
+                    ));
+                    continue;
                 }
-                let comparison = compare_played_game(
-                    &played,
-                    &snapshot.catalog,
-                    repertoire,
-                    color,
-                    document.pgn.as_deref(),
-                )
-                .map_err(|error| error.to_string())?;
-                let observations: Vec<_> = comparison
-                    .observations
-                    .into_iter()
-                    .map(|obs| GameObservation {
-                        ply: obs.ply,
-                        target: obs.target,
-                        version: obs.version,
-                        played: obs.played,
-                        prescribed: obs.prescribed,
+            };
+            let documents = match side {
+                LearnerColor::White => &white_documents,
+                LearnerColor::Black => &black_documents,
+            };
+            let decisions = compare_active_repertoires(&played, &snapshot.catalog, side, documents)
+                .map_err(|error| domain("invalid_comparison", error))?;
+            let versions: Vec<_> = decisions
+                .iter()
+                .flat_map(|decision| {
+                    decision.observations.iter().map(|obs| {
+                        (
+                            obs.ply,
+                            &obs.target,
+                            obs.version,
+                            &obs.played,
+                            &obs.prescribed,
+                        )
                     })
-                    .collect();
-                let versions: Vec<_> = observations
-                    .iter()
-                    .map(|obs| (obs.ply, &obs.target, obs.version))
-                    .collect();
-                let first_deviation_ply = observations
-                    .iter()
-                    .find(|obs| obs.played != obs.prescribed)
-                    .map(|obs| obs.ply);
-                let deviations = observations
+                })
+                .collect();
+            let routes: Vec<_> = decisions
+                .iter()
+                .filter_map(|decision| match &decision.adherence {
+                    DecisionAdherence::Miss { candidates } => Some((
+                        decision.ply,
+                        candidates.iter().map(|o| &o.target).collect::<Vec<_>>(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            let comparison_id = hash(&json!([
+                "combined",
+                game.source,
+                game.id,
+                learner,
+                versions,
+                routes
+            ]));
+            if let Some(selection) = selection
+                && selection.comparison_id != comparison_id
+            {
+                return Err(invalid("The comparison changed. Compare the game again."));
+            }
+            let mut summary = GameSummary {
+                source: game.source.clone(),
+                game_id: game.id.clone(),
+                url: game.url.clone(),
+                repertoire_id: String::new(),
+                learner: learner.clone(),
+                occurrence_end_ms: game.end_ms,
+                matches: 0,
+                deviations: 0,
+                first_deviation_ply: None,
+                coverage_gaps: 0,
+                opponent_deviations: tempo_chess::opponent_deviations(&played, side, documents)
+                    .map_err(|error| domain("invalid_comparison", error))?,
+                correction_effect: Some(GameReviewEffect::RecordedOnly),
+                choices: vec![],
+                disagreements: vec![],
+            };
+            let repertoire_of =
+                |target: &TargetId| match &snapshot.catalog.items[target].definition.kind {
+                    ContentKind::Repertoire { repertoire, .. } => repertoire.clone(),
+                    _ => unreachable!("Chess returned a repertoire target"),
+                };
+            let mut disagreements = BTreeMap::<String, Vec<usize>>::new();
+            let mut observations = Vec::new();
+            let mut failures = Vec::new();
+            let mut choice_groups = BTreeSet::new();
+            let mut resolved = false;
+            for decision in decisions {
+                for observation in decision
+                    .observations
                     .iter()
                     .filter(|obs| obs.played != obs.prescribed)
-                    .count();
-                let summary = GameSummary {
-                    source: game.source.clone(),
-                    game_id: game.id.clone(),
-                    url: game.url.clone(),
-                    repertoire_id: repertoire.into(),
-                    learner: learner.clone(),
-                    occurrence_end_ms: game.end_ms,
-                    matches: observations.len() - deviations,
-                    deviations,
-                    first_deviation_ply,
-                    coverage_gaps: comparison.coverage_gaps,
-                    opponent_deviations: comparison.opponent_deviations,
+                {
+                    disagreements
+                        .entry(repertoire_of(&observation.target))
+                        .or_default()
+                        .push(decision.ply);
+                }
+                let candidates = match decision.adherence {
+                    DecisionAdherence::Matched => {
+                        summary.matches += 1;
+                        continue;
+                    }
+                    DecisionAdherence::Uncovered => {
+                        summary.coverage_gaps += 1;
+                        continue;
+                    }
+                    DecisionAdherence::Miss { candidates } => candidates,
                 };
-                let key = json!([
-                    game.source,
-                    game.id,
-                    learner,
-                    repertoire,
-                    versions,
-                    summary.coverage_gaps,
-                    summary.opponent_deviations
-                ]);
-                let id = blake3::hash(key.to_string().as_bytes())
-                    .to_hex()
-                    .to_string();
-                Ok(Some(ComparedGame {
-                    game,
-                    id,
-                    summary,
-                    observations,
-                }))
-            }) {
-                Ok(Some(compared)) => comparisons.push(compared),
-                Ok(None) => report.opposite_color_skipped += 1,
-                Err(error) => report.errors.push(format!("Game {}: {error}", index + 1)),
-            }
-        }
-        self.resolve_pgn_timing(&snapshot.dataset, &mut comparisons)?;
-        let reset = self
-            .store
-            .repertoire_reset_at(&snapshot.dataset, repertoire)?;
-        let mut changes = BTreeMap::<TargetId, LearningState>::new();
-        for compared in &comparisons {
-            let mut game_effects = Vec::new();
-            for observation in compared
-                .observations
-                .iter()
-                .filter(|obs| obs.played != obs.prescribed)
-            {
-                if !after_reset(reset, compared.game.start_ms) {
+                summary.deviations += 1;
+                summary.first_deviation_ply.get_or_insert(decision.ply);
+                if legacy_plies.is_some_and(|plies| !plies.contains(&decision.ply)) {
                     continue;
                 }
-                let Some(prior) = game_state(&snapshot, &observation.target, observation.version)
-                else {
+                if selection.is_none()
+                    && self.store.game_choice_resolved(
+                        &snapshot.dataset,
+                        &game.source,
+                        &game.id,
+                        &decision.position.0,
+                    )?
+                {
+                    if summary.correction_effect != Some(GameReviewEffect::AgainApplied) {
+                        summary.correction_effect = Some(GameReviewEffect::AlreadyAddressed);
+                    }
+                    continue;
+                }
+                let candidate = if let Some(selection) = selection {
+                    if decision.ply != selection.ply || decision.position.0 != selection.position {
+                        continue;
+                    }
+                    if candidates.len() <= 1 {
+                        return Err(invalid("This miss has no unresolved choice."));
+                    }
+                    let chosen = candidates
+                        .iter()
+                        .find(|obs| obs.target == selection.target)
+                        .ok_or_else(|| invalid("Choose a current target from the comparison."))?;
+                    resolved = true;
+                    chosen
+                } else if let [only] = candidates.as_slice() {
+                    only
+                } else {
+                    let eligible: Vec<_> = candidates
+                        .iter()
+                        .filter_map(|obs| {
+                            let repertoire_id = repertoire_of(&obs.target);
+                            self.after_game_reset(resets[&repertoire_id], &game, &played)
+                                .then(|| GameChoiceTarget {
+                                    repertoire_id,
+                                    target_id: obs.target.clone(),
+                                    version: obs.version,
+                                })
+                        })
+                        .collect();
+                    if !eligible.is_empty() && choice_groups.insert(decision.position.0.clone()) {
+                        summary.choices.push(GameChoice {
+                            ply: decision.ply,
+                            position: decision.position.0.clone(),
+                            candidates: eligible,
+                        });
+                    }
                     continue;
                 };
-                let state = changes
-                    .entry(observation.target.clone())
-                    .or_insert_with(|| prior.clone());
-                let outcome = state
-                    .observe_game_miss(GameMiss {
-                        answer_version: observation.version,
-                        earliest_ms: compared.game.start_ms,
-                        latest_ms: compared.game.end_ms,
-                    })
-                    .map_err(|e| domain("learning_error", e))?;
-                game_effects.push(outcome);
+                let repertoire = repertoire_of(&candidate.target);
+                if !self.after_game_reset(resets[&repertoire], &game, &played) {
+                    if selection.is_some() {
+                        return Err(invalid("This game predates the repertoire progress reset."));
+                    }
+                    continue;
+                }
+                observations.push(GameObservation {
+                    ply: candidate.ply,
+                    target: candidate.target.clone(),
+                    version: candidate.version,
+                    played: candidate.played.clone(),
+                    prescribed: candidate.prescribed.clone(),
+                });
+                let key = GameFailureKey {
+                    source: game.source.clone(),
+                    game_id: game.id.clone(),
+                    target: candidate.target.clone(),
+                    version: candidate.version,
+                    chosen_position: selection.map(|selection| selection.position.clone()),
+                };
+                if self.store.game_failed(&snapshot.dataset, &key)?
+                    || !accepted.insert((
+                        key.source.clone(),
+                        key.game_id.clone(),
+                        key.target.clone(),
+                    ))
+                {
+                    if summary.correction_effect != Some(GameReviewEffect::AgainApplied) {
+                        summary.correction_effect = Some(GameReviewEffect::AlreadyAddressed);
+                    }
+                    continue;
+                }
+                let prior = changes
+                    .entry(key.target.clone())
+                    .or_insert_with(|| snapshot.learning[&key.target].clone());
+                let provider = format!("game:{}", key.source);
+                let event_id = EventId(hash(&json!([key.game_id, key.target])));
+                let input = AssessmentInput {
+                    grade: Grade::Again,
+                    accepted_at: at,
+                    source: AssessmentSource::Game {
+                        source: key.source.clone(),
+                        game_id: key.game_id.clone(),
+                        played_date: parsed_game_date(&played).map(|date| date.to_string()),
+                        started_at_ms: game.start_ms,
+                        ended_at_ms: game.end_ms,
+                    },
+                };
+                let mut transition = DailyLearning::assess_game(
+                    self.components.learning.as_ref(),
+                    prior,
+                    &input,
+                    key.version,
+                    decision.previous_move,
+                )
+                .map_err(|error| domain("learning_error", error))?;
+                if legacy_plies.is_none() {
+                    transition.state.game_review = None;
+                    transition.state.game_teaching_relevance = false;
+                }
+                *prior = transition.state.clone();
+                failures.push(AssessmentRecord {
+                    key: AssessmentKey::External { provider, event_id },
+                    dataset: snapshot.dataset.clone(),
+                    target: key.target,
+                    content_version: key.version,
+                    input,
+                    transition,
+                });
+                summary.correction_effect = Some(GameReviewEffect::AgainApplied);
             }
+            if selection.is_some() && !resolved {
+                return Err(invalid("This miss is no longer available."));
+            }
+            summary.disagreements = disagreements
+                .into_iter()
+                .map(|(repertoire_id, plies)| RepertoireDisagreement {
+                    repertoire_id,
+                    plies,
+                })
+                .collect();
+            if !summary.choices.is_empty() {
+                summary.correction_effect = Some(GameReviewEffect::ChoiceRequired);
+            }
+            let id = selection.map_or_else(
+                || comparison_id.clone(),
+                |selection| hash(&json!([comparison_id, selection.ply, selection.target])),
+            );
+            comparisons.push(ComparedGame {
+                game,
+                id,
+                summary,
+                observations,
+                failures,
+                resolved_choice: selection
+                    .map(|selection| (comparison_id, selection.ply, selection.position.clone())),
+            });
+        }
+        for compared in &comparisons {
             report.matches += compared.summary.matches;
             report.deviations += compared.summary.deviations;
             report.results.push(GameResult {
                 comparison_id: Some(compared.id.clone()),
                 summary: compared.summary.clone(),
-                effect: summarize_effects(game_effects),
+                effect: compared
+                    .summary
+                    .correction_effect
+                    .unwrap_or(GameReviewEffect::RecordedOnly),
             });
         }
         let reply =
@@ -350,16 +726,34 @@ impl Tempo {
         report_from_receipt(stored)
     }
 
+    fn after_game_reset(
+        &self,
+        cutoff: Option<u64>,
+        game: &GameRecord,
+        played: &PlayedGame,
+    ) -> bool {
+        let Some(cutoff) = cutoff else {
+            return true;
+        };
+        if let Some(start) = game.start_ms {
+            return start > cutoff;
+        }
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        parsed_game_date(played).is_some_and(|date| {
+            date.signed_duration_since(epoch).num_days()
+                >= i64::from(self.components.clock.day_at(cutoff).0)
+        })
+    }
+
     // Resolve all occurrences before projecting any report or Learning effect.
     // Store rechecks these effective times against concurrent writes at commit.
     fn resolve_pgn_timing(
         &self,
         dataset: &DatasetId,
-        comparisons: &mut [ComparedGame],
+        games: &mut [Result<(GameRecord, PlayedGame), String>],
     ) -> Result<(), AppError> {
         let mut timings = BTreeMap::<String, PgnTiming>::new();
-        for compared in comparisons.iter() {
-            let game = &compared.game;
+        for (game, _) in games.iter().filter_map(|record| record.as_ref().ok()) {
             let Some(incoming) = game.precise_pgn_timing() else {
                 continue;
             };
@@ -373,12 +767,11 @@ impl Tempo {
             };
             current.merge_end(&incoming)?;
         }
-        for compared in comparisons {
-            if compared.game.source == "pgn"
-                && let Some(timing) = timings.get(&compared.game.id)
+        for (game, _) in games.iter_mut().filter_map(|record| record.as_mut().ok()) {
+            if game.source == "pgn"
+                && let Some(timing) = timings.get(&game.id)
             {
-                compared.game.end_ms = timing.end_ms;
-                compared.summary.occurrence_end_ms = timing.end_ms;
+                game.end_ms = timing.end_ms;
             }
         }
         Ok(())
@@ -393,33 +786,36 @@ fn report_from_receipt(receipt: AcceptedGames) -> Result<GameReport, AppError> {
     Ok(report)
 }
 
-fn game_state<'a>(
-    snapshot: &'a Snapshot,
-    target: &TargetId,
-    version: ContentVersion,
-) -> Option<&'a LearningState> {
-    let item = snapshot.catalog.items.get(target)?;
-    if !item.active() || item.version != version {
-        return None;
-    }
-    snapshot.learning.get(target)
-}
-
-fn after_reset(reset: Option<u64>, start: Option<u64>) -> bool {
-    reset.is_none_or(|reset| start.is_some_and(|start| start > reset))
-}
-
-fn summarize_effects(effects: impl IntoIterator<Item = GameReviewEffect>) -> GameReviewEffect {
-    effects
+fn parsed_game_date(game: &PlayedGame) -> Option<NaiveDate> {
+    ["UTCDate", "Date"]
         .into_iter()
-        .max_by_key(|effect| match effect {
-            GameReviewEffect::RequestedReview => 4,
-            GameReviewEffect::PrioritizedTeaching => 3,
-            GameReviewEffect::AlreadyAddressed => 2,
-            GameReviewEffect::StaleContent => 1,
-            GameReviewEffect::RecordedOnly => 0,
-        })
-        .unwrap_or(GameReviewEffect::RecordedOnly)
+        .find_map(|tag| NaiveDate::parse_from_str(game.tags.get(tag)?, "%Y.%m.%d").ok())
+}
+
+fn parse_stored_game(mut game: GameRecord) -> Result<(GameRecord, PlayedGame), String> {
+    let mut parsed = parse_played_games(&game.pgn).map_err(|error| error.to_string())?;
+    if parsed.len() != 1 {
+        return Err("Expected one stored completed game.".into());
+    }
+    let played = parsed.pop().unwrap().map_err(|error| error.to_string())?;
+    if game.mainline_signature.is_empty() && game.start_ms.is_none() {
+        game.mainline_signature = mainline_signature(&played, &game.white, &game.black);
+    }
+    Ok((game, played))
+}
+
+fn hash(value: &Value) -> String {
+    blake3::hash(value.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct SelectedCorrection {
+    pub comparison_id: String,
+    pub ply: usize,
+    pub target: TargetId,
+    pub position: String,
 }
 
 fn mainline_signature(game: &PlayedGame, white: &str, black: &str) -> String {
@@ -486,8 +882,13 @@ fn uploaded_record(game: &PlayedGame, fetched_ms: u64) -> Result<GameRecord, Str
     let setup = tag("FEN").map_or_else(String::new, |fen| {
         format!("[SetUp \"1\"]\n[FEN {}]\n", json!(fen))
     });
+    let date_tag = date
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y.%m.%d").ok())
+        .map_or_else(String::new, |date| {
+            format!("[Date \"{}\"]\n", date.format("%Y.%m.%d"))
+        });
     let pgn = format!(
-        "[White {}]\n[Black {}]\n[Result {}]\n{setup}\n{}\n",
+        "[White {}]\n[Black {}]\n[Result {}]\n{setup}{date_tag}\n{}\n",
         json!(white),
         json!(black),
         json!(game.result),
@@ -503,6 +904,9 @@ fn uploaded_record(game: &PlayedGame, fetched_ms: u64) -> Result<GameRecord, Str
         start_ms,
         end_ms,
         fetched_ms,
+        played_date_ms: parsed_game_date(game)
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .and_then(|date| date.and_utc().timestamp_millis().try_into().ok()),
         pgn,
     })
 }

@@ -16,6 +16,8 @@ pub struct AttemptView {
     pub status: String,
     pub activity: ActivityMode,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrective_repair: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lesson: Option<LessonView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional public display text. Consumers may render or omit it.

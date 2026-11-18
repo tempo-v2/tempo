@@ -8,6 +8,11 @@ use tempo_types::StudyTime;
 /// Implement it for real time; use [`crate::FixedClock`] for repeatable examples.
 pub trait Clock {
     fn now(&self) -> StudyTime;
+    fn day_at(&self, unix_ms: u64) -> tempo_types::StudyDay {
+        let now = self.now();
+        let offset = (unix_ms / 86_400_000) as i64 - (now.unix_ms / 86_400_000) as i64;
+        tempo_types::StudyDay((i64::from(now.day.0) + offset) as i32)
+    }
 }
 
 #[cfg(test)]

@@ -91,6 +91,7 @@ impl Tempo {
                 status: "empty".into(),
                 dataset_id: active.dataset,
                 done: true,
+                corrective_recalls_remaining: None,
                 outstanding: 0,
                 repertoire_remaining: 0,
                 tactics_remaining: 0,
@@ -132,7 +133,7 @@ impl Tempo {
         } else {
             None
         };
-        let lesson = (record.mode == ActivityMode::Teach
+        let lesson = (matches!(record.mode, ActivityMode::Teach | ActivityMode::Repair)
             && attempt.status == AttemptStatus::Active)
             .then(|| {
                 let expected = &issued.definition.decisions[0].expected.uci;

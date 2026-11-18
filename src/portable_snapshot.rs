@@ -17,6 +17,8 @@ pub struct PortableSnapshot {
     pub catalog: Catalog,
     pub learning: BTreeMap<TargetId, LearningState>,
     pub policy: SchedulerSettings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub game_failures: Vec<tempo_store::GameFailureKey>,
 }
 
 #[cfg(test)]

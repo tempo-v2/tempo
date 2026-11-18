@@ -88,7 +88,8 @@ impl Tempo {
                 };
                 if state.first_introduced == Some(at.day) {
                     match kind {
-                        DailyKind::Repertoire => admitted.0 += 1,
+                        DailyKind::Repertoire if !state.game_introduction => admitted.0 += 1,
+                        DailyKind::Repertoire => {}
                         DailyKind::Tactic if state.taught_at.is_none() => admitted.1 += 1,
                         DailyKind::Tactic => {}
                     }
@@ -104,16 +105,23 @@ impl Tempo {
                     capture_priority.insert(item.target.clone(), introduced.unix_ms);
                 }
                 let may_test = state.can_accept_daily_test(at.day);
-                if item.active() {
-                    if may_test
-                        && state.game_review.is_some_and(|review| {
-                            review.answer_version == item.version && review.actionable_day <= at.day
-                        })
-                    {
-                        evidence.requested_tests.insert(item.target.clone());
-                    }
-                    if state.game_teaching_relevance {
-                        evidence.teaching_targets.insert(item.target.clone());
+                let correction = state
+                    .correction
+                    .as_ref()
+                    .filter(|correction| correction.answer_version == item.version);
+                if item.active()
+                    && let Some(correction) = correction
+                {
+                    evidence.corrective_recalls_remaining +=
+                        usize::from(3 - correction.clean_recalls);
+                    match correction.next_recall_day {
+                        None => {
+                            evidence.repair_targets.insert(item.target.clone());
+                        }
+                        Some(day) if day <= at.day && may_test => {
+                            evidence.requested_tests.insert(item.target.clone());
+                        }
+                        Some(_) => {}
                     }
                 }
                 item.active().then(|| {
@@ -121,9 +129,11 @@ impl Tempo {
                         item.target.clone(),
                         DailyCandidate {
                             kind,
-                            introduced_this_version: state.introduced,
+                            introduced_this_version: state.introduced
+                                && !correction
+                                    .is_some_and(|correction| correction.awaiting_introduction),
                             first_introduced: state.first_introduced,
-                            due: state.due.filter(|_| may_test),
+                            due: state.due.filter(|_| may_test && correction.is_none()),
                         },
                     )
                 })
@@ -180,6 +190,8 @@ impl Tempo {
             status: "empty".into(),
             dataset_id,
             done,
+            corrective_recalls_remaining: (selection.corrective_recalls_remaining > 0)
+                .then_some(selection.corrective_recalls_remaining),
             outstanding: selection.outstanding,
             repertoire_remaining: selection.repertoire_remaining,
             tactics_remaining: selection.tactics_remaining,
@@ -198,6 +210,7 @@ impl Tempo {
         let item = &snapshot.catalog.items[&choice.target];
         let mode = match choice.activity {
             DailyActivity::Teach => ActivityMode::Teach,
+            DailyActivity::Repair => ActivityMode::Repair,
             DailyActivity::Test => ActivityMode::Test,
             DailyActivity::Practice => ActivityMode::Practice,
         };
@@ -225,7 +238,27 @@ impl Tempo {
             route: choice.route.clone(),
             first_introduction: choice.new_kind.is_some(),
             exercise_name: exercise_name(item),
-            lesson: item.lesson.clone().filter(|_| mode == ActivityMode::Teach),
+            lesson: match mode {
+                ActivityMode::Teach => item.lesson.clone(),
+                ActivityMode::Repair => {
+                    let context = snapshot.learning[&item.target]
+                        .correction
+                        .as_ref()
+                        .and_then(|correction| correction.previous_move.clone());
+                    let expected = &item.definition.decisions[0].expected.uci;
+                    let mut lesson =
+                        item.lesson
+                            .clone()
+                            .unwrap_or_else(|| tempo_chess::RepertoireLesson {
+                                san: expected.clone(),
+                                comments: vec![],
+                                previous_move: None,
+                            });
+                    lesson.previous_move = context;
+                    Some(lesson)
+                }
+                _ => None,
+            },
             acceptance: None,
         };
         let scope = StudyScope {
