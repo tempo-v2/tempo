@@ -38,4 +38,9 @@ pub enum RepertoireCommand {
         repertoire_id: String,
         name: String,
     },
+    ResetProgress {
+        dataset_id: DatasetId,
+        repertoire_id: String,
+        command_id: String,
+    },
 }

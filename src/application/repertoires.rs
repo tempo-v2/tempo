@@ -20,7 +20,7 @@ use tempo_chess::{
     plan_repertoire_replacement,
 };
 use tempo_learning::{DailyLearning, LearningState};
-use tempo_store::{ContentReceipt, ContentSource, Snapshot, Write};
+use tempo_store::{ContentReceipt, ContentSource, RepertoireReset, Snapshot, Write};
 use tempo_types::DatasetId;
 
 #[derive(Serialize)]
@@ -65,9 +65,19 @@ impl Tempo {
                 "revision": document.revision, "document": availability,
             }));
         }
+        if let RepertoireCommand::ResetProgress {
+            dataset_id,
+            repertoire_id,
+            command_id,
+        } = &command
+        {
+            return self.reset_repertoire(dataset_id, repertoire_id, command_id);
+        }
         let (snapshot, revision) = self.store.content_state()?;
         match command {
-            RepertoireCommand::ReadDocument { .. } => unreachable!("handled as a bounded read"),
+            RepertoireCommand::ReadDocument { .. } | RepertoireCommand::ResetProgress { .. } => {
+                unreachable!("handled without reading the catalog")
+            }
             RepertoireCommand::List => Ok(list(&snapshot.dataset, &snapshot.catalog)),
             RepertoireCommand::Rename {
                 dataset_id,
@@ -182,6 +192,48 @@ impl Tempo {
                 Ok(reply)
             }
         }
+    }
+
+    fn reset_repertoire(
+        &mut self,
+        dataset: &DatasetId,
+        repertoire: &str,
+        command_id: &str,
+    ) -> Result<Value, AppError> {
+        if command_id.trim().is_empty() || command_id.len() > 120 {
+            return Err(AppError::new(
+                "invalid_command_id",
+                "A reset command identity is required.",
+            ));
+        }
+        let at = self.components.clock.now();
+        match self.store.reset_repertoire(
+            dataset,
+            repertoire,
+            command_id,
+            at.unix_ms,
+            &LearningState::default(),
+        )? {
+            RepertoireReset::Applied(targets) => {
+                let daily = self.daily.as_mut().expect("daily release");
+                for target in &targets {
+                    daily.queue.clear_deferral(target);
+                }
+            }
+            RepertoireReset::Replayed => {}
+            RepertoireReset::UnknownRepertoire => return Err(unknown_repertoire()),
+            RepertoireReset::StaleDataset => return Err(super::content_preview::stale_dataset()),
+            RepertoireReset::CommandConflict => {
+                return Err(AppError::new(
+                    "command_conflict",
+                    "This reset command was already used for another repertoire.",
+                ));
+            }
+        }
+        Ok(json!({
+            "schema_version": CONTENT_WIRE_VERSION, "status": "progress_reset",
+            "dataset_id": dataset, "repertoire_id": repertoire,
+        }))
     }
 }
 
