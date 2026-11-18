@@ -24,7 +24,7 @@ pub mod wire;
 
 pub use adapters::{CounterIds, FixedClock, FixtureGames, JsonSnapshotCodec, UnavailableGames};
 pub use app_error::AppError;
-pub use application::{IntroductionLimits, Tempo};
+pub use application::{IntroductionLimits, TacticThemes, Tempo, tactic_themes};
 pub use commands::{AbandonCommand, AgainCommand, SubmitCommand};
 pub use components::Components;
 pub use game::Game;
