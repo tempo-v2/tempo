@@ -11,8 +11,8 @@ use tempo_chess::ChessFeedback;
 use tempo_learning::{AssessmentInput, AssessmentSource};
 use tempo_queue::OrderEvent;
 use tempo_store::{
-    ActivityMode, AnswerResult, AssessmentKey, AssessmentRecord, Receipt, ReceiptResult,
-    StoredAttempt, StudyScope, Write,
+    AcceptanceKind, ActivityAcceptance, ActivityMode, AnswerResult, AssessmentKey,
+    AssessmentRecord, Receipt, ReceiptResult, StoredAttempt, StudyScope, Write,
 };
 use tempo_study::AttemptStatus;
 use tempo_types::Grade;
@@ -80,8 +80,29 @@ impl Tempo {
             )
         }
         .map_err(study_input)?;
+        let accepted_at = progress.assessment.map(|_| self.components.clock.now());
+        let acceptance = if self.daily.is_some() {
+            accepted_at
+                .zip(progress.assessment)
+                .map(|(at, grade)| {
+                    let decision_index = old.attempt.state.decision_index;
+                    let kind = match grade {
+                        Grade::Good => AcceptanceKind::Recall,
+                        Grade::Again if give_up => AcceptanceKind::Revealed { decision_index },
+                        Grade::Again => AcceptanceKind::WrongMove {
+                            uci: command.answer.uci.clone(),
+                            decision_index,
+                        },
+                    };
+                    ActivityAcceptance { at, kind }
+                })
+                .or_else(|| old.acceptance.clone())
+        } else {
+            old.acceptance.clone()
+        };
         let updated = StoredAttempt {
             attempt: progress.attempt.clone(),
+            acceptance,
             ..old.clone()
         };
         let mut writes = vec![Write::Progress(updated)];
@@ -92,7 +113,7 @@ impl Tempo {
         {
             let input = AssessmentInput {
                 grade,
-                accepted_at: self.components.clock.now(),
+                accepted_at: accepted_at.expect("new grade has acceptance time"),
                 source: AssessmentSource::Human {
                     attempt_id: command.attempt_id.clone(),
                     issued_miss_revision: old.issued_miss_revision,

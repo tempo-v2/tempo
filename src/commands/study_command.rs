@@ -1,7 +1,7 @@
 //! The transport envelope around the supported study intents.
 use crate::{AbandonCommand, SubmitCommand};
 use serde::{Deserialize, Serialize};
-use tempo_types::AttemptId;
+use tempo_types::{AttemptId, DatasetId, SubmissionId};
 
 /// Deserialize one UI intent, then pass it to [`crate::Tempo::handle`].
 ///
@@ -14,7 +14,15 @@ use tempo_types::AttemptId;
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StudyCommand {
     Next,
-    Resume { attempt_id: AttemptId },
+    PracticeTactics,
+    StudyStatus,
+    LearnMoreTactics {
+        dataset_id: DatasetId,
+        submission_id: SubmissionId,
+    },
+    Resume {
+        attempt_id: AttemptId,
+    },
     Answer(SubmitCommand),
     Acknowledge(SubmitCommand),
     GiveUp(AbandonCommand),

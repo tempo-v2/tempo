@@ -16,6 +16,12 @@ impl Tempo {
     pub fn handle(&mut self, command: StudyCommand) -> StudyView {
         let result: Result<StudyView, AppError> = match command {
             StudyCommand::Next => self.next_view(),
+            StudyCommand::StudyStatus => self.study_status(),
+            StudyCommand::PracticeTactics => self.practice_tactics(),
+            StudyCommand::LearnMoreTactics {
+                dataset_id,
+                submission_id,
+            } => self.learn_more_tactics(dataset_id, submission_id),
             StudyCommand::ResumeSkipped => {
                 if let Some(daily) = &mut self.daily {
                     daily.queue.resume_skipped();
@@ -42,22 +48,25 @@ impl Tempo {
         result.unwrap_or_else(Into::into)
     }
 
+    fn study_status(&self) -> Result<StudyView, AppError> {
+        if self.daily.is_none() {
+            return Err(AppError::new("unsupported", "Use the local study release."));
+        }
+        let snapshot = self.store.study_state(StudyScope {
+            catalog: true,
+            ..StudyScope::default()
+        })?;
+        let at = self.components.clock.now();
+        let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
+        let selection = self.daily_selection(&snapshot, at, extra);
+        Ok(self.daily_summary(snapshot.dataset, selection))
+    }
+
     fn next_view(&mut self) -> Result<StudyView, AppError> {
         let active = self.store.study_state(StudyScope::default())?;
         if let Some(id) = &active.active_attempt {
             return self.project(self.resume_from(&active, id)?);
         }
-        let empty = |dataset_id, outstanding, repertoire_remaining, tactics_remaining| {
-            StudyView::Empty(EmptyView {
-                schema_version: STUDY_WIRE_VERSION,
-                status: "empty".into(),
-                dataset_id,
-                done: outstanding == 0,
-                outstanding,
-                repertoire_remaining,
-                tactics_remaining,
-            })
-        };
         if self.daily.is_some() {
             let snapshot = self.store.study_state(StudyScope {
                 catalog: true,
@@ -67,33 +76,36 @@ impl Tempo {
                 return self.project(self.resume_from(&snapshot, id)?);
             }
             let at = self.components.clock.now();
-            let selection = self.daily_selection(&snapshot, at);
+            let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
+            let selection = self.daily_selection(&snapshot, at, extra);
             if let Some(choice) = selection.next {
                 let result = self.issue_daily(&snapshot, at, choice)?;
                 return self.project(result);
             }
-            return Ok(empty(
-                snapshot.dataset,
-                selection.outstanding,
-                selection.repertoire_remaining,
-                selection.tactics_remaining,
-            ));
+            return Ok(self.daily_summary(snapshot.dataset, selection));
         }
         match self.next_exercise()? {
             Some(value) => self.project(value),
-            None => Ok(empty(active.dataset, 0, 0, 0)),
+            None => Ok(StudyView::Empty(EmptyView {
+                schema_version: STUDY_WIRE_VERSION,
+                status: "empty".into(),
+                dataset_id: active.dataset,
+                done: true,
+                outstanding: 0,
+                repertoire_remaining: 0,
+                tactics_remaining: 0,
+                can_practice_tactics: false,
+                can_learn_more_tactics: false,
+                learn_more_count: 0,
+            })),
         }
     }
 
-    fn project(&self, result: AnswerResult) -> Result<StudyView, AppError> {
+    pub(super) fn project(&self, result: AnswerResult) -> Result<StudyView, AppError> {
         let attempt = &result.attempt;
-        let state = self.store.study_state(StudyScope {
-            attempt: Some(&attempt.id),
-            ..StudyScope::default()
-        })?;
-        let record = state
-            .attempts
-            .get(&attempt.id)
+        let record = self
+            .store
+            .stored_attempt(&attempt.id)?
             .ok_or_else(|| AppError::new("unknown_attempt", "Issued activity is missing."))?;
         // Immutable definitions keep replay deterministic after content replacement.
         let issued = self
@@ -124,24 +136,19 @@ impl Tempo {
             && attempt.status == AttemptStatus::Active)
             .then(|| {
                 let expected = &issued.definition.decisions[0].expected.uci;
+                let lesson = record.lesson.as_ref().or(issued.lesson.as_ref());
                 LessonView {
                     move_uci: expected.clone(),
-                    move_san: issued
-                        .lesson
-                        .as_ref()
-                        .map_or_else(|| expected.clone(), |lesson| lesson.san.clone()),
-                    comments: issued
-                        .lesson
-                        .as_ref()
-                        .map_or_else(Vec::new, |lesson| lesson.comments.clone()),
-                    previous_move: issued.lesson.and_then(|lesson| lesson.previous_move),
+                    move_san: lesson.map_or_else(|| expected.clone(), |lesson| lesson.san.clone()),
+                    comments: lesson.map_or_else(Vec::new, |lesson| lesson.comments.clone()),
+                    previous_move: lesson.and_then(|lesson| lesson.previous_move.clone()),
                 }
             });
         Ok(StudyView::attempt(
             result,
             board,
             correction_uci,
-            record,
+            &record,
             lesson,
         ))
     }

@@ -28,6 +28,12 @@ struct Profile {
     study_timezone: String,
     introductions: IntroductionLimits,
     preview_key: [u8; 32],
+    #[serde(default = "default_more_tactics")]
+    more_tactics: usize,
+}
+
+fn default_more_tactics() -> usize {
+    10
 }
 
 impl Default for Profile {
@@ -36,6 +42,7 @@ impl Default for Profile {
             study_timezone: "America/New_York".into(),
             introductions: IntroductionLimits::default(),
             preview_key: [0; 32],
+            more_tactics: default_more_tactics(),
         }
     }
 }
@@ -57,7 +64,12 @@ pub fn init(path: &Path) -> LocalResult<()> {
     Ok(())
 }
 
-pub fn configure(path: &Path, repertoire: usize, tactics: usize) -> LocalResult<()> {
+pub fn configure(
+    path: &Path,
+    repertoire: usize,
+    tactics: usize,
+    more: Option<usize>,
+) -> LocalResult<()> {
     let store = SqliteStore::open(path)?;
     let previous = stored_profile(&store)?;
     let mut profile: Profile = serde_json::from_str(&previous)?;
@@ -65,6 +77,9 @@ pub fn configure(path: &Path, repertoire: usize, tactics: usize) -> LocalResult<
         repertoire,
         tactics,
     };
+    if let Some(more) = more {
+        profile.more_tactics = more;
+    }
     store.update_local_profile(&previous, &serde_json::to_string(&profile)?)?;
     println!(
         "Saved daily introduction limits of {repertoire} opening positions and {tactics} tactics. Restart Tempo to apply them."
@@ -100,6 +115,7 @@ fn open(path: &Path) -> LocalResult<Tempo> {
         components(profile.study_timezone.parse()?)?,
         profile.introductions,
         profile.preview_key,
+        profile.more_tactics,
     )?)
 }
 
@@ -141,14 +157,18 @@ impl Clock for LocalClock {
         let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        let timestamp = DateTime::from_timestamp(elapsed.as_secs() as i64, elapsed.subsec_nanos())
-            .expect("system clock fits supported calendar");
-        let local_date = timestamp.with_timezone(&self.0).date_naive();
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
-        StudyTime {
-            day: StudyDay(local_date.signed_duration_since(epoch).num_days() as i32),
-            unix_ms: elapsed.as_millis() as u64,
-        }
+        study_time(elapsed.as_millis() as u64, self.0)
+    }
+}
+
+fn study_time(unix_ms: u64, zone: Tz) -> StudyTime {
+    let timestamp = DateTime::from_timestamp_millis(unix_ms as i64)
+        .expect("system clock fits supported calendar");
+    let local_date = timestamp.with_timezone(&zone).date_naive();
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
+    StudyTime {
+        day: StudyDay(local_date.signed_duration_since(epoch).num_days() as i32),
+        unix_ms,
     }
 }
 
@@ -161,5 +181,40 @@ impl AttemptIds for LocalIds {
     fn next_id(&mut self) -> AttemptId {
         self.sequence += 1;
         AttemptId(format!("attempt-{}-{}", self.run, self.sequence))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn study_day_changes_at_new_york_midnight_across_dst() {
+        let zone = chrono_tz::America::New_York;
+        for (first, second, length) in [
+            ("2024-03-10T05:00:00Z", "2024-03-11T04:00:00Z", 23),
+            ("2024-11-03T04:00:00Z", "2024-11-04T05:00:00Z", 25),
+        ] {
+            let millis = |time| {
+                DateTime::parse_from_rfc3339(time)
+                    .unwrap()
+                    .timestamp_millis() as u64
+            };
+            let first = millis(first);
+            let second = millis(second);
+            assert_eq!((second - first) / 3_600_000, length);
+            assert_eq!(
+                study_time(first - 1, zone).day.0 + 1,
+                study_time(first, zone).day.0
+            );
+            assert_eq!(
+                study_time(first, zone).day,
+                study_time(second - 1, zone).day
+            );
+            assert_eq!(
+                study_time(second - 1, zone).day.0 + 1,
+                study_time(second, zone).day.0
+            );
+        }
     }
 }

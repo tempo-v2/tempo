@@ -1,10 +1,11 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
 use super::LocalResult;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
 use tempo::{
     AppError, Tempo,
-    wire::{RepertoireCommand, StudyCommand, StudyView},
+    wire::{RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -99,10 +100,17 @@ fn respond(
             "application/json; charset=utf-8",
             serde_json::to_vec(&reply)?,
         ))?;
-    } else if request.method() == &Method::Post && request.url() == "/api/repertoires" {
-        let reply = match command::<RepertoireCommand>(&mut request, MAX_CONTENT_COMMAND_BYTES) {
-            Ok(intent) => app.handle_repertoire(intent),
-            Err(error) => serde_json::to_value(StudyView::from(error))?,
+    } else if request.method() == &Method::Post
+        && matches!(request.url(), "/api/repertoires" | "/api/tactics")
+    {
+        let reply = if request.url() == "/api/repertoires" {
+            content_command(&mut request, |intent: RepertoireCommand| {
+                app.handle_repertoire(intent)
+            })?
+        } else {
+            content_command(&mut request, |intent: TacticCaptureCommand| {
+                app.handle_tactic_capture(intent)
+            })?
         };
         request.respond(body(
             "application/json; charset=utf-8",
@@ -121,6 +129,16 @@ fn respond(
         request.respond(Response::empty(StatusCode(405)))?;
     }
     Ok(())
+}
+
+fn content_command<T: DeserializeOwned>(
+    request: &mut Request,
+    handle: impl FnOnce(T) -> Value,
+) -> LocalResult<Value> {
+    Ok(match command(request, MAX_CONTENT_COMMAND_BYTES) {
+        Ok(intent) => handle(intent),
+        Err(error) => serde_json::to_value(StudyView::from(error))?,
+    })
 }
 
 fn command<T: DeserializeOwned>(request: &mut Request, max_bytes: usize) -> Result<T, AppError> {

@@ -4,13 +4,16 @@
 //! exposed publicly merely to organize an operation into its own source file.
 mod abandon;
 mod again;
+mod content_preview;
 mod current_attempt;
+
 mod daily;
 mod export;
 mod handle;
 mod import_pgn;
 mod ingest_games;
 mod next_exercise;
+mod optional_tactics;
 mod queue_source;
 mod receipts;
 mod repertoires;
@@ -18,6 +21,8 @@ mod repertoires;
 mod restore;
 mod resume;
 mod submit;
+mod tactic_capture;
+
 mod teach;
 
 pub use daily::IntroductionLimits;

@@ -53,8 +53,17 @@ impl Tempo {
         snapshot: &Snapshot,
         catalog: &Catalog,
     ) -> Result<ContentPlan, AppError> {
-        let plan = tempo_chess::plan_import(&snapshot.catalog, catalog)
-            .map_err(|e| domain("content_change_error", e))?;
+        let plan = if self.daily.is_some()
+            && catalog
+                .items
+                .values()
+                .all(|item| !item.definition.is_repertoire())
+        {
+            tempo_chess::plan_tactic_capture(&snapshot.catalog, catalog).map(|plan| plan.content)
+        } else {
+            tempo_chess::plan_import(&snapshot.catalog, catalog)
+        }
+        .map_err(|e| domain("content_change_error", e))?;
         if plan.catalog == snapshot.catalog {
             return Ok(plan);
         }

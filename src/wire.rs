@@ -7,3 +7,4 @@ pub use crate::commands::StudyCommand;
 pub use crate::views::{AttemptView, EmptyView, ErrorView, StudyView};
 pub(crate) const STUDY_WIRE_VERSION: u32 = 4;
 pub use crate::commands::RepertoireCommand;
+pub use crate::commands::TacticCaptureCommand;

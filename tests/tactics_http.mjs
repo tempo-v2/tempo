@@ -31,7 +31,7 @@ async function start(database) {
     child.stderr.on('data', chunk => { diagnostics += chunk; });
     let url;
     for await (const line of output) {
-        const match = line.match(/^Tempo tactics: (http:\/\/127\.0\.0\.1:\d+)$/);
+        const match = line.match(/^Tempo study at (http:\/\/127\.0\.0\.1:\d+)$/);
         if (match) {
             url = match[1];
             break;
@@ -170,13 +170,66 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
 
     client = controller();
     const reloaded = await client.start();
-    assert.equal(reloaded.attempt_id, complete.attempt_id);
-    assert.equal(reloaded.display_fen, complete.display_fen);
-    const repeat = await client.next();
-    assert.notEqual(repeat.attempt_id, issued.attempt_id);
-    assert.equal(repeat.display_fen, issued.display_fen);
+    assert.equal(reloaded.status, 'empty');
+    assert.equal(reloaded.done, true);
+    assert.equal(reloaded.can_practice_tactics, true);
+    const practice = await client.practiceTactics();
+    assert.equal(practice.activity, 'practice');
+    assert.notEqual(practice.attempt_id, issued.attempt_id);
+    assert.equal(practice.display_fen, issued.display_fen);
     await client.answer('a6c8');
     assert.equal((await client.answer('e1e8')).assessment, 'good');
-    assert.deepEqual(persisted(database).grades, ['again', 'good']);
+    assert.deepEqual(persisted(database).grades, ['again']);
     assert.equal((await client.next()).status, 'empty');
+});
+
+test('SQLite rolls back a teaching acknowledgement if its receipt cannot be stored', { timeout: 15_000 }, async t => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'tempo-v2-rollback-'));
+    let host;
+    t.after(async () => {
+        await host?.stop();
+        await rm(dir, { recursive: true, force: true });
+    });
+    const database = path.join(dir, 'opening.sqlite');
+    execFileSync(binary, ['init', database]);
+    host = await start(database);
+    const post = async (url, command) => {
+        const result = await fetch(host.url + '/api/' + url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(command),
+        });
+        return result.json();
+    };
+    const { dataset_id } = await post('repertoires', { command: 'list' });
+    const input = { dataset_id, name: 'Opening', learner_color: 'white', pgn: '1. e4 *' };
+    const preview = await post('repertoires', { command: 'preview', ...input });
+    const save = await post('repertoires', { command: 'save', ...input, token: preview.token });
+    assert.equal(save.status, 'repertoires');
+    const card = await post('study', { command: 'next' });
+    const ack = {
+        command: 'acknowledge', dataset_id, submission_id: 'teaching-rollback',
+        attempt_id: card.attempt_id, expected_revision: card.revision, answer: { uci: 'e2e4' },
+    };
+    const before = persisted(database);
+    const sql = new DatabaseSync(database);
+    try {
+        sql.exec(`CREATE TRIGGER fail_test_receipt BEFORE INSERT ON receipts
+            BEGIN SELECT RAISE(ABORT, 'disposable receipt failure'); END;`);
+        const failure = await post('study', ack);
+        assert.equal(failure.status, 'error');
+        assert.equal(failure.retryable, true);
+        assert.deepEqual(persisted(database), before);
+        assert.deepEqual(await post('study', { command: 'next' }), card);
+        assert.equal(sql.prepare("SELECT json_extract(state, '$.taught_at') AS taught FROM learning").get().taught, null);
+        sql.exec('DROP TRIGGER fail_test_receipt');
+        const accepted = await post('study', ack);
+        assert.equal(accepted.assessment, null);
+        assert.equal(accepted.status, 'complete');
+        assert.deepEqual(await post('study', ack), accepted);
+        assert.equal(persisted(database).receipts, 1);
+        assert.deepEqual(persisted(database).grades, []);
+    } finally {
+        sql.close();
+    }
 });

@@ -9,7 +9,8 @@ use crate::{
 };
 use tempo_learning::DailyLearning;
 use tempo_store::{
-    ActivityMode, AnswerResult, Receipt, ReceiptResult, StoredAttempt, StudyScope, Write,
+    AcceptanceKind, ActivityAcceptance, ActivityMode, AnswerResult, Receipt, ReceiptResult,
+    StoredAttempt, StudyScope, Write,
 };
 use tempo_study::{AttemptStatus, check_open::check_open};
 
@@ -60,6 +61,10 @@ impl Tempo {
             vec![
                 Write::Progress(StoredAttempt {
                     attempt,
+                    acceptance: Some(ActivityAcceptance {
+                        at,
+                        kind: AcceptanceKind::Teaching,
+                    }),
                     ..old.clone()
                 }),
                 Write::Learning {

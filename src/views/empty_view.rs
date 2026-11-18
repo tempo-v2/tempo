@@ -15,6 +15,12 @@ pub struct EmptyView {
     pub outstanding: usize,
     pub repertoire_remaining: usize,
     pub tactics_remaining: usize,
+    #[serde(default)]
+    pub can_practice_tactics: bool,
+    #[serde(default)]
+    pub can_learn_more_tactics: bool,
+    #[serde(default)]
+    pub learn_more_count: usize,
 }
 
 #[cfg(test)]
@@ -43,7 +49,8 @@ mod tests {
             serde_json::to_value(view).unwrap(),
             serde_json::json!({
                 "schema_version": 4, "status": "empty", "dataset_id": "empty",
-                "done": true, "outstanding": 0, "repertoire_remaining": 0, "tactics_remaining": 0
+                "done": true, "outstanding": 0, "repertoire_remaining": 0, "tactics_remaining": 0,
+                "can_practice_tactics": false, "can_learn_more_tactics": false, "learn_more_count": 0
             })
         );
         assert!(app.snapshot().unwrap().attempts.is_empty());

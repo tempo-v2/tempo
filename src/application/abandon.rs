@@ -58,7 +58,8 @@ impl Tempo {
         if snapshot.active_attempt.as_ref() == Some(&command.attempt_id) {
             writes.push(Write::Active(None));
         }
-        let at = skip.then(|| self.components.clock.now());
+        let at = (skip && old.mode != tempo_store::ActivityMode::Practice)
+            .then(|| self.components.clock.now());
         self.commit_study(&snapshot, writes, scope)?;
         if let (Some(at), Some(daily)) = (at, &mut self.daily) {
             daily.queue.defer(result.attempt.target.clone(), at.day);

@@ -1,6 +1,11 @@
 //! Compose today's admissions and durable activity issuance.
 use super::Tempo;
-use crate::{AppError, Components, app_error::domain};
+use crate::{
+    AppError, Components,
+    app_error::domain,
+    views::{EmptyView, StudyView},
+    wire::STUDY_WIRE_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tempo_chess::ContentItem;
@@ -10,7 +15,7 @@ use tempo_queue::{
 };
 use tempo_store::{ActivityMode, AnswerResult, Snapshot, Store, StoredAttempt, StudyScope, Write};
 use tempo_study::{Attempt, AttemptStatus};
-use tempo_types::{Revision, StudyTime};
+use tempo_types::{DatasetId, Revision, StudyTime};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +37,7 @@ pub(super) struct DailyStudy {
     pub(super) limits: IntroductionLimits,
     pub(super) queue: DailySession,
     pub(super) preview_key: [u8; 32],
+    pub(super) more_tactics: usize,
 }
 
 impl Tempo {
@@ -41,17 +47,24 @@ impl Tempo {
         components: Components,
         limits: IntroductionLimits,
         preview_key: [u8; 32],
+        more_tactics: usize,
     ) -> Result<Self, AppError> {
         let mut app = Self::new(store, components)?;
         app.daily = Some(DailyStudy {
             limits,
             queue: DailySession::default(),
             preview_key,
+            more_tactics,
         });
         Ok(app)
     }
 
-    pub(super) fn daily_selection(&self, snapshot: &Snapshot, at: StudyTime) -> DailySelection {
+    pub(super) fn daily_selection(
+        &self,
+        snapshot: &Snapshot,
+        at: StudyTime,
+        extra_tactics: usize,
+    ) -> DailySelection {
         let daily = self.daily.as_ref().expect("daily release");
         let mut admitted = (0, 0);
         let candidates = snapshot
@@ -100,12 +113,39 @@ impl Tempo {
                 seed,
                 today: at.day,
                 repertoire_limit: daily.limits.repertoire,
-                tactics_limit: daily.limits.tactics,
+                tactics_limit: daily.limits.tactics.saturating_add(extra_tactics),
             },
             &candidates,
             &routes,
             admitted,
+            snapshot
+                .active_attempt
+                .as_ref()
+                .and_then(|id| snapshot.attempts.get(id))
+                .filter(|record| record.mode != ActivityMode::Practice)
+                .map(|record| &record.attempt.target),
         )
+    }
+
+    pub(super) fn daily_summary(
+        &self,
+        dataset_id: DatasetId,
+        selection: DailySelection,
+    ) -> StudyView {
+        let more = self.daily.as_ref().expect("daily release").more_tactics;
+        let done = selection.outstanding == 0;
+        StudyView::Empty(EmptyView {
+            schema_version: STUDY_WIRE_VERSION,
+            status: "empty".into(),
+            dataset_id,
+            done,
+            outstanding: selection.outstanding,
+            repertoire_remaining: selection.repertoire_remaining,
+            tactics_remaining: selection.tactics_remaining,
+            can_practice_tactics: done && selection.practice.is_some(),
+            can_learn_more_tactics: done && selection.unseen_tactics && more > 0,
+            learn_more_count: more,
+        })
     }
 
     pub(super) fn issue_daily(
@@ -144,6 +184,8 @@ impl Tempo {
             route: choice.route.clone(),
             first_introduction: choice.new_kind.is_some(),
             repertoire_name: repertoire_name(item),
+            lesson: item.lesson.clone().filter(|_| mode == ActivityMode::Teach),
+            acceptance: None,
         };
         let scope = StudyScope {
             target: Some(&item.target),

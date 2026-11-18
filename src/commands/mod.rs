@@ -11,3 +11,6 @@ pub use submit_command::SubmitCommand;
 
 mod repertoire_command;
 pub use repertoire_command::{RepertoireCommand, RepertoireInput};
+
+mod tactic_capture_command;
+pub use tactic_capture_command::TacticCaptureCommand;

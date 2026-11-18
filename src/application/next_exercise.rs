@@ -21,7 +21,8 @@ impl Tempo {
         }
         if self.daily.is_some() {
             let at = self.components.clock.now();
-            let selection = self.daily_selection(&snapshot, at);
+            let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
+            let selection = self.daily_selection(&snapshot, at, extra);
             return selection
                 .next
                 .map(|choice| self.issue_daily(&snapshot, at, choice))
@@ -65,6 +66,8 @@ impl Tempo {
             route: None,
             first_introduction: false,
             repertoire_name: None,
+            lesson: None,
+            acceptance: None,
         };
         self.commit(
             &snapshot,

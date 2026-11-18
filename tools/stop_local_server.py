@@ -23,7 +23,7 @@ def listeners(port):
     return {int(field[1:]) for field in fields if field.startswith("p")}
 
 
-def stop_local_server(port, executable):
+def stop_local_server(port, executables, database=None):
     if port == 0:
         return
     pids = listeners(port)
@@ -33,12 +33,20 @@ def stop_local_server(port, executable):
         raise RuntimeError(f"Port {port} has multiple listeners")
     pid, = pids
     files = lsof("-a", "-p", str(pid), "-u", str(os.getuid()), "-d", "txt", "-Fn")
-    expected = f"n{executable.resolve()}"
-    if expected not in files and f"{expected} (deleted)" not in files:
+    expected = {f"n{executable.resolve()}" for executable in executables}
+    paths = {field.removesuffix(" (deleted)") for field in files}
+    if not expected.intersection(paths):
         raise RuntimeError(
             f"Port {port} is held by another process (PID {pid}). "
             "Choose another port with TEMPO_PORT."
         )
+    if database is not None:
+        files = lsof("-a", "-p", str(pid), "-u", str(os.getuid()), "-Fn")
+        if f"n{database.resolve()}" not in files:
+            raise RuntimeError(
+                f"Tempo on port {port} is serving a different database (PID {pid}). "
+                "Choose another port with TEMPO_PORT."
+            )
 
     print(f"Stopping the existing Tempo server on port {port}.", flush=True)
     try:
@@ -55,12 +63,13 @@ def stop_local_server(port, executable):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("port", type=int, metavar="PORT")
-    parser.add_argument("executable", type=Path)
+    parser.add_argument("executable", type=Path, nargs="+")
+    parser.add_argument("--database", type=Path)
     args = parser.parse_args()
     if not 0 <= args.port <= 65535:
         parser.error("PORT must be between 0 and 65535")
     try:
-        stop_local_server(args.port, args.executable)
+        stop_local_server(args.port, args.executable, args.database)
     except (OSError, RuntimeError) as error:
         parser.exit(1, f"{error}\n")
 

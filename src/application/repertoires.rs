@@ -1,8 +1,13 @@
 //! Preview and replace one complete repertoire, fenced independently of study reviews.
-use super::Tempo;
+use super::{
+    Tempo,
+    content_preview::{
+        check_dataset, preview_id, read_preview, signature, source_id, stale_preview, validate_pgn,
+    },
+};
 use crate::{
     AppError,
-    app_error::{domain, study_input},
+    app_error::domain,
     commands::{RepertoireCommand, RepertoireInput},
     views::StudyView,
     wire::STUDY_WIRE_VERSION,
@@ -15,8 +20,8 @@ use tempo_chess::{
     plan_repertoire_replacement,
 };
 use tempo_learning::{DailyLearning, LearningState};
-use tempo_store::{Commit, ContentReceipt, ContentSource, Snapshot, StoredAttempt, Write};
-use tempo_types::{DatasetId, Revision};
+use tempo_store::{ContentReceipt, ContentSource, Snapshot, Write};
+use tempo_types::DatasetId;
 
 #[derive(Serialize)]
 struct Summary {
@@ -64,7 +69,7 @@ impl Tempo {
                     ));
                 }
                 if catalog != snapshot.catalog {
-                    self.commit_repertoire(&snapshot, &catalog, vec![], None, None)?;
+                    self.commit_catalog(&snapshot, &catalog, vec![], None, None)?;
                 }
                 Ok(list(&snapshot.dataset, &catalog))
             }
@@ -73,19 +78,12 @@ impl Tempo {
                     let digest = signature(&key, revision, "", &input);
                     format!("repertoire-{}", &digest[..32])
                 });
-                let mac = signature(&key, revision, &id, &input);
-                let token = format!("{}:{id}:{mac}", revision.0);
+                let token = preview_id(&key, revision, &id, &input);
                 let (_, incoming, plan) = prepare(&snapshot, &input, &id)?;
                 Ok(preview(&snapshot, &incoming, &plan, token))
             }
             RepertoireCommand::Save { input, token } => {
-                let mut fields = token.splitn(3, ':');
-                let revision_in_token = fields.next().and_then(|r| r.parse().ok()).map(Revision);
-                let id = fields.next().unwrap_or_default();
-                let mac = fields.next().unwrap_or_default();
-                let revision_in_token = revision_in_token
-                    .filter(|r| signature(&key, *r, id, &input) == mac)
-                    .ok_or_else(stale_preview)?;
+                let (revision_in_token, id) = read_preview(&key, &token, &input)?;
                 check_dataset(&snapshot, &input.dataset_id)?;
                 if let Some(saved) = self.store.content_receipt(&token)? {
                     return serde_json::from_str(&saved).map_err(|e| domain("invalid_receipt", e));
@@ -100,96 +98,37 @@ impl Tempo {
                     request: &token,
                     reply: &encoded,
                 };
-                if plan.catalog != snapshot.catalog {
-                    let learning = plan
-                        .changes
-                        .iter()
-                        .filter_map(|change| {
-                            let state = match change.kind {
-                                ChangeKind::Added => LearningState::default(),
-                                ChangeKind::Semantic => DailyLearning::changed_answer(
-                                    &snapshot.learning[&change.target],
-                                ),
-                                _ => return None,
-                            };
-                            Some(Write::Learning {
-                                target: change.target.clone(),
-                                state,
-                            })
+                let learning = plan
+                    .changes
+                    .iter()
+                    .filter_map(|change| {
+                        let state = match change.kind {
+                            ChangeKind::Added => LearningState::default(),
+                            ChangeKind::Semantic => {
+                                DailyLearning::changed_answer(&snapshot.learning[&change.target])
+                            }
+                            _ => return None,
+                        };
+                        Some(Write::Learning {
+                            target: change.target.clone(),
+                            state,
                         })
-                        .collect();
-                    self.commit_repertoire(
-                        &snapshot,
-                        &plan.catalog,
-                        learning,
-                        Some(ContentSource {
-                            id: &source,
-                            pgn: &input.pgn,
-                        }),
-                        Some(receipt),
-                    )?;
-                } else {
-                    self.store.commit_content(
-                        Commit {
-                            expected_revision: snapshot.revision,
-                            expected_dataset: snapshot.dataset.clone(),
-                            writes: vec![],
-                        },
-                        None,
-                        Some(receipt),
-                    )?;
-                }
+                    })
+                    .collect();
+                self.commit_catalog(
+                    &snapshot,
+                    &plan.catalog,
+                    learning,
+                    Some(ContentSource {
+                        id: &source,
+                        pgn: &input.pgn,
+                    }),
+                    Some(receipt),
+                )?;
                 Ok(reply)
             }
         }
     }
-
-    fn commit_repertoire(
-        &mut self,
-        snapshot: &Snapshot,
-        catalog: &Catalog,
-        mut writes: Vec<Write>,
-        source: Option<ContentSource<'_>>,
-        receipt: Option<ContentReceipt<'_>>,
-    ) -> Result<(), AppError> {
-        if let Some(active) = &snapshot.active_attempt {
-            let record = &snapshot.attempts[active];
-            let old = &record.attempt;
-            if catalog
-                .items
-                .get(&old.target)
-                .is_none_or(|item| !item.active() || item.version != old.content_version)
-            {
-                let attempt = tempo_study::abandon(old, old.revision).map_err(study_input)?;
-                writes.push(Write::Progress(StoredAttempt {
-                    attempt,
-                    ..record.clone()
-                }));
-                writes.push(Write::Active(None));
-            }
-        }
-        writes.insert(0, Write::Catalog(catalog.clone()));
-        self.store.commit_content(
-            Commit {
-                expected_revision: snapshot.revision,
-                expected_dataset: snapshot.dataset.clone(),
-                writes,
-            },
-            source,
-            receipt,
-        )?;
-        Ok(())
-    }
-}
-
-fn check_dataset(snapshot: &Snapshot, dataset: &DatasetId) -> Result<(), AppError> {
-    if &snapshot.dataset != dataset {
-        return Err(AppError::new(
-            "stale_dataset",
-            "This command belongs to an earlier dataset. Reload Tempo.",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_name(name: &str) -> Result<&str, AppError> {
@@ -203,16 +142,6 @@ fn validate_name(name: &str) -> Result<&str, AppError> {
     Ok(name)
 }
 
-fn stale_preview() -> AppError {
-    AppError::new("stale_preview", "Preview this PGN again before saving.")
-}
-
-fn signature(key: &[u8; 32], revision: Revision, id: &str, input: &RepertoireInput) -> String {
-    let bytes =
-        serde_json::to_vec(&(revision, id, input)).expect("serializable repertoire preview");
-    blake3::keyed_hash(key, &bytes).to_hex().to_string()
-}
-
 fn prepare(
     snapshot: &Snapshot,
     input: &RepertoireInput,
@@ -220,12 +149,7 @@ fn prepare(
 ) -> Result<(String, Catalog, ContentPlan), AppError> {
     check_dataset(snapshot, &input.dataset_id)?;
     let name = validate_name(&input.name)?;
-    if input.pgn.len() > 256 * 1024 {
-        return Err(AppError::new(
-            "pgn_too_large",
-            "The PGN must be at most 256 KiB.",
-        ));
-    }
+    validate_pgn(&input.pgn)?;
     if let Some(replacement) = &input.repertoire_id {
         let metadata = summaries(&snapshot.catalog)
             .remove(replacement)
@@ -240,7 +164,7 @@ fn prepare(
             ));
         }
     }
-    let source = format!("pgn:{}", blake3::hash(input.pgn.as_bytes()).to_hex());
+    let source = source_id(&input.pgn);
     let incoming = compile_repertoire(&input.pgn, id, name, input.learner_color, &source)
         .map_err(|e| domain("invalid_pgn", e))?;
     let plan = plan_repertoire_replacement(&snapshot.catalog, &incoming, id)
