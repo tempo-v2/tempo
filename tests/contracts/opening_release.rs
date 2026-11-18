@@ -1070,6 +1070,144 @@ fn dated_game(app: &mut Tempo, repertoire: &str, date: &str, play: &str, time: &
 }
 
 #[test]
+fn reset_progress_scopes_study_history_and_games_and_replays_after_new_learning() {
+    use tempo_chess::ContentKind;
+    use tempo_learning::LearningState;
+
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("reset.sqlite");
+    let day = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits::default();
+    let mut app = open(&db, day.clone(), limits, 0);
+    let (_, saved) = preview_and_save(&mut app, SHORT, "London", None);
+    let london = saved["repertoires"][0]["id"].as_str().unwrap();
+    for index in 0..2 {
+        let lesson = study(&mut app, json!({"command":"next"}));
+        let mut ack = activity_command("acknowledge", &lesson, &format!("london-{index}"));
+        ack["answer"] = json!({"uci":lesson["lesson"]["move_uci"]});
+        assert_eq!(study(&mut app, ack)["status"], "complete");
+    }
+    preview_and_save(&mut app, "1. e4 *", "London", Some(london));
+    let (_, saved) = preview_and_save(&mut app, "1. d4 *", "Other", None);
+    let other = saved["repertoires"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "Other")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let lesson = study(&mut app, json!({"command":"next"}));
+    let mut other_ack = activity_command("acknowledge", &lesson, "other-lesson");
+    other_ack["answer"] = json!({"uci":"d2d4"});
+    let other_result = study(&mut app, other_ack.clone());
+    assert_eq!(other_result["status"], "complete");
+
+    day.store(20_001, Ordering::Relaxed);
+    let old_game = json!({
+        "repertoire_id":london, "learner":"learner", "command_id":"london-game",
+        "dataset_id":"opening-proof",
+        "pgn":"[White \"Learner\"]\n[Black \"Other\"]\n1. d4 d5 1-0",
+    });
+    let import = |app: &mut Tempo, request: Value| {
+        serde_json::to_value(
+            app.import_game_pgn(serde_json::from_value(request).unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let original_game = import(&mut app, old_game.clone());
+    let mut london_test = None;
+    for index in 0..2 {
+        let test = study(&mut app, json!({"command":"next"}));
+        let mut answer = activity_command("answer", &test, &format!("test-{index}"));
+        answer["answer"] =
+            json!({"uci":if test["exercise_name"] == "London" {"e2e4"} else {"d2d4"}});
+        assert_eq!(study(&mut app, answer.clone())["assessment"], "good");
+        if test["exercise_name"] == "London" {
+            london_test = Some(answer);
+        }
+    }
+    let london_test = london_test.unwrap();
+    let before = app.snapshot().unwrap();
+    let read =
+        json!({"command":"read_document", "dataset_id":"opening-proof", "repertoire_id":london});
+    let document = content(&mut app, read.clone());
+    let reset = json!({"command":"reset_progress", "dataset_id":"opening-proof",
+        "repertoire_id":london, "command_id":"reset-london"});
+    assert_eq!(
+        content(
+            &mut app,
+            json!({
+                "command":"reset_progress", "dataset_id":"other-dataset", "repertoire_id":london,
+                "command_id":"wrong-dataset",
+            })
+        )["code"],
+        "stale_dataset"
+    );
+    assert_eq!(app.snapshot().unwrap(), before);
+    let accepted = content(&mut app, reset.clone());
+    assert_eq!(accepted["status"], "progress_reset", "{accepted}");
+    assert_eq!(content(&mut app, read), document);
+    let after = app.snapshot().unwrap();
+    let targets: Vec<_> = before.catalog.items.values().filter(|item|
+        matches!(&item.definition.kind, ContentKind::Repertoire { repertoire, .. } if repertoire == london))
+        .map(|item| &item.target).collect();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(after.catalog, before.catalog);
+    assert_eq!(after.content_history, before.content_history);
+    for (target, state) in &after.learning {
+        if targets.contains(&target) {
+            assert_eq!(*state, LearningState::default());
+        } else {
+            assert_eq!(state, &before.learning[target]);
+        }
+    }
+    assert!(
+        after
+            .attempts
+            .values()
+            .all(|attempt| !targets.contains(&&attempt.attempt.target))
+    );
+    assert_eq!(after.assessments.len(), 1);
+    assert!(!targets.contains(&&after.assessments[0].target));
+    assert_eq!(study(&mut app, london_test)["code"], "unknown_attempt");
+    assert_eq!(study(&mut app, other_ack), other_result);
+    let mut conflicting = reset.clone();
+    conflicting["repertoire_id"] = json!(other);
+    assert_eq!(content(&mut app, conflicting)["code"], "command_conflict");
+
+    assert_eq!(import(&mut app, old_game.clone()), original_game);
+    let mut duplicate = old_game;
+    duplicate["command_id"] = json!("london-game-duplicate");
+    assert_eq!(
+        import(&mut app, duplicate)["results"][0]["effect"],
+        "recorded_only"
+    );
+    assert_eq!(
+        app.game_history().unwrap()["results"][0]["effect"],
+        "recorded_only"
+    );
+    assert_eq!(app.snapshot().unwrap(), after);
+
+    let lesson = study(&mut app, json!({"command":"next"}));
+    assert_eq!(lesson["exercise_name"], "London");
+    assert_eq!(lesson["lesson"]["move_uci"], "e2e4");
+    let mut ack = activity_command("acknowledge", &lesson, "learn-london-again");
+    ack["answer"] = json!({"uci":"e2e4"});
+    assert_eq!(study(&mut app, ack)["status"], "complete");
+    let learned_again = app.snapshot().unwrap();
+    drop(app);
+    let mut app = open(&db, day.clone(), limits, 1);
+    assert_eq!(content(&mut app, reset), accepted);
+    assert_eq!(app.snapshot().unwrap(), learned_again);
+
+    day.store(20_002, Ordering::Relaxed);
+    let new_game = dated_game(&mut app, london, "2024.10.05", "1. d4 d5", "12:00:00");
+    assert_eq!(new_game["results"][0]["effect"], "requested_review");
+}
+
+#[test]
 fn real_daily_tests_address_covered_game_misses_and_preserve_newer_work() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("daily-games.sqlite");

@@ -27,28 +27,38 @@ impl Tempo {
     pub fn game_history(&self) -> Result<Value, AppError> {
         let history = self.store.game_history()?;
         let (snapshot, _) = self.store.content_state()?;
-        let results: Vec<_> = history
-            .results
-            .into_iter()
-            .map(|entry| {
-                let effect = summarize_effects(entry.deviations.into_iter().map(|deviation| {
-                    let miss = GameMiss {
-                        answer_version: deviation.version,
-                        earliest_ms: deviation.start_ms,
-                        latest_ms: deviation.end_ms,
-                    };
-                    game_state(&snapshot, &deviation.target, deviation.version)
-                        .map_or(GameReviewEffect::StaleContent, |prior| {
-                            prior.game_miss_effect(miss)
-                        })
-                }));
-                GameResult {
-                    comparison_id: Some(entry.comparison_id),
-                    summary: entry.summary,
-                    effect,
+        let mut resets = BTreeMap::new();
+        let mut results = Vec::with_capacity(history.results.len());
+        for entry in history.results {
+            let reset = match resets.entry(entry.summary.repertoire_id.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let reset = self
+                        .store
+                        .repertoire_reset_at(&snapshot.dataset, entry.key())?;
+                    *entry.insert(reset)
                 }
-            })
-            .collect();
+            };
+            let effect = summarize_effects(entry.deviations.into_iter().map(|deviation| {
+                if !after_reset(reset, deviation.start_ms) {
+                    return GameReviewEffect::RecordedOnly;
+                }
+                let miss = GameMiss {
+                    answer_version: deviation.version,
+                    earliest_ms: deviation.start_ms,
+                    latest_ms: deviation.end_ms,
+                };
+                game_state(&snapshot, &deviation.target, deviation.version)
+                    .map_or(GameReviewEffect::StaleContent, |prior| {
+                        prior.game_miss_effect(miss)
+                    })
+            }));
+            results.push(GameResult {
+                comparison_id: Some(entry.comparison_id),
+                summary: entry.summary,
+                effect,
+            });
+        }
         Ok(
             json!({"results":results,"last_successful_refresh_ms":history.last_successful_refresh_ms}),
         )
@@ -279,6 +289,9 @@ impl Tempo {
             }
         }
         self.resolve_pgn_timing(&snapshot.dataset, &mut comparisons)?;
+        let reset = self
+            .store
+            .repertoire_reset_at(&snapshot.dataset, repertoire)?;
         let mut changes = BTreeMap::<TargetId, LearningState>::new();
         for compared in &comparisons {
             let mut game_effects = Vec::new();
@@ -287,6 +300,9 @@ impl Tempo {
                 .iter()
                 .filter(|obs| obs.played != obs.prescribed)
             {
+                if !after_reset(reset, compared.game.start_ms) {
+                    continue;
+                }
                 let Some(prior) = game_state(&snapshot, &observation.target, observation.version)
                 else {
                     continue;
@@ -387,6 +403,10 @@ fn game_state<'a>(
         return None;
     }
     snapshot.learning.get(target)
+}
+
+fn after_reset(reset: Option<u64>, start: Option<u64>) -> bool {
+    reset.is_none_or(|reset| start.is_some_and(|start| start > reset))
 }
 
 fn summarize_effects(effects: impl IntoIterator<Item = GameReviewEffect>) -> GameReviewEffect {

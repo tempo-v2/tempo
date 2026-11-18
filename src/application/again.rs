@@ -1,10 +1,11 @@
 //! Apply identified external feedback without inventing a human study attempt.
 use super::{Tempo, receipts::replay};
 use crate::{AgainCommand, AppError, app_error::domain};
+use tempo_chess::ContentKind;
 use tempo_learning::{AssessmentInput, AssessmentSource, Transition};
 use tempo_queue::OrderEvent;
 use tempo_store::{AssessmentKey, AssessmentRecord, Receipt, ReceiptResult, Write};
-use tempo_types::{Grade, SubmissionId};
+use tempo_types::Grade;
 
 impl Tempo {
     /// Apply or replay one externally observed miss.
@@ -15,10 +16,8 @@ impl Tempo {
         let snapshot = self.store.snapshot()?;
         let fingerprint =
             serde_json::to_string(&("again", &command)).map_err(|e| domain("codec_error", e))?;
-        let identity =
-            serde_json::to_string(&(&command.dataset_id, &command.provider, &command.event_id))
-                .map_err(|e| domain("codec_error", e))?;
-        let submission = SubmissionId(format!("external:{identity}"));
+        let submission =
+            Receipt::external_id(&command.dataset_id, &command.provider, &command.event_id);
         if let Some(result) = replay(&snapshot, &submission, &fingerprint)? {
             return match result {
                 ReceiptResult::External { transition, .. } => Ok(transition),
@@ -52,6 +51,17 @@ impl Tempo {
             return Err(AppError::new(
                 "inactive_target",
                 "feedback target is quarantined",
+            ));
+        }
+        if let ContentKind::Repertoire { repertoire, .. } = &item.definition.kind
+            && self
+                .store
+                .repertoire_reset_at(&snapshot.dataset, repertoire)?
+                .is_some_and(|reset| command.observed_at_ms <= reset)
+        {
+            return Err(AppError::new(
+                "before_progress_reset",
+                "This observation predates the repertoire's progress reset.",
             ));
         }
         let input = AssessmentInput {
