@@ -1,6 +1,11 @@
 //! Optional tactics continue after the required daily work is complete.
 use super::{Tempo, receipts::replay};
-use crate::{AppError, app_error::domain, views::StudyView};
+use crate::{
+    AppError,
+    app_error::domain,
+    views::{EmptyView, StudyView},
+    wire::STUDY_WIRE_VERSION,
+};
 use tempo_store::{Receipt, ReceiptResult, StudyScope};
 use tempo_types::{DatasetId, SubmissionId};
 
@@ -49,7 +54,21 @@ impl Tempo {
         if let Some(receipt) = replay(&prior, &submission, &fingerprint)? {
             return match receipt {
                 ReceiptResult::TacticsAllowance { reply } => {
-                    serde_json::from_str(&reply).map_err(|e| domain("invalid_receipt", e))
+                    let mut saved: EmptyView =
+                        serde_json::from_str(&reply).map_err(|e| domain("invalid_receipt", e))?;
+                    if saved.status != "empty"
+                        || saved.dataset_id != dataset
+                        || !matches!(saved.schema_version, 4 | STUDY_WIRE_VERSION)
+                    {
+                        return Err(AppError::new(
+                            "invalid_receipt",
+                            "Unrecognized saved tactics allowance response.",
+                        ));
+                    }
+                    // Wire 5 changed attempt display names. The Empty fields
+                    // still describe the accepted allowance on its original day.
+                    saved.schema_version = STUDY_WIRE_VERSION;
+                    Ok(StudyView::Empty(saved))
                 }
                 _ => Err(AppError::new("submission_conflict", "receipt kind differs")),
             };

@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
 use tempo::{
     AppError, Tempo,
-    wire::{ErrorView, RepertoireCommand, StudyCommand, TacticCaptureCommand},
+    wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use tempo_store::SqliteStore;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -103,6 +103,24 @@ fn respond(
         let reply = command(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
             .unwrap_or_else(|error| serde_json::json!(ErrorView::for_content(error)));
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/tactics-collection" {
+        let reply = command::<tempo::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
+            .and_then(|intent| app.read_tactics(intent))
+            .map(|content| serde_json::json!(content))
+            .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
+        let reply = command::<Option<tempo::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
+            .and_then(|known| app.study_progress(known.as_ref()))
+            .map(|progress| serde_json::json!(progress))
+            .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
         request.respond(body(
             "application/json; charset=utf-8",
             serde_json::to_vec(&reply)?,
