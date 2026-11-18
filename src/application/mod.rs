@@ -10,6 +10,7 @@ mod current_attempt;
 
 mod daily;
 mod export;
+mod game_evidence;
 mod handle;
 mod import_pgn;
 mod ingest_games;

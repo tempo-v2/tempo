@@ -985,3 +985,48 @@ fn current_pgn_read_and_edit_keep_the_full_document_and_its_content_fence() {
     assert_eq!(content(&mut app, read), latest);
     assert_eq!(app.snapshot().unwrap(), before_replay);
 }
+
+#[test]
+fn game_import_is_answer_safe_and_evidence_only_across_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("games.sqlite");
+    let today = Arc::new(AtomicI32::new(20_000));
+    let mut app = open(&db, today.clone(), IntroductionLimits::default(), 0);
+    let (_, saved) = preview_and_save(&mut app, SHORT, "White", None);
+    let repertoire = saved["repertoires"][0]["id"].as_str().unwrap();
+    let command = json!({
+        "repertoire_id": repertoire, "learner":"learner",
+        "pgn":"[White \"Learner\"]\n[Black \"Other\"]\n1. d4 (1. e4 e5) d5 1-0\n\n[White \"Learner\"]\n[Black \"Other\"]\n1. e9 1-0",
+    });
+    let active = study(&mut app, json!({"command":"next"}));
+    let before = app.snapshot().unwrap();
+    let report = app
+        .import_game_pgn(serde_json::from_value(command.clone()).unwrap())
+        .unwrap();
+    assert_eq!(
+        (report.fetched, report.new_games, report.deviations),
+        (2, 1, 1)
+    );
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.results[0].summary.first_deviation_ply, Some(1));
+    let public = serde_json::to_string(&report).unwrap();
+    for secret in ["e2e4", "d2d4", "prescribed", "played"] {
+        assert!(!public.contains(secret), "{public}");
+    }
+    assert_eq!(app.snapshot().unwrap(), before);
+    drop(app);
+    let mut app = open(&db, today, IntroductionLimits::default(), 1);
+    let report = app
+        .import_game_pgn(serde_json::from_value(command).unwrap())
+        .unwrap();
+    assert_eq!((report.new_games, report.duplicates), (0, 1));
+    assert_eq!(
+        app.game_history().unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(study(&mut app, json!({"command":"next"})), active);
+    assert_eq!(app.snapshot().unwrap(), before);
+}
