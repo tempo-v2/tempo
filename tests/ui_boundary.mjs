@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createStudyController, renderStudy, validateStudyView } from '../ui/index.js';
+import { createStudyController, renderStudy, validateStudyView } from '../../tempo-ui/index.js';
 import { stdioTransport } from '../demo/stdio-transport.mjs';
 
 test('actual Rust application replies satisfy UI contract through a complete study journey', async t => {

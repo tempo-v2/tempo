@@ -4,7 +4,7 @@
 //! then resolved to an exercise. Study never imports Queue, Chess, or Store.
 //! The retained block is copied into this adapter and accepted by Tempo only
 //! after the issuance transaction succeeds.
-use crate::{AppError, ChessGrader, app_error::domain};
+use crate::{AppError, app_error::domain};
 use std::collections::BTreeSet;
 use tempo_chess::ChessDefinition;
 use tempo_queue::{Candidate, Group, Line, QueueInput, QueueOrderContext, QueuePolicy};
@@ -15,7 +15,6 @@ use tempo_types::{StudyDay, TargetId};
 pub(super) struct QueueSource<'a> {
     pub(super) snapshot: &'a Snapshot,
     pub(super) queue: &'a dyn QueuePolicy,
-    pub(super) grader: &'a ChessGrader,
     pub(super) today: StudyDay,
     pub(super) context: QueueOrderContext,
     pub(super) remaining: Vec<TargetId>,
@@ -33,7 +32,7 @@ impl QuestionSource for QueueSource<'_> {
                 let learning = &self.snapshot.learning[&item.target];
                 Candidate {
                     target: item.target.clone(),
-                    active: item.active() && self.grader.start(&item.definition).is_ok(),
+                    active: item.active(),
                     introduced: learning.introduced,
                     due: learning.due,
                     repeat_pending: learning.repeat_pending,

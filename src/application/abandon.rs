@@ -7,7 +7,7 @@ use crate::{
     AbandonCommand, AppError,
     app_error::{domain, study_input},
 };
-use tempo_store::{AnswerResult, Receipt, ReceiptResult, StoredAttempt, Write};
+use tempo_store::{AnswerResult, Receipt, ReceiptResult, StoredAttempt, StudyScope, Write};
 
 impl Tempo {
     /// Stop an attempt without producing a new assessment.
@@ -15,9 +15,23 @@ impl Tempo {
     /// Abandonment clears its active pointer and saves a receipt atomically. An
     /// assessment already emitted by an earlier miss remains part of the attempt.
     pub fn abandon(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
-        let snapshot = self.store.snapshot()?;
+        self.leave(command, false)
+    }
+
+    pub(super) fn skip(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
+        self.leave(command, true)
+    }
+
+    fn leave(&mut self, command: AbandonCommand, skip: bool) -> Result<AnswerResult, AppError> {
+        let scope = StudyScope {
+            attempt: Some(&command.attempt_id),
+            submission: Some(&command.submission_id),
+            ..StudyScope::default()
+        };
+        let snapshot = self.store.study_state(scope)?;
+        let action = if skip { "skip" } else { "abandon" };
         let fingerprint =
-            serde_json::to_string(&("abandon", &command)).map_err(|e| domain("codec_error", e))?;
+            serde_json::to_string(&(action, &command)).map_err(|e| domain("codec_error", e))?;
         if let Some(result) = replay(&snapshot, &command.submission_id, &fingerprint)? {
             return study_result(result);
         }
@@ -36,7 +50,7 @@ impl Tempo {
                 ..old.clone()
             }),
             Write::Receipt(Receipt {
-                id: command.submission_id,
+                id: command.submission_id.clone(),
                 command: fingerprint,
                 result: ReceiptResult::Study(result.clone()),
             }),
@@ -44,7 +58,11 @@ impl Tempo {
         if snapshot.active_attempt.as_ref() == Some(&command.attempt_id) {
             writes.push(Write::Active(None));
         }
-        self.commit(&snapshot, writes)?;
+        let at = skip.then(|| self.components.clock.now());
+        self.commit_study(&snapshot, writes, scope)?;
+        if let (Some(at), Some(daily)) = (at, &mut self.daily) {
+            daily.queue.defer(result.attempt.target.clone(), at.day);
+        }
         Ok(result)
     }
 }

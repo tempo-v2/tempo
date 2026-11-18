@@ -16,6 +16,10 @@ pub enum StudyCommand {
     Next,
     Resume { attempt_id: AttemptId },
     Answer(SubmitCommand),
+    Acknowledge(SubmitCommand),
+    GiveUp(AbandonCommand),
+    Skip(AbandonCommand),
+    ResumeSkipped,
     Abandon(AbandonCommand),
 }
 

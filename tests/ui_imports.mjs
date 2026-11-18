@@ -4,7 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-const ui = fileURLToPath(new URL('../ui/', import.meta.url));
+const ui = fileURLToPath(new URL('../../tempo-ui/', import.meta.url));
 const core = fileURLToPath(new URL('../../tempo-core-components/', import.meta.url));
 const corePackage = '@tempo-v2/core-components';
 

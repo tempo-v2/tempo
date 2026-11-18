@@ -1,17 +1,23 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
 use super::LocalResult;
+use serde::de::DeserializeOwned;
 use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
-use tempo::{AppError, Tempo, wire::StudyCommand};
+use tempo::{
+    AppError, Tempo,
+    wire::{RepertoireCommand, StudyCommand, StudyView},
+};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
+// A bounded 256 KiB PGN may expand sixfold when JSON escapes control characters.
+const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn serve(app: &mut Tempo, ui: &Path, port: u16) -> LocalResult<()> {
     let public = build_files(ui)?;
     let server = Server::http((Ipv4Addr::LOCALHOST, port))?;
     let address = server.server_addr().to_string();
     let origin = format!("http://{address}");
-    println!("Tempo tactics: {origin}");
+    println!("Tempo study at {origin}");
     for request in server.incoming_requests() {
         if let Err(error) = respond(app, request, &public, &address, &origin) {
             eprintln!("Tempo HTTP: {error}");
@@ -86,9 +92,18 @@ fn respond(
     {
         request.respond(Response::empty(StatusCode(403)))?;
     } else if request.method() == &Method::Post && request.url() == "/api/study" {
-        let reply = command(&mut request)
+        let reply = command::<StudyCommand>(&mut request, MAX_COMMAND_BYTES)
             .map(|intent| app.handle(intent))
             .unwrap_or_else(Into::into);
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/repertoires" {
+        let reply = match command::<RepertoireCommand>(&mut request, MAX_CONTENT_COMMAND_BYTES) {
+            Ok(intent) => app.handle_repertoire(intent),
+            Err(error) => serde_json::to_value(StudyView::from(error))?,
+        };
         request.respond(body(
             "application/json; charset=utf-8",
             serde_json::to_vec(&reply)?,
@@ -108,16 +123,13 @@ fn respond(
     Ok(())
 }
 
-fn command(request: &mut Request) -> Result<StudyCommand, AppError> {
+fn command<T: DeserializeOwned>(request: &mut Request, max_bytes: usize) -> Result<T, AppError> {
     let invalid = |message| AppError::new("invalid_command", message);
     let mime = header(request, "Content-Type").and_then(|value| value.split(';').next());
     if mime != Some("application/json") {
         return Err(invalid("Use an application/json command."));
     }
-    let Some(size) = request
-        .body_length()
-        .filter(|size| *size <= MAX_COMMAND_BYTES)
-    else {
+    let Some(size) = request.body_length().filter(|size| *size <= max_bytes) else {
         return Err(invalid("Expected a bounded command body."));
     };
     let mut bytes = vec![0; size];

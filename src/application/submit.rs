@@ -4,13 +4,15 @@ use super::{
     receipts::{replay, study_result},
 };
 use crate::{
-    AppError, SubmitCommand,
+    AbandonCommand, AppError, SubmitCommand,
     app_error::{domain, study_input},
 };
+use tempo_chess::ChessFeedback;
 use tempo_learning::{AssessmentInput, AssessmentSource};
 use tempo_queue::OrderEvent;
 use tempo_store::{
-    AnswerResult, AssessmentKey, AssessmentRecord, Receipt, ReceiptResult, StoredAttempt, Write,
+    ActivityMode, AnswerResult, AssessmentKey, AssessmentRecord, Receipt, ReceiptResult,
+    StoredAttempt, StudyScope, Write,
 };
 use tempo_study::AttemptStatus;
 use tempo_types::Grade;
@@ -21,21 +23,62 @@ impl Tempo {
     /// The grader decides correctness. A new terminal assessment is interpreted
     /// by Learning and saved in the same commit as the attempt and receipt.
     pub fn submit(&mut self, command: SubmitCommand) -> Result<AnswerResult, AppError> {
-        let snapshot = self.store.snapshot()?;
+        self.advance(command, false)
+    }
+
+    pub(super) fn give_up(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
+        self.advance(
+            SubmitCommand {
+                dataset_id: command.dataset_id,
+                attempt_id: command.attempt_id,
+                expected_revision: command.expected_revision,
+                submission_id: command.submission_id.clone(),
+                answer: "".into(),
+            },
+            true,
+        )
+    }
+
+    fn advance(&mut self, command: SubmitCommand, give_up: bool) -> Result<AnswerResult, AppError> {
+        let scope = StudyScope {
+            attempt: Some(&command.attempt_id),
+            submission: Some(&command.submission_id),
+            ..StudyScope::default()
+        };
+        let snapshot = self.store.study_state(scope)?;
+        let action = if give_up { "give_up" } else { "answer" };
         let fingerprint =
-            serde_json::to_string(&("answer", &command)).map_err(|e| domain("codec_error", e))?;
+            serde_json::to_string(&(action, &command)).map_err(|e| domain("codec_error", e))?;
         if let Some(result) = replay(&snapshot, &command.submission_id, &fingerprint)? {
             return study_result(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
         let definition = &snapshot.catalog.items[&old.attempt.target].definition;
-        let progress = tempo_study::submit(
-            self.components.grader.as_ref(),
-            definition,
-            &old.attempt,
-            command.expected_revision,
-            &command.answer,
-        )
+        if old.mode == ActivityMode::Teach {
+            return Err(AppError::new(
+                "wrong_activity",
+                "acknowledge this lesson after reproducing the shown move",
+            ));
+        }
+        let progress = if give_up {
+            tempo_study::give_up(
+                &old.attempt,
+                command.expected_revision,
+                ChessFeedback {
+                    correct: false,
+                    message: "The prescribed move is shown.".into(),
+                    autoplay: vec![],
+                },
+            )
+        } else {
+            tempo_study::submit(
+                self.components.grader.as_ref(),
+                definition,
+                &old.attempt,
+                command.expected_revision,
+                &command.answer,
+            )
+        }
         .map_err(study_input)?;
         let updated = StoredAttempt {
             attempt: progress.attempt.clone(),
@@ -43,7 +86,10 @@ impl Tempo {
         };
         let mut writes = vec![Write::Progress(updated)];
         let mut effect = None;
-        if let Some(grade) = progress.assessment {
+        if let Some(grade) = progress
+            .assessment
+            .filter(|_| old.mode == ActivityMode::Test)
+        {
             let input = AssessmentInput {
                 grade,
                 accepted_at: self.components.clock.now(),
@@ -74,11 +120,13 @@ impl Tempo {
         let result = AnswerResult {
             attempt: progress.attempt,
             feedback: Some(progress.feedback),
-            assessment: progress.assessment,
+            assessment: progress
+                .assessment
+                .filter(|_| old.mode == ActivityMode::Test),
             learning_effect: effect,
         };
         writes.push(Write::Receipt(Receipt {
-            id: command.submission_id,
+            id: command.submission_id.clone(),
             command: fingerprint,
             result: ReceiptResult::Study(result.clone()),
         }));
@@ -87,13 +135,13 @@ impl Tempo {
         {
             writes.push(Write::Active(None));
         }
-        self.commit(&snapshot, writes)?;
-        if result.assessment == Some(Grade::Again) {
+        self.commit_study(&snapshot, writes, scope)?;
+        if self.daily.is_none() && result.assessment == Some(Grade::Again) {
             self.order_history.push(OrderEvent::Missed {
                 target: result.attempt.target.clone(),
             });
         }
-        if result.attempt.status == AttemptStatus::Complete {
+        if self.daily.is_none() && result.attempt.status == AttemptStatus::Complete {
             self.order_history.push(OrderEvent::Completed {
                 target: result.attempt.target.clone(),
             });

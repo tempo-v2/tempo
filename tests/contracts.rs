@@ -8,6 +8,9 @@ mod content_updates;
 mod durable_repertoire;
 #[path = "contracts/external_feedback.rs"]
 mod external_feedback;
+#[path = "contracts/opening_release.rs"]
+mod opening_release;
+
 #[path = "contracts/portable_restore.rs"]
 mod portable_restore;
 #[path = "contracts/queue_substitution.rs"]

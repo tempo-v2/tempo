@@ -5,6 +5,7 @@
 mod abandon;
 mod again;
 mod current_attempt;
+mod daily;
 mod export;
 mod handle;
 mod import_pgn;
@@ -12,13 +13,18 @@ mod ingest_games;
 mod next_exercise;
 mod queue_source;
 mod receipts;
+mod repertoires;
+
 mod restore;
 mod resume;
 mod submit;
+mod teach;
+
+pub use daily::IntroductionLimits;
 
 use crate::{AppError, Components, app_error::domain};
 use tempo_queue::OrderEvent;
-use tempo_store::{Commit, MemoryStore, Snapshot, Store, Write};
+use tempo_store::{Commit, MemoryStore, Snapshot, Store, StudyScope, Write};
 use tempo_types::TargetId;
 
 /// Coordinate domain decisions and commit the resulting operation atomically.
@@ -41,11 +47,15 @@ pub struct Tempo {
     components: Components,
     remaining_block: Vec<TargetId>,
     order_history: Vec<OrderEvent>,
+    daily: Option<daily::DailyStudy>,
 }
 impl Tempo {
     /// Assemble the application after checking stored policy and learning compatibility.
     pub fn new(store: Box<dyn Store>, components: Components) -> Result<Self, AppError> {
-        let snapshot = store.snapshot()?;
+        let snapshot = store.study_state(StudyScope {
+            catalog: true,
+            ..StudyScope::default()
+        })?;
         if snapshot.policy != components.learning.settings() {
             return Err(AppError::new(
                 "policy_mismatch",
@@ -63,6 +73,7 @@ impl Tempo {
             components,
             remaining_block: vec![],
             order_history: vec![],
+            daily: None,
         })
     }
     /// Create the reproducible in-memory repertoire/tactic demonstration.
@@ -80,6 +91,23 @@ impl Tempo {
     pub fn snapshot(&self) -> Result<Snapshot, AppError> {
         self.store.snapshot().map_err(Into::into)
     }
+    fn commit_study(
+        &mut self,
+        snapshot: &Snapshot,
+        writes: Vec<Write>,
+        scope: StudyScope<'_>,
+    ) -> Result<(), AppError> {
+        self.store.commit_study(
+            Commit {
+                expected_revision: snapshot.revision,
+                expected_dataset: snapshot.dataset.clone(),
+                writes,
+            },
+            scope,
+        )?;
+        Ok(())
+    }
+
     fn commit(&mut self, snapshot: &Snapshot, writes: Vec<Write>) -> Result<(), AppError> {
         self.store.commit(Commit {
             expected_revision: snapshot.revision,

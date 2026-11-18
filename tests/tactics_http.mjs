@@ -9,10 +9,10 @@ import readline from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createStudyController } from '../ui/study_controller.js';
+import { createStudyController } from '../../tempo-ui/study_controller.js';
 
 const binary = process.env.TEMPO_BINARY ?? fileURLToPath(new URL('../../target/debug/tempo', import.meta.url));
-const ui = fileURLToPath(new URL('../ui/dist', import.meta.url));
+const ui = fileURLToPath(new URL('../../tempo-ui/dist', import.meta.url));
 
 // Solver-start state of Lichess 03ySM after b6d4, from Tempo mateIn2-focused-04.
 const tactic = {

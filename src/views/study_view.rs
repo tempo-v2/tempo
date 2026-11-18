@@ -1,10 +1,10 @@
 //! The three reply shapes a presentation client must handle.
 use super::attempt_view::AttemptFeedback;
-use crate::views::{AttemptView, EmptyView, ErrorView};
+use crate::views::{AttemptView, EmptyView, ErrorView, LessonView};
 use crate::{AppError, wire::STUDY_WIRE_VERSION};
 use serde::{Deserialize, Serialize};
 use tempo_chess::PositionDisplay;
-use tempo_store::AnswerResult;
+use tempo_store::{AnswerResult, StoredAttempt};
 use tempo_study::AttemptStatus;
 
 /// A versioned reply carrying a displayable attempt, an empty queue, or an error.
@@ -36,6 +36,8 @@ impl StudyView {
         value: AnswerResult,
         board: PositionDisplay,
         correction_uci: Option<String>,
+        record: &StoredAttempt,
+        lesson: Option<LessonView>,
     ) -> Self {
         let attempt = value.attempt;
         let status = match attempt.status {
@@ -46,6 +48,9 @@ impl StudyView {
         Self::Attempt(Box::new(AttemptView {
             schema_version: STUDY_WIRE_VERSION,
             status: status.into(),
+            activity: record.mode,
+            lesson,
+            repertoire_name: record.repertoire_name.clone(),
             dataset_id: attempt.dataset,
             attempt_id: attempt.id,
             target_id: attempt.target,

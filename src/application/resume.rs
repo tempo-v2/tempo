@@ -1,7 +1,7 @@
 //! Read current attempt progress without grading or writing new learning.
 use super::Tempo;
 use crate::AppError;
-use tempo_store::{AnswerResult, Snapshot};
+use tempo_store::{AnswerResult, Snapshot, StudyScope};
 use tempo_types::AttemptId;
 
 impl Tempo {
@@ -22,7 +22,13 @@ impl Tempo {
     }
     /// Read an existing attempt against the current catalog, without a write.
     pub fn resume(&self, id: &AttemptId) -> Result<AnswerResult, AppError> {
-        self.resume_from(&self.store.snapshot()?, id)
+        self.resume_from(
+            &self.store.study_state(StudyScope {
+                attempt: Some(id),
+                ..StudyScope::default()
+            })?,
+            id,
+        )
     }
 }
 

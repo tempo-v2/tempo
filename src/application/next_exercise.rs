@@ -2,7 +2,7 @@
 use super::{Tempo, queue_source::QueueSource};
 use crate::{AppError, app_error::domain};
 use tempo_queue::QueueOrderContext;
-use tempo_store::{AnswerResult, StoredAttempt, Write};
+use tempo_store::{AnswerResult, StoredAttempt, StudyScope, Write};
 use tempo_study::Availability;
 
 impl Tempo {
@@ -11,10 +11,23 @@ impl Tempo {
     /// `None` means no exercise is eligible now, not that the study service is
     /// permanently finished. Issuance and the active pointer are committed together.
     pub fn next_exercise(&mut self) -> Result<Option<AnswerResult>, AppError> {
-        let snapshot = self.store.snapshot()?;
+        let scope = StudyScope {
+            catalog: true,
+            ..StudyScope::default()
+        };
+        let snapshot = self.store.study_state(scope)?;
         if let Some(id) = &snapshot.active_attempt {
             return self.resume_from(&snapshot, id).map(Some);
         }
+        if self.daily.is_some() {
+            let at = self.components.clock.now();
+            let selection = self.daily_selection(&snapshot, at);
+            return selection
+                .next
+                .map(|choice| self.issue_daily(&snapshot, at, choice))
+                .transpose();
+        }
+        let at = self.components.clock.now();
         let context = QueueOrderContext {
             seed: snapshot.revision.0,
             history: self.order_history.clone(),
@@ -22,8 +35,7 @@ impl Tempo {
         let mut source = QueueSource {
             snapshot: &snapshot,
             queue: self.components.queue.as_ref(),
-            grader: self.components.grader.as_ref(),
-            today: self.components.clock.now().day,
+            today: at.day,
             context,
             remaining: self.remaining_block.clone(),
         };
@@ -47,8 +59,12 @@ impl Tempo {
             })?;
         let row = StoredAttempt {
             attempt: started.attempt,
-            issued_at: self.components.clock.now(),
+            issued_at: at,
             issued_miss_revision: state.miss_revision,
+            mode: tempo_store::ActivityMode::Test,
+            route: None,
+            first_introduction: false,
+            repertoire_name: None,
         };
         self.commit(
             &snapshot,

@@ -10,7 +10,7 @@ The longer cross-component journeys stay in [tests/contracts.rs](tests/contracts
 
 The [local tactics guide](TACTICS.md) covers building the React page, importing
 existing Tempo puzzles into a fresh SQLite practice dataset, and launching the
-loopback host. Browser session logic lives in [ui/](ui/README.md) and uses the
+loopback host. Browser session logic lives in the separate tempo-ui checkout and uses the
 version 3 Study views.
 
 ## Choose the entry point
@@ -136,3 +136,5 @@ restart-safe identities. The stdio demonstration still uses its fixed fixture
 policies and in-memory store. Provider game comparison remains fixture-backed.
 Store snapshots currently read the complete dataset. Cross-repository ownership
 lives in `.planning/INTERFACES.md`.
+
+For the local opening checkpoint and start instructions, see [Opening study](OPENING.md).

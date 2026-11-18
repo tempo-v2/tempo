@@ -10,6 +10,7 @@ use std::path::Path;
 fn reopen(path: &Path) -> Tempo {
     let mut components = Components::fixtures();
     components.grader = Box::new(LegalSequenceGrader);
+    components.learning = Box::new(tempo_learning::DailyLearning::default());
     Tempo::new(Box::new(SqliteStore::open(path).unwrap()), components).unwrap()
 }
 

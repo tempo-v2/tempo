@@ -4,7 +4,7 @@ pub mod empty_view;
 pub mod error_view;
 pub mod study_view;
 
-pub use attempt_view::AttemptView;
+pub use attempt_view::{AttemptView, LessonView};
 pub use empty_view::EmptyView;
 pub use error_view::ErrorView;
 pub use study_view::StudyView;

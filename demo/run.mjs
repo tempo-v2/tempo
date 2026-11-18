@@ -1,4 +1,4 @@
-import { createStudyController } from '../ui/index.js';
+import { createStudyController } from '../../tempo-ui/index.js';
 import { stdioTransport } from './stdio-transport.mjs';
 
 const transport = stdioTransport();

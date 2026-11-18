@@ -1,6 +1,7 @@
 //! The current attempt as presentation data, with private grading state removed.
 use serde::{Deserialize, Serialize};
 use tempo_chess::{ChessFeedback, ChessPrompt, LearnerColor};
+use tempo_store::ActivityMode;
 use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision, TargetId};
 
 /// Render an issued attempt and copy its identity/revision into the next intent.
@@ -9,10 +10,15 @@ use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision, TargetI
 /// the prompt and per-answer feedback. Only a miss reveals a correction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttemptView {
-    /// Wire schema version, currently 3.
+    /// Wire schema version, currently 4.
     pub schema_version: u32,
     /// `ready`, `complete`, or `abandoned`.
     pub status: String,
+    pub activity: ActivityMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<LessonView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repertoire_name: Option<String>,
     /// Dataset identity that invalidates commands after a portable restore.
     pub dataset_id: DatasetId,
     /// This attempt, shared by all learner decisions within it.
@@ -37,6 +43,16 @@ pub struct AttemptView {
     pub feedback: Option<AttemptFeedback>,
     /// The attempt's lifetime grade, including an earlier miss during correction.
     pub assessment: Option<Grade>,
+}
+
+/// Guided reproduction data. Blind tests never include a lesson.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LessonView {
+    pub move_uci: String,
+    pub move_san: String,
+    pub comments: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_move: Option<String>,
 }
 
 /// Presentation-only feedback. Stored submission receipts use ChessFeedback.

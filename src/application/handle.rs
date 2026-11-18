@@ -4,31 +4,37 @@ use crate::{
     AppError,
     app_error::domain,
     commands::StudyCommand,
-    views::{EmptyView, StudyView},
+    views::{EmptyView, LessonView, StudyView},
     wire::STUDY_WIRE_VERSION,
 };
 use tempo_chess::project_position;
-use tempo_store::AnswerResult;
+use tempo_store::{ActivityMode, AnswerResult, StudyScope};
 use tempo_study::AttemptStatus;
 
 impl Tempo {
     /// Handle one decoded transport intent, returning an attempt, empty, or error view.
     pub fn handle(&mut self, command: StudyCommand) -> StudyView {
         let result: Result<StudyView, AppError> = match command {
-            StudyCommand::Next => self.next_exercise().and_then(|value| match value {
-                Some(value) => self.project(value),
-                None => Ok(StudyView::Empty(EmptyView {
-                    schema_version: STUDY_WIRE_VERSION,
-                    status: "empty".into(),
-                    dataset_id: self.snapshot()?.dataset,
-                })),
-            }),
+            StudyCommand::Next => self.next_view(),
+            StudyCommand::ResumeSkipped => {
+                if let Some(daily) = &mut self.daily {
+                    daily.queue.resume_skipped();
+                }
+                self.next_view()
+            }
             StudyCommand::Resume { attempt_id } => self
                 .resume(&attempt_id)
                 .and_then(|value| self.project(value)),
             StudyCommand::Answer(command) => {
                 self.submit(command).and_then(|value| self.project(value))
             }
+            StudyCommand::Acknowledge(command) => self
+                .acknowledge(command)
+                .and_then(|value| self.project(value)),
+            StudyCommand::GiveUp(command) => {
+                self.give_up(command).and_then(|value| self.project(value))
+            }
+            StudyCommand::Skip(command) => self.skip(command).and_then(|value| self.project(value)),
             StudyCommand::Abandon(command) => {
                 self.abandon(command).and_then(|value| self.project(value))
             }
@@ -36,22 +42,66 @@ impl Tempo {
         result.unwrap_or_else(Into::into)
     }
 
-    fn project(&self, result: AnswerResult) -> Result<StudyView, AppError> {
-        let snapshot = self.snapshot()?;
-        let attempt = &result.attempt;
-        // Receipt replay can return a definition from before a semantic import
-        // or dataset restore. Resume already checks the current catalog.
-        let issued = snapshot
-            .content_history
-            .iter()
-            .find(|entry| {
-                entry.dataset == attempt.dataset
-                    && entry.item.target == attempt.target
-                    && entry.item.version == attempt.content_version
+    fn next_view(&mut self) -> Result<StudyView, AppError> {
+        let active = self.store.study_state(StudyScope::default())?;
+        if let Some(id) = &active.active_attempt {
+            return self.project(self.resume_from(&active, id)?);
+        }
+        let empty = |dataset_id, outstanding, repertoire_remaining, tactics_remaining| {
+            StudyView::Empty(EmptyView {
+                schema_version: STUDY_WIRE_VERSION,
+                status: "empty".into(),
+                dataset_id,
+                done: outstanding == 0,
+                outstanding,
+                repertoire_remaining,
+                tactics_remaining,
             })
+        };
+        if self.daily.is_some() {
+            let snapshot = self.store.study_state(StudyScope {
+                catalog: true,
+                ..StudyScope::default()
+            })?;
+            if let Some(id) = &snapshot.active_attempt {
+                return self.project(self.resume_from(&snapshot, id)?);
+            }
+            let at = self.components.clock.now();
+            let selection = self.daily_selection(&snapshot, at);
+            if let Some(choice) = selection.next {
+                let result = self.issue_daily(&snapshot, at, choice)?;
+                return self.project(result);
+            }
+            return Ok(empty(
+                snapshot.dataset,
+                selection.outstanding,
+                selection.repertoire_remaining,
+                selection.tactics_remaining,
+            ));
+        }
+        match self.next_exercise()? {
+            Some(value) => self.project(value),
+            None => Ok(empty(active.dataset, 0, 0, 0)),
+        }
+    }
+
+    fn project(&self, result: AnswerResult) -> Result<StudyView, AppError> {
+        let attempt = &result.attempt;
+        let state = self.store.study_state(StudyScope {
+            attempt: Some(&attempt.id),
+            ..StudyScope::default()
+        })?;
+        let record = state
+            .attempts
+            .get(&attempt.id)
+            .ok_or_else(|| AppError::new("unknown_attempt", "Issued activity is missing."))?;
+        // Immutable definitions keep replay deterministic after content replacement.
+        let issued = self
+            .store
+            .issued_item(&attempt.dataset, &attempt.target, attempt.content_version)?
             .ok_or_else(|| AppError::new("invalid_content", "issued definition is missing"))?;
         let board = project_position(
-            &issued.item.definition,
+            &issued.definition,
             &attempt.state,
             attempt.status == AttemptStatus::Active,
         )
@@ -60,7 +110,6 @@ impl Tempo {
             // A miss leaves the cursor on the same decision, including on replay
             // of a receipt whose pinned definition has since been replaced.
             let decision = issued
-                .item
                 .definition
                 .decisions
                 .get(attempt.state.decision_index)
@@ -71,7 +120,30 @@ impl Tempo {
         } else {
             None
         };
-        Ok(StudyView::attempt(result, board, correction_uci))
+        let lesson = (record.mode == ActivityMode::Teach
+            && attempt.status == AttemptStatus::Active)
+            .then(|| {
+                let expected = &issued.definition.decisions[0].expected.uci;
+                LessonView {
+                    move_uci: expected.clone(),
+                    move_san: issued
+                        .lesson
+                        .as_ref()
+                        .map_or_else(|| expected.clone(), |lesson| lesson.san.clone()),
+                    comments: issued
+                        .lesson
+                        .as_ref()
+                        .map_or_else(Vec::new, |lesson| lesson.comments.clone()),
+                    previous_move: issued.lesson.and_then(|lesson| lesson.previous_move),
+                }
+            });
+        Ok(StudyView::attempt(
+            result,
+            board,
+            correction_uci,
+            record,
+            lesson,
+        ))
     }
 }
 

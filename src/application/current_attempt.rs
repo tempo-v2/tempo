@@ -40,6 +40,14 @@ impl Tempo {
                 "exercise changed after this attempt was issued",
             ));
         }
+        if record.attempt.status == tempo_study::AttemptStatus::Active
+            && snapshot.active_attempt.as_ref() != Some(id)
+        {
+            return Err(AppError::new(
+                "stale_activity",
+                "activity is no longer current",
+            ));
+        }
         Ok(record)
     }
 }

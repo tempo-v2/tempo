@@ -8,3 +8,6 @@ pub use abandon_command::AbandonCommand;
 pub use again_command::AgainCommand;
 pub use study_command::StudyCommand;
 pub use submit_command::SubmitCommand;
+
+mod repertoire_command;
+pub use repertoire_command::{RepertoireCommand, RepertoireInput};

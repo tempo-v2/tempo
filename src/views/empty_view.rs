@@ -11,6 +11,10 @@ pub struct EmptyView {
     pub schema_version: u32,
     pub status: String,
     pub dataset_id: DatasetId,
+    pub done: bool,
+    pub outstanding: usize,
+    pub repertoire_remaining: usize,
+    pub tactics_remaining: usize,
 }
 
 #[cfg(test)]
@@ -38,7 +42,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(view).unwrap(),
             serde_json::json!({
-                "schema_version": 3, "status": "empty", "dataset_id": "empty"
+                "schema_version": 4, "status": "empty", "dataset_id": "empty",
+                "done": true, "outstanding": 0, "repertoire_remaining": 0, "tactics_remaining": 0
             })
         );
         assert!(app.snapshot().unwrap().attempts.is_empty());
