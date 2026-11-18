@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
 use tempo::{
     AppError, Tempo,
-    wire::{RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
+    wire::{ErrorView, RepertoireCommand, StudyCommand, TacticCaptureCommand},
 };
 use tempo_store::SqliteStore;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -102,7 +102,7 @@ fn respond(
     } else if request.method() == &Method::Post && request.url() == "/api/tactic-settings" {
         let reply = command(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
-            .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
+            .unwrap_or_else(|error| serde_json::json!(ErrorView::for_content(error)));
         request.respond(body(
             "application/json; charset=utf-8",
             serde_json::to_vec(&reply)?,
@@ -152,7 +152,7 @@ fn content_command<T: DeserializeOwned>(
 ) -> LocalResult<Value> {
     Ok(match command(request, MAX_CONTENT_COMMAND_BYTES) {
         Ok(intent) => handle(intent),
-        Err(error) => serde_json::to_value(StudyView::from(error))?,
+        Err(error) => serde_json::to_value(ErrorView::for_content(error))?,
     })
 }
 

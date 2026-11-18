@@ -48,7 +48,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(view).unwrap(),
             serde_json::json!({
-                "schema_version": 4, "status": "empty", "dataset_id": "empty",
+                "schema_version": 5, "status": "empty", "dataset_id": "empty",
                 "done": true, "outstanding": 0, "repertoire_remaining": 0, "tactics_remaining": 0,
                 "can_practice_tactics": false, "can_learn_more_tactics": false, "learn_more_count": 0
             })

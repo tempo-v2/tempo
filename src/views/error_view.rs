@@ -1,4 +1,5 @@
 //! Application failure data that a transport can serialize as a normal reply.
+use crate::{AppError, wire::CONTENT_WIRE_VERSION};
 use serde::{Deserialize, Serialize};
 
 /// Display a failure and tell the controller whether to retain its command.
@@ -12,6 +13,23 @@ pub struct ErrorView {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+}
+
+impl ErrorView {
+    /// Project failures from content commands using the content reply version.
+    pub fn for_content(error: AppError) -> Self {
+        Self::new(error, CONTENT_WIRE_VERSION)
+    }
+
+    pub(super) fn new(error: AppError, schema_version: u32) -> Self {
+        Self {
+            schema_version,
+            status: "error".into(),
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        }
+    }
 }
 
 #[cfg(test)]

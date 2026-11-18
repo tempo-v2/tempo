@@ -209,7 +209,7 @@ impl Tempo {
             mode,
             route: choice.route.clone(),
             first_introduction: choice.new_kind.is_some(),
-            repertoire_name: repertoire_name(item),
+            exercise_name: exercise_name(item),
             lesson: item.lesson.clone().filter(|_| mode == ActivityMode::Teach),
             acceptance: None,
         };
@@ -239,6 +239,8 @@ impl Tempo {
     }
 }
 
-fn repertoire_name(item: &ContentItem) -> Option<String> {
-    item.definition.is_repertoire().then(|| item.label.clone())
+fn exercise_name(item: &ContentItem) -> Option<String> {
+    // Repertoire labels are already public. Tactic catalog labels can reveal
+    // motifs, so they are not public display names for blind exercises.
+    (item.definition.is_repertoire() && !item.label.trim().is_empty()).then(|| item.label.clone())
 }
