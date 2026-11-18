@@ -10,7 +10,7 @@ use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision, TargetI
 /// the prompt and per-answer feedback. Only a miss reveals a correction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttemptView {
-    /// Wire schema version, currently 4.
+    /// Wire schema version, currently 5.
     pub schema_version: u32,
     /// `ready`, `complete`, or `abandoned`.
     pub status: String,
@@ -18,7 +18,8 @@ pub struct AttemptView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lesson: Option<LessonView>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub repertoire_name: Option<String>,
+    /// Optional public display text. Consumers may render or omit it.
+    pub exercise_name: Option<String>,
     /// Dataset identity that invalidates commands after a portable restore.
     pub dataset_id: DatasetId,
     /// This attempt, shared by all learner decisions within it.

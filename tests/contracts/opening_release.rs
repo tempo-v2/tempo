@@ -101,6 +101,10 @@ fn quota_teach_restart_due_fsrs_and_complete_replacement() {
     let id = saved["repertoires"][0]["id"].as_str().unwrap();
     let first = study(&mut app, json!({"command":"next"}));
     assert_eq!(first["activity"], "teach");
+    assert_eq!(first["schema_version"], 5);
+    assert_eq!(first["exercise_name"], "White");
+    assert!(first.get("repertoire_name").is_none());
+    assert_eq!(saved["schema_version"], 4);
     assert_eq!(first["lesson"]["comments"][0], "Control the centre.");
     assert_eq!(first["lesson"]["move_uci"], "e2e4");
     let initial_rev = app.snapshot().unwrap().revision;
@@ -154,6 +158,7 @@ fn quota_teach_restart_due_fsrs_and_complete_replacement() {
     let mut app = open(&db, today.clone(), limits, 1);
     let current = study(&mut app, json!({"command":"next"}));
     assert_eq!(current["activity"], "test");
+    assert_eq!(current["exercise_name"], "White openings");
     assert!(current.get("lesson").is_none());
     assert!(!current.to_string().contains("expected"));
     drop(app);
@@ -194,6 +199,7 @@ fn quota_teach_restart_due_fsrs_and_complete_replacement() {
         answer["answer"] = json!({"uci":correct});
         let answer_result = study(&mut app, answer.clone());
         assert_eq!(answer_result["assessment"], "good", "{answer_result}");
+        assert_eq!(answer_result["exercise_name"], "White openings");
         assert_eq!(study(&mut app, answer), answer_result);
     }
     let reviewed = app.snapshot().unwrap();
@@ -372,6 +378,7 @@ fn mixed_study_independent_quotas_due_order_and_optional_actions() {
             openings += 1;
         } else {
             assert!(card.get("lesson").is_none());
+            assert!(card.get("exercise_name").is_none());
             if index == 1 {
                 let give_up = activity_command("give_up", &card, "learn-first-miss");
                 let miss = study(&mut app, give_up.clone());

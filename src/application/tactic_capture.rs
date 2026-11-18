@@ -4,8 +4,8 @@ use super::{
     content_preview::{check_dataset, preview_id, read_preview, source_id, stale_preview},
 };
 use crate::{
-    AppError, app_error::domain, commands::TacticCaptureCommand, views::StudyView,
-    wire::STUDY_WIRE_VERSION,
+    AppError, app_error::domain, commands::TacticCaptureCommand, views::ErrorView,
+    wire::CONTENT_WIRE_VERSION,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -18,7 +18,7 @@ use tempo_store::{ContentReceipt, ContentSource, Write};
 impl Tempo {
     pub fn handle_tactic_capture(&mut self, command: TacticCaptureCommand) -> Value {
         self.tactic_capture(command)
-            .unwrap_or_else(|error| json!(StudyView::from(error)))
+            .unwrap_or_else(|error| json!(ErrorView::for_content(error)))
     }
 
     fn tactic_capture(&mut self, command: TacticCaptureCommand) -> Result<Value, AppError> {
@@ -36,7 +36,7 @@ impl Tempo {
                     .map_err(|error| domain("invalid_pgn", error))?;
                 let token = preview_id(&key, revision, "tactics", &input);
                 Ok(
-                    json!({ "schema_version": STUDY_WIRE_VERSION, "status": "tactics_preview",
+                    json!({ "schema_version": CONTENT_WIRE_VERSION, "status": "tactics_preview",
                     "token": token, "rows": preview.rows }),
                 )
             }
@@ -99,7 +99,7 @@ impl Tempo {
                         writes.push(Write::Learning { target, state });
                     }
                 }
-                let reply = json!({ "schema_version": STUDY_WIRE_VERSION, "status": "tactics_saved",
+                let reply = json!({ "schema_version": CONTENT_WIRE_VERSION, "status": "tactics_saved",
                     "count": selected.len(), "ready_for_review": writes.len(), "alternate_solutions": plan.alternate_solutions });
                 let payload = reply.to_string();
                 self.commit_catalog(

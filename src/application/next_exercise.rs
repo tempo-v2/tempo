@@ -65,7 +65,7 @@ impl Tempo {
             mode: tempo_store::ActivityMode::Test,
             route: None,
             first_introduction: false,
-            repertoire_name: None,
+            exercise_name: None,
             lesson: None,
             acceptance: None,
         };

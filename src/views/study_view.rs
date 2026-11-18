@@ -22,13 +22,7 @@ pub enum StudyView {
 
 impl From<AppError> for StudyView {
     fn from(error: AppError) -> Self {
-        Self::Error(ErrorView {
-            schema_version: STUDY_WIRE_VERSION,
-            status: "error".into(),
-            code: error.code,
-            message: error.message,
-            retryable: error.retryable,
-        })
+        Self::Error(ErrorView::new(error, STUDY_WIRE_VERSION))
     }
 }
 impl StudyView {
@@ -50,7 +44,7 @@ impl StudyView {
             status: status.into(),
             activity: record.mode,
             lesson,
-            repertoire_name: record.repertoire_name.clone(),
+            exercise_name: record.exercise_name.clone(),
             dataset_id: attempt.dataset,
             attempt_id: attempt.id,
             target_id: attempt.target,

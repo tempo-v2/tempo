@@ -9,8 +9,8 @@ use crate::{
     AppError,
     app_error::domain,
     commands::{RepertoireCommand, RepertoireInput},
-    views::StudyView,
-    wire::STUDY_WIRE_VERSION,
+    views::ErrorView,
+    wire::CONTENT_WIRE_VERSION,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -35,7 +35,7 @@ impl Tempo {
     /// Handle local content operations against the same durable learning dataset.
     pub fn handle_repertoire(&mut self, command: RepertoireCommand) -> Value {
         self.repertoire(command)
-            .unwrap_or_else(|error| json!(StudyView::from(error)))
+            .unwrap_or_else(|error| json!(ErrorView::for_content(error)))
     }
 
     fn repertoire(&mut self, command: RepertoireCommand) -> Result<Value, AppError> {
@@ -198,7 +198,7 @@ fn summaries(catalog: &Catalog) -> BTreeMap<String, Summary> {
 
 fn list(dataset: &DatasetId, catalog: &Catalog) -> Value {
     json!({
-        "schema_version": STUDY_WIRE_VERSION, "status": "repertoires", "dataset_id": dataset,
+        "schema_version": CONTENT_WIRE_VERSION, "status": "repertoires", "dataset_id": dataset,
         "repertoires": summaries(catalog).into_values().collect::<Vec<_>>(),
     })
 }
@@ -228,7 +228,7 @@ fn preview(snapshot: &Snapshot, incoming: &Catalog, plan: &ContentPlan, token: S
         }
     }
     json!({
-        "schema_version": STUDY_WIRE_VERSION, "status": "preview", "token": token,
+        "schema_version": CONTENT_WIRE_VERSION, "status": "preview", "token": token,
         "positions": incoming.items.len(), "routes": incoming.lines.len(),
         "added": added, "removed": removed, "changed": changed, "affected_learning": affected_learning,
     })
