@@ -1426,5 +1426,29 @@ fn pgn_batch_resolves_timing_in_either_order_and_rejects_conflicting_end_atomica
             invalid.errors,
             ["Game 1: PGN has an invalid occurrence interval."]
         );
+
+        // First enrich a different game only after an ordinary assessment
+        // already covers its occurrence. This must not reopen the request.
+        let later_identity = without_end.replace("1. d4 d5", "1. c4 e5");
+        let undecided = app
+            .import_game_pgn(request("other-unknown", &later_identity))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(undecided).unwrap()["results"][0]["effect"],
+            "recorded_only"
+        );
+        let test = study(&mut app, json!({"command":"next"}));
+        let mut answer = activity_command("answer", &test, "cover-both-games");
+        answer["answer"] = json!({"uci":"e2e4"});
+        assert_eq!(study(&mut app, answer)["assessment"], "good");
+        let after_test = app.snapshot().unwrap();
+        let resolved = app
+            .import_game_pgn(request("other-enriched", &unrelated))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(resolved).unwrap()["results"][0]["effect"],
+            "already_addressed"
+        );
+        assert_eq!(app.snapshot().unwrap(), after_test);
     }
 }
