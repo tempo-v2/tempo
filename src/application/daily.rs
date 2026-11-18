@@ -1,0 +1,244 @@
+//! Compose today's admissions and durable activity issuance.
+use super::{
+    TacticThemes, Tempo, tactic_capture::PERSONAL_CAPTURE, tactic_preferences::new_tactic_order,
+};
+use crate::{
+    AppError, Components,
+    app_error::domain,
+    views::{EmptyView, StudyView},
+    wire::STUDY_WIRE_VERSION,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use tempo_chess::ContentItem;
+use tempo_queue::{
+    DailyActivity, DailyCandidate, DailyChoice, DailyContext, DailyKind, DailySelection,
+    DailySession, Line,
+};
+use tempo_store::{ActivityMode, AnswerResult, Snapshot, Store, StoredAttempt, StudyScope, Write};
+use tempo_study::{Attempt, AttemptStatus};
+use tempo_types::{DatasetId, Revision, StudyTime};
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntroductionLimits {
+    pub repertoire: usize,
+    pub tactics: usize,
+}
+
+impl Default for IntroductionLimits {
+    fn default() -> Self {
+        Self {
+            repertoire: 10,
+            tactics: 20,
+        }
+    }
+}
+
+pub(super) struct DailyStudy {
+    pub(super) limits: IntroductionLimits,
+    pub(super) tactic_themes: Option<TacticThemes>,
+    pub(super) starter_themes: bool,
+    pub(super) queue: DailySession,
+    pub(super) preview_key: [u8; 32],
+    pub(super) more_tactics: usize,
+}
+
+impl Tempo {
+    /// Assemble the local release with daily activities and introduction limits.
+    pub fn daily(
+        store: Box<dyn Store>,
+        components: Components,
+        limits: IntroductionLimits,
+        preview_key: [u8; 32],
+        more_tactics: usize,
+    ) -> Result<Self, AppError> {
+        let mut app = Self::new(store, components)?;
+        app.daily = Some(DailyStudy {
+            limits,
+            tactic_themes: None,
+            starter_themes: false,
+            queue: DailySession::default(),
+            preview_key,
+            more_tactics,
+        });
+        Ok(app)
+    }
+
+    pub(super) fn daily_selection(
+        &self,
+        snapshot: &Snapshot,
+        at: StudyTime,
+        extra_tactics: usize,
+    ) -> DailySelection {
+        let daily = self.daily.as_ref().expect("daily release");
+        let mut admitted = (0, 0);
+        let mut capture_priority = BTreeMap::new();
+        let candidates = snapshot
+            .catalog
+            .items
+            .values()
+            .filter_map(|item| {
+                let state = &snapshot.learning[&item.target];
+                let kind = if item.definition.is_repertoire() {
+                    DailyKind::Repertoire
+                } else {
+                    DailyKind::Tactic
+                };
+                if state.first_introduced == Some(at.day) {
+                    match kind {
+                        DailyKind::Repertoire => admitted.0 += 1,
+                        DailyKind::Tactic if state.taught_at.is_none() => admitted.1 += 1,
+                        DailyKind::Tactic => {}
+                    }
+                }
+                if kind == DailyKind::Tactic
+                    && state.last_review_at.is_none()
+                    && let Some(introduced) = state.taught_at
+                    && item
+                        .provenance
+                        .iter()
+                        .any(|value| value == PERSONAL_CAPTURE)
+                {
+                    capture_priority.insert(item.target.clone(), introduced.unix_ms);
+                }
+                item.active().then(|| {
+                    (
+                        item.target.clone(),
+                        DailyCandidate {
+                            kind,
+                            introduced_this_version: state.introduced,
+                            first_introduced: state.first_introduced,
+                            due: state.due,
+                        },
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let routes = snapshot
+            .catalog
+            .lines
+            .iter()
+            .map(|line| Line {
+                id: line.id.clone(),
+                targets: line.targets.clone(),
+            })
+            .collect::<Vec<_>>();
+        let hash = blake3::hash(snapshot.dataset.0.as_bytes());
+        let seed = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("fixed hash width"));
+        let order = new_tactic_order(
+            snapshot,
+            at.day,
+            daily.tactic_themes.as_ref(),
+            daily.starter_themes,
+        );
+        daily.queue.select_with_capture_priority(
+            DailyContext {
+                seed,
+                today: at.day,
+                repertoire_limit: daily.limits.repertoire,
+                tactics_limit: daily.limits.tactics.saturating_add(extra_tactics),
+            },
+            &candidates,
+            &routes,
+            admitted,
+            snapshot
+                .active_attempt
+                .as_ref()
+                .and_then(|id| snapshot.attempts.get(id))
+                .filter(|record| record.mode != ActivityMode::Practice)
+                .map(|record| &record.attempt.target),
+            order.as_ref(),
+            &capture_priority,
+        )
+    }
+
+    pub(super) fn daily_summary(
+        &self,
+        dataset_id: DatasetId,
+        selection: DailySelection,
+    ) -> StudyView {
+        let more = self.daily.as_ref().expect("daily release").more_tactics;
+        let done = selection.outstanding == 0;
+        StudyView::Empty(EmptyView {
+            schema_version: STUDY_WIRE_VERSION,
+            status: "empty".into(),
+            dataset_id,
+            done,
+            outstanding: selection.outstanding,
+            repertoire_remaining: selection.repertoire_remaining,
+            tactics_remaining: selection.tactics_remaining,
+            can_practice_tactics: done && selection.practice.is_some(),
+            can_learn_more_tactics: done && selection.unseen_tactics && more > 0,
+            learn_more_count: more,
+        })
+    }
+
+    pub(super) fn issue_daily(
+        &mut self,
+        snapshot: &Snapshot,
+        at: StudyTime,
+        choice: DailyChoice,
+    ) -> Result<AnswerResult, AppError> {
+        let item = &snapshot.catalog.items[&choice.target];
+        let mode = match choice.activity {
+            DailyActivity::Teach => ActivityMode::Teach,
+            DailyActivity::Test => ActivityMode::Test,
+            DailyActivity::Practice => ActivityMode::Practice,
+        };
+        let start = self
+            .components
+            .grader
+            .start(&item.definition)
+            .map_err(|e| domain("invalid_content", e))?;
+        let attempt = Attempt {
+            id: self.components.ids.next_id(),
+            dataset: snapshot.dataset.clone(),
+            target: item.target.clone(),
+            content_version: item.version,
+            revision: Revision(0),
+            state: start.state,
+            prompt: Some(start.prompt),
+            terminal: None,
+            status: AttemptStatus::Active,
+        };
+        let record = StoredAttempt {
+            attempt: attempt.clone(),
+            issued_at: at,
+            issued_miss_revision: snapshot.learning[&item.target].miss_revision,
+            mode,
+            route: choice.route.clone(),
+            first_introduction: choice.new_kind.is_some(),
+            repertoire_name: repertoire_name(item),
+            lesson: item.lesson.clone().filter(|_| mode == ActivityMode::Teach),
+            acceptance: None,
+        };
+        let scope = StudyScope {
+            target: Some(&item.target),
+            ..StudyScope::default()
+        };
+        self.commit_study(
+            snapshot,
+            vec![
+                Write::Issue(record),
+                Write::Active(Some(attempt.id.clone())),
+            ],
+            scope,
+        )?;
+        self.daily
+            .as_mut()
+            .expect("daily release")
+            .queue
+            .issued(&choice, at.day);
+        Ok(AnswerResult {
+            attempt,
+            feedback: None,
+            assessment: None,
+            learning_effect: None,
+        })
+    }
+}
+
+fn repertoire_name(item: &ContentItem) -> Option<String> {
+    item.definition.is_repertoire().then(|| item.label.clone())
+}
