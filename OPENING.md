@@ -24,4 +24,63 @@ Use **Tactic capture** to paste or upload a PGN. A single-line FEN snippet start
 
 **Practice tactics** uses puzzles you have already learned and leaves their due dates alone. **Learn 10 more tactics today** adds to today's allowance. To customize that increment, pass it as the final argument to `tempo configure DATABASE OPENINGS TACTICS MORE_TACTICS`.
 
-The combined release upgrades the opening database in place. The same start command resumes retained lessons and tests. Keep using the same SQLite path.
+The same start command resumes retained lessons and tests from `.local/usable-release/study.sqlite`. Keep using that path for ordinary study.
+
+## Running and checking Tempo on the Mac
+
+Run these commands from `/Users/andy/Developer/tempo-v2`. `make start` builds with the workspace Cargo lock and the UI npm lock. It serves `target/debug/tempo` with `tempo-ui/dist` in the foreground and logs to that terminal. Ctrl+C stops it. It can replace an existing listener only after matching both the workspace executable and the selected database.
+
+Use this read-only status request. It reports today's remaining work without issuing an activity.
+
+```sh
+curl -fsS http://127.0.0.1:41822/api/study \
+  -H 'Content-Type: application/json' \
+  --data '{"command":"study_status"}'
+```
+
+The Mac checkpoint installation also has a session LaunchAgent at `.local/usable-release/com.tempo-v2.usable-release.plist`. It serves the archived `checkpoints/04/tempo` and `checkpoints/04/ui` pair with the same database. Its logs are `.local/usable-release/server-04.log` and `.local/usable-release/server-04.err`. To check or stop that managed instance, use the corresponding command below.
+
+```sh
+launchctl print "gui/$(id -u)/com.tempo-v2.usable-release"
+launchctl bootout "gui/$(id -u)/com.tempo-v2.usable-release"
+```
+
+To start the managed instance, stop any foreground listener first. Bootstrap the archived job if it is unloaded, or kickstart it if it is loaded and stopped.
+
+```sh
+launchctl bootstrap "gui/$(id -u)" "$PWD/.local/usable-release/com.tempo-v2.usable-release.plist"
+launchctl kickstart "gui/$(id -u)/com.tempo-v2.usable-release"
+```
+
+## Scheduling and settings
+
+The runtime uses the upstream Rust FSRS crate pinned at `6.6.2` with its default parameter vector and 0.90 desired retention. The versioned policy and calendar settings are in SQLite. Actual reviews use the elapsed study days since the last accepted review. The scheduler rounds its returned intervals to whole study days, bounded from 1 to 36,500 days. A teaching acknowledgement schedules tomorrow's first blind review without creating FSRS memory.
+
+Run the archive's executable for configuration if you have not built the debug executable. For example, the following sets 10 opening introductions, 20 tactics introductions, and a 10-tactic extra increment. Restart the same instance to apply the new allowances.
+
+```sh
+.local/usable-release/checkpoints/04/tempo configure .local/usable-release/study.sqlite 10 20 10
+```
+
+## Backup and recovery
+
+Run this from the workspace to make a consistent SQLite backup, including learned material, active work, receipts, and the saved profile. Keep the backup private.
+
+```sh
+umask 077
+recovery_dir=$(mktemp -d "$PWD/.local/usable-release/recovery.XXXXXX")
+sqlite3 -readonly .local/usable-release/study.sqlite ".backup '$recovery_dir/backup.sqlite'"
+sqlite3 -readonly "$recovery_dir/backup.sqlite" 'PRAGMA integrity_check; PRAGMA foreign_key_check;'
+```
+
+A valid check prints `ok` with no foreign-key rows. To recover or inspect that backup, copy it into a new file and serve it on a separate port with the matching schema-3 checkpoint.
+
+```sh
+cp -n "$recovery_dir/backup.sqlite" "$recovery_dir/recovered.sqlite"
+.local/usable-release/checkpoints/04/tempo serve \
+  "$recovery_dir/recovered.sqlite" .local/usable-release/checkpoints/04/ui 41823
+```
+
+Open [the recovered copy](http://127.0.0.1:41823). Confirm the expected study state before choosing a recovery file for routine use. Keep the original database and backup intact. To use the recovered copy on port 41822, first stop the regular listener using the matching stop command above, then run `make start TEMPO_DB="$recovery_dir/recovered.sqlite"`. An older backup contains only the learning present at the time it was made.
+
+Opening imports support standard-start orthodox games. Tactic capture accepts explicit setup instructions and selected game segments. It checks move legality and does not evaluate the solution with an engine.
