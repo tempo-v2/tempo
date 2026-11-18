@@ -43,7 +43,9 @@ impl Tempo {
                 expected_dataset: snapshot.dataset.clone(),
                 writes,
             },
-            source.filter(|_| catalog_changed),
+            source.filter(|source| {
+                catalog_changed || matches!(source, ContentSource::RepertoireDocument { .. })
+            }),
             receipt,
         )?;
         Ok(())
@@ -52,12 +54,16 @@ impl Tempo {
 
 pub(super) fn check_dataset(snapshot: &Snapshot, dataset: &DatasetId) -> Result<(), AppError> {
     if &snapshot.dataset != dataset {
-        return Err(AppError::new(
-            "stale_dataset",
-            "This command belongs to an earlier dataset. Reload Tempo.",
-        ));
+        return Err(stale_dataset());
     }
     Ok(())
+}
+
+pub(super) fn stale_dataset() -> AppError {
+    AppError::new(
+        "stale_dataset",
+        "This command belongs to an earlier dataset. Reload Tempo.",
+    )
 }
 
 pub(super) fn stale_preview() -> AppError {
