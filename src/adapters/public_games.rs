@@ -50,12 +50,16 @@ pub(crate) struct Game {
 
 #[derive(Default)]
 pub(crate) struct FetchedGames {
+    pub(crate) received: usize,
     pub(crate) games: Vec<Game>,
     pub(crate) errors: Vec<String>,
 }
 
 impl FetchedGames {
     fn record(&mut self, row: Result<Option<Game>, AppError>) {
+        if !matches!(row, Ok(None)) {
+            self.received += 1;
+        }
         match row {
             Ok(Some(game)) => self.games.push(game),
             Ok(None) => {}
@@ -131,40 +135,9 @@ impl PublicGames {
     }
 
     fn chess_com(&mut self, account: &str, range: &GameRange) -> Result<FetchedGames, AppError> {
-        let base = format!("{CHESS_COM_API}{account}/games");
-        let body = self.read(
-            Provider::ChessCom,
-            &format!("{base}/archives"),
-            "application/json",
-        )?;
-        let archives: Archives = serde_json::from_slice(&body)
-            .map_err(|_| provider_error("Chess.com returned an invalid archive list."))?;
-
-        let mut batch = FetchedGames::default();
-        for archive in archive_urls(&base, range) {
-            // Construct URLs locally so a changed or untrusted archive list
-            // cannot broaden host, path, or requested month.
-            if !archives.archives.contains(&archive) {
-                continue;
-            }
-            let month = &archive[archive.len() - 7..];
-            let result = self
-                .read(Provider::ChessCom, &archive, "application/json")
-                .and_then(|body| decode_chess_com(&body, account, range, month, &mut batch));
-            if let Err(error) = result {
-                batch
-                    .errors
-                    .push(format!("Chess.com {month}: {}", error.message));
-                if error.code == "provider_rate_limited" {
-                    break;
-                }
-            }
-            if batch.games.len() > MAX_GAMES {
-                break;
-            }
-        }
-        batch.cap();
-        Ok(batch)
+        chess_com_archives(account, range, |url| {
+            self.read(Provider::ChessCom, url, "application/json")
+        })
     }
 
     fn read(&mut self, provider: Provider, url: &str, accept: &str) -> Result<Vec<u8>, AppError> {
@@ -229,6 +202,42 @@ impl PublicGames {
             ))),
         }
     }
+}
+
+fn chess_com_archives(
+    account: &str,
+    range: &GameRange,
+    mut read: impl FnMut(&str) -> Result<Vec<u8>, AppError>,
+) -> Result<FetchedGames, AppError> {
+    let base = format!("{CHESS_COM_API}{account}/games");
+    let body = read(&format!("{base}/archives"))?;
+    let archives: Archives = serde_json::from_slice(&body)
+        .map_err(|_| provider_error("Chess.com returned an invalid archive list."))?;
+
+    let mut batch = FetchedGames::default();
+    for archive in archive_urls(&base, range) {
+        // Construct URLs locally so a changed or untrusted archive list
+        // cannot broaden host, path, or requested month.
+        if !archives.archives.contains(&archive) {
+            continue;
+        }
+        let month = &archive[archive.len() - 7..];
+        let result = read(&archive)
+            .and_then(|body| decode_chess_com(&body, account, range, month, &mut batch));
+        if let Err(error) = result {
+            batch
+                .errors
+                .push(format!("Chess.com {month}: {}", error.message));
+            if error.code == "provider_rate_limited" {
+                break;
+            }
+        }
+        if batch.games.len() > MAX_GAMES {
+            break;
+        }
+    }
+    batch.cap();
+    Ok(batch)
 }
 
 fn valid_account(account: &str) -> bool {
@@ -450,15 +459,15 @@ fn decode_lichess(body: &[u8], account: &str, range: &GameRange) -> FetchedGames
             );
             break;
         }
-        let game = serde_json::from_slice::<LichessGame>(row)
-            .map_err(|_| provider_error("Incomplete or invalid game data."))
-            .and_then(|game| {
-                if (range.from_ms..range.to_ms).contains(&game.created_at) {
-                    game.normalize(account).map(Some)
-                } else {
-                    Ok(None)
+        let game = serde_json::from_slice::<Value>(row)
+            .and_then(|row| {
+                if outside_window(row["createdAt"].as_u64(), range) {
+                    return Ok(None);
                 }
-            });
+                serde_json::from_value::<LichessGame>(row).map(Some)
+            })
+            .map_err(|_| provider_error("Incomplete or invalid game data."))
+            .and_then(|game| game.map(|game| game.normalize(account)).transpose());
         batch.record(game.map_err(|error| {
             provider_error(format!("Lichess game {}: {}", index + 1, error.message))
         }));
@@ -563,6 +572,12 @@ struct ChessComPlayer {
     username: String,
 }
 
+fn outside_window(time_ms: Option<u64>, range: &GameRange) -> bool {
+    time_ms
+        .filter(|&time| time > 0 && timestamp(time).is_some())
+        .is_some_and(|time| !(range.from_ms..range.to_ms).contains(&time))
+}
+
 fn decode_chess_com(
     body: &[u8],
     account: &str,
@@ -573,6 +588,14 @@ fn decode_chess_com(
     let archive: ChessComArchive =
         serde_json::from_slice(body).map_err(|_| provider_error("Invalid game archive."))?;
     for (index, row) in archive.games.into_iter().enumerate() {
+        if outside_window(
+            row["end_time"]
+                .as_u64()
+                .and_then(|end| end.checked_mul(1000)),
+            range,
+        ) {
+            continue;
+        }
         let game = serde_json::from_value::<ChessComGame>(row)
             .map_err(|_| provider_error("Incomplete or invalid game data."))
             .and_then(|game| game.normalize(account, range));
@@ -718,6 +741,7 @@ mod tests {
             lichess_row()
         );
         let batch = decode_lichess(body.as_bytes(), "Thibault", &range);
+        assert_eq!(batch.received, 4);
         assert_eq!(batch.errors.len(), 3);
         assert_eq!(batch.games.len(), 1);
         let game = &batch.games[0];
@@ -767,6 +791,7 @@ mod tests {
             &mut batch,
         )
         .unwrap();
+        assert_eq!(batch.received, 4);
         assert_eq!(batch.errors.len(), 2);
         assert_eq!(batch.games.len(), 2);
         assert_eq!(batch.games[0].start_ms, batch.games[1].start_ms);
@@ -781,6 +806,54 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn chess_com_archive_and_limit_diagnostics_do_not_count_as_games() {
+        let range = GameRange {
+            from_ms: 1_254_672_000_000 - 86_400_000,
+            to_ms: 1_254_672_000_000,
+        };
+        let month = format!("{CHESS_COM_API}erik/games/2009/10");
+        let archives = json!({"archives": [&month]}).to_string().into_bytes();
+        let failed = chess_com_archives("erik", &range, |url| {
+            if url.ends_with("/archives") {
+                return Ok(archives.clone());
+            }
+            assert_eq!(url, month);
+            Err(provider_error("Provider request timed out."))
+        })
+        .unwrap();
+        assert_eq!(failed.received, 0);
+        assert!(failed.games.is_empty());
+        assert_eq!(
+            failed.errors,
+            ["Chess.com 2009/10: Provider request timed out."]
+        );
+
+        let valid = json!({
+            "url": "https://www.chess.com/game/daily/29099782",
+            "white": {"username": "learner"},
+            "black": {"username": "erik"},
+            "end_time": 1254670734_u64,
+            "rules": "chess",
+            "pgn": "1. e4 d6 1-0"
+        });
+        let mut rows = vec![Value::Null];
+        rows.extend(std::iter::repeat_n(valid, MAX_GAMES + 1));
+        let archive = json!({"games":rows}).to_string().into_bytes();
+        let partial = chess_com_archives("erik", &range, |url| {
+            Ok(if url.ends_with("/archives") {
+                archives.clone()
+            } else {
+                archive.clone()
+            })
+        })
+        .unwrap();
+        assert_eq!(partial.received, MAX_GAMES + 2);
+        assert_eq!(partial.games.len(), MAX_GAMES);
+        assert_eq!(partial.errors.len(), 2);
+        assert!(partial.errors[1].contains("exceeded 500 games"));
     }
 
     #[test]

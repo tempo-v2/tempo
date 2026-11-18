@@ -11,7 +11,7 @@ use tempo_chess::{LearnerColor, PlayedGame, compare_played_game, parse_played_ga
 use tempo_learning::{GameMiss, GameReviewEffect, LearningState};
 use tempo_store::{
     AcceptedGames, Commit, ComparedGame, GameObservation, GameReceipt, GameRecord, GameSummary,
-    Snapshot, Write,
+    PgnTiming, Snapshot, Write,
 };
 use tempo_types::{ContentVersion, DatasetId, TargetId};
 
@@ -43,6 +43,7 @@ impl Tempo {
                         })
                 }));
                 GameResult {
+                    comparison_id: Some(entry.comparison_id),
                     summary: entry.summary,
                     effect,
                 }
@@ -76,6 +77,7 @@ impl Tempo {
         if records.len() > 500 {
             return Err(invalid("Upload at most 500 games at a time."));
         }
+        let fetched = records.len();
         let at = self.components.clock.now().unix_ms;
         let games = records
             .into_iter()
@@ -100,7 +102,10 @@ impl Tempo {
             &request.repertoire_id,
             &request.learner,
             games,
-            Vec::new(),
+            GameReport {
+                fetched,
+                ..GameReport::default()
+            },
             None,
         )
     }
@@ -149,7 +154,11 @@ impl Tempo {
             repertoire,
             learner,
             games,
-            fetched.errors,
+            GameReport {
+                fetched: fetched.received,
+                errors: fetched.errors,
+                ..GameReport::default()
+            },
             Some(at),
         )
     }
@@ -161,7 +170,7 @@ impl Tempo {
         repertoire: &str,
         learner: &str,
         games: Vec<Result<(GameRecord, PlayedGame), String>>,
-        errors: Vec<String>,
+        mut report: GameReport,
         refresh_at: Option<u64>,
     ) -> Result<GameReport, AppError> {
         let learner = learner.trim().to_lowercase();
@@ -181,14 +190,7 @@ impl Tempo {
             .as_ref()
             .ok_or_else(|| invalid("Choose an existing repertoire."))?;
         let color = learner_color(item);
-        let mut report = GameReport {
-            fetched: games.len() + errors.len(),
-            errors,
-            ..GameReport::default()
-        };
         let mut comparisons = Vec::new();
-        let mut changes = BTreeMap::<TargetId, LearningState>::new();
-        let mut effects = Vec::new();
         for (index, record) in games.into_iter().enumerate() {
             match record.and_then(|(game, played)| {
                 let side = match (
@@ -271,43 +273,42 @@ impl Tempo {
                     observations,
                 }))
             }) {
-                Ok(Some(compared)) => {
-                    let mut game_effects = Vec::new();
-                    for observation in compared
-                        .observations
-                        .iter()
-                        .filter(|obs| obs.played != obs.prescribed)
-                    {
-                        let Some(prior) =
-                            game_state(&snapshot, &observation.target, observation.version)
-                        else {
-                            continue;
-                        };
-                        let state = changes
-                            .entry(observation.target.clone())
-                            .or_insert_with(|| prior.clone());
-                        let outcome = state
-                            .observe_game_miss(GameMiss {
-                                answer_version: observation.version,
-                                earliest_ms: compared.game.start_ms,
-                                latest_ms: compared.game.end_ms,
-                            })
-                            .map_err(|e| domain("learning_error", e))?;
-                        game_effects.push(outcome);
-                    }
-                    comparisons.push(compared);
-                    effects.push(summarize_effects(game_effects));
-                }
+                Ok(Some(compared)) => comparisons.push(compared),
                 Ok(None) => report.opposite_color_skipped += 1,
                 Err(error) => report.errors.push(format!("Game {}: {error}", index + 1)),
             }
         }
-        for (comparison, effect) in comparisons.iter().zip(effects) {
-            report.matches += comparison.summary.matches;
-            report.deviations += comparison.summary.deviations;
+        self.resolve_pgn_timing(&snapshot.dataset, &mut comparisons)?;
+        let mut changes = BTreeMap::<TargetId, LearningState>::new();
+        for compared in &comparisons {
+            let mut game_effects = Vec::new();
+            for observation in compared
+                .observations
+                .iter()
+                .filter(|obs| obs.played != obs.prescribed)
+            {
+                let Some(prior) = game_state(&snapshot, &observation.target, observation.version)
+                else {
+                    continue;
+                };
+                let state = changes
+                    .entry(observation.target.clone())
+                    .or_insert_with(|| prior.clone());
+                let outcome = state
+                    .observe_game_miss(GameMiss {
+                        answer_version: observation.version,
+                        earliest_ms: compared.game.start_ms,
+                        latest_ms: compared.game.end_ms,
+                    })
+                    .map_err(|e| domain("learning_error", e))?;
+                game_effects.push(outcome);
+            }
+            report.matches += compared.summary.matches;
+            report.deviations += compared.summary.deviations;
             report.results.push(GameResult {
-                summary: comparison.summary.clone(),
-                effect,
+                comparison_id: Some(compared.id.clone()),
+                summary: compared.summary.clone(),
+                effect: summarize_effects(game_effects),
             });
         }
         let reply =
@@ -331,6 +332,40 @@ impl Tempo {
             },
         )?;
         report_from_receipt(stored)
+    }
+
+    // Resolve all occurrences before projecting any report or Learning effect.
+    // Store rechecks these effective times against concurrent writes at commit.
+    fn resolve_pgn_timing(
+        &self,
+        dataset: &DatasetId,
+        comparisons: &mut [ComparedGame],
+    ) -> Result<(), AppError> {
+        let mut timings = BTreeMap::<String, PgnTiming>::new();
+        for compared in comparisons.iter() {
+            let game = &compared.game;
+            let Some(incoming) = game.precise_pgn_timing() else {
+                continue;
+            };
+            let current = match timings.entry(game.id.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                    self.store
+                        .pgn_timing(dataset, &game.id)?
+                        .unwrap_or_else(|| incoming.clone()),
+                ),
+            };
+            current.merge_end(&incoming)?;
+        }
+        for compared in comparisons {
+            if compared.game.source == "pgn"
+                && let Some(timing) = timings.get(&compared.game.id)
+            {
+                compared.game.end_ms = timing.end_ms;
+                compared.summary.occurrence_end_ms = timing.end_ms;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -411,8 +446,9 @@ fn uploaded_record(game: &PlayedGame, fetched_ms: u64) -> Result<GameRecord, Str
     let date = tag("UTCDate").or_else(|| tag("Date"));
     let start_ms = utc_ms(tag("UTCDate"), tag("UTCTime"));
     let end_ms = utc_ms(tag("UTCEndDate"), tag("UTCEndTime")).and_then(|ms| ms.checked_add(999));
-    let end_ms =
-        end_ms.filter(|end| start_ms.is_none_or(|start| start <= *end) && *end <= fetched_ms);
+    if end_ms.is_some_and(|end| start_ms.is_some_and(|start| end < start) || end > fetched_ms) {
+        return Err("PGN has an invalid occurrence interval.".into());
+    }
     let (start_position, moves) = game.mainline_identity();
     let identity = json!([
         white.to_lowercase(),

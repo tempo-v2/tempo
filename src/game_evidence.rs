@@ -45,6 +45,9 @@ pub struct GameReport {
 
 #[derive(Serialize, Deserialize)]
 pub struct GameResult {
+    /// Checkpoint 12 receipts preserve their original shape on replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_id: Option<String>,
     #[serde(flatten)]
     pub summary: GameSummary,
     pub effect: GameReviewEffect,
