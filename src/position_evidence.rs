@@ -20,7 +20,7 @@ use tempo_chess::{
     legal_model_moves,
 };
 use tempo_store::{SqliteStore, Store};
-use tempo_types::DatasetId;
+use tempo_types::{DatasetId, Revision};
 mod repertoires;
 use repertoires::BookPositions;
 
@@ -32,6 +32,13 @@ enum Source {
     Rated,
     Masters,
     Maia,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewVersion {
+    revision: Revision,
+    document_id: String,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +55,7 @@ pub struct EvidenceRequest {
     #[serde(default)]
     pins: Vec<String>,
     candidate_count: Option<usize>,
+    review_version: Option<ReviewVersion>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +147,16 @@ impl PositionEvidence {
             return Err(AppError::new(
                 "invalid_candidate_count",
                 "Choose one to five Stockfish lines.",
+            ));
+        }
+        if request.review_version.is_some()
+            && (request.source != Source::Repertoire
+                || request.repertoire_id.is_none()
+                || request.dataset_id.is_none())
+        {
+            return Err(AppError::new(
+                "invalid_review_scope",
+                "Choose a game review and its repertoire.",
             ));
         }
         let id = request.request_id.clone();
@@ -288,10 +306,11 @@ impl Services {
                         r.learner_color,
                     )?);
                 }
-                let data = books
-                    .as_ref()
-                    .expect("loaded book positions")
-                    .compare(&r.fen, &job.key)?;
+                let data = books.as_ref().expect("loaded book positions").compare(
+                    &r.fen,
+                    &job.key,
+                    r.review_version.as_ref(),
+                )?;
                 if store.model_content_marker()? != marker {
                     return Err(AppError::new(
                         "stale_repertoire",
@@ -337,6 +356,7 @@ mod tests {
                     ratings: Ratings::default(),
                     pins: vec![],
                     candidate_count: None,
+                    review_version: None,
                 },
             }
         };
