@@ -18,7 +18,9 @@ use tempo_queue::{
     DailyActivity, DailyCandidate, DailyChoice, DailyContext, DailyEvidence, DailyKind,
     DailySelection, DailySession, Line, RelevanceReason, TargetRelevance,
 };
-use tempo_store::{ActivityMode, AnswerResult, Snapshot, Store, StoredAttempt, StudyScope, Write};
+use tempo_store::{
+    ActivityMode, AnswerResult, Store, StoredAttempt, StudyScope, StudyState, Write,
+};
 use tempo_study::{Attempt, AttemptStatus};
 use tempo_types::{DatasetId, Revision, StudyTime};
 
@@ -70,11 +72,12 @@ impl Tempo {
 
     pub(super) fn daily_selection(
         &self,
-        snapshot: &Snapshot,
+        snapshot: &StudyState,
         at: StudyTime,
         extra_tactics: usize,
     ) -> Result<DailySelection, AppError> {
         let daily = self.daily.as_ref().expect("daily release");
+        let (catalog, learning) = snapshot.complete_catalog()?;
         let mut admitted = (0, 0);
         let mut evidence = DailyEvidence {
             relevance: self
@@ -97,12 +100,11 @@ impl Tempo {
         };
 
         let mut capture_priority = BTreeMap::new();
-        let candidates = snapshot
-            .catalog
+        let candidates = catalog
             .items
             .values()
             .filter_map(|item| {
-                let state = &snapshot.learning[&item.target];
+                let state = &learning[&item.target];
                 let kind = if item.definition.is_repertoire() {
                     DailyKind::Repertoire
                 } else {
@@ -169,8 +171,7 @@ impl Tempo {
                 })
             })
             .collect::<BTreeMap<_, _>>();
-        let routes = snapshot
-            .catalog
+        let routes = catalog
             .lines
             .iter()
             .map(|line| Line {
@@ -181,7 +182,7 @@ impl Tempo {
         let hash = blake3::hash(snapshot.dataset.0.as_bytes());
         let seed = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("fixed hash width"));
         let order = new_tactic_order(
-            tactic_pack_candidates(snapshot),
+            tactic_pack_candidates(catalog, learning),
             at.day,
             daily.tactic_themes.as_ref(),
             daily.starter_themes,
@@ -246,11 +247,13 @@ impl Tempo {
 
     pub(super) fn issue_daily(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &StudyState,
         at: StudyTime,
         choice: DailyChoice,
     ) -> Result<AnswerResult, AppError> {
-        let item = &snapshot.catalog.items[&choice.target];
+        let (item, learning) = snapshot
+            .target(&choice.target)?
+            .ok_or_else(|| AppError::new("stale_content", "selected target is unavailable"))?;
         let mode = match choice.activity {
             DailyActivity::Teach => ActivityMode::Teach,
             DailyActivity::Repair => ActivityMode::Repair,
@@ -276,7 +279,7 @@ impl Tempo {
         let record = StoredAttempt {
             attempt: attempt.clone(),
             issued_at: at,
-            issued_miss_revision: snapshot.learning[&item.target].miss_revision,
+            issued_miss_revision: learning.miss_revision,
             mode,
             route: choice.route.clone(),
             first_introduction: choice.new_kind.is_some(),
@@ -285,7 +288,7 @@ impl Tempo {
             lesson: match mode {
                 ActivityMode::Teach => item.lesson.clone(),
                 ActivityMode::Repair => {
-                    let context = snapshot.learning[&item.target]
+                    let context = learning
                         .correction
                         .as_ref()
                         .and_then(|correction| correction.previous_move.clone());

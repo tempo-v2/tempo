@@ -21,7 +21,9 @@ use tempo_chess::{
     compile_repertoire, plan_repertoire_replacement,
 };
 use tempo_learning::{DailyLearning, LearningState};
-use tempo_store::{ContentReceipt, ContentSource, RepertoireReset, Snapshot, Write, model_targets};
+use tempo_store::{
+    ContentReceipt, ContentSource, ContentState, RepertoireReset, Write, model_targets,
+};
 use tempo_types::{DatasetId, Revision};
 
 #[derive(Serialize)]
@@ -52,7 +54,8 @@ impl Tempo {
             .as_ref()
             .ok_or_else(|| AppError::new("unsupported", "Use the local study release."))?
             .preview_key;
-        let (snapshot, revision) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
+        let revision = snapshot.content_revision;
         check_dataset(&snapshot, &input.dataset_id)?;
         if revision != base_revision {
             return Err(stale_draft());
@@ -110,7 +113,8 @@ impl Tempo {
         {
             return self.reset_repertoire(dataset_id, repertoire_id, command_id);
         }
-        let (snapshot, revision) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
+        let revision = snapshot.content_revision;
         match command {
             RepertoireCommand::ReadDocument { .. } | RepertoireCommand::ResetProgress { .. } => {
                 unreachable!("handled without reading the catalog")
@@ -379,7 +383,7 @@ fn validate_name(name: &str) -> Result<&str, AppError> {
 }
 
 fn prepare(
-    snapshot: &Snapshot,
+    snapshot: &ContentState,
     input: &RepertoireInput,
     id: &str,
 ) -> Result<(String, Catalog, ContentPlan), AppError> {
@@ -439,7 +443,12 @@ fn list(dataset: &DatasetId, catalog: &Catalog) -> Result<Value, AppError> {
     }))
 }
 
-fn preview(snapshot: &Snapshot, incoming: &Catalog, plan: &ContentPlan, token: String) -> Value {
+fn preview(
+    snapshot: &ContentState,
+    incoming: &Catalog,
+    plan: &ContentPlan,
+    token: String,
+) -> Value {
     let mut added = 0;
     let mut removed = 0;
     let mut changed = 0;

@@ -37,7 +37,8 @@ impl Tempo {
             if pending.is_empty() {
                 return Ok(());
             }
-            let (snapshot, revision) = self.store.content_state()?;
+            let snapshot = self.store.content_state()?;
+            let revision = snapshot.content_revision;
             if snapshot.dataset != dataset {
                 continue;
             }
@@ -195,7 +196,8 @@ impl Tempo {
         let dataset = request.dataset_id.clone();
         let repertoire_id = request.repertoire_id.clone();
         let (draft, revision) = self.gap_position(request)?;
-        let (snapshot, current_revision) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
+        let current_revision = snapshot.content_revision;
         if snapshot.dataset != dataset || current_revision != revision {
             return Err(AppError::new(
                 "stale_repertoire",

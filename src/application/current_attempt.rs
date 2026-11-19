@@ -1,7 +1,7 @@
 //! Check that a new command addresses the current dataset and content version.
 use super::Tempo;
 use crate::AppError;
-use tempo_store::{Snapshot, StoredAttempt};
+use tempo_store::{StoredAttempt, StudyState};
 use tempo_types::{AttemptId, DatasetId};
 
 impl Tempo {
@@ -9,7 +9,7 @@ impl Tempo {
     // reply remains replayable even after its target has changed.
     pub(super) fn current<'a>(
         &self,
-        snapshot: &'a Snapshot,
+        snapshot: &'a StudyState,
         dataset: &DatasetId,
         id: &AttemptId,
     ) -> Result<&'a StoredAttempt, AppError> {
@@ -29,10 +29,8 @@ impl Tempo {
                 "attempt belongs to a different dataset",
             ));
         }
-        let item = snapshot
-            .catalog
-            .items
-            .get(&record.attempt.target)
+        let (item, _) = snapshot
+            .target(&record.attempt.target)?
             .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
         if !item.active() || item.version != record.attempt.content_version {
             return Err(AppError::new(

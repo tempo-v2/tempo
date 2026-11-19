@@ -78,12 +78,13 @@ impl Tempo {
             catalog: true,
             ..StudyScope::default()
         })?;
+        let (catalog, learning) = snapshot.complete_catalog()?;
         let themes = self
             .daily
             .as_ref()
             .and_then(|daily| daily.tactic_themes.clone())
             .unwrap_or_else(|| {
-                if has_starter_packs(tactic_pack_candidates(&snapshot)) {
+                if has_starter_packs(tactic_pack_candidates(catalog, learning)) {
                     TacticThemes::starter()
                 } else {
                     TacticThemes::Any
@@ -227,7 +228,7 @@ mod tests {
         };
         let order = |snapshot: &Snapshot, day| {
             let mut ranked = new_tactic_order(
-                tactic_pack_candidates(snapshot),
+                tactic_pack_candidates(&snapshot.catalog, &snapshot.learning),
                 StudyDay(day),
                 Some(&preference),
                 true,

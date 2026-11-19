@@ -2,9 +2,10 @@
 //! The Tempo 1 converter writes a validated pack envelope. Capture Save marks
 //! an accepted personal capture. Other provenance entries are attribution.
 use serde::Deserialize;
+use std::collections::BTreeMap;
+use tempo_chess::Catalog;
 use tempo_chess::ContentItem;
 use tempo_learning::LearningState;
-use tempo_store::Snapshot;
 use tempo_types::{StudyDay, TargetId};
 
 const PERSONAL_CAPTURE: &str = "tempo:capture-save";
@@ -102,16 +103,16 @@ impl PackMemberships<'_> {
 }
 
 /// Adapt retained content and Learning to the inputs used by new-pack ordering.
-pub(super) fn tactic_pack_candidates(
-    snapshot: &Snapshot,
-) -> impl Iterator<Item = TacticPackCandidate<'_>> + Clone {
-    snapshot
-        .catalog
+pub(super) fn tactic_pack_candidates<'a>(
+    catalog: &'a Catalog,
+    learning: &'a BTreeMap<TargetId, LearningState>,
+) -> impl Iterator<Item = TacticPackCandidate<'a>> + Clone {
+    catalog
         .items
         .values()
         .filter(|item| item.active() && !item.definition.is_repertoire())
         .map(move |item| {
-            let state = &snapshot.learning[&item.target];
+            let state = &learning[&item.target];
             TacticPackCandidate {
                 target: &item.target,
                 memberships: PackMemberships(&item.provenance),

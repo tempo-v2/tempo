@@ -301,7 +301,7 @@ fn equivalent_documents_keep_authority_until_only_one_books_route_changes() {
             .unwrap()
             .is_empty()
     );
-    let (before, _) = store.content_state().unwrap();
+    let before = store.content_state().unwrap();
     let changed =
         compile_repertoire(new_route, &book_id, "First", LearnerColor::White, "fixture").unwrap();
     let changed = plan_repertoire_replacement(&before.catalog, &changed, &book_id)

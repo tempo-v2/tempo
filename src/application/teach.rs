@@ -35,7 +35,9 @@ impl Tempo {
             ));
         }
         let revision = check_open(&old.attempt, command.expected_revision).map_err(study_input)?;
-        let item = &snapshot.catalog.items[&old.attempt.target];
+        let (item, prior) = snapshot
+            .target(&old.attempt.target)?
+            .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
         if item.definition.decisions[0].expected != command.answer {
             return Err(AppError::new(
                 "try_shown_move",
@@ -43,7 +45,6 @@ impl Tempo {
             ));
         }
         let at = self.components.clock.now();
-        let prior = &snapshot.learning[&item.target];
         let state = match old.mode {
             ActivityMode::Repair => {
                 DailyLearning::repair(prior, item.version, old.issued_miss_revision, at)

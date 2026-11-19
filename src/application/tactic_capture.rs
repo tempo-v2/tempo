@@ -27,7 +27,8 @@ impl Tempo {
             .as_ref()
             .ok_or_else(|| AppError::new("unsupported", "Use the local study release."))?
             .preview_key;
-        let (snapshot, revision) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
+        let revision = snapshot.content_revision;
         match command {
             TacticCaptureCommand::Preview(input) => {
                 check_dataset(&snapshot, &input.dataset_id)?;

@@ -42,7 +42,7 @@ pub use tactic_preferences::{TacticThemes, tactic_themes};
 
 use crate::{AppError, Components, app_error::domain};
 use tempo_queue::OrderEvent;
-use tempo_store::{Commit, MemoryStore, Snapshot, Store, StudyScope, Write};
+use tempo_store::{Commit, MemoryStore, Snapshot, Store, StudyScope, StudyState, Write};
 use tempo_types::TargetId;
 
 /// Coordinate domain decisions and commit the resulting operation atomically.
@@ -81,7 +81,8 @@ impl Tempo {
                 "stored learning policy differs from selected implementation",
             ));
         }
-        for state in snapshot.learning.values() {
+        let (_, learning) = snapshot.complete_catalog()?;
+        for state in learning.values() {
             components
                 .learning
                 .validate_state(state)
@@ -113,7 +114,7 @@ impl Tempo {
     }
     fn commit_study(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &StudyState,
         writes: Vec<Write>,
         scope: StudyScope<'_>,
     ) -> Result<(), AppError> {
@@ -128,10 +129,15 @@ impl Tempo {
         Ok(())
     }
 
-    fn commit(&mut self, snapshot: &Snapshot, writes: Vec<Write>) -> Result<(), AppError> {
+    fn commit(
+        &mut self,
+        dataset: &tempo_types::DatasetId,
+        revision: tempo_types::Revision,
+        writes: Vec<Write>,
+    ) -> Result<(), AppError> {
         self.store.commit(Commit {
-            expected_revision: snapshot.revision,
-            expected_dataset: snapshot.dataset.clone(),
+            expected_revision: revision,
+            expected_dataset: dataset.clone(),
             writes,
         })?;
         Ok(())
