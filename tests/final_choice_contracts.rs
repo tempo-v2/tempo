@@ -225,7 +225,7 @@ fn old_choice_stays_closed_without_version_upgrade_or_reset_regrading() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("versioned-choice.sqlite");
     let day = Arc::new(AtomicI32::new(20_004));
-    let mut app = open(&db, day, IntroductionLimits::default(), 0);
+    let mut app = open(&db, day.clone(), IntroductionLimits::default(), 0);
     preview_and_save(&mut app, "1. e4 e5 2. Nf3 *", "First", None);
     preview_and_save(&mut app, "1. e4 e5 2. Bc4 *", "Second", None);
     let game = date_only_import(&mut app, "ambiguous", "2024.10.06", "1. e4 e5 2. Nc3");
@@ -262,6 +262,41 @@ fn old_choice_stays_closed_without_version_upgrade_or_reset_regrading() {
     assert_eq!(app.snapshot().unwrap().learning, changed.learning);
     preview_and_save(&mut app, "1. e4 *", &name, Some(&rep));
     assert!(!app.snapshot().unwrap().catalog.items[&target].active());
+    let export = app.export(&tempo::JsonSnapshotCodec).unwrap();
+    let mut legacy: Value = serde_json::from_str(&export).unwrap();
+    legacy["schema_version"] = json!(3);
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("resolved_game_choices");
+    for (label, data) in [
+        ("legacy-three", legacy.to_string()),
+        ("retired-five", export),
+    ] {
+        let path = directory.path().join(format!("{label}.sqlite"));
+        let mut restored = open(&path, day.clone(), IntroductionLimits::default(), 0);
+        restored
+            .restore(label.into(), &data, &tempo::JsonSnapshotCodec)
+            .unwrap();
+        let restored_item = &restored.snapshot().unwrap().catalog.items[&target];
+        assert!(!restored_item.active());
+        assert!(old_version.0 < restored_item.version.0);
+        let restored_store = SqliteStore::open(&path).unwrap();
+        let result = &game["results"][0];
+        let choices = restored_store
+            .game_choices(
+                &label.into(),
+                result["source"].as_str().unwrap(),
+                result["game_id"].as_str().unwrap(),
+            )
+            .unwrap();
+        let saved = choices[choice["position"].as_str().unwrap()]
+            .as_ref()
+            .unwrap();
+        assert_eq!(saved.target, target);
+        assert_eq!(saved.answer_version, old_version);
+    }
+
     date_only_import(
         &mut app,
         "retired-reimport",

@@ -175,10 +175,12 @@ fn display_rename_must_preserve_modeled_due_order() {
     drop(store);
     let renamed_db = dir.path().join("renamed.sqlite");
     std::fs::copy(&db, &renamed_db).unwrap();
+    let tactics_db = dir.path().join("tactics.sqlite");
+    std::fs::copy(&db, &tactics_db).unwrap();
     let mut ranked = open(&db, day.clone(), limits, 1);
     let ranked_first = study(&mut ranked, json!({"command":"next"}));
     assert_eq!(ranked_first["target_id"], favored.0);
-    let mut renamed = open(&renamed_db, day, limits, 1);
+    let mut renamed = open(&renamed_db, day.clone(), limits, 1);
     let reply = content(
         &mut renamed,
         json!({"command":"rename","dataset_id":"opening-proof","repertoire_id":repertoire,"name":"After"}),
@@ -200,6 +202,41 @@ fn display_rename_must_preserve_modeled_due_order() {
     assert_eq!(
         renamed_first["target_id"], ranked_first["target_id"],
         "A display-only rename must preserve review selection"
+    );
+    let mut tactics_store = SqliteStore::open(&tactics_db).unwrap();
+    let current = tactics_store.snapshot().unwrap();
+    let mut catalog = current.catalog;
+    let mut tactic = tempo_chess::demo_catalog()
+        .items
+        .remove(&TargetId::from("t1"))
+        .unwrap();
+    tactic.status = tempo_chess::ContentStatus::Quarantined;
+    let target = tactic.target.clone();
+    catalog.items.insert(target.clone(), tactic);
+    tactics_store
+        .commit(Commit {
+            expected_dataset: current.dataset.clone(),
+            expected_revision: current.revision,
+            writes: vec![
+                Write::Catalog(catalog),
+                Write::Learning {
+                    target,
+                    state: Default::default(),
+                },
+            ],
+        })
+        .unwrap();
+    assert_eq!(
+        tactics_store
+            .game_relevance(&current.dataset, REACH_MODEL_KEY)
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut tactics = open(&tactics_db, day, limits, 1);
+    assert_eq!(
+        study(&mut tactics, json!({"command":"next"}))["target_id"],
+        ranked_first["target_id"]
     );
 }
 
@@ -330,4 +367,107 @@ fn equivalent_documents_keep_authority_until_only_one_books_route_changes() {
             .complete_current,
         2
     );
+}
+
+#[test]
+fn issued_reason_survives_new_model_order_and_old_work_cannot_cross_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("issued.sqlite");
+    let day = Arc::new(AtomicI32::new(20_000));
+    let mut app = open(&path, day.clone(), IntroductionLimits::default(), 0);
+    preview_and_save(&mut app, "1. e4 e5 2. Nf3 Nc6 3. Bb5 *", "Three", None);
+    for teach in 0..3 {
+        let card = study(&mut app, json!({"command":"next"}));
+        assert_eq!(card["activity"], "teach");
+        let reply = play_activity(
+            &mut app,
+            &card,
+            "acknowledge",
+            &format!("teach-{teach}"),
+            card["lesson"]["move_uci"].as_str().unwrap(),
+        );
+        assert_eq!(reply["status"], "complete");
+    }
+    day.store(20_001, Ordering::Relaxed);
+    let mut store = SqliteStore::open(&path).unwrap();
+    let dataset = app.snapshot().unwrap().dataset;
+    let book = store
+        .projection_books(&dataset, ProjectionScope::AllVerified)
+        .unwrap()
+        .remove(0);
+    let targets: Vec<_> = book.targets.keys().cloned().collect();
+    let scores = |weights: [u32; 3]| targets.iter().cloned().zip(weights).collect();
+    publish(
+        &mut store,
+        &dataset,
+        &book,
+        true,
+        &scores([900_000, 600_000, 100_000]),
+    )
+    .unwrap();
+    let issued = study(&mut app, json!({"command":"next"}));
+    assert_eq!(issued["target_id"], targets[0].0);
+    let attempt = issued["attempt_id"].as_str().unwrap().into();
+    let reason = app.study_relevance_reason(&dataset, &attempt).unwrap();
+    assert_eq!(
+        reason["reason"],
+        "Modeled reach · 90.0% under Maia Rapid 1500."
+    );
+
+    publish(
+        &mut store,
+        &dataset,
+        &book,
+        true,
+        &scores([10_000, 200_000, 800_000]),
+    )
+    .unwrap();
+    assert_eq!(
+        study(&mut app, json!({"command":"next"}))["attempt_id"],
+        issued["attempt_id"]
+    );
+    assert_eq!(
+        app.study_relevance_reason(&dataset, &attempt).unwrap(),
+        reason
+    );
+    let response = &book.targets[&targets[0]].1.decisions[0].expected.uci;
+    let saved = play_activity(&mut app, &issued, "answer", "ranked-answer", response);
+    assert_eq!(saved["status"], "complete");
+    assert_eq!(
+        study(&mut app, json!({"command":"next"}))["target_id"],
+        targets[2].0
+    );
+
+    let current = store.snapshot().unwrap();
+    let fresh = DatasetId::from("fresh-model-dataset");
+    store
+        .commit(Commit {
+            expected_dataset: dataset.clone(),
+            expected_revision: current.revision,
+            writes: vec![Write::Restore {
+                dataset: fresh.clone(),
+                catalog: current.catalog,
+                learning: current.learning,
+                policy: current.policy,
+            }],
+        })
+        .unwrap();
+    assert!(matches!(
+        publish(
+            &mut store,
+            &dataset,
+            &book,
+            true,
+            &scores([900_000, 600_000, 100_000])
+        ),
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(
+        store
+            .game_relevance(&fresh, REACH_MODEL_KEY)
+            .unwrap()
+            .is_empty()
+    );
+    let status = store.game_model_projection_status(&fresh).unwrap().unwrap();
+    assert_eq!((status.unavailable, status.complete_current), (1, 0));
 }
