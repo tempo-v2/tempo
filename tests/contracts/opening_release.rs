@@ -1325,6 +1325,7 @@ fn repair_context_follows_the_issued_miss_and_preserves_study() {
     let before = app.snapshot().unwrap();
     let context = repair_context(&app, &first);
     assert_eq!(context["played_san"], "Bc4");
+    assert_eq!(context["played_uci"], "f1c4");
     assert_eq!(context["url"], Value::Null);
     let moves = context["line"]["moves"].as_array().unwrap();
     assert_eq!(

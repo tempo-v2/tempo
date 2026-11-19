@@ -1,6 +1,8 @@
 //! Compose today's admissions and durable activity issuance.
 use super::{
-    TacticThemes, Tempo, tactic_capture::PERSONAL_CAPTURE, tactic_preferences::new_tactic_order,
+    TacticThemes, Tempo,
+    tactic_catalog_facts::{capture_review_priority, tactic_pack_candidates},
+    tactic_preferences::new_tactic_order,
 };
 use crate::{
     AppError, Components,
@@ -93,6 +95,7 @@ impl Tempo {
                 .collect(),
             ..DailyEvidence::default()
         };
+
         let mut capture_priority = BTreeMap::new();
         let candidates = snapshot
             .catalog
@@ -114,14 +117,10 @@ impl Tempo {
                     }
                 }
                 if kind == DailyKind::Tactic
-                    && state.last_review_at.is_none()
-                    && let Some(introduced) = state.taught_at
-                    && item
-                        .provenance
-                        .iter()
-                        .any(|value| value == PERSONAL_CAPTURE)
+                    && item.active()
+                    && let Some(introduced_at) = capture_review_priority(item, state)
                 {
-                    capture_priority.insert(item.target.clone(), introduced.unix_ms);
+                    capture_priority.insert(item.target.clone(), introduced_at);
                 }
                 let may_test = state.can_accept_daily_test(at.day);
                 let correction = state
@@ -182,7 +181,7 @@ impl Tempo {
         let hash = blake3::hash(snapshot.dataset.0.as_bytes());
         let seed = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("fixed hash width"));
         let order = new_tactic_order(
-            snapshot,
+            tactic_pack_candidates(snapshot),
             at.day,
             daily.tactic_themes.as_ref(),
             daily.starter_themes,

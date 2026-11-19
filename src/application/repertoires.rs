@@ -98,7 +98,7 @@ impl Tempo {
             return Ok(json!({
                 "schema_version": CONTENT_WIRE_VERSION, "status": "document",
                 "dataset_id": document.dataset, "repertoire_id": repertoire_id,
-                "name": item.label, "learner_color": learner_color(&item),
+                "name": item.label, "learner_color": item.definition.learner_color().map_err(|error| domain("invalid_content", error))?,
                 "revision": document.revision, "document": availability,
             }));
         }
@@ -115,7 +115,7 @@ impl Tempo {
             RepertoireCommand::ReadDocument { .. } | RepertoireCommand::ResetProgress { .. } => {
                 unreachable!("handled without reading the catalog")
             }
-            RepertoireCommand::List => Ok(list(&snapshot.dataset, &snapshot.catalog)),
+            RepertoireCommand::List => list(&snapshot.dataset, &snapshot.catalog),
             RepertoireCommand::Rename {
                 dataset_id,
                 repertoire_id,
@@ -137,7 +137,7 @@ impl Tempo {
                 if catalog != snapshot.catalog {
                     self.commit_catalog(&snapshot, &catalog, vec![], None, None)?;
                 }
-                Ok(list(&snapshot.dataset, &catalog))
+                list(&snapshot.dataset, &catalog)
             }
             RepertoireCommand::Preview(input) => {
                 let id = input.repertoire_id.clone().unwrap_or_else(|| {
@@ -199,7 +199,7 @@ impl Tempo {
                     input.learner_color,
                     model_targets(&plan.catalog, id),
                 );
-                let reply = list(&snapshot.dataset, &plan.catalog);
+                let reply = list(&snapshot.dataset, &plan.catalog)?;
                 let encoded = reply.to_string();
                 let receipt = ContentReceipt {
                     request: &token,
@@ -327,7 +327,7 @@ fn prepare(
     check_dataset(snapshot, &input.dataset_id)?;
     let name = validate_name(&input.name)?;
     if let Some(replacement) = &input.repertoire_id {
-        let metadata = summaries(&snapshot.catalog)
+        let metadata = summaries(&snapshot.catalog)?
             .remove(replacement)
             .ok_or_else(unknown_repertoire)?;
         if id != replacement
@@ -348,38 +348,36 @@ fn prepare(
     Ok((source, incoming, plan))
 }
 
-fn summaries(catalog: &Catalog) -> BTreeMap<String, Summary> {
+fn summaries(catalog: &Catalog) -> Result<BTreeMap<String, Summary>, AppError> {
+    use std::collections::btree_map::Entry;
+
     let mut summaries = BTreeMap::new();
     for item in catalog.items.values() {
         let ContentKind::Repertoire { repertoire, .. } = &item.definition.kind else {
             continue;
         };
-        let summary = summaries
-            .entry(repertoire.clone())
-            .or_insert_with(|| Summary {
+        let summary = match summaries.entry(repertoire.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(Summary {
                 id: repertoire.clone(),
                 name: item.label.clone(),
-                learner_color: learner_color(item),
+                learner_color: item
+                    .definition
+                    .learner_color()
+                    .map_err(|error| domain("invalid_content", error))?,
                 positions: 0,
-            });
+            }),
+        };
         summary.positions += usize::from(item.active());
     }
-    summaries
+    Ok(summaries)
 }
 
-pub(super) fn learner_color(item: &ContentItem) -> LearnerColor {
-    if item.definition.decisions[0].fen.split_whitespace().nth(1) == Some("b") {
-        LearnerColor::Black
-    } else {
-        LearnerColor::White
-    }
-}
-
-fn list(dataset: &DatasetId, catalog: &Catalog) -> Value {
-    json!({
+fn list(dataset: &DatasetId, catalog: &Catalog) -> Result<Value, AppError> {
+    Ok(json!({
         "schema_version": CONTENT_WIRE_VERSION, "status": "repertoires", "dataset_id": dataset,
-        "repertoires": summaries(catalog).into_values().collect::<Vec<_>>(),
-    })
+        "repertoires": summaries(catalog)?.into_values().collect::<Vec<_>>(),
+    }))
 }
 
 fn preview(snapshot: &Snapshot, incoming: &Catalog, plan: &ContentPlan, token: String) -> Value {

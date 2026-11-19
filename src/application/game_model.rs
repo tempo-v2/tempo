@@ -1,5 +1,5 @@
 //! Read verified authored context and the model evidence applied to it.
-use super::{Tempo, content_preview::source_id, repertoires::learner_color};
+use super::{Tempo, content_preview::source_id};
 use crate::game_model::{GapRequest, MODEL_KEY, PROFILE_LABEL, model_input_stamp};
 use crate::{
     AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
@@ -55,7 +55,7 @@ impl Tempo {
                     .as_deref()
                     .zip(doc.item.as_ref())
                     .and_then(|(pgn, item)| {
-                        let color = learner_color(item);
+                        let color = item.definition.learner_color().ok()?;
                         let compiled =
                             compile_repertoire(pgn, &id, &item.label, color, &source_id).ok()?;
                         let targets = model_targets(&snapshot.catalog, &id);
@@ -152,7 +152,10 @@ impl Tempo {
                 "The repertoire changed. Refresh game evidence before editing.",
             ));
         }
-        let color = learner_color(&item);
+        let color = item
+            .definition
+            .learner_color()
+            .map_err(|error| domain("invalid_content", error))?;
         let authored =
             AuthoredRepertoire::parse(&pgn).map_err(|error| domain("invalid_repertoire", error))?;
         let draft = authored

@@ -2,6 +2,7 @@
 use super::{
     Tempo,
     content_preview::{check_dataset, preview_id, read_preview, source_id, stale_preview},
+    tactic_catalog_facts::CaptureOrigin,
 };
 use crate::{
     AppError, app_error::domain, commands::TacticCaptureCommand, views::ErrorView,
@@ -12,7 +13,6 @@ use std::collections::BTreeSet;
 use tempo_chess::{plan_tactic_capture, preview_tactic_pgn};
 use tempo_learning::DailyLearning;
 
-pub(super) const PERSONAL_CAPTURE: &str = "tempo:capture-save";
 use tempo_store::{ContentReceipt, ContentSource, Write};
 
 impl Tempo {
@@ -88,14 +88,7 @@ impl Tempo {
                     if item.active() && !prior.introduced {
                         let state = DailyLearning::introduce_capture(&prior, at)
                             .map_err(|error| domain("learning_error", error))?;
-                        if !item
-                            .provenance
-                            .iter()
-                            .any(|value| value == PERSONAL_CAPTURE)
-                        {
-                            item.provenance.push(PERSONAL_CAPTURE.into());
-                            item.provenance.sort();
-                        }
+                        CaptureOrigin::record_personal_capture(&mut item.provenance);
                         writes.push(Write::Learning { target, state });
                     }
                 }

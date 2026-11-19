@@ -29,6 +29,7 @@ mod study_progress;
 mod submit;
 pub use study_progress::{ProgressStamp, StudyProgress};
 mod tactic_capture;
+mod tactic_catalog_facts;
 mod tactic_preferences;
 mod tactics_collection;
 pub use tactics_collection::{TacticsRead, TacticsReadReply};

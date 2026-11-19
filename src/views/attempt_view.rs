@@ -68,6 +68,8 @@ pub struct AttemptFeedback {
     pub result: ChessFeedback,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correction_uci: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correction_san: Option<String>,
 }
 
 #[cfg(test)]
@@ -76,6 +78,29 @@ mod tests {
         Tempo,
         wire::{StudyCommand, StudyView},
     };
+
+    #[test]
+    fn only_the_miss_discloses_the_chess_projected_correction_label() {
+        use crate::SubmitCommand;
+
+        let mut app = Tempo::demo().unwrap();
+        let StudyView::Attempt(issued) = app.handle(StudyCommand::Next) else {
+            panic!("ready exercise");
+        };
+        assert!(issued.feedback.is_none());
+        let miss = app.handle(StudyCommand::Answer(SubmitCommand {
+            dataset_id: issued.dataset_id,
+            attempt_id: issued.attempt_id,
+            expected_revision: issued.revision,
+            submission_id: "show-san".into(),
+            answer: "e2e3".into(),
+        }));
+        let json = serde_json::to_value(&miss).unwrap();
+        assert_eq!(json["feedback"]["correction_san"], "e4");
+        let legacy = serde_json::to_value(miss.without_move_details()).unwrap();
+        assert_eq!(legacy["feedback"]["correction_uci"], "e2e4");
+        assert!(legacy["feedback"].get("correction_san").is_none());
+    }
 
     #[test]
     fn the_ui_gets_prompt_and_identity_but_no_private_answer_or_learning_state() {
