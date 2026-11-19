@@ -1,53 +1,80 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id, repertoires::learner_color};
-use crate::game_model::{GapRequest, MODEL_KEY, ModelBook, ModelInput, PROFILE_LABEL};
+use crate::game_model::{GapRequest, MODEL_KEY, PROFILE_LABEL, model_input_stamp};
 use crate::{AppError, app_error::domain, gap_analysis::GapAnalysisInput};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use tempo_chess::{AuthoredRepertoire, ContentKind, GapDraft, PositionKey};
-use tempo_types::{DatasetId, Revision};
+use tempo_chess::{AuthoredRepertoire, ContentKind, GapDraft, PositionKey, compile_repertoire};
+use tempo_store::{ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets};
+use tempo_types::Revision;
 
 impl Tempo {
-    pub(crate) fn model_input(&self, dataset: &DatasetId) -> Result<ModelInput, AppError> {
-        let (snapshot, revision) = self.store.content_state()?;
-        if &snapshot.dataset != dataset {
-            return Err(AppError::new(
-                "stale_dataset",
-                "The active dataset changed.",
-            ));
-        }
-        let mut targets = BTreeMap::<String, BTreeMap<PositionKey, _>>::new();
-        for item in snapshot.catalog.items.values().filter(|item| item.active()) {
-            if let ContentKind::Repertoire {
-                repertoire,
-                position,
-            } = &item.definition.kind
-            {
-                targets
-                    .entry(repertoire.clone())
-                    .or_default()
-                    .insert(position.clone(), item.target.clone());
+    pub(crate) fn model_projection_status(&self) -> Result<Option<ProjectionStatus>, AppError> {
+        Ok(self
+            .store
+            .game_model_projection_status(&self.game_dataset()?)?)
+    }
+
+    /// Verify legacy source associations once against accepted content before cache reprojection.
+    pub fn bootstrap_model_inputs(&mut self) -> Result<(), AppError> {
+        for _ in 0..4 {
+            let dataset = self.game_dataset()?;
+            let pending = self.store.model_bootstrap_repertoires(&dataset)?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let (snapshot, revision) = self.store.content_state()?;
+            if snapshot.dataset != dataset {
+                continue;
+            }
+            for id in pending {
+                let doc = self.store.repertoire_document(&id)?;
+                if doc.dataset != dataset || doc.revision != revision {
+                    break;
+                }
+                let (Some(source_id), ModelAuthority::NeedsBootstrap) =
+                    (doc.source_id, doc.model_authority)
+                else {
+                    continue;
+                };
+                let stamp = doc
+                    .pgn
+                    .as_deref()
+                    .zip(doc.item.as_ref())
+                    .and_then(|(pgn, item)| {
+                        let color = learner_color(item);
+                        let compiled =
+                            compile_repertoire(pgn, &id, &item.label, color, &source_id).ok()?;
+                        let targets = model_targets(&snapshot.catalog, &id);
+                        let compiled_targets = model_targets(&compiled, &id);
+                        if model_lines(&compiled, &id) != model_lines(&snapshot.catalog, &id)
+                            || !compiled_targets
+                                .iter()
+                                .map(|(id, (_, definition))| (id, definition))
+                                .eq(targets.iter().map(|(id, (_, definition))| (id, definition)))
+                        {
+                            return None;
+                        }
+                        let authored = AuthoredRepertoire::parse(pgn).ok()?;
+                        Some(model_input_stamp(&authored, color, targets))
+                    });
+                match self.store.finish_model_bootstrap(
+                    &dataset,
+                    revision,
+                    &id,
+                    &source_id,
+                    stamp.as_ref(),
+                ) {
+                    Ok(()) => {}
+                    Err(StoreError::Conflict(_)) => break,
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
-        let mut books = Vec::new();
-        for (id, targets) in targets {
-            let doc = self.store.repertoire_document(&id)?;
-            if doc.dataset != snapshot.dataset || doc.revision != revision {
-                return Err(AppError::new("stale_repertoire", "The repertoire changed."));
-            }
-            if let (Some(pgn), Some(item)) = (doc.pgn, doc.item) {
-                books.push(ModelBook {
-                    pgn,
-                    color: learner_color(&item),
-                    targets,
-                });
-            }
-        }
-        Ok(ModelInput {
-            dataset: snapshot.dataset,
-            revision,
-            books,
-        })
+        Err(AppError::new(
+            "stale_repertoire",
+            "The repertoire changed during model source verification.",
+        ))
     }
 
     pub fn opponent_gaps(&mut self, offset: usize) -> Result<Value, AppError> {

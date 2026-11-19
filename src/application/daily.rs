@@ -77,7 +77,7 @@ impl Tempo {
         let mut evidence = DailyEvidence {
             relevance: self
                 .store
-                .game_relevance(&snapshot.dataset, crate::game_model::MODEL_KEY)?
+                .game_relevance(&snapshot.dataset, tempo_store::REACH_MODEL_KEY)?
                 .into_iter()
                 .map(|(target, fact)| {
                     (

@@ -110,6 +110,7 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
         return Err("place the study database outside the public UI build".into());
     }
     let mut app = open(database)?;
+    app.bootstrap_model_inputs()?;
     app.reconcile_legacy_game_requests()?;
     let encounters = app.reconcile_choice_encounters()?;
     eprintln!(

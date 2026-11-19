@@ -5,17 +5,20 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
-        mpsc::{Receiver, sync_channel},
+        mpsc::{Receiver, SyncSender, sync_channel},
     },
     time::Duration,
 };
-use tempo_chess::{AuthoredRepertoire, LearnerColor, PositionKey, legal_model_moves};
-use tempo_store::{SqliteStore, Store};
-use tempo_types::{DatasetId, Revision, TargetId};
+use tempo_chess::{AuthoredRepertoire, ContentKind, LearnerColor, PositionKey, legal_model_moves};
+use tempo_store::{
+    BookProjection, ModelInputStamp, ModelTargets, ProjectionBook, ProjectionScope,
+    REACH_MODEL_KEY, SqliteStore, Store, StoreError,
+};
+use tempo_types::{DatasetId, TargetId};
 
 pub(crate) const MODEL_KEY: &str = "maia2-0.11.0:65aae8465eed5e65df66a24ea7370715579f9e5435098d06fe18bdb1e267e997:rapid:1500:1500:cpu";
 pub(crate) const PROFILE_LABEL: &str = "Maia Rapid 1500";
@@ -38,16 +41,39 @@ pub struct GapRequest {
     pub response: Option<String>,
 }
 
-pub(crate) struct ModelInput {
-    pub dataset: DatasetId,
-    pub revision: Revision,
-    pub books: Vec<ModelBook>,
+struct ModelBook {
+    color: LearnerColor,
+    targets: BTreeMap<PositionKey, TargetId>,
 }
 
-pub(crate) struct ModelBook {
-    pub pgn: String,
-    pub color: LearnerColor,
-    pub targets: BTreeMap<PositionKey, TargetId>,
+pub(crate) fn model_input_stamp(
+    authored: &AuthoredRepertoire,
+    color: LearnerColor,
+    targets: ModelTargets,
+) -> ModelInputStamp {
+    let routes: BTreeSet<Vec<_>> = authored
+        .routes
+        .iter()
+        .map(|path| {
+            path.iter()
+                .map(|(before, played)| {
+                    (before, played, &authored.positions[before].replies[played])
+                })
+                .collect()
+        })
+        .collect();
+    let input = serde_json::to_vec(&(
+        "tempo-model-input-v1",
+        REACH_MODEL_KEY,
+        color,
+        routes,
+        &targets,
+    ))
+    .expect("serializable repertoire model input");
+    ModelInputStamp {
+        key: blake3::hash(&input).to_hex().to_string(),
+        targets,
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -74,59 +100,197 @@ impl Default for Status {
     }
 }
 
+/// One publisher for cache-only projections and explicitly requested inference.
 pub struct GameModel {
-    database: PathBuf,
-    status: Arc<Mutex<Status>>,
+    wake: SyncSender<()>,
+    jobs: Arc<Mutex<ModelJobs>>,
+}
+
+#[derive(Default)]
+struct ModelJobs {
+    explicit: Option<DatasetId>,
+    cached: Option<DatasetId>,
+    active_explicit: Option<DatasetId>,
+    status: Status,
+}
+
+impl ModelJobs {
+    fn next(&mut self) -> Option<(DatasetId, ProjectionScope)> {
+        if let Some(dataset) = self.explicit.take() {
+            self.active_explicit = Some(dataset.clone());
+            return Some((dataset, ProjectionScope::AllVerified));
+        }
+        self.cached
+            .take()
+            .map(|dataset| (dataset, ProjectionScope::Pending))
+    }
 }
 
 impl GameModel {
-    pub fn new(database: &Path) -> Self {
-        Self {
-            database: database.to_path_buf(),
-            status: Arc::new(Mutex::new(Status::default())),
-        }
+    pub fn new(database: &Path) -> Result<Self, AppError> {
+        let (wake, queued) = sync_channel(1);
+        let jobs = Arc::new(Mutex::new(ModelJobs::default()));
+        let worker_jobs = Arc::clone(&jobs);
+        let database = database.to_path_buf();
+        std::thread::Builder::new()
+            .name("tempo-maia".into())
+            .spawn(move || {
+                model_worker(&database, queued, &worker_jobs);
+            })
+            .map_err(|error| domain("model_unavailable", error))?;
+        Ok(Self { wake, jobs })
     }
 
-    pub fn status(&self) -> Value {
-        json!(*self.status.lock().expect("model status"))
+    pub fn status(&self, app: &Tempo) -> Result<Value, AppError> {
+        let mut status = json!(self.jobs.lock().expect("model jobs").status);
+        if let Some(projection) = app.model_projection_status()? {
+            status["projection"] = json!(projection);
+        }
+        Ok(status)
     }
 
     pub fn start(&self, app: &Tempo, request: ModelRequest) -> Result<Value, AppError> {
-        if self.status.lock().expect("model status").status == "running" {
-            return Ok(self.status());
+        if app.game_dataset()? != request.dataset_id {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
         }
-        let input = app.model_input(&request.dataset_id)?;
-        let directory = self
-            .database
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("maia");
-        let status = Arc::clone(&self.status);
-        let database = self.database.clone();
-        *status.lock().expect("model status") = Status {
-            status: "running",
-            ..Status::default()
-        };
-        if let Err(error) = std::thread::Builder::new()
-            .name("tempo-maia".into())
-            .spawn(move || {
-                if let Err(error) = run(&database, &directory, input, &status) {
-                    let mut view = status.lock().expect("model status");
-                    view.status = "incomplete";
-                    view.error = Some(error.to_string());
-                }
-            })
         {
-            *self.status.lock().expect("model status") = Status::default();
-            return Err(domain("model_unavailable", error));
+            let mut jobs = self.jobs.lock().expect("model jobs");
+            if jobs.active_explicit.as_ref() != Some(&request.dataset_id)
+                && jobs.explicit.as_ref() != Some(&request.dataset_id)
+            {
+                jobs.status = Status {
+                    status: "running",
+                    ..Status::default()
+                };
+                jobs.explicit = Some(request.dataset_id);
+                self.wake_worker()?;
+            }
         }
-        Ok(self.status())
+        self.status(app)
+    }
+
+    pub fn project_cached(&self, dataset: DatasetId) -> Result<(), AppError> {
+        self.jobs.lock().expect("model jobs").cached = Some(dataset);
+        self.wake_worker()
+    }
+
+    fn wake_worker(&self) -> Result<(), AppError> {
+        match self.wake.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(error) => Err(domain("model_unavailable", error)),
+        }
+    }
+}
+
+fn model_worker(database: &Path, queued: Receiver<()>, jobs: &Mutex<ModelJobs>) {
+    let directory = database.parent().unwrap_or(Path::new(".")).join("maia");
+    while queued.recv().is_ok() {
+        loop {
+            let next = jobs.lock().expect("model jobs").next();
+            let Some((dataset, scope)) = next else { break };
+            let explicit = scope == ProjectionScope::AllVerified;
+            let outcome = run(database, &directory, &dataset, scope, |completed, total| {
+                if explicit {
+                    let mut state = jobs.lock().expect("model jobs");
+                    if state.explicit.is_none() {
+                        state.status.completed = completed;
+                        state.status.total = total;
+                    }
+                }
+            });
+            if explicit {
+                let mut state = jobs.lock().expect("model jobs");
+                state.active_explicit = None;
+                if state.explicit.is_none() {
+                    let (projected, error) = outcome.unwrap_or_else(|error| (0, Some(error)));
+                    state.status.projected = projected;
+                    state.status.status = if error.is_some() {
+                        "incomplete"
+                    } else {
+                        "complete"
+                    };
+                    state.status.error = error.map(|error| error.message);
+                }
+            } else {
+                match outcome {
+                    Ok((_, Some(error))) | Err(error) => {
+                        eprintln!("Tempo cached model projection: {error}")
+                    }
+                    Ok((_, None)) => {}
+                }
+            }
+        }
     }
 }
 
 struct PreparedBook {
+    repertoire_id: String,
+    input_key: String,
     book: ModelBook,
     tree: Prefix,
+    jobs: BTreeSet<PositionKey>,
+}
+
+impl PreparedBook {
+    fn new(source: ProjectionBook) -> Result<Self, AppError> {
+        let authored = AuthoredRepertoire::parse(&source.pgn)
+            .map_err(|error| domain("invalid_repertoire", error))?;
+        let mut targets = BTreeMap::new();
+        let mut color = None;
+        for (target, (_, definition)) in &source.targets {
+            let ContentKind::Repertoire { position, .. } = &definition.kind else {
+                return Err(AppError::new(
+                    "invalid_repertoire",
+                    "Modeled targets must belong to a repertoire.",
+                ));
+            };
+            let Some(node) = authored.positions.get(position) else {
+                return Err(AppError::new(
+                    "invalid_repertoire",
+                    "An active target is absent from its model document.",
+                ));
+            };
+            if color
+                .replace(node.side)
+                .is_some_and(|side| side != node.side)
+            {
+                return Err(AppError::new(
+                    "invalid_repertoire",
+                    "A model book has more than one learner side.",
+                ));
+            }
+            targets.insert(position.clone(), target.clone());
+        }
+        if let Some(color) = color
+            && model_input_stamp(&authored, color, source.targets).key != source.input_key
+        {
+            return Err(AppError::new(
+                "stale_repertoire",
+                "The verified model input no longer matches its document.",
+            ));
+        }
+        let jobs = authored
+            .positions
+            .iter()
+            .filter(|(_, node)| {
+                !node.replies.is_empty() && color.is_some_and(|side| node.side != side)
+            })
+            .map(|(position, _)| position.clone())
+            .collect();
+        Ok(Self {
+            repertoire_id: source.repertoire_id,
+            input_key: source.input_key,
+            book: ModelBook {
+                color: color.unwrap_or(LearnerColor::White),
+                targets,
+            },
+            tree: Prefix::from_book(authored),
+            jobs,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -190,34 +354,33 @@ impl Prefix {
 fn run(
     database: &Path,
     directory: &Path,
-    input: ModelInput,
-    status: &Mutex<Status>,
-) -> Result<(), AppError> {
+    dataset: &DatasetId,
+    scope: ProjectionScope,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<(usize, Option<AppError>), AppError> {
     let mut store = SqliteStore::open(database)?;
-    let mut jobs = BTreeSet::new();
-    let mut books = Vec::new();
-    for book in input.books {
-        let authored = AuthoredRepertoire::parse(&book.pgn)
-            .map_err(|error| domain("invalid_repertoire", error))?;
-        jobs.extend(
-            authored
-                .positions
-                .iter()
-                .filter(|(_, node)| !node.replies.is_empty() && node.side != book.color)
-                .map(|(position, _)| position.clone()),
-        );
-        books.push(PreparedBook {
-            book,
-            tree: Prefix::from_book(authored),
-        });
-    }
-    status.lock().expect("model status").total = jobs.len();
-    if books.is_empty() {
+    let input = store.projection_books(dataset, scope)?;
+    if input.is_empty() && scope == ProjectionScope::AllVerified {
         return Err(AppError::new(
             "model_unavailable",
             "No verified repertoire documents are available.",
         ));
     }
+    let mut books = Vec::new();
+    let mut error = None;
+    for source in input {
+        match PreparedBook::new(source) {
+            Ok(book) => books.push(book),
+            Err(invalid) => {
+                error.get_or_insert(invalid);
+            }
+        }
+    }
+    let jobs: BTreeSet<_> = books
+        .iter()
+        .flat_map(|book| book.jobs.iter().cloned())
+        .collect();
+    let total = jobs.len();
     let mut cache = BTreeMap::new();
     let mut missing = Vec::new();
     for position in jobs {
@@ -227,41 +390,72 @@ fn run(
             missing.push(position);
         }
     }
-    status.lock().expect("model status").completed = cache.len();
-    let result = if missing.is_empty() {
-        Ok(())
-    } else {
-        (|| {
+    progress(cache.len(), total);
+    if scope == ProjectionScope::AllVerified && !missing.is_empty() {
+        let result = (|| {
             let mut maia = Maia::start(directory)?;
             for position in missing {
                 let distribution = maia.infer(&position)?;
                 store.save_game_move_distribution(MODEL_KEY, &position.0, &distribution)?;
                 cache.insert(position, distribution);
-                status.lock().expect("model status").completed = cache.len();
+                progress(cache.len(), total);
             }
-            Ok(())
-        })()
-    };
-    let mut reach = BTreeMap::new();
-    for PreparedBook { book, tree } in books {
-        tree.project(&book, Some(1.0), &cache, &mut BTreeSet::new(), &mut reach);
+            Ok::<_, AppError>(())
+        })();
+        if let Err(incomplete) = result {
+            error.get_or_insert(incomplete);
+        }
     }
-    let reach: BTreeMap<_, _> = reach
-        .into_iter()
-        .filter_map(|(target, reach)| {
-            reach.map(|mass| (target, (mass.clamp(0.0, 1.0) * 1_000_000.0).round() as u32))
-        })
-        .collect();
-    store.replace_game_model_reach(&input.dataset, MODEL_KEY, input.revision, &reach)?;
-    let mut view = status.lock().expect("model status");
-    view.projected = reach.len();
-    view.status = if result.is_ok() {
-        "complete"
-    } else {
-        "incomplete"
-    };
-    view.error = result.err().map(|error: AppError| error.message);
-    Ok(())
+    let mut projected = 0;
+    for input in books {
+        let mut reach = BTreeMap::new();
+        input.tree.project(
+            &input.book,
+            Some(1.0),
+            &cache,
+            &mut BTreeSet::new(),
+            &mut reach,
+        );
+        let complete = input
+            .jobs
+            .iter()
+            .all(|position| cache.contains_key(position));
+        let reach: BTreeMap<_, _> = input
+            .book
+            .targets
+            .values()
+            .filter_map(|target| {
+                let mass = match reach.get(target) {
+                    Some(mass) => *mass,
+                    None => complete.then_some(0.0),
+                }?;
+                Some((
+                    target.clone(),
+                    (mass.clamp(0.0, 1.0) * 1_000_000.0).round() as u32,
+                ))
+            })
+            .collect();
+        let publication = store.replace_game_model_reach(
+            dataset,
+            BookProjection {
+                repertoire_id: &input.repertoire_id,
+                input_key: &input.input_key,
+                model: REACH_MODEL_KEY,
+                complete,
+                reach: &reach,
+            },
+        );
+        match publication {
+            Ok(()) => projected += reach.len(),
+            Err(StoreError::Conflict(message)) => {
+                error.get_or_insert(AppError::new("stale_repertoire", message));
+            }
+            Err(failed) => {
+                error.get_or_insert(failed.into());
+            }
+        }
+    }
+    Ok((projected, error))
 }
 
 struct Maia {
@@ -346,6 +540,134 @@ mod tests {
     use super::*;
     use tempo_chess::{ContentKind, compile_repertoire};
 
+    fn full_distribution(position: &PositionKey, known: &[(&str, f64)]) -> Distribution {
+        let moves = legal_model_moves(position).unwrap();
+        let other = (1.0 - known.iter().map(|(_, mass)| mass).sum::<f64>())
+            / (moves.len() - known.len()) as f64;
+        moves
+            .into_iter()
+            .map(|played| {
+                let mass = known
+                    .iter()
+                    .find(|(candidate, _)| *candidate == played)
+                    .map_or(other, |(_, mass)| *mass);
+                (played, mass)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cache_only_projection_publishes_partial_and_terminal_reach_without_python() {
+        use crate::{Components, IntroductionLimits};
+        use tempo_chess::Catalog;
+        use tempo_learning::{DailyLearning, LearningPolicy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projection.sqlite");
+        let dataset = DatasetId::from("model-proof");
+        let pgn = "1. Nf3 Nf6 (1... g6 2. g3 Nf6) 2. g3 g6 3. Bg2 *";
+        let learning = DailyLearning::default();
+        let store = SqliteStore::create(
+            &path,
+            dataset.clone(),
+            Catalog::default(),
+            learning.settings(),
+        )
+        .unwrap();
+        let mut components = Components::fixtures();
+        components.learning = Box::new(learning);
+        let mut app = Tempo::daily(
+            Box::new(store),
+            components,
+            IntroductionLimits::default(),
+            [42; 32],
+            0,
+        )
+        .unwrap();
+        let mut command = json!({
+            "command":"preview", "dataset_id":dataset, "pgn":pgn, "name":"Terminal", "learner_color":"white"
+        });
+        let preview = app.handle_repertoire(serde_json::from_value(command.clone()).unwrap());
+        assert_eq!(preview["status"], "preview", "{preview}");
+        command["command"] = json!("save");
+        command["token"] = preview["token"].clone();
+        let saved = app.handle_repertoire(serde_json::from_value(command).unwrap());
+        assert_eq!(saved["status"], "repertoires", "{saved}");
+
+        let authored = AuthoredRepertoire::parse(pgn).unwrap();
+        let paths = &authored.routes;
+        let endpoint = &paths[0][4].0;
+        let mut store = SqliteStore::open(&path).unwrap();
+        let target = app.snapshot().unwrap().catalog.items.into_values().find(|item| {
+            matches!(&item.definition.kind, ContentKind::Repertoire { position, .. } if position == endpoint)
+        }).unwrap().target;
+        for (position, probabilities) in [
+            (&paths[0][1].0, &[("g8f6", 0.4), ("g7g6", 0.3)][..]),
+            (&paths[0][3].0, &[("g7g6", 0.5)][..]),
+        ] {
+            store
+                .save_game_move_distribution(
+                    MODEL_KEY,
+                    &position.0,
+                    &full_distribution(position, probabilities),
+                )
+                .unwrap();
+        }
+        let no_python = dir.path().join("missing-maia");
+        run(
+            &path,
+            &no_python,
+            &dataset,
+            ProjectionScope::Pending,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .game_model_projection_status(&dataset)
+                .unwrap()
+                .unwrap()
+                .partial_current,
+            1
+        );
+        assert!(
+            !store
+                .game_relevance(&dataset, REACH_MODEL_KEY)
+                .unwrap()
+                .contains_key(&target)
+        );
+
+        let alternate = &paths[1][3].0;
+        store
+            .save_game_move_distribution(
+                MODEL_KEY,
+                &alternate.0,
+                &full_distribution(alternate, &[("g8f6", 0.6)]),
+            )
+            .unwrap();
+        let (_, error) = run(
+            &path,
+            &no_python,
+            &dataset,
+            ProjectionScope::AllVerified,
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(
+            store
+                .game_model_projection_status(&dataset)
+                .unwrap()
+                .unwrap()
+                .complete_current,
+            1
+        );
+        assert_eq!(
+            store.game_relevance(&dataset, REACH_MODEL_KEY).unwrap()[&target].modeled_millionths,
+            Some(380_000)
+        );
+    }
+
     #[test]
     fn modeled_reach_counts_first_arrival_and_keeps_missing_paths_unknown() {
         let pgn = "1. Nf3 Nf6 (1... g6 2. g3 Nf6) 2. g3 g6 3. Bg2 *";
@@ -376,11 +698,7 @@ mod tests {
         assert_eq!(targets.get(endpoint), Some(&target));
         assert!(authored.positions[endpoint].replies.contains_key("f1g2"));
         let root = Prefix::from_book(authored);
-        let book = ModelBook {
-            pgn: pgn.into(),
-            color,
-            targets,
-        };
+        let book = ModelBook { color, targets };
         let branch = paths[0][1].0.clone();
         let mut cache = BTreeMap::from([(
             branch,
@@ -401,10 +719,9 @@ mod tests {
         root.project(&book, Some(1.0), &cache, &mut BTreeSet::new(), &mut reach);
         assert!((reach[&target].unwrap() - (0.4 * 0.5 + 0.3 * 0.6)).abs() < 1e-12);
 
-        let continued = AuthoredRepertoire::parse(
-            "1. Nf3 Nf6 (1... g6 2. g3 Nf6 3. Bg2) 2. g3 g6 3. Bg2 *",
-        )
-        .unwrap();
+        let continued =
+            AuthoredRepertoire::parse("1. Nf3 Nf6 (1... g6 2. g3 Nf6 3. Bg2) 2. g3 g6 3. Bg2 *")
+                .unwrap();
         let mut continued_reach = BTreeMap::new();
         Prefix::from_book(continued).project(
             &book,
