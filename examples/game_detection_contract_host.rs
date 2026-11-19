@@ -11,13 +11,19 @@ use tempo_chess::{
 
 struct Fixture {
     scenario: String,
+    alternate: bool,
 }
 
 impl GameDetector for Fixture {
     fn descriptor(&self) -> DetectorDescriptor {
         DetectorDescriptor {
-            id: "contract-fixture".into(),
-            revision: "1".into(),
+            id: if self.alternate {
+                "contract-alternate"
+            } else {
+                "contract-fixture"
+            }
+            .into(),
+            revision: if self.alternate { "2" } else { "1" }.into(),
             configuration_fingerprint: self.scenario.clone(),
             label: "External contract fixture".into(),
         }
@@ -36,12 +42,19 @@ impl GameDetector for Fixture {
                 "start_fen": timeline.first().map(|board| board.fen()),
             })
         );
+        if self.scenario == "delayed"
+            && timeline
+                .first()
+                .is_some_and(|board| board.fen().ends_with(" 12"))
+        {
+            std::thread::sleep(Duration::from_millis(1200));
+        }
         match self.scenario.as_str() {
             "empty" => DetectionOutcome::Complete(Vec::new()),
             "unsupported" => DetectionOutcome::Unsupported,
             "failed" => DetectionOutcome::Failed("fixture failure".into()),
             "slow" => {
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(1000));
                 DetectionOutcome::Complete(Vec::new())
             }
             _ => {
@@ -75,7 +88,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut registry = DetectorRegistry::default();
     registry.register(Fixture {
         scenario: scenario.clone(),
+        alternate: false,
     })?;
+    if scenario == "delayed" {
+        registry.register(Fixture {
+            scenario: "alternate".into(),
+            alternate: true,
+        })?;
+    }
     let options = if scenario == "slow" {
         AnalysisOptions {
             deadline: Duration::from_millis(40),

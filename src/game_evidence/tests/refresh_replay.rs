@@ -1,6 +1,6 @@
 use super::super::*;
 use crate::{
-    Components, FixedClock, IntroductionLimits, JsonSnapshotCodec, adapters::public_games::Game,
+    DailyComponents, FixedClock, IntroductionLimits, JsonSnapshotCodec, adapters::public_games::Game,
 };
 use std::path::{Path, PathBuf};
 use tempo_chess::Catalog;
@@ -13,13 +13,13 @@ const NOW: u64 = 20_000 * 86_400_000;
 fn app(store: SqliteStore) -> Tempo {
     Tempo::daily(
         Box::new(store),
-        Components {
+        DailyComponents {
             clock: Box::new(FixedClock(StudyTime {
                 day: StudyDay(20_000),
                 unix_ms: NOW,
             })),
             learning: Box::new(DailyLearning::default()),
-            ..Components::fixtures()
+            ..DailyComponents::fixtures()
         },
         IntroductionLimits::default(),
         [42; 32],

@@ -5,7 +5,7 @@ use super::{
     tactic_preferences::new_tactic_order,
 };
 use crate::{
-    AppError, Components,
+    AppError, DailyComponents,
     app_error::domain,
     views::{EmptyView, StudyView},
     wire::STUDY_WIRE_VERSION,
@@ -53,12 +53,12 @@ impl Tempo {
     /// Assemble the local release with daily activities and introduction limits.
     pub fn daily(
         store: Box<dyn Store>,
-        components: Components,
+        components: DailyComponents,
         limits: IntroductionLimits,
         preview_key: [u8; 32],
         more_tactics: usize,
     ) -> Result<Self, AppError> {
-        let mut app = Self::new(store, components)?;
+        let mut app = Self::assemble(store, components, None)?;
         app.daily = Some(DailyStudy {
             limits,
             tactic_themes: None,

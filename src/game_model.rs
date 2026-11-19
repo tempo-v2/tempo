@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn cache_only_projection_publishes_partial_and_terminal_reach_without_python() {
-        use crate::{Components, IntroductionLimits};
+        use crate::{DailyComponents, IntroductionLimits};
         use tempo_chess::Catalog;
         use tempo_learning::{DailyLearning, LearningPolicy};
 
@@ -628,7 +628,7 @@ mod tests {
             learning.settings(),
         )
         .unwrap();
-        let mut components = Components::fixtures();
+        let mut components = DailyComponents::fixtures();
         components.learning = Box::new(learning);
         let mut app = Tempo::daily(
             Box::new(store),

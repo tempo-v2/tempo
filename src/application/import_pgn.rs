@@ -17,15 +17,14 @@ impl Tempo {
         dataset: &DatasetId,
         request: &ImportRequest,
     ) -> Result<Vec<tempo_chess::ContentChange>, AppError> {
-        if self.daily.is_some() {
-            return Err(AppError::new(
-                "unsupported",
+        let fixture = self.fixture.as_ref().ok_or_else(|| {
+            AppError::new(
+                "unsupported_capability",
                 "Use Repertoires to preview and save repertoire PGN.",
-            ));
-        }
+            )
+        })?;
         let snapshot = self.import_snapshot(dataset)?;
-        let parsed = self
-            .components
+        let parsed = fixture
             .parser
             .parse(request)
             .map_err(|e| domain("content_parse_error", e))?;

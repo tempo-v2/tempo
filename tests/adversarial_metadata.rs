@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicI32, Ordering},
     },
 };
-use tempo::{Clock, Components, CounterIds, IntroductionLimits, Tempo, wire::StudyCommand};
+use tempo::{Clock, DailyComponents, CounterIds, IntroductionLimits, Tempo, wire::StudyCommand};
 use tempo_chess::{
     Catalog, LearnerColor, LegalSequenceGrader, compile_repertoire, plan_repertoire_replacement,
 };
@@ -48,12 +48,12 @@ fn open(path: &Path, day: Day, limits: IntroductionLimits, generation: u8) -> Te
         )
         .unwrap()
     };
-    let components = Components {
+    let components = DailyComponents {
         clock: Box::new(TestClock(day)),
         grader: Box::new(LegalSequenceGrader),
         ids: Box::new(CounterIds(u64::from(generation) * 1_000)),
         learning: Box::new(learning),
-        ..Components::fixtures()
+        ..DailyComponents::fixtures()
     };
     Tempo::daily(Box::new(store), components, limits, [42; 32], 10).unwrap()
 }

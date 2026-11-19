@@ -29,7 +29,7 @@ pub use application::{
     Tempo, tactic_themes,
 };
 pub use commands::{AbandonCommand, AgainCommand, SubmitCommand};
-pub use components::Components;
+pub use components::{Components, DailyComponents};
 pub use game::Game;
 pub use game_range::GameRange;
 pub use portable_snapshot::PortableSnapshot;

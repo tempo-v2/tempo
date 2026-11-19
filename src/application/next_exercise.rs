@@ -37,7 +37,7 @@ impl Tempo {
         let mut source = QueueSource {
             catalog,
             learning,
-            queue: self.components.queue.as_ref(),
+            queue: self.fixture.as_ref().expect("fixture app").queue.as_ref(),
             today: at.day,
             context,
             remaining: self.remaining_block.clone(),

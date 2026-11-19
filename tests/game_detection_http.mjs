@@ -111,6 +111,13 @@ test('external fixture scans an accepted Black-start game through the daily host
             })).body.code, 'expired');
             const admitted = await request(host, 'games/detection', intent);
             assert.equal(admitted.status, 202, JSON.stringify(admitted.body));
+            if (scenario === 'slow') {
+                const study = await request(host, 'study-progress', null);
+                assert.equal(study.status, 200);
+                assert.notEqual(study.body.code, 'unsupported');
+                const busy = await request(host, 'games/detection', { ...intent, request_id: 'during-A' });
+                assert.equal(busy.body.code, 'busy');
+            }
             const terminal = await finish(intent);
             assert.equal(terminal.status, 200);
             assert.equal(terminal.body.status, status, JSON.stringify(terminal.body));

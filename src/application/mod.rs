@@ -22,8 +22,8 @@ mod optional_tactics;
 mod queue_source;
 mod receipts;
 mod repertoires;
-mod study_game_context;
 mod study_analysis_context;
+mod study_game_context;
 
 mod restore;
 mod resume;
@@ -41,7 +41,9 @@ mod teach;
 pub use daily::IntroductionLimits;
 pub use tactic_preferences::{TacticThemes, tactic_themes};
 
-use crate::{AppError, Components, app_error::domain};
+use crate::{
+    AppError, Components, DailyComponents, app_error::domain, components::FixtureOperations,
+};
 use tempo_queue::OrderEvent;
 use tempo_store::{Commit, MemoryStore, Snapshot, Store, StudyScope, StudyState, Write};
 use tempo_types::TargetId;
@@ -63,7 +65,8 @@ use tempo_types::TargetId;
 /// ```
 pub struct Tempo {
     store: Box<dyn Store>,
-    components: Components,
+    components: DailyComponents,
+    fixture: Option<FixtureOperations>,
     remaining_block: Vec<TargetId>,
     order_history: Vec<OrderEvent>,
     daily: Option<daily::DailyStudy>,
@@ -72,6 +75,15 @@ pub struct Tempo {
 impl Tempo {
     /// Assemble the application after checking stored policy and learning compatibility.
     pub fn new(store: Box<dyn Store>, components: Components) -> Result<Self, AppError> {
+        let (common, fixture) = components.split();
+        Self::assemble(store, common, Some(fixture))
+    }
+
+    fn assemble(
+        store: Box<dyn Store>,
+        components: DailyComponents,
+        fixture: Option<FixtureOperations>,
+    ) -> Result<Self, AppError> {
         let snapshot = store.study_state(StudyScope {
             catalog: true,
             ..StudyScope::default()
@@ -92,6 +104,7 @@ impl Tempo {
         Ok(Self {
             store,
             components,
+            fixture,
             remaining_block: vec![],
             order_history: vec![],
             daily: None,
