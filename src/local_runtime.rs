@@ -12,11 +12,12 @@ use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tempo::{AttemptIds, Clock, Components, IntroductionLimits, TacticThemes, Tempo};
+use crate::{AttemptIds, Clock, Components, IntroductionLimits, TacticThemes, Tempo};
 use tempo_chess::{
     Catalog, ChessError, ContentParser, Deviation, GameComparator, ImportRequest,
     LegalSequenceGrader,
 };
+use crate::game_detection::{AnalysisOptions, DetectorRegistry, GameDetection};
 use tempo_learning::DailyLearning;
 use tempo_queue::StableQueue;
 use tempo_store::SqliteStore;
@@ -106,6 +107,17 @@ pub fn backfill_personal_tactics(path: &Path, apply: bool) -> LocalResult<()> {
 }
 
 pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
+    serve_with_detectors(database, ui, port, DetectorRegistry::default(), AnalysisOptions::default())
+}
+
+/// Serve the real daily app with an explicitly composed detector registry.
+pub fn serve_with_detectors(
+    database: &Path,
+    ui: &Path,
+    port: u16,
+    detectors: DetectorRegistry,
+    analysis_options: AnalysisOptions,
+) -> LocalResult<()> {
     if fs::canonicalize(database)?.starts_with(fs::canonicalize(ui)?) {
         return Err("place the study database outside the public UI build".into());
     }
@@ -117,7 +129,14 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
         "Choice encounters examined={}, repaired={}, unresolved={}",
         encounters.examined, encounters.repaired, encounters.unresolved
     );
-    http::serve(&mut app, &SqliteStore::open(database)?, database, ui, port)
+    http::serve(
+        &mut app,
+        &SqliteStore::open(database)?,
+        database,
+        ui,
+        port,
+        GameDetection::new(detectors, analysis_options)?,
+    )
 }
 
 fn stored_profile(store: &SqliteStore) -> LocalResult<String> {

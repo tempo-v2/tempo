@@ -47,3 +47,6 @@ mod maia;
 mod stockfish;
 mod gap_recommendation;
 pub mod gap_explorer;
+
+pub mod game_detection;
+pub mod local_runtime;

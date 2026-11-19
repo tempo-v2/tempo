@@ -11,6 +11,7 @@ mod current_attempt;
 mod daily;
 mod export;
 mod game_backfill;
+mod game_detection;
 mod game_evidence;
 mod game_model;
 mod handle;

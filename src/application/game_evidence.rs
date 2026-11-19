@@ -1084,7 +1084,7 @@ fn encounter_projection(decisions: &[PlayedDecision], choices: &GameChoices) -> 
     encounters
 }
 
-fn learner_side(game: &GameRecord, learner: &str) -> Option<LearnerColor> {
+pub(super) fn learner_side(game: &GameRecord, learner: &str) -> Option<LearnerColor> {
     match (
         game.white.to_lowercase() == learner,
         game.black.to_lowercase() == learner,

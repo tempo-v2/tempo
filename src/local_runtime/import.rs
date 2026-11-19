@@ -2,7 +2,7 @@
 use super::LocalResult;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io, path::Path};
-use tempo::Tempo;
+use crate::Tempo;
 use tempo_chess::{
     Catalog, ChangeKind, ContentChange, ContentStatus, TacticRecord, compile_tactics,
 };
