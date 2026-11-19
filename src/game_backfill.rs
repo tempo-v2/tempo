@@ -307,14 +307,31 @@ impl BackfillCoordinator {
 
     pub fn retry(&mut self, app: &mut Tempo, request: BackfillRetry) -> Result<Value, AppError> {
         check_id(&request.command_id)?;
+        check_id(&request.job_id)?;
+        if app.game_dataset()? != request.dataset_id {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
+        }
+
+        // The saved acceptance outlives the coordinator's current-job view.
+        if let Some(saved) = app.read_backfill(&request.dataset_id, Some(&request.job_id))? {
+            if saved.id != request.job_id || saved.request.dataset_id != request.dataset_id {
+                return Err(invalid(
+                    "The saved historical job has a different identity.",
+                ));
+            }
+            if saved.retries.contains(&request.command_id) {
+                return Ok(saved.view());
+            }
+        }
+
         let job = self
             .job
             .as_mut()
             .filter(|job| job.id == request.job_id && job.request.dataset_id == request.dataset_id)
             .ok_or_else(|| invalid("The current historical job changed."))?;
-        if job.retries.contains(&request.command_id) {
-            return Ok(job.view());
-        }
         if self.fetching.is_some() || self.applying.is_some() {
             return Err(invalid("A historical window is still being processed."));
         }
@@ -573,6 +590,126 @@ mod tests {
             provider,
             response,
         )
+    }
+
+    #[test]
+    fn retained_retry_acknowledgement_leaves_newer_job_and_windows_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry.sqlite");
+        let dataset = DatasetId::from("dataset");
+        let now = 20_000 * DAY;
+        let open_app = |store| {
+            Tempo::daily(
+                Box::new(store),
+                Components {
+                    clock: Box::new(FixedClock(StudyTime {
+                        day: StudyDay(20_000),
+                        unix_ms: now,
+                    })),
+                    learning: Box::new(DailyLearning::default()),
+                    ..Components::fixtures()
+                },
+                IntroductionLimits::default(),
+                [42; 32],
+                0,
+            )
+            .unwrap()
+        };
+        let store = SqliteStore::create(
+            &path,
+            dataset.clone(),
+            Catalog::default(),
+            DailyLearning::default().settings(),
+        )
+        .unwrap();
+        let mut app = open_app(store);
+        let (mut jobs, provider, response) = fixture_coordinator(&app);
+        let begin = |id: &str| BackfillRequest {
+            command_id: id.into(),
+            dataset_id: dataset.clone(),
+            from_ms: now - DAY,
+            to_ms: now,
+            lichess: Some("learner".into()),
+            chess_com: None,
+        };
+        let pending = r#"{"command_id":"retry-a","dataset_id":"dataset","job_id":"history-a"}"#;
+        let exact_retry = || serde_json::from_str::<BackfillRetry>(pending).unwrap();
+        let finish_window = |jobs: &mut BackfillCoordinator, app: &mut Tempo, reply: Reply| {
+            response.send(reply).unwrap();
+            for _ in 0..4 {
+                jobs.poll(app);
+            }
+        };
+
+        jobs.begin(&mut app, begin("history-a")).unwrap();
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        finish_window(
+            &mut jobs,
+            &mut app,
+            Err(invalid("Fixture provider failure.")),
+        );
+        assert_eq!(jobs.status()["status"], "incomplete");
+        assert_eq!(
+            jobs.retry(&mut app, exact_retry()).unwrap()["status"],
+            "running"
+        );
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        finish_window(&mut jobs, &mut app, Ok(FetchedGames::default()));
+
+        let assert_replay = |jobs: &mut BackfillCoordinator, app: &mut Tempo, current_id: &str| {
+            let before = jobs.status();
+            assert_eq!(before["job_id"], current_id);
+            let saved_before = app.read_backfill(&dataset, None).unwrap().unwrap();
+            assert_eq!(saved_before.id, current_id);
+            let reply = jobs.retry(app, exact_retry()).unwrap();
+            assert_eq!(reply["job_id"], "history-a");
+            assert_eq!(reply["request"]["dataset_id"], "dataset");
+            assert_eq!(reply["status"], "complete");
+            assert_eq!(jobs.status(), before);
+            assert_eq!(
+                serde_json::to_vec(&app.read_backfill(&dataset, None).unwrap().unwrap()).unwrap(),
+                serde_json::to_vec(&saved_before).unwrap()
+            );
+            let saved_a = app
+                .read_backfill(&dataset, Some("history-a"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved_a.retries, ["retry-a"]);
+            assert_eq!(saved_a.windows[0].attempt, 1);
+        };
+        assert_replay(&mut jobs, &mut app, "history-a");
+
+        jobs.begin(&mut app, begin("history-b")).unwrap();
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        assert!(jobs.status()["active_window"].is_number());
+        assert_replay(&mut jobs, &mut app, "history-b");
+
+        let mut unseen_retry = exact_retry();
+        unseen_retry.command_id = "unseen-retry".into();
+        assert!(jobs.retry(&mut app, unseen_retry).is_err());
+        let mut wrong_job = exact_retry();
+        wrong_job.job_id = "history-b".into();
+        assert!(jobs.retry(&mut app, wrong_job).is_err());
+        let mut wrong_dataset = exact_retry();
+        wrong_dataset.dataset_id = DatasetId::from("other");
+        assert_eq!(
+            jobs.retry(&mut app, wrong_dataset).unwrap_err().code,
+            "stale_dataset"
+        );
+        assert_replay(&mut jobs, &mut app, "history-b");
+
+        finish_window(&mut jobs, &mut app, Ok(FetchedGames::default()));
+        assert_eq!(jobs.status()["status"], "complete");
+        assert_replay(&mut jobs, &mut app, "history-b");
+        drop(jobs);
+        drop(app);
+        let mut reopened = open_app(SqliteStore::open(&path).unwrap());
+        let (mut restarted, provider, _) = fixture_coordinator(&reopened);
+        assert_replay(&mut restarted, &mut reopened, "history-b");
+        assert!(provider.try_recv().is_err());
     }
 
     #[test]

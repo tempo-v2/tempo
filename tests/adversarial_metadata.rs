@@ -297,7 +297,7 @@ fn equivalent_documents_keep_authority_until_only_one_books_route_changes() {
     );
     assert!(
         store
-            .projection_books(&dataset, ProjectionScope::Pending)
+            .projection_books(&dataset, ProjectionScope::MissingOrPartial)
             .unwrap()
             .is_empty()
     );
@@ -347,7 +347,7 @@ fn equivalent_documents_keep_authority_until_only_one_books_route_changes() {
 
     preview_and_save(&mut app, new_route, "First", Some(&book_id));
     let new = store
-        .projection_books(&dataset, ProjectionScope::Pending)
+        .projection_books(&dataset, ProjectionScope::MissingOrPartial)
         .unwrap()
         .remove(0);
     assert_ne!(new.input_key, old.input_key);

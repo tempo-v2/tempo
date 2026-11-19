@@ -112,6 +112,21 @@ pub struct GameModel {
     jobs: Arc<Mutex<ModelJobs>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkIntent {
+    CacheRefresh,
+    Analyze,
+}
+
+impl WorkIntent {
+    fn projection_scope(self) -> ProjectionScope {
+        match self {
+            Self::CacheRefresh => ProjectionScope::MissingOrPartial,
+            Self::Analyze => ProjectionScope::AllVerified,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ModelJobs {
     explicit: Option<DatasetId>,
@@ -127,17 +142,42 @@ struct CachedProjection {
 }
 
 impl ModelJobs {
-    fn next(&mut self, now: Instant) -> Option<(DatasetId, ProjectionScope, usize)> {
+    fn request(&mut self, intent: WorkIntent, dataset: DatasetId, now: Instant) -> bool {
+        match intent {
+            WorkIntent::CacheRefresh => {
+                self.cached = Some(CachedProjection {
+                    dataset,
+                    failures: 0,
+                    ready_at: now,
+                });
+            }
+            WorkIntent::Analyze => {
+                if self.active_explicit.as_ref() == Some(&dataset)
+                    || self.explicit.as_ref() == Some(&dataset)
+                {
+                    return false;
+                }
+                self.status = Status {
+                    status: "running",
+                    ..Status::default()
+                };
+                self.explicit = Some(dataset);
+            }
+        }
+        true
+    }
+
+    fn next(&mut self, now: Instant) -> Option<(DatasetId, WorkIntent, usize)> {
         if let Some(dataset) = self.explicit.take() {
             self.active_explicit = Some(dataset.clone());
-            return Some((dataset, ProjectionScope::AllVerified, 0));
+            return Some((dataset, WorkIntent::Analyze, 0));
         }
         if self.cached.as_ref()?.ready_at > now {
             return None;
         }
         self.cached
             .take()
-            .map(|job| (job.dataset, ProjectionScope::Pending, job.failures))
+            .map(|job| (job.dataset, WorkIntent::CacheRefresh, job.failures))
     }
 
     fn retry_cached(&mut self, dataset: DatasetId, failures: usize, now: Instant) -> bool {
@@ -189,14 +229,7 @@ impl GameModel {
         }
         {
             let mut jobs = self.jobs.lock().expect("model jobs");
-            if jobs.active_explicit.as_ref() != Some(&request.dataset_id)
-                && jobs.explicit.as_ref() != Some(&request.dataset_id)
-            {
-                jobs.status = Status {
-                    status: "running",
-                    ..Status::default()
-                };
-                jobs.explicit = Some(request.dataset_id);
+            if jobs.request(WorkIntent::Analyze, request.dataset_id, Instant::now()) {
                 self.wake_worker()?;
             }
         }
@@ -204,11 +237,11 @@ impl GameModel {
     }
 
     pub fn project_cached(&self, dataset: DatasetId) -> Result<(), AppError> {
-        self.jobs.lock().expect("model jobs").cached = Some(CachedProjection {
+        self.jobs.lock().expect("model jobs").request(
+            WorkIntent::CacheRefresh,
             dataset,
-            failures: 0,
-            ready_at: Instant::now(),
-        });
+            Instant::now(),
+        );
         self.wake_worker()
     }
 
@@ -233,17 +266,23 @@ fn model_worker(database: &Path, queued: Receiver<()>, jobs: &Mutex<ModelJobs>) 
                 .map(|job| job.ready_at.saturating_duration_since(now));
             (next, retry_delay)
         };
-        if let Some((dataset, scope, failures)) = next {
-            let explicit = scope == ProjectionScope::AllVerified;
-            let outcome = run(database, &directory, &dataset, scope, |completed, total| {
-                if explicit {
-                    let mut state = jobs.lock().expect("model jobs");
-                    if state.explicit.is_none() {
-                        state.status.completed = completed;
-                        state.status.total = total;
+        if let Some((dataset, intent, failures)) = next {
+            let explicit = intent == WorkIntent::Analyze;
+            let outcome = run(
+                database,
+                &directory,
+                &dataset,
+                intent,
+                |completed, total| {
+                    if explicit {
+                        let mut state = jobs.lock().expect("model jobs");
+                        if state.explicit.is_none() {
+                            state.status.completed = completed;
+                            state.status.total = total;
+                        }
                     }
-                }
-            });
+                },
+            );
             if explicit {
                 let mut state = jobs.lock().expect("model jobs");
                 state.active_explicit = None;
@@ -415,12 +454,12 @@ fn run(
     database: &Path,
     directory: &Path,
     dataset: &DatasetId,
-    scope: ProjectionScope,
+    intent: WorkIntent,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<(usize, Option<AppError>), AppError> {
     let mut store = SqliteStore::open(database)?;
-    let input = store.projection_books(dataset, scope)?;
-    if input.is_empty() && scope == ProjectionScope::AllVerified {
+    let input = store.projection_books(dataset, intent.projection_scope())?;
+    if input.is_empty() && intent == WorkIntent::Analyze {
         return Err(AppError::new(
             "model_unavailable",
             "No verified repertoire documents are available.",
@@ -451,7 +490,7 @@ fn run(
         }
     }
     progress(cache.len(), total);
-    if scope == ProjectionScope::AllVerified && !missing.is_empty() {
+    if intent == WorkIntent::Analyze && !missing.is_empty() {
         let result = (|| {
             let mut maia = Maia::start(directory)?;
             for position in missing {
@@ -627,30 +666,26 @@ mod tests {
             assert!(jobs.retry_cached(dataset.clone(), failures, failed_at));
             assert_eq!(jobs.next(failed_at + delay / 2), None);
             if failures == 0 {
-                jobs.explicit = Some(dataset.clone());
+                assert!(jobs.request(WorkIntent::Analyze, dataset.clone(), failed_at));
                 assert_eq!(
                     jobs.next(failed_at),
-                    Some((dataset.clone(), ProjectionScope::AllVerified, 0))
+                    Some((dataset.clone(), WorkIntent::Analyze, 0))
                 );
             }
             failed_at += delay;
             assert_eq!(
                 jobs.next(failed_at),
-                Some((dataset.clone(), ProjectionScope::Pending, failures + 1))
+                Some((dataset.clone(), WorkIntent::CacheRefresh, failures + 1))
             );
         }
         assert!(!jobs.retry_cached(dataset.clone(), CACHE_RETRY_DELAYS.len(), failed_at));
         assert!(jobs.next(failed_at).is_none());
 
-        jobs.cached = Some(CachedProjection {
-            dataset: newer.clone(),
-            failures: 0,
-            ready_at: failed_at,
-        });
+        assert!(jobs.request(WorkIntent::CacheRefresh, newer.clone(), failed_at));
         assert!(jobs.retry_cached(dataset, 1, failed_at));
         assert_eq!(
             jobs.next(failed_at),
-            Some((newer, ProjectionScope::Pending, 0))
+            Some((newer, WorkIntent::CacheRefresh, 0))
         );
     }
 
@@ -712,14 +747,18 @@ mod tests {
                 .unwrap();
         }
         let no_python = dir.path().join("missing-maia");
-        run(
-            &path,
-            &no_python,
-            &dataset,
-            ProjectionScope::Pending,
-            |_, _| {},
-        )
-        .unwrap();
+        let refresh = || {
+            let (_, error) = run(
+                &path,
+                &no_python,
+                &dataset,
+                WorkIntent::CacheRefresh,
+                |_, _| {},
+            )
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+        };
+        refresh();
         assert_eq!(
             store
                 .game_model_projection_status(&dataset)
@@ -734,6 +773,15 @@ mod tests {
                 .unwrap()
                 .contains_key(&target)
         );
+        // An existing partial header is eligible even when the cache still cannot complete it.
+        assert_eq!(
+            store
+                .projection_books(&dataset, ProjectionScope::MissingOrPartial)
+                .unwrap()
+                .len(),
+            1
+        );
+        refresh();
 
         let alternate = &paths[1][3].0;
         store
@@ -743,15 +791,7 @@ mod tests {
                 &full_distribution(alternate, &[("g8f6", 0.6)]),
             )
             .unwrap();
-        let (_, error) = run(
-            &path,
-            &no_python,
-            &dataset,
-            ProjectionScope::AllVerified,
-            |_, _| {},
-        )
-        .unwrap();
-        assert!(error.is_none(), "{error:?}");
+        refresh();
         assert_eq!(
             store
                 .game_model_projection_status(&dataset)
@@ -763,6 +803,12 @@ mod tests {
         assert_eq!(
             store.game_relevance(&dataset, REACH_MODEL_KEY).unwrap()[&target].modeled_millionths,
             Some(380_000)
+        );
+        assert!(
+            store
+                .projection_books(&dataset, ProjectionScope::MissingOrPartial)
+                .unwrap()
+                .is_empty()
         );
     }
 
