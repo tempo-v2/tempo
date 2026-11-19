@@ -1,12 +1,14 @@
 //! Project original pack membership into an order for new tactics only.
-use super::Tempo;
+use super::{
+    Tempo,
+    tactic_catalog_facts::{TacticPackCandidate, tactic_pack_candidates},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::LazyLock,
 };
-use tempo_chess::ContentItem;
-use tempo_store::{Snapshot, StudyScope};
+use tempo_store::StudyScope;
 use tempo_types::{StudyDay, TargetId};
 
 const STARTER: [&str; 7] = [
@@ -81,7 +83,7 @@ impl Tempo {
             .as_ref()
             .and_then(|daily| daily.tactic_themes.clone())
             .unwrap_or_else(|| {
-                if has_starter_packs(&snapshot) {
+                if has_starter_packs(tactic_pack_candidates(&snapshot)) {
                     TacticThemes::starter()
                 } else {
                     TacticThemes::Any
@@ -91,48 +93,17 @@ impl Tempo {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct PackMember<'a> {
-    motif: &'a str,
-    difficulty: &'a str,
-    deck_id: &'a str,
-    deck_position: usize,
-}
-
-type PackOrder = (u8, usize, usize);
-
-fn memberships(item: &ContentItem) -> impl Iterator<Item = (&str, PackOrder)> {
-    item.provenance.iter().filter_map(|entry| {
-        let member: PackMember<'_> =
-            serde_json::from_str(entry.strip_prefix("tempo1:catalog-metadata:")?).ok()?;
-        let tier = match member.difficulty {
-            "easy" => 0,
-            "medium" => 1,
-            "hard" => 2,
-            _ => return None,
-        };
-        let (pack, ordinal) = member.deck_id.rsplit_once('-')?;
-        let (theme, difficulty) = pack.rsplit_once('-')?;
-        let ordinal = ordinal.parse().ok()?;
-        (theme == member.motif
-            && difficulty == member.difficulty
-            && ordinal > 0
-            && member.deck_position > 0)
-            .then_some((theme, (tier, ordinal, member.deck_position)))
+fn has_starter_packs<'a>(mut candidates: impl Iterator<Item = TacticPackCandidate<'a>>) -> bool {
+    candidates.any(|candidate| {
+        candidate
+            .memberships
+            .iter()
+            .any(|pack| STARTER.contains(&pack.theme))
     })
 }
 
-fn has_starter_packs(snapshot: &Snapshot) -> bool {
-    snapshot.catalog.items.values().any(|item| {
-        item.active()
-            && !item.definition.is_repertoire()
-            && memberships(item).any(|(theme, _)| STARTER.contains(&theme))
-    })
-}
-
-pub(super) fn new_tactic_order(
-    snapshot: &Snapshot,
+pub(super) fn new_tactic_order<'a>(
+    candidates: impl Iterator<Item = TacticPackCandidate<'a>> + Clone,
     today: StudyDay,
     preference: Option<&TacticThemes>,
     use_starter: bool,
@@ -140,7 +111,7 @@ pub(super) fn new_tactic_order(
     let starter;
     let preference = match preference {
         Some(preference) => preference,
-        None if use_starter && has_starter_packs(snapshot) => {
+        None if use_starter && has_starter_packs(candidates.clone()) => {
             starter = TacticThemes::starter();
             &starter
         }
@@ -161,29 +132,30 @@ pub(super) fn new_tactic_order(
 
     let mut admitted = vec![0; themes.len()];
     let mut eligible = Vec::new();
-    for item in snapshot
-        .catalog
-        .items
-        .values()
-        .filter(|item| item.active() && !item.definition.is_repertoire())
-    {
-        let state = &snapshot.learning[&item.target];
-        if state.taught_at.is_some() {
+    for candidate in candidates {
+        if candidate.guided_introduction {
             continue;
         }
-        let first = state.first_introduced;
+        let first = candidate.first_introduced;
         if first.is_some() && first != Some(today) {
             continue;
         }
         // Attribute overlapping source memberships to their earliest eligible pack.
-        if let Some((order, theme)) = memberships(item)
-            .filter_map(|(theme, order)| Some((order, *themes.get(theme)?)))
+        if let Some((order, theme)) = candidate
+            .memberships
+            .iter()
+            .filter_map(|pack| {
+                Some((
+                    (pack.difficulty, pack.ordinal, pack.position),
+                    *themes.get(pack.theme)?,
+                ))
+            })
             .min()
         {
             if first.is_some() {
                 admitted[theme] += 1;
             } else {
-                eligible.push((theme, order, &item.target));
+                eligible.push((theme, order, candidate.target));
             }
         }
     }
@@ -210,6 +182,7 @@ mod tests {
     use super::*;
     use crate::Tempo;
     use tempo_learning::LearningState;
+    use tempo_store::Snapshot;
 
     #[test]
     fn first_introductions_rotate_by_day_and_prefer_earlier_packs() {
@@ -253,10 +226,15 @@ mod tests {
             theme_ids: ["fork".into(), "hangingPiece".into()].into(),
         };
         let order = |snapshot: &Snapshot, day| {
-            let mut ranked = new_tactic_order(snapshot, StudyDay(day), Some(&preference), true)
-                .unwrap()
-                .into_iter()
-                .collect::<Vec<_>>();
+            let mut ranked = new_tactic_order(
+                tactic_pack_candidates(snapshot),
+                StudyDay(day),
+                Some(&preference),
+                true,
+            )
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
             ranked.sort_by_key(|(_, order)| *order);
             ranked
                 .into_iter()
@@ -274,6 +252,12 @@ mod tests {
             ]
         );
         assert_eq!(order(&snapshot, 2)[0], "hanging-first");
+        let original_order = order(&snapshot, 1);
+        for item in snapshot.catalog.items.values_mut() {
+            item.label = "Renamed puzzle".into();
+            item.provenance.push("unrelated attribution".into());
+        }
+        assert_eq!(order(&snapshot, 1), original_order);
         snapshot
             .learning
             .get_mut(&TargetId::from("fork-first"))

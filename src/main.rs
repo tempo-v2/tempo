@@ -51,7 +51,7 @@ fn stdio() -> Result<(), Box<dyn Error + Send + Sync>> {
             continue;
         }
         let view = match serde_json::from_str::<StudyCommand>(&line) {
-            Ok(command) => app.handle(command),
+            Ok(command) => app.handle(command).without_move_details(),
             Err(error) => StudyView::from(AppError::new("invalid_command", error.to_string())),
         };
         serde_json::to_writer(&mut output, &view)?;

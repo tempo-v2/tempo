@@ -1,6 +1,6 @@
 //! Normalize game records and coordinate answer-safe comparison and persistence.
 
-use super::{Tempo, content_preview::source_id, repertoires::learner_color};
+use super::{Tempo, content_preview::source_id};
 use crate::adapters::public_games::FetchedGames;
 use crate::game_evidence::{GameImport, GameReport, GameResult, check_id, fingerprint};
 use crate::{AppError, app_error::domain};
@@ -978,7 +978,10 @@ impl Tempo {
             if doc.dataset != snapshot.dataset || doc.revision != revision {
                 return Err(invalid("A repertoire changed during refresh."));
             }
-            let color = learner_color(item);
+            let color = item
+                .definition
+                .learner_color()
+                .map_err(|error| domain("invalid_content", error))?;
             books.colors.insert(repertoire.clone(), color);
             if let Some(pgn) = doc.pgn {
                 let authored = AuthoredRepertoire::parse(&pgn)
