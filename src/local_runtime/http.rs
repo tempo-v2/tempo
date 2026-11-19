@@ -16,13 +16,15 @@ use tempo::{
     game_model::{GameModel, GapRequest, ModelRequest},
     gap_analysis::{GapAnalysis, GapAnalysisRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
-    wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
+    wire::{
+        ErrorView, MAX_CONTENT_COMMAND_BYTES, RepertoireCommand, StudyCommand, StudyView,
+        TacticCaptureCommand,
+    },
 };
 use tempo_store::SqliteStore;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
-const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn serve(
     app: &mut Tempo,

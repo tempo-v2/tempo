@@ -2589,6 +2589,13 @@ fn marked_line_preview_and_exact_save_recovery() {
     drop(app);
     let mut app = open(&db, today, limits, 1);
     assert_eq!(content(&mut app, preview["save_command"].clone()), saved);
+    for index in 0..3 {
+        let lesson = study(&mut app, json!({"command":"next"}));
+        let mut ack = activity_command("acknowledge", &lesson, &format!("marked-lesson-{index}"));
+        ack["answer"] = json!({"uci":lesson["lesson"]["move_uci"]});
+        assert_eq!(study(&mut app, ack)["status"], "complete");
+    }
+    let before = app.snapshot().unwrap();
     let document = content(
         &mut app,
         json!({"command":"read_document","dataset_id":"opening-proof","repertoire_id":preview["repertoire_id"]}),
@@ -2600,6 +2607,7 @@ fn marked_line_preview_and_exact_save_recovery() {
     let next = content(&mut app, replace.clone());
     assert_eq!(next["status"], "preview", "{next}");
     assert_eq!(next["replacements"][0]["old_move"], "e4");
+    assert_eq!(next["affected_learning"], 3);
     assert_eq!(next["removed"], 2);
     assert_eq!(next["changed"], 1);
     assert_eq!(next["retired_routes"].as_array().unwrap().len(), 2);
@@ -2607,6 +2615,21 @@ fn marked_line_preview_and_exact_save_recovery() {
         content(&mut app, next["save_command"].clone())["status"],
         "repertoires"
     );
+    let after = app.snapshot().unwrap();
+    for (id, previous) in &before.catalog.items {
+        let item = &after.catalog.items[id];
+        if item.active() {
+            assert_eq!(item.version.0, previous.version.0 + 1);
+            assert_eq!(
+                after.learning[id],
+                DailyLearning::changed_answer(&before.learning[id])
+            );
+        } else {
+            assert_eq!(item.version, previous.version);
+            assert_eq!(after.learning[id], before.learning[id]);
+        }
+    }
+    assert_eq!(after.assessments, before.assessments);
     assert_eq!(content(&mut app, replace)["code"], "stale_draft");
 }
 
@@ -2690,4 +2713,43 @@ fn conceding_a_scheduled_review_recovers_its_issued_position_once() {
         assert_eq!(study(&mut app, duplicate)["status"], "error");
         assert_eq!(app.snapshot().unwrap(), after_edit);
     }
+}
+
+#[test]
+fn marked_preview_declines_a_generated_save_larger_than_the_transport_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = open(
+        &directory.path().join("size.sqlite"),
+        Arc::new(AtomicI32::new(20_000)),
+        IntroductionLimits::default(),
+        0,
+    );
+    let limit = tempo::wire::MAX_CONTENT_COMMAND_BYTES;
+    let mut source = "[Site \"\"]\n1.e4 *".to_string();
+    let initial = content(&mut app, book_request("preview", &source, "White", None));
+    let mut save = book_request("save", &source, "White", None);
+    save["token"] = initial["token"].clone();
+    let padding = limit - serde_json::to_vec(&save).unwrap().len() - 4;
+    source.insert_str(7, &"a".repeat(padding));
+    let preview = content(&mut app, book_request("preview", &source, "White", None));
+    assert_eq!(preview["status"], "preview");
+    save["pgn"] = json!(source);
+    save["token"] = preview["token"].clone();
+    assert_eq!(serde_json::to_vec(&save).unwrap().len(), limit - 4);
+    let saved = content(&mut app, save);
+    let id = &saved["repertoires"][0]["id"];
+    let document = content(
+        &mut app,
+        json!({"command":"read_document","dataset_id":"opening-proof","repertoire_id":id}),
+    );
+    let revision = app.snapshot().unwrap().revision;
+    let extended = content(
+        &mut app,
+        json!({"command":"marked_preview","dataset_id":"opening-proof","repertoire_id":id,
+        "name":"White","learner_color":"white","anchor_fen":tempo_chess::START_FEN,
+        "base_revision":document["revision"],"lines":[["e2e4","e7e5","g1f3"]]}),
+    );
+    assert_eq!(extended["code"], "save_too_large");
+    assert!(extended.get("save_command").is_none());
+    assert_eq!(app.snapshot().unwrap().revision, revision);
 }
