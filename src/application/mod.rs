@@ -14,6 +14,8 @@ mod game_backfill;
 mod game_detection;
 mod game_evidence;
 mod game_model;
+mod game_review;
+pub use game_review::{GameReviewLine, GameReviewRead};
 mod handle;
 mod import_pgn;
 mod ingest_games;

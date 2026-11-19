@@ -70,13 +70,16 @@ impl Tempo {
         let results: Vec<_> = history
             .results
             .into_iter()
-            .map(|entry| GameResult {
-                comparison_id: Some(entry.comparison_id),
-                effect: entry
-                    .summary
-                    .correction_effect
-                    .unwrap_or(GameReviewEffect::RecordedOnly),
-                summary: entry.summary,
+            .map(|entry| {
+                let mut result = json!(GameResult {
+                    comparison_id: Some(entry.comparison_id),
+                    effect: entry.summary.correction_effect.unwrap_or(GameReviewEffect::RecordedOnly),
+                    summary: entry.summary,
+                });
+                result["players"] = json!({
+                    "white":entry.white, "black":entry.black, "played_date_ms":entry.played_date_ms
+                });
+                result
             })
             .collect();
         Ok(
@@ -1109,7 +1112,7 @@ fn parsed_game_date(game: &PlayedGame) -> Option<NaiveDate> {
         .find_map(|tag| NaiveDate::parse_from_str(game.tags.get(tag)?, "%Y.%m.%d").ok())
 }
 
-fn parse_stored_game(mut game: GameRecord) -> Result<(GameRecord, PlayedGame), String> {
+pub(super) fn parse_stored_game(mut game: GameRecord) -> Result<(GameRecord, PlayedGame), String> {
     let mut parsed = parse_played_games(&game.pgn).map_err(|error| error.to_string())?;
     if parsed.len() != 1 {
         return Err("Expected one stored completed game.".into());

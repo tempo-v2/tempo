@@ -234,6 +234,7 @@ fn respond(
             | "/api/games/model"
             | "/api/games/gaps"
             | "/api/games/gap-draft"
+            | "/api/games/review"
             | "/api/games/gap-analysis"
             | "/api/games/gap-explorer"
             | "/api/study/relevance"
@@ -290,6 +291,11 @@ fn respond(
                 202,
                 command::<GapExplorerRequest>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.gap_explorer.start(app, intent)),
+            ),
+            (&Method::Post, "/api/games/review") => (
+                200,
+                command::<crate::GameReviewRead>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|request| app.game_review(request)),
             ),
             (&Method::Post, "/api/games/gap-draft") => (
                 200,
