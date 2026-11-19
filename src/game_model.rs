@@ -18,7 +18,7 @@ use tempo_store::{
 };
 use tempo_types::{DatasetId, Revision, TargetId};
 
-use crate::maia::{Distribution, MODEL_KEY, Maia, PROFILE_LABEL};
+use crate::maia::{Distribution, MODEL_KEY, Maia, PROFILE_LABEL, checked_distribution};
 #[cfg(test)]
 use tempo_chess::legal_model_moves;
 const CACHE_RETRY_DELAYS: [Duration; 3] = [
@@ -83,6 +83,8 @@ pub(crate) fn model_input_stamp(
 #[derive(Clone, Serialize)]
 struct Status {
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dataset_id: Option<DatasetId>,
     profile: &'static str,
     completed: usize,
     total: usize,
@@ -95,6 +97,7 @@ impl Default for Status {
     fn default() -> Self {
         Self {
             status: "idle",
+            dataset_id: None,
             profile: PROFILE_LABEL,
             completed: 0,
             total: 0,
@@ -157,6 +160,7 @@ impl ModelJobs {
                 }
                 self.status = Status {
                     status: "running",
+                    dataset_id: Some(dataset.clone()),
                     ..Status::default()
                 };
                 self.explicit = Some(dataset);
@@ -211,8 +215,16 @@ impl GameModel {
     }
 
     pub fn status(&self, app: &Tempo) -> Result<Value, AppError> {
-        let mut status = json!(self.jobs.lock().expect("model jobs").status);
-        if let Some(projection) = app.model_projection_status()? {
+        let dataset = app.game_dataset()?;
+        let mut status = {
+            let jobs = self.jobs.lock().expect("model jobs");
+            if jobs.status.dataset_id.as_ref() == Some(&dataset) {
+                json!(jobs.status)
+            } else {
+                json!(Status::default())
+            }
+        };
+        if let Some(projection) = app.model_projection_status(&dataset)? {
             status["projection"] = json!(projection);
         }
         Ok(status)
@@ -274,7 +286,7 @@ fn model_worker(database: &Path, queued: Receiver<()>, jobs: &Mutex<ModelJobs>) 
                 |completed, total| {
                     if explicit {
                         let mut state = jobs.lock().expect("model jobs");
-                        if state.explicit.is_none() {
+                        if state.status.dataset_id.as_ref() == Some(&dataset) {
                             state.status.completed = completed;
                             state.status.total = total;
                         }
@@ -284,7 +296,7 @@ fn model_worker(database: &Path, queued: Receiver<()>, jobs: &Mutex<ModelJobs>) 
             if explicit {
                 let mut state = jobs.lock().expect("model jobs");
                 state.active_explicit = None;
-                if state.explicit.is_none() {
+                if state.status.dataset_id.as_ref() == Some(&dataset) {
                     let (projected, error) = outcome.unwrap_or_else(|error| (0, Some(error)));
                     state.status.projected = projected;
                     state.status.status = if error.is_some() {
@@ -480,9 +492,18 @@ fn run(
     let total = jobs.len();
     let mut cache = BTreeMap::new();
     let mut missing = Vec::new();
+    let mut invalid_cache = BTreeSet::new();
     for position in jobs {
         if let Some(distribution) = store.game_move_distribution(MODEL_KEY, &position.0)? {
-            cache.insert(position, distribution);
+            match checked_distribution(&position, distribution) {
+                Ok(distribution) => {
+                    cache.insert(position, distribution);
+                }
+                Err(invalid) => {
+                    invalid_cache.insert(position);
+                    error.get_or_insert(invalid);
+                }
+            }
         } else {
             missing.push(position);
         }
@@ -505,6 +526,11 @@ fn run(
     }
     let mut projected = 0;
     for input in books {
+        // Reject new reach from invalid evidence. Keep any already published
+        // current result and continue projecting independent repertoires.
+        if !input.jobs.is_disjoint(&invalid_cache) {
+            continue;
+        }
         let mut reach = BTreeMap::new();
         input.tree.project(
             &input.book,
@@ -574,6 +600,65 @@ mod tests {
                 (played, mass)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_model_host_only_reports_run_status_for_the_current_dataset() {
+        use crate::{DailyComponents, IntroductionLimits};
+        use tempo_chess::Catalog;
+        use tempo_learning::{DailyLearning, LearningPolicy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            let learning = DailyLearning::default();
+            let store = SqliteStore::create(
+                &dir.path().join(format!("{name}.sqlite")),
+                DatasetId::from(name),
+                Catalog::default(),
+                learning.settings(),
+            )
+            .unwrap();
+            let mut components = DailyComponents::fixtures();
+            components.learning = Box::new(learning);
+            Tempo::daily(
+                Box::new(store),
+                components,
+                IntroductionLimits::default(),
+                [42; 32],
+                0,
+            )
+            .unwrap()
+        };
+        let old = open("old");
+        let current = open("current");
+        let (wake, _controlled) = sync_channel(1);
+        let host = GameModel {
+            wake,
+            jobs: Arc::new(Mutex::new(ModelJobs::default())),
+        };
+        let requesting = |dataset| ModelRequest {
+            dataset_id: DatasetId::from(dataset),
+        };
+        let old_reply = host.start(&old, requesting("old")).unwrap();
+        assert_eq!(old_reply["status"], "running");
+        assert_eq!(old_reply["dataset_id"], "old");
+        {
+            // Hold an old run in flight through the same host while the
+            // application changes its active dataset.
+            let mut jobs = host.jobs.lock().unwrap();
+            assert_eq!(
+                jobs.next(Instant::now()),
+                Some((DatasetId::from("old"), WorkIntent::Analyze, 0))
+            );
+        }
+        let clean = host.status(&current).unwrap();
+        assert_eq!(clean["status"], "idle");
+        assert!(clean.get("dataset_id").is_none());
+        assert_eq!(clean["projection"]["dataset_id"], "current");
+        assert!(host.start(&current, requesting("old")).is_err());
+        let new_reply = host.start(&current, requesting("current")).unwrap();
+        assert_eq!(new_reply["status"], "running");
+        assert_eq!(new_reply["dataset_id"], "current");
     }
 
     #[test]
@@ -730,6 +815,33 @@ mod tests {
                 .projection_books(&dataset, ProjectionScope::MissingOrPartial)
                 .unwrap()
                 .is_empty()
+        );
+        // A retained map can decode correctly and still be invalid
+        // evidence. It cannot replace a verified current result.
+        let mut excess_mass = full_distribution(alternate, &[("g8f6", 1.0)]);
+        let another = excess_mass
+            .keys()
+            .find(|key| *key != "g8f6")
+            .unwrap()
+            .clone();
+        excess_mass.insert(another, 1.0);
+        let excess_mass = serde_json::to_string(&excess_mass).unwrap();
+        let output = std::process::Command::new("sqlite3")
+            .arg(&path)
+            .arg(format!(
+                "UPDATE game_move_models SET distribution='{excess_mass}' WHERE model_key='{MODEL_KEY}' AND position='{}'",
+                alternate.0
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let (published, error) =
+            run(&path, &no_python, &dataset, WorkIntent::Analyze, |_, _| {}).unwrap();
+        assert_eq!(published, 0);
+        assert_eq!(error.unwrap().code, "invalid_maia_reply");
+        assert_eq!(
+            store.game_relevance(&dataset, REACH_MODEL_KEY).unwrap()[&target].modeled_millionths,
+            Some(380_000)
         );
     }
 
