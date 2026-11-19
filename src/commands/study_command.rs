@@ -26,6 +26,7 @@ pub enum StudyCommand {
     Answer(SubmitCommand),
     Acknowledge(SubmitCommand),
     GiveUp(AbandonCommand),
+    Concede(AbandonCommand),
     Skip(AbandonCommand),
     ResumeSkipped,
     Abandon(AbandonCommand),

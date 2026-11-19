@@ -36,12 +36,17 @@ pub(super) fn serve(
     let address = server.server_addr().to_string();
     let origin = format!("http://{address}");
     println!("Tempo study at {origin}");
+    let explorer = std::sync::Arc::new(tempo::explorer::ExplorerClient::new(database));
     let mut games = Games {
         refresh: GameJobs::start()?,
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
         gap_analysis: GapAnalysis::new(database),
-        gap_explorer: GapExplorer::new(database),
+        position_evidence: tempo::position_evidence::PositionEvidence::new(
+            database,
+            explorer.clone(),
+        ),
+        gap_explorer: GapExplorer::with_client(explorer),
     };
     let mut model_marker = None;
     let mut next_model_check = Instant::now();
@@ -87,6 +92,7 @@ struct Games {
     model: GameModel,
     gap_analysis: GapAnalysis,
     gap_explorer: GapExplorer,
+    position_evidence: tempo::position_evidence::PositionEvidence,
 }
 
 #[derive(serde::Deserialize)]
@@ -100,6 +106,15 @@ struct GapPage {
 struct StudyAttemptRead {
     dataset_id: tempo_types::DatasetId,
     attempt_id: tempo_types::AttemptId,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StudyAnalysisRead {
+    dataset_id: tempo_types::DatasetId,
+    attempt_id: tempo_types::AttemptId,
+    revision: tempo_types::Revision,
+    content_version: tempo_types::ContentVersion,
 }
 
 struct Asset {
@@ -176,6 +191,8 @@ fn respond(
     } else if matches!(
         request.url(),
         "/api/games"
+            | "/api/analysis/evidence"
+            | "/api/analysis/result"
             | "/api/games/job"
             | "/api/games/import"
             | "/api/games/refresh"
@@ -190,8 +207,22 @@ fn respond(
             | "/api/games/gap-explorer"
             | "/api/study/relevance"
             | "/api/study/game-context"
+            | "/api/study/analysis-context"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
+            (&Method::Post, "/api/analysis/evidence") => (
+                202,
+                command::<tempo::position_evidence::EvidenceRequest>(
+                    &mut request,
+                    MAX_COMMAND_BYTES,
+                )
+                .and_then(|r| games.position_evidence.start(r)),
+            ),
+            (&Method::Post, "/api/analysis/result") => (
+                200,
+                command::<tempo::position_evidence::EvidenceRead>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|r| games.position_evidence.read(r)),
+            ),
             (&Method::Get, "/api/games") => (200, app.game_history()),
             (&Method::Get, "/api/games/job") => (200, Ok(games.refresh.poll(app))),
             (&Method::Get, "/api/games/backfill") => (200, Ok(games.backfill.status())),
@@ -238,6 +269,12 @@ fn respond(
                 200,
                 command::<StudyAttemptRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
                     app.study_relevance_reason(&intent.dataset_id, &intent.attempt_id)
+                }),
+            ),
+            (&Method::Post, "/api/study/analysis-context") => (
+                200,
+                command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                    app.study_analysis_context(&intent.dataset_id, &intent.attempt_id, intent.revision, intent.content_version)
                 }),
             ),
             (&Method::Post, "/api/study/game-context") => (

@@ -27,6 +27,16 @@ pub enum RepertoireCommand {
         #[serde(flatten)]
         input: RepertoireInput,
     },
+    MarkedPreview {
+        dataset_id: DatasetId,
+        repertoire_id: Option<String>,
+        base_revision: Option<Revision>,
+        name: String,
+        learner_color: LearnerColor,
+        anchor_fen: String,
+        anchor_route: Option<Vec<String>>,
+        lines: Vec<Vec<String>>,
+    },
     Preview(RepertoireInput),
     Save {
         #[serde(flatten)]
