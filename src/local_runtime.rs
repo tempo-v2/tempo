@@ -147,7 +147,7 @@ fn stored_profile(store: &SqliteStore) -> LocalResult<String> {
         .ok_or_else(|| "this database has no Tempo V2 study profile".into())
 }
 
-fn open(path: &Path) -> LocalResult<Tempo> {
+pub(crate) fn open(path: &Path) -> LocalResult<Tempo> {
     let store = SqliteStore::open(path)?;
     if let Some(choices) = store.choice_migration_report() {
         eprintln!(

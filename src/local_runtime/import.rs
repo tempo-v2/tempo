@@ -105,7 +105,7 @@ struct Report {
     retained_membership_gaps: Vec<RetainedMembershipGap>,
 }
 
-pub(super) fn run(app: &mut Tempo, batch: Batch) -> LocalResult<()> {
+fn apply(app: &mut Tempo, batch: Batch) -> LocalResult<Report> {
     let dataset = app.snapshot()?.dataset;
     let plan = app.apply_tactic_transfer(&batch.catalog)?;
     let final_tactic_count = plan
@@ -158,7 +158,7 @@ pub(super) fn run(app: &mut Tempo, batch: Batch) -> LocalResult<()> {
             }
         })
         .collect();
-    let report = Report {
+    Ok(Report {
         schema_version: 1,
         dataset: dataset.0,
         changes: plan.changes,
@@ -167,10 +167,96 @@ pub(super) fn run(app: &mut Tempo, batch: Batch) -> LocalResult<()> {
         final_tactic_count,
         already_present_tactic_count: final_tactic_count - added,
         retained_membership_gaps,
-    };
+    })
+}
+
+pub(super) fn run(app: &mut Tempo, batch: Batch) -> LocalResult<()> {
+    let report = apply(app, batch)?;
     use std::io::Write;
     let mut output = io::stdout().lock();
     serde_json::to_writer_pretty(&mut output, &report)?;
     writeln!(output)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn batch(directory: &Path, label: &str, membership: Option<(&str, usize)>) -> Batch {
+        let metadata = membership.map(|(theme, position)| {
+            format!(
+                "tempo1:catalog-metadata:{}",
+                json!({"Motif":theme,"Difficulty":"easy",
+                "DeckId":format!("{theme}-easy-01"),"DeckPosition":position})
+            )
+        });
+        let mut provenance = vec!["https://example.invalid/source".to_owned()];
+        provenance.extend(metadata);
+        let transfer = directory.join("transfer.json");
+        std::fs::write(
+            &transfer,
+            json!({"schema_version":1,"puzzles":[{
+                "namespace":"catalog-test","source_id":"puzzle",
+                "solver_fen":"4k3/8/8/8/8/8/4P3/4K3 w - - 0 1","solution":["e2e4"],
+                "label":label,"provenance":provenance,
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        Batch::open(&transfer).unwrap()
+    }
+
+    fn daily(directory: &Path, name: &str) -> Tempo {
+        let database = directory.join(name);
+        super::super::init(&database).unwrap();
+        let mut app = super::super::open(&database).unwrap();
+        app.set_local_tactic_preferences(
+            10,
+            Some(crate::TacticThemes::Selected {
+                theme_ids: ["fork".to_owned()].into(),
+            }),
+        );
+        app
+    }
+
+    #[test]
+    fn transfer_membership_controls_actual_daily_admission_and_retained_data_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let mut accepted = daily(path, "accepted.sqlite");
+        let report = apply(&mut accepted, batch(path, "First label", Some(("fork", 2)))).unwrap();
+        let target = &report.sources[0].target;
+        let proposal = accepted.next_exercise().unwrap().unwrap();
+        assert_eq!(&proposal.attempt.target, target);
+
+        let mut equivalent = daily(path, "equivalent.sqlite");
+        apply(
+            &mut equivalent,
+            batch(path, "Renamed label", Some(("fork", 2))),
+        )
+        .unwrap();
+        assert_eq!(
+            &equivalent.next_exercise().unwrap().unwrap().attempt.target,
+            target
+        );
+
+        let mut other = daily(path, "other.sqlite");
+        apply(&mut other, batch(path, "First label", Some(("pin", 2)))).unwrap();
+        assert!(other.next_exercise().unwrap().is_none());
+
+        let mut retained = daily(path, "retained.sqlite");
+        apply(&mut retained, batch(path, "Retained label", None)).unwrap();
+        let before = retained.snapshot().unwrap();
+        for _ in 0..2 {
+            let imported =
+                apply(&mut retained, batch(path, "New label", Some(("fork", 2)))).unwrap();
+            assert_eq!(imported.retained_membership_gaps.len(), 1);
+            assert_eq!(&imported.retained_membership_gaps[0].target, target);
+            assert_eq!(imported.retained_membership_gaps[0].position, 2);
+            assert_eq!(retained.snapshot().unwrap(), before);
+            assert!(retained.next_exercise().unwrap().is_none());
+        }
+    }
 }

@@ -511,3 +511,131 @@ fn digest(value: &Value) -> String {
         .to_hex()
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{JsonSnapshotCodec, game_evidence::GameImport, local_runtime};
+
+    struct BlockingDetector {
+        entered: SyncSender<()>,
+        release: std::sync::Mutex<Receiver<()>>,
+    }
+
+    impl GameDetector for BlockingDetector {
+        fn descriptor(&self) -> DetectorDescriptor {
+            DetectorDescriptor {
+                id: "barrier".into(),
+                revision: "1".into(),
+                configuration_fingerprint: "fixture".into(),
+                label: "Barrier fixture".into(),
+            }
+        }
+
+        fn detect(
+            &self,
+            _input: &GameDetectionInput,
+            _control: &dyn DetectionControl,
+        ) -> DetectionOutcome {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            DetectionOutcome::Complete(Vec::new())
+        }
+    }
+
+    fn report(app: &Tempo, game: &DetectionRequest, jobs: &mut GameDetection) -> Value {
+        let started = Instant::now();
+        loop {
+            let reply = jobs.read(
+                app,
+                DetectionRead {
+                    schema_version: VERSION,
+                    request_id: game.request_id.clone(),
+                    dataset_id: game.dataset_id.clone(),
+                },
+            );
+            if reply.status != 202 {
+                return reply.body;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "worker did not deliver"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn replay_keeps_the_worker_slot_and_dataset_replacement_fences_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("detector.sqlite");
+        local_runtime::init(&database).unwrap();
+        let mut app = local_runtime::open(&database).unwrap();
+        let original_dataset = app.game_dataset().unwrap();
+        let empty = app.export(&JsonSnapshotCodec).unwrap();
+        app.import_game_pgn(GameImport {
+            dataset_id: original_dataset.clone(),
+            command_id: "seed".to_owned(),
+            learner: "Learner".to_owned(),
+            repertoire_id: None,
+            pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[Result \"1-0\"]\n1.e4 e5 1-0\n"
+                .into(),
+        })
+        .unwrap();
+        let history = app.game_history().unwrap();
+        let game = &history["results"][0];
+        let a = DetectionRequest {
+            schema_version: VERSION,
+            request_id: "a".into(),
+            dataset_id: original_dataset,
+            source: game["source"].as_str().unwrap().into(),
+            game_id: game["game_id"].as_str().unwrap().into(),
+            learner: "Learner".into(),
+            detector_id: "barrier".into(),
+        };
+        let b = DetectionRequest {
+            request_id: "b".into(),
+            ..a.clone()
+        };
+        let c = DetectionRequest {
+            request_id: "c".into(),
+            ..a.clone()
+        };
+        let (entered, observe) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let mut registry = DetectorRegistry::default();
+        registry
+            .register(BlockingDetector {
+                entered,
+                release: std::sync::Mutex::new(wait),
+            })
+            .unwrap();
+        let mut jobs = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+
+        assert_eq!(jobs.start(&app, a.clone()).status, 202);
+        observe.recv_timeout(Duration::from_secs(2)).unwrap();
+        release.send(()).unwrap();
+        let a_reply = report(&app, &a, &mut jobs);
+        assert_eq!(a_reply["status"], "complete");
+        assert_eq!(jobs.start(&app, b.clone()).status, 202);
+        observe.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(jobs.start(&app, a.clone()).body, a_reply);
+        assert_eq!(jobs.start(&app, c).body["code"], "busy");
+
+        app.restore("replacement".into(), &empty, &JsonSnapshotCodec)
+            .unwrap();
+        let stale = report(&app, &b, &mut jobs);
+        assert_eq!(stale["status"], "source_unavailable");
+        assert!(
+            jobs.active
+                .as_ref()
+                .unwrap()
+                .stop
+                .cancelled
+                .load(Ordering::Relaxed)
+        );
+        assert_eq!(jobs.start(&app, a).body["status"], "source_unavailable");
+        release.send(()).unwrap();
+        assert_eq!(report(&app, &b, &mut jobs)["status"], "source_unavailable");
+    }
+}
