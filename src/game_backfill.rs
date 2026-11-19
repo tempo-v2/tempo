@@ -197,6 +197,7 @@ impl WindowGames {
 pub struct BackfillCoordinator {
     requests: SyncSender<Request>,
     replies: Receiver<Reply>,
+    dataset: DatasetId,
     job: Option<BackfillJob>,
     fetching: Option<usize>,
     applying: Option<ApplyWindow>,
@@ -221,10 +222,12 @@ impl BackfillCoordinator {
                     }
                 }
             })?;
-        let job = app.read_backfill(&app.game_dataset()?, None)?;
+        let dataset = app.game_dataset()?;
+        let job = app.read_backfill(&dataset, None)?;
         Ok(Self {
             requests,
             replies,
+            dataset,
             job,
             fetching: None,
             applying: None,
@@ -233,7 +236,12 @@ impl BackfillCoordinator {
         })
     }
 
-    pub fn status(&self) -> Value {
+    pub fn current_status(&mut self, app: &Tempo) -> Result<Value, AppError> {
+        self.reconcile_dataset(app, app.game_dataset()?)?;
+        Ok(self.status())
+    }
+
+    fn status(&self) -> Value {
         let mut view = self
             .job
             .as_ref()
@@ -261,6 +269,7 @@ impl BackfillCoordinator {
         mut request: BackfillRequest,
     ) -> Result<Value, AppError> {
         check_id(&request.command_id)?;
+        self.require_dataset(app, &request.dataset_id)?;
         for account in [&mut request.lichess, &mut request.chess_com]
             .into_iter()
             .flatten()
@@ -307,14 +316,26 @@ impl BackfillCoordinator {
 
     pub fn retry(&mut self, app: &mut Tempo, request: BackfillRetry) -> Result<Value, AppError> {
         check_id(&request.command_id)?;
+        check_id(&request.job_id)?;
+        self.require_dataset(app, &request.dataset_id)?;
+
+        // The saved acceptance outlives the coordinator's current-job view.
+        if let Some(saved) = app.read_backfill(&request.dataset_id, Some(&request.job_id))? {
+            if saved.id != request.job_id || saved.request.dataset_id != request.dataset_id {
+                return Err(invalid(
+                    "The saved historical job has a different identity.",
+                ));
+            }
+            if saved.retries.contains(&request.command_id) {
+                return Ok(saved.view());
+            }
+        }
+
         let job = self
             .job
             .as_mut()
             .filter(|job| job.id == request.job_id && job.request.dataset_id == request.dataset_id)
             .ok_or_else(|| invalid("The current historical job changed."))?;
-        if job.retries.contains(&request.command_id) {
-            return Ok(job.view());
-        }
         if self.fetching.is_some() || self.applying.is_some() {
             return Err(invalid("A historical window is still being processed."));
         }
@@ -334,7 +355,38 @@ impl BackfillCoordinator {
         Ok(job.view())
     }
 
+    fn require_dataset(&mut self, app: &Tempo, requested: &DatasetId) -> Result<(), AppError> {
+        let active = app.game_dataset()?;
+        if &active != requested {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
+        }
+        self.reconcile_dataset(app, active)
+    }
+
+    fn reconcile_dataset(&mut self, app: &Tempo, active: DatasetId) -> Result<(), AppError> {
+        if self.dataset != active {
+            self.job = None;
+            self.applying = None;
+            self.last_error = None;
+            // A reply to an old request may still be outstanding across multiple restores.
+            self.discard_provider_reply |= self.fetching.take().is_some();
+            self.job = app.read_backfill(&active, None)?;
+            self.dataset = active;
+        }
+        Ok(())
+    }
+
     pub fn poll(&mut self, app: &mut Tempo) {
+        if app
+            .game_dataset()
+            .and_then(|active| self.reconcile_dataset(app, active))
+            .is_err()
+        {
+            return; // The status read reports the error, and the next poll can retry.
+        }
         if self.discard_provider_reply {
             match self.replies.try_recv() {
                 Err(TryRecvError::Empty) => return,
@@ -353,13 +405,6 @@ impl BackfillCoordinator {
 
     fn advance(&mut self, app: &mut Tempo) -> Result<(), AppError> {
         let job = self.job.as_mut().expect("active job");
-        if app.game_dataset()? != job.request.dataset_id {
-            self.job = app.read_backfill(&app.game_dataset()?, None)?;
-            self.applying = None;
-            // Keep an outstanding provider read associated with its original job.
-            self.discard_provider_reply = self.fetching.take().is_some();
-            return Ok(());
-        }
         if let Some(mut applying) = self.applying.take() {
             let window = &job.windows[applying.index];
             let batch = applying.games.take_batch();
@@ -557,13 +602,13 @@ mod tests {
     ) -> (BackfillCoordinator, Receiver<Request>, SyncSender<Reply>) {
         let (requests, provider) = sync_channel(1);
         let (response, replies) = sync_channel(1);
-        let job = app
-            .read_backfill(&app.game_dataset().unwrap(), None)
-            .unwrap();
+        let dataset = app.game_dataset().unwrap();
+        let job = app.read_backfill(&dataset, None).unwrap();
         (
             BackfillCoordinator {
                 requests,
                 replies,
+                dataset,
                 job,
                 fetching: None,
                 applying: None,
@@ -573,6 +618,307 @@ mod tests {
             provider,
             response,
         )
+    }
+
+    fn dataset_boundary_app(path: &std::path::Path) -> Tempo {
+        let components = Components {
+            clock: Box::new(FixedClock(StudyTime {
+                day: StudyDay(20_000),
+                unix_ms: 20_000 * DAY,
+            })),
+            learning: Box::new(DailyLearning::default()),
+            ..Components::fixtures()
+        };
+        let store = SqliteStore::create(
+            path,
+            DatasetId::from("dataset-a"),
+            Catalog::default(),
+            components.learning.settings(),
+        )
+        .unwrap();
+        Tempo::daily(
+            Box::new(store),
+            components,
+            IntroductionLimits::default(),
+            [42; 32],
+            0,
+        )
+        .unwrap()
+    }
+
+    fn dataset_boundary_begin(id: &str, dataset: &str) -> BackfillRequest {
+        BackfillRequest {
+            command_id: id.into(),
+            dataset_id: DatasetId::from(dataset),
+            from_ms: 19_999 * DAY,
+            to_ms: 20_000 * DAY,
+            lichess: Some("learner".into()),
+            chess_com: None,
+        }
+    }
+
+    fn restore_empty_dataset(app: &mut Tempo, dataset: &str) {
+        let codec = crate::JsonSnapshotCodec;
+        let portable = app.export(&codec).unwrap();
+        app.restore(DatasetId::from(dataset), &portable, &codec)
+            .unwrap();
+    }
+
+    #[test]
+    fn historical_begin_replay_is_scoped_to_the_active_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = dataset_boundary_app(&dir.path().join("begin.sqlite"));
+        let (mut jobs, provider, response) = fixture_coordinator(&app);
+        let begin = dataset_boundary_begin("history-a", "dataset-a");
+        jobs.begin(&mut app, begin.clone()).unwrap();
+        let mut normalized_equivalent = begin.clone();
+        normalized_equivalent.lichess = Some(" LEARNER ".into());
+        let before = jobs.status();
+        assert_eq!(jobs.begin(&mut app, normalized_equivalent).unwrap(), before);
+        let mut changed = begin.clone();
+        changed.lichess = Some("another".into());
+        let error = jobs.begin(&mut app, changed).unwrap_err();
+        assert_eq!(
+            error.message,
+            "The backfill ID already belongs to different input."
+        );
+        assert_eq!(jobs.status(), before);
+        let saved = |app: &Tempo| {
+            let job = app
+                .read_backfill(&begin.dataset_id, Some(&begin.command_id))
+                .unwrap()
+                .unwrap();
+            serde_json::to_vec(&job).unwrap()
+        };
+        assert_eq!(
+            saved(&app),
+            serde_json::to_vec(jobs.job.as_ref().unwrap()).unwrap()
+        );
+
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        response.send(Ok(FetchedGames::default())).unwrap();
+        for _ in 0..4 {
+            jobs.poll(&mut app);
+        }
+        assert_eq!(jobs.status()["status"], "complete");
+        let retained = saved(&app);
+        restore_empty_dataset(&mut app, "dataset-b");
+        assert_eq!(
+            jobs.begin(&mut app, begin.clone()).unwrap_err().code,
+            "stale_dataset"
+        );
+        assert_eq!(
+            jobs.retry(
+                &mut app,
+                BackfillRetry {
+                    command_id: "retry-a".into(),
+                    job_id: begin.command_id.clone(),
+                    dataset_id: begin.dataset_id.clone(),
+                }
+            )
+            .unwrap_err()
+            .code,
+            "stale_dataset"
+        );
+        assert_eq!(saved(&app), retained);
+        assert!(
+            app.read_backfill(&DatasetId::from("dataset-b"), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(provider.try_recv().is_err());
+    }
+
+    #[test]
+    fn historical_poll_reconciles_settled_and_paused_jobs_after_restore() {
+        for expected in ["complete", "incomplete", "paused"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = dataset_boundary_app(&dir.path().join("current.sqlite"));
+            let (mut jobs, provider, response) = fixture_coordinator(&app);
+            jobs.begin(&mut app, dataset_boundary_begin("history-a", "dataset-a"))
+                .unwrap();
+            jobs.poll(&mut app);
+            provider.try_recv().unwrap();
+            if expected == "paused" {
+                drop(response);
+            } else {
+                let reply = if expected == "incomplete" {
+                    Err(invalid("Fixture failed."))
+                } else {
+                    Ok(FetchedGames::default())
+                };
+                response.send(reply).unwrap();
+            }
+            for _ in 0..4 {
+                jobs.poll(&mut app);
+            }
+            assert_eq!(jobs.status()["status"], expected);
+            restore_empty_dataset(&mut app, "dataset-b");
+            if expected == "incomplete" {
+                app.create_backfill(dataset_boundary_begin("history-b", "dataset-b"))
+                    .unwrap();
+                jobs.poll(&mut app);
+                assert_eq!(jobs.status()["job_id"], "history-b");
+            } else {
+                jobs.poll(&mut app);
+                assert_eq!(
+                    jobs.status(),
+                    json!({"status": "idle"}),
+                    "old state: {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn historical_provider_reply_is_drained_before_new_dataset_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = dataset_boundary_app(&dir.path().join("drain.sqlite"));
+        let (mut jobs, provider, response) = fixture_coordinator(&app);
+        jobs.begin(&mut app, dataset_boundary_begin("history-a", "dataset-a"))
+            .unwrap();
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        restore_empty_dataset(&mut app, "dataset-b");
+        jobs.poll(&mut app);
+        restore_empty_dataset(&mut app, "dataset-c");
+        jobs.begin(&mut app, dataset_boundary_begin("history-c", "dataset-c"))
+            .unwrap();
+        jobs.poll(&mut app);
+        assert!(provider.try_recv().is_err());
+        response
+            .send(Err(invalid("Stale provider result.")))
+            .unwrap();
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        response.send(Ok(FetchedGames::default())).unwrap();
+        for _ in 0..4 {
+            jobs.poll(&mut app);
+        }
+        assert_eq!(jobs.status()["status"], "complete");
+        assert_eq!(jobs.status()["job_id"], "history-c");
+        assert_eq!(jobs.status()["windows"][0]["notes"], json!([]));
+    }
+
+    #[test]
+    fn retained_retry_acknowledgement_leaves_newer_job_and_windows_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry.sqlite");
+        let dataset = DatasetId::from("dataset");
+        let now = 20_000 * DAY;
+        let open_app = |store| {
+            Tempo::daily(
+                Box::new(store),
+                Components {
+                    clock: Box::new(FixedClock(StudyTime {
+                        day: StudyDay(20_000),
+                        unix_ms: now,
+                    })),
+                    learning: Box::new(DailyLearning::default()),
+                    ..Components::fixtures()
+                },
+                IntroductionLimits::default(),
+                [42; 32],
+                0,
+            )
+            .unwrap()
+        };
+        let store = SqliteStore::create(
+            &path,
+            dataset.clone(),
+            Catalog::default(),
+            DailyLearning::default().settings(),
+        )
+        .unwrap();
+        let mut app = open_app(store);
+        let (mut jobs, provider, response) = fixture_coordinator(&app);
+        let begin = |id: &str| BackfillRequest {
+            command_id: id.into(),
+            dataset_id: dataset.clone(),
+            from_ms: now - DAY,
+            to_ms: now,
+            lichess: Some("learner".into()),
+            chess_com: None,
+        };
+        let pending = r#"{"command_id":"retry-a","dataset_id":"dataset","job_id":"history-a"}"#;
+        let exact_retry = || serde_json::from_str::<BackfillRetry>(pending).unwrap();
+        let finish_window = |jobs: &mut BackfillCoordinator, app: &mut Tempo, reply: Reply| {
+            response.send(reply).unwrap();
+            for _ in 0..4 {
+                jobs.poll(app);
+            }
+        };
+
+        jobs.begin(&mut app, begin("history-a")).unwrap();
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        finish_window(
+            &mut jobs,
+            &mut app,
+            Err(invalid("Fixture provider failure.")),
+        );
+        assert_eq!(jobs.status()["status"], "incomplete");
+        assert_eq!(
+            jobs.retry(&mut app, exact_retry()).unwrap()["status"],
+            "running"
+        );
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        finish_window(&mut jobs, &mut app, Ok(FetchedGames::default()));
+
+        let assert_replay = |jobs: &mut BackfillCoordinator, app: &mut Tempo, current_id: &str| {
+            let before = jobs.status();
+            assert_eq!(before["job_id"], current_id);
+            let saved_before = app.read_backfill(&dataset, None).unwrap().unwrap();
+            assert_eq!(saved_before.id, current_id);
+            let reply = jobs.retry(app, exact_retry()).unwrap();
+            assert_eq!(reply["job_id"], "history-a");
+            assert_eq!(reply["request"]["dataset_id"], "dataset");
+            assert_eq!(reply["status"], "complete");
+            assert_eq!(jobs.status(), before);
+            assert_eq!(
+                serde_json::to_vec(&app.read_backfill(&dataset, None).unwrap().unwrap()).unwrap(),
+                serde_json::to_vec(&saved_before).unwrap()
+            );
+            let saved_a = app
+                .read_backfill(&dataset, Some("history-a"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved_a.retries, ["retry-a"]);
+            assert_eq!(saved_a.windows[0].attempt, 1);
+        };
+        assert_replay(&mut jobs, &mut app, "history-a");
+
+        jobs.begin(&mut app, begin("history-b")).unwrap();
+        jobs.poll(&mut app);
+        provider.try_recv().unwrap();
+        assert!(jobs.status()["active_window"].is_number());
+        assert_replay(&mut jobs, &mut app, "history-b");
+
+        let mut unseen_retry = exact_retry();
+        unseen_retry.command_id = "unseen-retry".into();
+        assert!(jobs.retry(&mut app, unseen_retry).is_err());
+        let mut wrong_job = exact_retry();
+        wrong_job.job_id = "history-b".into();
+        assert!(jobs.retry(&mut app, wrong_job).is_err());
+        let mut wrong_dataset = exact_retry();
+        wrong_dataset.dataset_id = DatasetId::from("other");
+        assert_eq!(
+            jobs.retry(&mut app, wrong_dataset).unwrap_err().code,
+            "stale_dataset"
+        );
+        assert_replay(&mut jobs, &mut app, "history-b");
+
+        finish_window(&mut jobs, &mut app, Ok(FetchedGames::default()));
+        assert_eq!(jobs.status()["status"], "complete");
+        assert_replay(&mut jobs, &mut app, "history-b");
+        drop(jobs);
+        drop(app);
+        let mut reopened = open_app(SqliteStore::open(&path).unwrap());
+        let (mut restarted, provider, _) = fixture_coordinator(&reopened);
+        assert_replay(&mut restarted, &mut reopened, "history-b");
+        assert!(provider.try_recv().is_err());
     }
 
     #[test]

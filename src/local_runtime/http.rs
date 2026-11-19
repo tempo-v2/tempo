@@ -227,7 +227,7 @@ fn respond(
             ),
             (&Method::Get, "/api/games") => (200, app.game_history()),
             (&Method::Get, "/api/games/job") => (200, Ok(games.refresh.poll(app))),
-            (&Method::Get, "/api/games/backfill") => (200, Ok(games.backfill.status())),
+            (&Method::Get, "/api/games/backfill") => (200, games.backfill.current_status(app)),
             (&Method::Post, "/api/games/backfill") => (
                 202,
                 command::<BackfillRequest>(&mut request, MAX_COMMAND_BYTES)
