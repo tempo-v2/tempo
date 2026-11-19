@@ -1,6 +1,8 @@
 //! Restore portable content/learning into an empty store with a fresh identity.
 use super::Tempo;
 use crate::{AppError, SnapshotCodec, app_error::domain};
+use tempo_chess::ContentKind;
+use tempo_learning::DailyLearning;
 use tempo_store::Write;
 use tempo_types::DatasetId;
 
@@ -22,8 +24,8 @@ impl Tempo {
                 "restore targets an empty destination; content import is separate",
             ));
         }
-        let portable = codec.decode(data)?;
-        if !matches!(portable.schema_version, 1..=3)
+        let mut portable = codec.decode(data)?;
+        if !matches!(portable.schema_version, 1..=4)
             || portable.policy != self.components.learning.settings()
         {
             return Err(AppError::new(
@@ -37,45 +39,41 @@ impl Tempo {
                 "dataset identity is required",
             ));
         }
-        for (target, state) in &portable.learning {
-            let version = state
+        for (target, state) in &mut portable.learning {
+            let item = portable.catalog.items.get(target).ok_or_else(|| {
+                AppError::new("invalid_learning", "Learning refers to a missing target.")
+            })?;
+            if state
                 .correction
                 .as_ref()
-                .map(|correction| correction.answer_version)
-                .or_else(|| state.game_review.map(|legacy| legacy.answer_version));
-            if version.is_some_and(|version| {
-                portable
-                    .catalog
-                    .items
-                    .get(target)
-                    .is_none_or(|item| version != item.version)
-            }) {
+                .is_some_and(|correction| correction.answer_version != item.version)
+            {
                 return Err(AppError::new(
                     "invalid_learning",
                     "Game review refers to a different answer version.",
                 ));
+            }
+            if state.game_review.is_some()
+                || state.game_teaching_relevance
+                || state.restored_game_obligation.is_some()
+            {
+                if self.daily.is_none()
+                    || !matches!(item.definition.kind, ContentKind::Repertoire { .. })
+                {
+                    return Err(AppError::new(
+                        "invalid_learning",
+                        "Legacy game obligations require a Daily Study repertoire target.",
+                    ));
+                }
+                DailyLearning::restore_portable(state, item.version)
+                    .map_err(|e| domain("invalid_learning", e))?;
             }
             self.components
                 .learning
                 .validate_state(state)
                 .map_err(|e| domain("invalid_learning", e))?;
         }
-        for key in &portable.game_failures {
-            if key.source.is_empty()
-                || key.game_id.is_empty()
-                || portable
-                    .catalog
-                    .items
-                    .get(&key.target)
-                    .is_none_or(|item| key.version.0 == 0 || item.version.0 < key.version.0)
-            {
-                return Err(AppError::new(
-                    "invalid_learning",
-                    "Invalid game failure provenance.",
-                ));
-            }
-        }
-        self.store.restore_with_game_failures(
+        self.store.restore_with_game_evidence(
             tempo_store::Commit {
                 expected_dataset: snapshot.dataset,
                 expected_revision: snapshot.revision,
@@ -86,7 +84,7 @@ impl Tempo {
                     policy: portable.policy,
                 }],
             },
-            &portable.game_failures,
+            &portable.game_evidence,
         )?;
         self.remaining_block.clear();
         self.order_history.clear();

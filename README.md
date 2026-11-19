@@ -22,9 +22,9 @@ version 3 Study views.
 | Reload persisted progress | `Tempo::resume` | [resume.rs](src/application/resume.rs) demonstrates a read with no new assessment or write. |
 | Answer the displayed learner decision | `SubmitCommand` → `Tempo::submit` | [submit_command.rs](src/commands/submit_command.rs) constructs a retryable action; [submit.rs](src/application/submit.rs) shows progress, learning, assessment and receipt saved together. |
 | Stop an attempt | `AbandonCommand` → `Tempo::abandon` | [abandon_command.rs](src/commands/abandon_command.rs) supplies revision/identity without an answer; [abandon.rs](src/application/abandon.rs) clears the active pointer. |
-| Report an externally observed miss | `AgainCommand` → `Tempo::again` | [again_command.rs](src/commands/again_command.rs) rejects analysis against the wrong definition; [again.rs](src/application/again.rs) updates learning without fabricating a human attempt. |
+| Report a standard-profile external miss | `AgainCommand` → `Tempo::again` | [again_command.rs](src/commands/again_command.rs) rejects analysis against the wrong definition; [again.rs](src/application/again.rs) updates learning without fabricating a human attempt. |
 | Update repertoire or tactics content | `Tempo::import_pgn` or `Tempo::apply_catalog` | [import_pgn.rs](src/application/import_pgn.rs) applies both through one atomic content-change operation. |
-| Process games already fetched by a refresh job | `Tempo::ingest_games` | [ingest_games.rs](src/application/ingest_games.rs) demonstrates replay-aware ingestion. The count includes processed deviations that were already committed. |
+| Process fixture-profile games | `Tempo::ingest_games` | [ingest_games.rs](src/application/ingest_games.rs) demonstrates replay-aware ingestion. The count includes processed deviations that were already committed. |
 | Transfer content and learning to an empty dataset | `Tempo::export`, `Tempo::restore` | [export.rs](src/application/export.rs) shows a read-only export; [restore.rs](src/application/restore.rs) restores under a new dataset identity. |
 | Dispatch one decoded UI intent | `wire::StudyCommand` → `Tempo::handle` | [study_command.rs](src/commands/study_command.rs) decodes the versioned envelope; [handle.rs](src/application/handle.rs) returns typed replies even on application failure. |
 
@@ -38,7 +38,7 @@ transport boundary. Your `src/views/` files remain the homes of those view conce
 | Value | Produced by | Consumed by | What to notice |
 | --- | --- | --- | --- |
 | `SubmitCommand` / `AbandonCommand` | UI controller or another caller | Application operation | Copy the latest **attempt revision**, allocate one submission ID per user action, reuse the whole command for retries. |
-| `AgainCommand` | Game comparison or another feedback adapter | Application operation | Include the content version actually compared, provider namespace and stable event identity. |
+| `AgainCommand` | Standard-profile external feedback adapter | Application operation | Include the content version actually compared, provider namespace and stable event identity. |
 | [`Game`](src/game.rs) | `GameProvider` | `Tempo::ingest_games` | Stable provider/game IDs make rescans replayable; the PGN is still raw input for the comparator. |
 | [`GameRange`](src/game_range.rs) | Refresh caller | `GameProvider::fetch` | Inclusive observation-time endpoints; the provider validates their order. |
 | [`PortableSnapshot`](src/portable_snapshot.rs) | Export or a codec | Codec or restore | Content, learning and policy only. It omits source dataset ID, attempts, active pointer and receipts. |
@@ -77,10 +77,17 @@ optimistic transaction. Local queue history changes only after that commit.
 [receipts.rs](src/application/receipts.rs) and
 [current_attempt.rs](src/application/current_attempt.rs) keep those checks separate.
 
-Game fetching is an independent caller action. Fetched games enter `ingest_games`,
-then the same `again` operation available to other external feedback adapters.
-Each deviation commits independently: a batch can be partly processed if a later
-comparison or commit fails, and stable identities make rerunning it safe.
+The production Games UI uses the [loopback Games routes](src/local_runtime/http.rs).
+PGN imports call `Tempo::import_game_pgn`. Provider refresh uses `GameJobs` to fetch
+and deliver games separately from Study. `Tempo::reprocess_games` compares stored
+games again, and `Tempo::choose_game_correction` resolves an ambiguous target.
+These paths use combined repertoire coverage and `DailyLearning::assess_game`,
+which owns the model update, corrective obligation and human Test cadence.
+Store commits the results and command receipt together.
+
+`GameProvider` and `Tempo::ingest_games` serve the fixture profile through a
+supplied comparator. `Tempo::again` serves the standard external-feedback
+profile, where each deviation commits independently.
 
 Content import updates the current dataset and preserves learning unless the
 definition actually changes. Portable restore requires an empty destination,
@@ -133,7 +140,7 @@ content-update journeys. Shared explicit clock/store setup lives in
 
 The loopback host uses the real Chess rules, SQLite Store, UTC clock, and
 restart-safe identities. The stdio demonstration still uses its fixed fixture
-policies and in-memory store. Provider game comparison remains fixture-backed.
+policies and in-memory store.
 Store snapshots currently read the complete dataset. Cross-repository ownership
 lives in `.planning/INTERFACES.md`.
 

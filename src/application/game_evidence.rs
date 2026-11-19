@@ -15,11 +15,11 @@ use tempo_learning::{
     AssessmentInput, AssessmentSource, DailyLearning, GameReviewEffect, LearningState,
 };
 use tempo_store::{
-    AcceptedGames, AssessmentKey, AssessmentRecord, Commit, ComparedGame, GameChoice,
-    GameChoiceTarget, GameFailureKey, GameObservation, GameReceipt, GameRecord, GameSummary,
-    PgnTiming, RepertoireDisagreement, Write,
+    AcceptedGames, AssessmentRecord, Commit, ComparedGame, GameChoice, GameChoiceTarget,
+    GameFailureKey, GameObservation, GameReceipt, GameRecord, GameSummary, PgnTiming,
+    RepertoireDisagreement, Write,
 };
-use tempo_types::{DatasetId, EventId, Grade, TargetId};
+use tempo_types::{DatasetId, Grade, TargetId};
 
 impl Tempo {
     pub(crate) fn game_dataset(&self) -> Result<DatasetId, AppError> {
@@ -628,8 +628,6 @@ impl Tempo {
                 let prior = changes
                     .entry(key.target.clone())
                     .or_insert_with(|| snapshot.learning[&key.target].clone());
-                let provider = format!("game:{}", key.source);
-                let event_id = EventId(hash(&json!([key.game_id, key.target])));
                 let input = AssessmentInput {
                     grade: Grade::Again,
                     accepted_at: at,
@@ -655,7 +653,7 @@ impl Tempo {
                 }
                 *prior = transition.state.clone();
                 failures.push(AssessmentRecord {
-                    key: AssessmentKey::External { provider, event_id },
+                    key: key.assessment_key(),
                     dataset: snapshot.dataset.clone(),
                     target: key.target,
                     content_version: key.version,
