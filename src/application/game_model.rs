@@ -1,11 +1,11 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id, repertoires::learner_color};
 use crate::game_model::{GapRequest, MODEL_KEY, ModelBook, ModelInput, PROFILE_LABEL};
-use crate::{AppError, app_error::domain};
+use crate::{AppError, app_error::domain, gap_analysis::GapAnalysisInput};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use tempo_chess::{AuthoredRepertoire, ContentKind, PositionKey};
-use tempo_types::DatasetId;
+use tempo_chess::{AuthoredRepertoire, ContentKind, GapDraft, PositionKey};
+use tempo_types::{DatasetId, Revision};
 
 impl Tempo {
     pub(crate) fn model_input(&self, dataset: &DatasetId) -> Result<ModelInput, AppError> {
@@ -50,7 +50,7 @@ impl Tempo {
         })
     }
 
-    pub fn opponent_gaps(&mut self) -> Result<Value, AppError> {
+    pub fn opponent_gaps(&mut self, offset: usize) -> Result<Value, AppError> {
         let dataset = self.game_dataset()?;
         let candidates = self.store.opponent_gaps(&dataset)?;
         if candidates.is_empty() {
@@ -67,6 +67,7 @@ impl Tempo {
                     "document_revision": document_revision,
                 }))
             })
+            .skip(offset)
             .take(101)
             .collect::<Vec<_>>();
         Ok(
@@ -75,7 +76,10 @@ impl Tempo {
         )
     }
 
-    pub fn game_gap_draft(&self, request: GapRequest) -> Result<Value, AppError> {
+    fn checked_gap(
+        &self,
+        request: &GapRequest,
+    ) -> Result<(AuthoredRepertoire, GapDraft, Revision), AppError> {
         let doc = self.store.repertoire_document(&request.repertoire_id)?;
         if doc.dataset != request.dataset_id {
             return Err(AppError::new(
@@ -107,6 +111,40 @@ impl Tempo {
                 request.response.as_deref(),
             )
             .map_err(|error| domain("stale_gap", error))?;
+        Ok((authored, draft, doc.revision))
+    }
+
+    pub(crate) fn gap_analysis_input(
+        &self,
+        mut request: GapRequest,
+    ) -> Result<GapAnalysisInput, AppError> {
+        request.response = None;
+        let (_, draft, revision) = self.checked_gap(&request)?;
+        let (snapshot, current_revision) = self.store.content_state()?;
+        if snapshot.dataset != request.dataset_id || current_revision != revision {
+            return Err(AppError::new(
+                "stale_repertoire",
+                "The repertoire changed. Open the gap again.",
+            ));
+        }
+        let mut catalog = BTreeMap::<PositionKey, Vec<String>>::new();
+        for item in snapshot.catalog.items.values().filter(|item| item.active()) {
+            if let ContentKind::Repertoire { position, .. } = &item.definition.kind {
+                catalog
+                    .entry(position.clone())
+                    .or_default()
+                    .push(item.label.clone());
+            }
+        }
+        Ok(GapAnalysisInput {
+            draft,
+            catalog,
+            revision,
+        })
+    }
+
+    pub fn game_gap_draft(&self, request: GapRequest) -> Result<Value, AppError> {
+        let (authored, draft, revision) = self.checked_gap(&request)?;
         let distribution = self
             .store
             .game_move_distribution(MODEL_KEY, &request.position.0)?;
@@ -134,7 +172,7 @@ impl Tempo {
         });
         Ok(json!({
             "draft": draft,
-            "content_revision": doc.revision,
+            "content_revision": revision,
             "profile": PROFILE_LABEL,
             "local_coverage": coverage,
             "actual_probability": actual_probability,

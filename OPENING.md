@@ -175,3 +175,8 @@ reuse them after interruption. An unavailable probability stays unknown.
 The displayed local coverage sums authored replies that have a saved learner
 response. Study also uses a separate modeled reach across authored routes
 where personal exposure is absent.
+
+The gap editor's Analyze position action runs a bounded Stockfish search using
+the local executable and the existing Maia Python environment. The editor also
+shows similar saved positions ranked by pawn files, piece placement and
+castling rights. Both results are read-only and leave the draft as entered.

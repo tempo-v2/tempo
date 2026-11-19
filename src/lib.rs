@@ -39,3 +39,5 @@ pub mod game_evidence;
 
 pub mod game_backfill;
 pub mod game_model;
+
+pub mod gap_analysis;
