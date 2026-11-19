@@ -10,7 +10,7 @@ impl Tempo {
     pub fn export(&self, codec: &dyn SnapshotCodec) -> Result<String, AppError> {
         let (snapshot, game_evidence) = self.store.portable_state()?;
         codec.encode(&PortableSnapshot {
-            schema_version: if self.daily.is_some() { 4 } else { 1 },
+            schema_version: if self.daily.is_some() { 5 } else { 1 },
             game_evidence,
             catalog: snapshot.catalog,
             learning: snapshot.learning,

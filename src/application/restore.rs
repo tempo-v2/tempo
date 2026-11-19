@@ -3,7 +3,7 @@ use super::Tempo;
 use crate::{AppError, SnapshotCodec, app_error::domain};
 use tempo_chess::ContentKind;
 use tempo_learning::DailyLearning;
-use tempo_store::Write;
+use tempo_store::{PortableChoiceFormat, Write};
 use tempo_types::DatasetId;
 
 impl Tempo {
@@ -25,7 +25,7 @@ impl Tempo {
             ));
         }
         let mut portable = codec.decode(data)?;
-        if !matches!(portable.schema_version, 1..=4)
+        if !matches!(portable.schema_version, 1..=5)
             || portable.policy != self.components.learning.settings()
         {
             return Err(AppError::new(
@@ -85,6 +85,11 @@ impl Tempo {
                 }],
             },
             &portable.game_evidence,
+            if portable.schema_version == 5 {
+                PortableChoiceFormat::Attributed
+            } else {
+                PortableChoiceFormat::Legacy
+            },
         )?;
         self.remaining_block.clear();
         self.order_history.clear();
