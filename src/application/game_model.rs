@@ -1,12 +1,25 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id, repertoires::learner_color};
 use crate::game_model::{GapRequest, MODEL_KEY, PROFILE_LABEL, model_input_stamp};
-use crate::{AppError, app_error::domain, gap_analysis::GapAnalysisInput};
+use crate::{
+    AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use tempo_chess::{AuthoredRepertoire, ContentKind, GapDraft, PositionKey, compile_repertoire};
+use tempo_chess::{
+    AuthoredRepertoire, ContentKind, GapDraft, LearnerColor, PositionKey, compile_repertoire,
+    legal_move_labels,
+};
 use tempo_store::{ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets};
 use tempo_types::Revision;
+
+struct CheckedGap {
+    authored: AuthoredRepertoire,
+    draft: GapDraft,
+    revision: Revision,
+    name: String,
+    color: LearnerColor,
+}
 
 impl Tempo {
     pub(crate) fn model_projection_status(&self) -> Result<Option<ProjectionStatus>, AppError> {
@@ -88,14 +101,21 @@ impl Tempo {
             .into_iter()
             .filter_map(|group| {
                 let document_revision = books.document_for_gap(&group.gap)?;
-                Some(json!({
-                    "repertoire_id": group.gap.repertoire_id, "position": group.gap.position,
-                    "actual_move": group.gap.actual_move, "games": group.games,
-                    "document_revision": document_revision,
-                }))
+                Some((group, document_revision))
             })
             .skip(offset)
             .take(101)
+            .map(|(group, document_revision)| {
+                let labels = legal_move_labels(&format!("{} 0 1", group.gap.position.0)).ok();
+                let san = labels
+                    .as_ref()
+                    .and_then(|moves| moves.get(&group.gap.actual_move));
+                json!({
+                    "repertoire_id": group.gap.repertoire_id, "position": group.gap.position,
+                    "actual_move": group.gap.actual_move, "actual_san": san, "games": group.games,
+                    "document_revision": document_revision,
+                })
+            })
             .collect::<Vec<_>>();
         Ok(
             json!({"dataset_id":dataset,"gaps":verified.iter().take(100).collect::<Vec<_>>(),
@@ -103,15 +123,21 @@ impl Tempo {
         )
     }
 
-    fn checked_gap(
-        &self,
-        request: &GapRequest,
-    ) -> Result<(AuthoredRepertoire, GapDraft, Revision), AppError> {
+    fn checked_gap(&self, request: &GapRequest) -> Result<CheckedGap, AppError> {
         let doc = self.store.repertoire_document(&request.repertoire_id)?;
         if doc.dataset != request.dataset_id {
             return Err(AppError::new(
                 "stale_dataset",
                 "The active dataset changed.",
+            ));
+        }
+        if request
+            .base_revision
+            .is_some_and(|revision| revision != doc.revision)
+        {
+            return Err(AppError::new(
+                "stale_draft",
+                "The repertoire changed. Reopen the gap before saving.",
             ));
         }
         let (Some(pgn), Some(item)) = (doc.pgn, doc.item) else {
@@ -138,17 +164,34 @@ impl Tempo {
                 request.response.as_deref(),
             )
             .map_err(|error| domain("stale_gap", error))?;
-        Ok((authored, draft, doc.revision))
+        Ok(CheckedGap {
+            authored,
+            draft,
+            revision: doc.revision,
+            name: item.label,
+            color,
+        })
+    }
+
+    pub(crate) fn gap_position(
+        &self,
+        mut request: GapRequest,
+    ) -> Result<(GapDraft, Revision), AppError> {
+        request.response = None;
+        let CheckedGap {
+            draft, revision, ..
+        } = self.checked_gap(&request)?;
+        Ok((draft, revision))
     }
 
     pub(crate) fn gap_analysis_input(
         &self,
-        mut request: GapRequest,
+        request: GapRequest,
     ) -> Result<GapAnalysisInput, AppError> {
-        request.response = None;
-        let (_, draft, revision) = self.checked_gap(&request)?;
+        let dataset = request.dataset_id.clone();
+        let (draft, revision) = self.gap_position(request)?;
         let (snapshot, current_revision) = self.store.content_state()?;
-        if snapshot.dataset != request.dataset_id || current_revision != revision {
+        if snapshot.dataset != dataset || current_revision != revision {
             return Err(AppError::new(
                 "stale_repertoire",
                 "The repertoire changed. Open the gap again.",
@@ -171,7 +214,34 @@ impl Tempo {
     }
 
     pub fn game_gap_draft(&self, request: GapRequest) -> Result<Value, AppError> {
-        let (authored, draft, revision) = self.checked_gap(&request)?;
+        let CheckedGap {
+            authored,
+            draft,
+            revision,
+            name,
+            color,
+        } = self.checked_gap(&request)?;
+        let save_token = draft
+            .pgn
+            .as_ref()
+            .map(|pgn| {
+                self.gap_response_token(
+                    &RepertoireInput {
+                        dataset_id: request.dataset_id.clone(),
+                        repertoire_id: Some(request.repertoire_id.clone()),
+                        name: name.clone(),
+                        learner_color: color,
+                        pgn: pgn.clone(),
+                    },
+                    &request.repertoire_id,
+                    revision,
+                )
+            })
+            .transpose()?;
+        let before = legal_move_labels(&format!("{} 0 1", request.position.0))
+            .map_err(|error| domain("invalid_gap_position", error))?;
+        let after =
+            legal_move_labels(&draft.fen).map_err(|error| domain("invalid_gap_position", error))?;
         let distribution = self
             .store
             .game_move_distribution(MODEL_KEY, &request.position.0)?;
@@ -200,6 +270,12 @@ impl Tempo {
         Ok(json!({
             "draft": draft,
             "content_revision": revision,
+            "save_token": save_token,
+            "repertoire_name": name,
+            "learner_color": match color { LearnerColor::White => "white", LearnerColor::Black => "black" },
+            "actual_san": before.get(&request.actual_move),
+            "opponent_move_labels": before,
+            "response_move_labels": after,
             "profile": PROFILE_LABEL,
             "local_coverage": coverage,
             "actual_probability": actual_probability,

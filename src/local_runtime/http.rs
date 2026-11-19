@@ -15,6 +15,7 @@ use tempo::{
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{GameModel, GapRequest, ModelRequest},
     gap_analysis::{GapAnalysis, GapAnalysisRequest},
+    gap_explorer::{GapExplorer, GapExplorerRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use tempo_store::SqliteStore;
@@ -40,6 +41,7 @@ pub(super) fn serve(
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
         gap_analysis: GapAnalysis::new(database),
+        gap_explorer: GapExplorer::new(database),
     };
     let mut model_marker = None;
     let mut next_model_check = Instant::now();
@@ -84,6 +86,7 @@ struct Games {
     backfill: BackfillCoordinator,
     model: GameModel,
     gap_analysis: GapAnalysis,
+    gap_explorer: GapExplorer,
 }
 
 #[derive(serde::Deserialize)]
@@ -181,6 +184,7 @@ fn respond(
             | "/api/games/gaps"
             | "/api/games/gap-draft"
             | "/api/games/gap-analysis"
+            | "/api/games/gap-explorer"
             | "/api/study/relevance"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
@@ -214,6 +218,12 @@ fn respond(
                 202,
                 command::<GapAnalysisRequest>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.gap_analysis.start(app, intent)),
+            ),
+            (&Method::Get, "/api/games/gap-explorer") => (200, Ok(games.gap_explorer.status())),
+            (&Method::Post, "/api/games/gap-explorer") => (
+                202,
+                command::<GapExplorerRequest>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.gap_explorer.start(app, intent)),
             ),
             (&Method::Post, "/api/games/gap-draft") => (
                 200,

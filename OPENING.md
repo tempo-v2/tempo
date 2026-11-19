@@ -167,7 +167,9 @@ Distinct raw game and target identities retain their existing acceptance keys.
 
 The latest 200 eligible games supply personal position counts. A confirmed
 opponent gap opens the current repertoire at the position after the reply.
-Add a learner response to the draft, then use Preview and Save. Retained
+Play a legal response and choose Save response. Tempo previews the addition
+against the current document and only signs changes that preserve existing
+answers and learning. After saving, Tempo loads the next gap. Retained
 source PGNs are required to confirm authored replies and endpoints.
 
 To enable the local Rapid 1500 model, run `sh tempo/tools/maia/setup.sh PATH`
@@ -180,7 +182,17 @@ The displayed local coverage sums authored replies that have a saved learner
 response. Study also uses a separate modeled reach across authored routes
 where personal exposure is absent.
 
-The gap editor's Analyze position action runs a bounded Stockfish search using
-the local executable and the existing Maia Python environment. The editor also
-shows similar saved positions ranked by pawn files, piece placement and
-castling rights. Both results are read-only and leave the draft as entered.
+Opening a gap runs a bounded Stockfish search using the local executable and
+the existing Maia Python environment. The modal also shows nearby saved
+positions ranked by pawn files, piece placement and castling rights.
+
+Lichess Explorer is optional. [Create a Lichess access token][explorer-token],
+name it “Tempo Explorer” and leave the permissions unchecked. Save only the
+token in a private plain-text file named `lichess-explorer.token` beside the
+active SQLite database. The Explorer setup panel shows the exact file path and
+can copy it. Choose **Retry Explorer** to pick up the file without restarting
+Tempo. The server sends only the current board position and the selected Rapid
+rating filter. You can remove the file or revoke the token in Lichess at any
+time. Local analysis and repertoire saves are available independently.
+
+[explorer-token]: https://lichess.org/account/oauth/token/create
