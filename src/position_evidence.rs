@@ -47,6 +47,7 @@ pub struct EvidenceRequest {
     ratings: Ratings,
     #[serde(default)]
     pins: Vec<String>,
+    candidate_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +132,15 @@ impl PositionEvidence {
                 "Choose up to sixteen legal candidate moves.",
             ));
         }
+        if request
+            .candidate_count
+            .is_some_and(|count| request.source != Source::Stockfish || !(1..=5).contains(&count))
+        {
+            return Err(AppError::new(
+                "invalid_candidate_count",
+                "Choose one to five Stockfish lines.",
+            ));
+        }
         let id = request.request_id.clone();
         let source = request.source;
         let reply = json!({"status":"running","fen":request.fen,"request_id":id,"source":source});
@@ -209,7 +219,13 @@ impl Services {
         match r.source {
             Source::Stockfish => {
                 let pins = r.pins.iter().map(String::as_str).collect::<Vec<_>>();
-                let result = stockfish(&self.directory, &r.fen, &job.legal, &pins)?;
+                let result = stockfish(
+                    &self.directory,
+                    &r.fen,
+                    &job.legal,
+                    &pins,
+                    r.candidate_count.unwrap_or(3),
+                )?;
                 let complete = result.comparison.is_some() || pins.is_empty();
                 Ok(
                     json!({"engine":result.engine,"comparison_complete":complete,"candidates":result.comparison.unwrap_or(result.candidates)}),
@@ -320,6 +336,7 @@ mod tests {
                     learner_color: None,
                     ratings: Ratings::default(),
                     pins: vec![],
+                    candidate_count: None,
                 },
             }
         };

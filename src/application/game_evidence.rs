@@ -1208,8 +1208,14 @@ fn uploaded_record(game: &PlayedGame, fetched_ms: u64) -> Result<GameRecord, Str
         .map_or_else(String::new, |date| {
             format!("[Date \"{}\"]\n", date.format("%Y.%m.%d"))
         });
+    // These validated PGN tag values retain their original escaping. Opening
+    // labels describe a game in the library and do not participate in identity.
+    let opening_tags = ["Opening", "Variation", "ECO", "ECOUrl"]
+        .into_iter()
+        .filter_map(|key| tag(key).map(|value| format!("[{key} \"{value}\"]\n")))
+        .collect::<String>();
     let pgn = format!(
-        "[White {}]\n[Black {}]\n[Result {}]\n{setup}{date_tag}\n{}\n",
+        "[White {}]\n[Black {}]\n[Result {}]\n{setup}{date_tag}{opening_tags}\n{}\n",
         json!(white),
         json!(black),
         json!(game.result),

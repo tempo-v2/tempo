@@ -224,6 +224,7 @@ fn respond(
         "/api/games"
             | "/api/analysis/evidence"
             | "/api/analysis/result"
+            | "/api/games/library"
             | "/api/games/job"
             | "/api/games/import"
             | "/api/games/refresh"
@@ -254,6 +255,11 @@ fn respond(
                 200,
                 command::<crate::position_evidence::EvidenceRead>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|r| games.position_evidence.read(r)),
+            ),
+            (&Method::Post, "/api/games/library") => (
+                200,
+                command::<crate::GameLibraryRead>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|r| app.game_library(r)),
             ),
             (&Method::Get, "/api/games") => (200, app.game_history()),
             (&Method::Get, "/api/games/job") => (200, Ok(games.refresh.poll(app))),

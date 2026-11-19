@@ -13,6 +13,8 @@ mod export;
 mod game_backfill;
 mod game_detection;
 mod game_evidence;
+mod game_library;
+pub use game_library::GameLibraryRead;
 mod game_model;
 mod game_review;
 pub use game_review::{GameReviewLine, GameReviewRead};
