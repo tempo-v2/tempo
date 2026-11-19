@@ -19,7 +19,7 @@ impl Tempo {
     ) -> Result<Vec<tempo_chess::ContentChange>, AppError> {
         let fixture = self.fixture.as_ref().ok_or_else(|| {
             AppError::new(
-                "unsupported_capability",
+                "unsupported",
                 "Use Repertoires to preview and save repertoire PGN.",
             )
         })?;

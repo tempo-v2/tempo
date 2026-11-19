@@ -1,13 +1,11 @@
 //! Project original pack membership into an order for new tactics only.
-use super::{
-    Tempo,
-    tactic_catalog_facts::{TacticPackCandidate, tactic_pack_candidates},
-};
+use super::{Tempo, tactic_catalog_facts::tactic_pack_candidates};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::LazyLock,
 };
+use tempo_queue::TacticPackCandidate;
 use tempo_store::StudyScope;
 use tempo_types::{StudyDay, TargetId};
 
@@ -40,6 +38,16 @@ pub fn tactic_themes() -> &'static [TacticTheme] {
         serde_json::from_str(include_str!("tactic_themes.json")).expect("bundled Tempo theme list")
     });
     &THEMES
+}
+
+pub(super) fn known_tactic_theme(id: &str) -> bool {
+    static IDS: LazyLock<BTreeSet<&'static str>> = LazyLock::new(|| {
+        tactic_themes()
+            .iter()
+            .map(|theme| theme.id.as_str())
+            .collect()
+    });
+    IDS.contains(id)
 }
 
 impl TacticThemes {
@@ -121,61 +129,12 @@ pub(super) fn new_tactic_order<'a>(
     let TacticThemes::Selected { theme_ids } = preference else {
         return None;
     };
-    let themes = tactic_themes()
+    let themes: Vec<_> = tactic_themes()
         .iter()
         .filter(|theme| theme_ids.contains(&theme.id))
-        .enumerate()
-        .map(|(index, theme)| (theme.id.as_str(), index))
-        .collect::<BTreeMap<_, _>>();
-    if themes.is_empty() {
-        return Some(BTreeMap::new());
-    }
-
-    let mut admitted = vec![0; themes.len()];
-    let mut eligible = Vec::new();
-    for candidate in candidates {
-        if candidate.guided_introduction {
-            continue;
-        }
-        let first = candidate.first_introduced;
-        if first.is_some() && first != Some(today) {
-            continue;
-        }
-        // Attribute overlapping source memberships to their earliest eligible pack.
-        if let Some((order, theme)) = candidate
-            .memberships
-            .iter()
-            .filter_map(|pack| {
-                Some((
-                    (pack.difficulty, pack.ordinal, pack.position),
-                    *themes.get(pack.theme)?,
-                ))
-            })
-            .min()
-        {
-            if first.is_some() {
-                admitted[theme] += 1;
-            } else {
-                eligible.push((theme, order, candidate.target));
-            }
-        }
-    }
-    let start = today.0.rem_euclid(themes.len() as i32) as usize;
-    eligible.sort_unstable_by_key(|&(theme, order, target)| {
-        (
-            admitted[theme],
-            (theme + themes.len() - start) % themes.len(),
-            order,
-            target,
-        )
-    });
-    Some(
-        eligible
-            .into_iter()
-            .enumerate()
-            .map(|(rank, (_, _, target))| (target.clone(), rank))
-            .collect(),
-    )
+        .map(|theme| theme.id.as_str())
+        .collect();
+    tempo_queue::rank_new_tactics(candidates, today, Some(&themes))
 }
 
 #[cfg(test)]

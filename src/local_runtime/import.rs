@@ -1,8 +1,8 @@
 //! Decode the transfer format and report dispositions for one atomic import.
 use super::LocalResult;
+use crate::{Tempo, application::tactic_catalog_facts::pack_memberships};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io, path::Path};
-use crate::Tempo;
 use tempo_chess::{
     Catalog, ChangeKind, ContentChange, ContentStatus, TacticRecord, compile_tactics,
 };
@@ -84,6 +84,16 @@ struct Mapping {
 }
 
 #[derive(Serialize)]
+struct RetainedMembershipGap {
+    target: TargetId,
+    source_id: String,
+    theme: String,
+    difficulty: &'static str,
+    ordinal: usize,
+    position: usize,
+}
+
+#[derive(Serialize)]
 struct Report {
     schema_version: u32,
     dataset: String,
@@ -92,6 +102,7 @@ struct Report {
     historical_learning_mapped: u32,
     final_tactic_count: usize,
     already_present_tactic_count: usize,
+    retained_membership_gaps: Vec<RetainedMembershipGap>,
 }
 
 pub(super) fn run(app: &mut Tempo, batch: Batch) -> LocalResult<()> {
@@ -108,12 +119,36 @@ pub(super) fn run(app: &mut Tempo, batch: Batch) -> LocalResult<()> {
         .iter()
         .filter(|change| change.kind == ChangeKind::Added)
         .count();
+    let mut retained_membership_gaps = Vec::new();
     let sources = batch
         .identities
         .into_iter()
         .zip(&plan.changes)
         .map(|(source, change)| {
             let item = &plan.catalog.items[&change.target];
+            if change.kind == ChangeKind::Unchanged
+                && let Some(incoming) = batch.catalog.items.get(&source.source_token)
+            {
+                let retained: Vec<_> = pack_memberships(&item.provenance).collect();
+                for fact in pack_memberships(&incoming.provenance) {
+                    if retained.contains(&fact) {
+                        continue;
+                    }
+                    let difficulty = match fact.difficulty {
+                        tempo_queue::PackDifficulty::Easy => "easy",
+                        tempo_queue::PackDifficulty::Medium => "medium",
+                        tempo_queue::PackDifficulty::Hard => "hard",
+                    };
+                    retained_membership_gaps.push(RetainedMembershipGap {
+                        target: item.target.clone(),
+                        source_id: source.source_id.clone(),
+                        theme: fact.theme.to_owned(),
+                        difficulty,
+                        ordinal: fact.ordinal,
+                        position: fact.position,
+                    });
+                }
+            }
             Mapping {
                 alias: source.source_token != item.target,
                 source,
@@ -131,6 +166,7 @@ pub(super) fn run(app: &mut Tempo, batch: Batch) -> LocalResult<()> {
         historical_learning_mapped: 0,
         final_tactic_count,
         already_present_tactic_count: final_tactic_count - added,
+        retained_membership_gaps,
     };
     use std::io::Write;
     let mut output = io::stdout().lock();

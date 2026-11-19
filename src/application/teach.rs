@@ -7,12 +7,13 @@ use crate::{
     AppError, SubmitCommand,
     app_error::{domain, study_input},
 };
+use tempo_chess::{GuidedMoveError, acknowledge_shown_move};
 use tempo_learning::DailyLearning;
 use tempo_store::{
     AcceptanceKind, ActivityAcceptance, ActivityMode, AnswerResult, Receipt, ReceiptResult,
     StoredAttempt, StudyScope, Write,
 };
-use tempo_study::{AttemptStatus, check_open::check_open};
+use tempo_study::{check_open::check_open, complete_ungraded};
 
 impl Tempo {
     pub(super) fn acknowledge(&mut self, command: SubmitCommand) -> Result<AnswerResult, AppError> {
@@ -34,16 +35,20 @@ impl Tempo {
                 "This activity is a blind test.",
             ));
         }
-        let revision = check_open(&old.attempt, command.expected_revision).map_err(study_input)?;
+        check_open(&old.attempt, command.expected_revision).map_err(study_input)?;
         let (item, prior) = snapshot
             .target(&old.attempt.target)?
             .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
-        if item.definition.decisions[0].expected != command.answer {
-            return Err(AppError::new(
-                "try_shown_move",
-                "Reproduce the shown move before acknowledging the lesson.",
-            ));
-        }
+        let next = acknowledge_shown_move(&item.definition, &old.attempt.state, &command.answer)
+            .map_err(|error| match error {
+                GuidedMoveError::TryShownMove => AppError::new(
+                    "try_shown_move",
+                    "Reproduce the shown move before acknowledging the lesson.",
+                ),
+                _ => AppError::new("invalid_content", "The shown move is unavailable."),
+            })?;
+        let attempt = complete_ungraded(&old.attempt, command.expected_revision, next)
+            .map_err(study_input)?;
         let at = self.components.clock.now();
         let state = match old.mode {
             ActivityMode::Repair => {
@@ -53,11 +58,6 @@ impl Tempo {
             _ => DailyLearning::teach(prior, at),
         }
         .map_err(|error| domain("learning_error", error))?;
-        let mut attempt = old.attempt.clone();
-        attempt.revision = revision;
-        attempt.state.decision_index = 1;
-        attempt.status = AttemptStatus::Complete;
-        attempt.prompt = None;
         let reply = AnswerResult {
             attempt: attempt.clone(),
             feedback: None,
