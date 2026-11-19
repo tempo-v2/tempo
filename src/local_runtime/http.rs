@@ -166,6 +166,9 @@ fn respond(
     address: &str,
     origin: &str,
 ) -> LocalResult<()> {
+    // Older open tabs have strict v5 reply validators. The opt-in changes
+    // display only, independent of submission identity and saved receipts.
+    let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     if header(&request, "Host") != Some(address)
         || header(&request, "Origin").is_some_and(|value| value != origin)
     {
@@ -240,7 +243,12 @@ fn respond(
             (&Method::Post, "/api/study/game-context") => (
                 200,
                 command::<StudyAttemptRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
-                    app.study_game_context(&intent.dataset_id, &intent.attempt_id)
+                    let mut reply =
+                        app.study_game_context(&intent.dataset_id, &intent.attempt_id)?;
+                    if !move_details && let Some(context) = reply["context"].as_object_mut() {
+                        context.remove("played_uci");
+                    }
+                    Ok(reply)
                 }),
             ),
             (&Method::Post, "/api/games/import") => (
@@ -323,6 +331,11 @@ fn respond(
         let reply = command::<StudyCommand>(&mut request, MAX_COMMAND_BYTES)
             .map(|intent| app.handle(intent))
             .unwrap_or_else(Into::into);
+        let reply = if move_details {
+            reply
+        } else {
+            reply.without_move_details()
+        };
         request.respond(body(
             "application/json; charset=utf-8",
             serde_json::to_vec(&reply)?,

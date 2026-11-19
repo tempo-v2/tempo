@@ -7,7 +7,7 @@ use crate::{
     views::{EmptyView, LessonView, StudyView},
     wire::STUDY_WIRE_VERSION,
 };
-use tempo_chess::project_position;
+use tempo_chess::{move_san, project_position};
 use tempo_store::{ActivityMode, AnswerResult, StudyScope};
 use tempo_study::AttemptStatus;
 
@@ -119,7 +119,7 @@ impl Tempo {
             attempt.status == AttemptStatus::Active,
         )
         .map_err(|error| domain("invalid_content", error))?;
-        let correction_uci = if result.feedback.as_ref().is_some_and(|f| !f.correct) {
+        let correction = if result.feedback.as_ref().is_some_and(|f| !f.correct) {
             // A miss leaves the cursor on the same decision, including on replay
             // of a receipt whose pinned definition has since been replaced.
             let decision = issued
@@ -129,33 +129,35 @@ impl Tempo {
                 .ok_or_else(|| {
                     AppError::new("invalid_content", "correction decision is missing")
                 })?;
-            Some(decision.expected.uci.clone())
+            let uci = &decision.expected.uci;
+            let san =
+                move_san(&decision.fen, uci).map_err(|error| domain("invalid_content", error))?;
+            Some((uci.clone(), san))
         } else {
             None
         };
         let lesson = (matches!(record.mode, ActivityMode::Teach | ActivityMode::Repair)
             && attempt.status == AttemptStatus::Active)
             .then(|| {
-                let expected = &issued.definition.decisions[0].expected.uci;
+                let decision = &issued.definition.decisions[0];
+                let expected = &decision.expected.uci;
+                let san = move_san(&decision.fen, expected)
+                    .map_err(|error| domain("invalid_content", error))?;
                 let lesson = record.lesson.as_ref().or(issued.lesson.as_ref());
-                LessonView {
+                Ok::<_, AppError>(LessonView {
                     move_uci: expected.clone(),
-                    move_san: lesson.map_or_else(|| expected.clone(), |lesson| lesson.san.clone()),
+                    move_san: san,
                     comments: lesson.map_or_else(Vec::new, |lesson| lesson.comments.clone()),
                     previous_move: lesson.and_then(|lesson| lesson.previous_move.clone()),
-                }
-            });
+                })
+            })
+            .transpose()?;
         let history = (attempt.state.decision_index > 0)
             .then(|| tempo_chess::revealed_line(&issued.definition, attempt.state.decision_index))
             .transpose()
             .map_err(|error| domain("invalid_content", error))?;
         Ok(StudyView::attempt(
-            result,
-            board,
-            correction_uci,
-            &record,
-            lesson,
-            history,
+            result, board, correction, &record, lesson, history,
         ))
     }
 }

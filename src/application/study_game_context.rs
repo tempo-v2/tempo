@@ -70,6 +70,8 @@ impl Tempo {
             "lichess" | "chess_com" => evidence.game.url,
             _ => None,
         };
-        Ok(json!({"context": {"played_san": played_san, "line": line, "url": url}}))
+        Ok(
+            json!({"context": {"played_san": played_san, "played_uci": evidence.played, "line": line, "url": url}}),
+        )
     }
 }

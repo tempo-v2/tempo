@@ -1,5 +1,11 @@
 //! On-demand authoring analysis. Neither result can write content or influence Study.
-use crate::{AppError, Tempo, app_error::domain, game_evidence::check_id, game_model::GapRequest};
+use crate::{
+    AppError, Tempo,
+    app_error::domain,
+    game_evidence::check_id,
+    game_model::GapRequest,
+    gap_recommendation::{SimilarMoves, recommend},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(unix)]
@@ -11,7 +17,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tempo_chess::{GapDraft, PositionKey, structural_neighbors};
+use tempo_chess::{GapDraft, PositionKey, SavedRepertoireResponse, nearby_repertoire_positions};
 use tempo_types::Revision;
 
 #[derive(Deserialize)]
@@ -23,7 +29,9 @@ pub struct GapAnalysisRequest {
 
 pub(crate) struct GapAnalysisInput {
     pub draft: GapDraft,
-    pub catalog: BTreeMap<PositionKey, Vec<String>>,
+    pub catalog: BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>,
+    pub repertoire_id: String,
+    pub repertoire_names: BTreeMap<String, String>,
     pub revision: Revision,
 }
 
@@ -39,6 +47,8 @@ struct EngineCandidate {
 struct EngineResult {
     engine: String,
     candidates: Vec<EngineCandidate>,
+    #[serde(skip_serializing)]
+    comparison: Option<Vec<EngineCandidate>>,
 }
 
 pub struct GapAnalysis {
@@ -75,7 +85,9 @@ impl GapAnalysis {
         if let Err(error) = std::thread::Builder::new()
             .name("tempo-gap-analysis".into())
             .spawn(move || {
-                let result = analyze(id, input, &directory);
+                let result = analyze(id, input, &directory, |progress| {
+                    *reply.lock().expect("gap analysis reply") = progress;
+                });
                 *reply.lock().expect("gap analysis reply") = result;
             })
         {
@@ -86,28 +98,85 @@ impl GapAnalysis {
     }
 }
 
-fn analyze(id: String, input: GapAnalysisInput, directory: &Path) -> Value {
-    let neighbors =
-        structural_neighbors(&input.draft.fen, input.catalog.keys(), 3).map(|positions| {
+const NEARBY_PER_GROUP: usize = 8;
+const MAX_COMPARISON_REPLIES: usize = 16;
+
+fn analyze(
+    id: String,
+    input: GapAnalysisInput,
+    directory: &Path,
+    publish: impl FnOnce(Value),
+) -> Value {
+    let nearby = nearby_repertoire_positions(
+        &input.draft.fen,
+        &input.repertoire_id,
+        &input.catalog,
+        NEARBY_PER_GROUP,
+    );
+    let similar = nearby.as_ref().map(SimilarMoves::rank).unwrap_or_default();
+    // Older open pages can continue reading the original three board examples.
+    let neighbors = nearby.as_ref().ok().map(|groups| {
+        let mut positions = BTreeMap::<_, BTreeSet<_>>::new();
+        for position in groups.current.iter().chain(&groups.other) {
             positions
-                .into_iter()
-                .map(|position| {
-                    json!({
-                        "fen": format!("{} 0 1", position.0),
-                        "repertoires": input.catalog[&position].iter().collect::<BTreeSet<_>>(),
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-    let engine = stockfish(directory, &input.draft);
-    json!({
-        "status": "complete", "request_id": id, "content_revision": input.revision,
-        "neighbors": neighbors.as_ref().ok(), "neighbors_error": neighbors.err().map(|error| error.to_string()),
-        "stockfish": engine.as_ref().ok(), "stockfish_error": engine.err().map(|error| error.message),
-    })
+                .entry((position.distance, &position.fen))
+                .or_default()
+                .extend(
+                    position
+                        .responses
+                        .iter()
+                        .filter_map(|saved| input.repertoire_names.get(&saved.repertoire_id)),
+                );
+        }
+        positions
+            .into_iter()
+            .take(3)
+            .map(|((_, fen), names)| json!({"fen": fen, "repertoires": names}))
+            .collect::<Vec<_>>()
+    });
+    let mut progress = json!({
+        "status": "running", "request_id": id, "content_revision": input.revision,
+        "nearby": nearby.as_ref().ok(), "neighbors": neighbors, "neighbors_error": nearby.as_ref().err().map(ToString::to_string),
+        "similar_responses": similar, "repertoire_names": input.repertoire_names,
+    });
+    publish(progress.clone());
+
+    let shortlist = similar
+        .ordered()
+        .take(MAX_COMPARISON_REPLIES)
+        .map(|(_, mv)| mv.uci)
+        .collect::<Vec<_>>();
+    let mut engine = stockfish(directory, &input.draft, &shortlist);
+    let recommendation = engine.as_ref().ok().and_then(|result| {
+        let best = result
+            .comparison
+            .as_ref()
+            .unwrap_or(&result.candidates)
+            .first()?;
+        let scores = result
+            .comparison
+            .iter()
+            .flatten()
+            .map(|mv| (mv.uci.as_str(), mv.centipawns));
+        recommend(&similar, (&best.uci, best.centipawns), scores)
+    });
+    progress["recommendation"] = json!(recommendation);
+    if let Ok(result) = &mut engine
+        && let Some(comparison) = result.comparison.take()
+    {
+        result.candidates = comparison.into_iter().take(3).collect();
+    }
+    progress["stockfish"] = json!(engine.as_ref().ok());
+    progress["stockfish_error"] = json!(engine.err().map(|error| error.message));
+    progress["status"] = json!("complete");
+    progress
 }
 
-fn stockfish(directory: &Path, draft: &GapDraft) -> Result<EngineResult, AppError> {
+fn stockfish(
+    directory: &Path,
+    draft: &GapDraft,
+    shortlist: &[&str],
+) -> Result<EngineResult, AppError> {
     let binary = [
         "/opt/homebrew/bin/stockfish",
         "/usr/local/bin/stockfish",
@@ -125,6 +194,7 @@ fn stockfish(directory: &Path, draft: &GapDraft) -> Result<EngineResult, AppErro
         return Ok(EngineResult {
             engine: "Stockfish".into(),
             candidates: vec![],
+            comparison: None,
         });
     }
     let mut command = Command::new(directory.join("venv/bin/python"));
@@ -136,6 +206,7 @@ fn stockfish(directory: &Path, draft: &GapDraft) -> Result<EngineResult, AppErro
             binary,
             &draft.fen,
         ])
+        .args(shortlist)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -150,24 +221,46 @@ fn stockfish(directory: &Path, draft: &GapDraft) -> Result<EngineResult, AppErro
             "Stockfish could not evaluate the position.",
         ));
     }
-    let reply: EngineResult = serde_json::from_slice(&output.stdout)
+    let mut reply: EngineResult = serde_json::from_slice(&output.stdout)
         .map_err(|error| domain("invalid_engine_reply", error))?;
     let unique: BTreeSet<_> = reply
         .candidates
         .iter()
-        .map(|move_result| &move_result.uci)
+        .map(|move_result| move_result.uci.as_str())
         .collect();
     if reply.candidates.is_empty()
         || reply.candidates.len() > 3
         || reply.candidates.len() != unique.len()
-        || !unique
-            .into_iter()
-            .all(|uci| draft.legal_moves.contains(uci))
+        || reply
+            .candidates
+            .iter()
+            .any(|mv| mv.centipawns.is_some() == mv.mate.is_some())
+        || !reply
+            .candidates
+            .iter()
+            .all(|mv| draft.legal_moves.contains(&mv.uci))
     {
         return Err(AppError::new(
             "invalid_engine_reply",
             "Stockfish returned an invalid candidate list.",
         ));
+    }
+    let expected = unique
+        .into_iter()
+        .chain(shortlist.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if reply.comparison.as_ref().is_some_and(|moves| {
+        moves.len() != expected.len()
+            || moves
+                .iter()
+                .map(|mv| mv.uci.as_str())
+                .collect::<BTreeSet<_>>()
+                != expected
+            || moves
+                .iter()
+                .any(|mv| mv.centipawns.is_some() == mv.mate.is_some())
+    }) {
+        reply.comparison = None;
     }
     Ok(reply)
 }

@@ -26,10 +26,21 @@ impl From<AppError> for StudyView {
     }
 }
 impl StudyView {
+    /// Keep the original strict v5 shape for consumers that did not opt in
+    /// to supplemental feedback labels. The attempt and receipt stay fixed.
+    pub fn without_move_details(mut self) -> Self {
+        if let Self::Attempt(view) = &mut self
+            && let Some(feedback) = &mut view.feedback
+        {
+            feedback.correction_san = None;
+        }
+        self
+    }
+
     pub(crate) fn attempt(
         value: AnswerResult,
         board: PositionDisplay,
-        correction_uci: Option<String>,
+        correction: Option<(String, String)>,
         record: &StoredAttempt,
         lesson: Option<LessonView>,
         history: Option<tempo_chess::RevealedLine>,
@@ -40,6 +51,9 @@ impl StudyView {
             AttemptStatus::Complete => "complete",
             AttemptStatus::Abandoned => "abandoned",
         };
+        let (correction_uci, correction_san) = correction
+            .map(|(uci, san)| (Some(uci), Some(san)))
+            .unwrap_or_default();
         Self::Attempt(Box::new(AttemptView {
             schema_version: STUDY_WIRE_VERSION,
             status: status.into(),
@@ -65,6 +79,7 @@ impl StudyView {
             feedback: value.feedback.map(|result| AttemptFeedback {
                 result,
                 correction_uci,
+                correction_san,
             }),
             assessment: attempt.terminal,
         }))
