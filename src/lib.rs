@@ -41,5 +41,9 @@ pub mod game_backfill;
 pub mod game_model;
 
 pub mod gap_analysis;
+pub mod position_evidence;
+pub mod explorer;
+mod maia;
+mod stockfish;
 mod gap_recommendation;
 pub mod gap_explorer;

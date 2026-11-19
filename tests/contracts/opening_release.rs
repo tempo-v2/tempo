@@ -2567,3 +2567,189 @@ fn deeper_game_positions_advance_their_own_eligible_frontier_in_either_branch() 
     assert_eq!(selected.len(), 2);
     assert_ne!(selected[0], selected[1]);
 }
+
+#[test]
+fn marked_line_preview_and_exact_save_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("marked.sqlite");
+    let today = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits::default();
+    let mut app = open(&db, today.clone(), limits, 0);
+    let draft = json!({
+        "command":"marked_preview", "dataset_id":"opening-proof", "name":"Board book",
+        "learner_color":"white", "repertoire_id":null, "base_revision":null,
+        "anchor_fen":tempo_chess::START_FEN,
+        "lines":[["e2e4","c7c5","g1f3"],["e2e4","e7e5","g1f3"]]
+    });
+    let preview = content(&mut app, draft.clone());
+    assert_eq!(preview["status"], "preview", "{preview}");
+    assert_eq!(preview["routes"], 2);
+    let saved = content(&mut app, preview["save_command"].clone());
+    assert_eq!(saved["status"], "repertoires", "{saved}");
+    drop(app);
+    let mut app = open(&db, today, limits, 1);
+    assert_eq!(content(&mut app, preview["save_command"].clone()), saved);
+    for index in 0..3 {
+        let lesson = study(&mut app, json!({"command":"next"}));
+        let mut ack = activity_command("acknowledge", &lesson, &format!("marked-lesson-{index}"));
+        ack["answer"] = json!({"uci":lesson["lesson"]["move_uci"]});
+        assert_eq!(study(&mut app, ack)["status"], "complete");
+    }
+    let before = app.snapshot().unwrap();
+    let document = content(
+        &mut app,
+        json!({"command":"read_document","dataset_id":"opening-proof","repertoire_id":preview["repertoire_id"]}),
+    );
+    let mut replace = draft;
+    replace["repertoire_id"] = preview["repertoire_id"].clone();
+    replace["base_revision"] = document["revision"].clone();
+    replace["lines"] = json!([["d2d4"]]);
+    let next = content(&mut app, replace.clone());
+    assert_eq!(next["status"], "preview", "{next}");
+    assert_eq!(next["replacements"][0]["old_move"], "e4");
+    assert_eq!(next["affected_learning"], 3);
+    assert_eq!(next["removed"], 2);
+    assert_eq!(next["changed"], 1);
+    assert_eq!(next["retired_routes"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        content(&mut app, next["save_command"].clone())["status"],
+        "repertoires"
+    );
+    let after = app.snapshot().unwrap();
+    for (id, previous) in &before.catalog.items {
+        let item = &after.catalog.items[id];
+        if item.active() {
+            assert_eq!(item.version.0, previous.version.0 + 1);
+            assert_eq!(
+                after.learning[id],
+                DailyLearning::changed_answer(&before.learning[id])
+            );
+        } else {
+            assert_eq!(item.version, previous.version);
+            assert_eq!(after.learning[id], before.learning[id]);
+        }
+    }
+    assert_eq!(after.assessments, before.assessments);
+    assert_eq!(content(&mut app, replace)["code"], "stale_draft");
+}
+
+#[test]
+fn conceding_a_scheduled_review_recovers_its_issued_position_once() {
+    use tempo_types::{AttemptId, ContentVersion, DatasetId, Revision};
+
+    fn analysis(app: &Tempo, view: &Value) -> Result<Value, tempo::AppError> {
+        app.study_analysis_context(
+            &DatasetId::from(view["dataset_id"].as_str().unwrap()),
+            &AttemptId::from(view["attempt_id"].as_str().unwrap()),
+            Revision(view["revision"].as_u64().unwrap()),
+            ContentVersion(view["content_version"].as_u64().unwrap()),
+        )
+    }
+
+    for already_missed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("concession.sqlite");
+        let today = Arc::new(AtomicI32::new(20_000));
+        let mut app = open(&db, today.clone(), IntroductionLimits::default(), 0);
+        let (_, saved) = preview_and_save(&mut app, "1. e4 *", "White", None);
+        let book = saved["repertoires"][0]["id"].as_str().unwrap();
+        let teach = study(&mut app, json!({"command":"next"}));
+        let before = app.snapshot().unwrap();
+        assert_eq!(analysis(&app, &teach).unwrap()["repertoireId"], book);
+        assert_eq!(
+            study(&mut app, activity_command("concede", &teach, "invalid"))["code"],
+            "wrong_activity"
+        );
+        assert_eq!(app.snapshot().unwrap(), before);
+        let mut ack = activity_command("acknowledge", &teach, "teach");
+        ack["answer"] = json!({"uci":"e2e4"});
+        assert_eq!(study(&mut app, ack)["status"], "complete");
+
+        today.store(20_001, Ordering::Relaxed);
+        let mut view = study(&mut app, json!({"command":"next"}));
+        assert_eq!(view["activity"], "test");
+        if already_missed {
+            let mut wrong = activity_command("answer", &view, "a-miss");
+            wrong["answer"] = json!({"uci":"e2e3"});
+            view = study(&mut app, wrong);
+        }
+        assert_eq!(
+            analysis(&app, &view).unwrap_err().code,
+            "analysis_requires_concession"
+        );
+        let before = app.snapshot().unwrap();
+        let concede = activity_command("concede", &view, "confirmed-concession");
+        let closed = study(&mut app, concede.clone());
+        assert_eq!(closed["status"], "abandoned", "{closed}");
+        assert_eq!(closed["assessment"], "again");
+        let after = app.snapshot().unwrap();
+        assert_eq!(after.active_attempt, None);
+        assert_eq!(after.assessments.len(), 1);
+        assert_eq!(after.receipts.len(), before.receipts.len() + 1);
+        if already_missed {
+            assert_eq!(before.learning, after.learning);
+        }
+        let origin = analysis(&app, &closed).unwrap();
+        assert_eq!(origin["fen"], view["display_fen"]);
+        assert_eq!(origin["prescribedUci"], "e2e4");
+        assert_eq!(
+            origin["playedUci"],
+            if already_missed {
+                json!("e2e3")
+            } else {
+                Value::Null
+            }
+        );
+        drop(app);
+
+        let mut app = open(&db, today.clone(), IntroductionLimits::default(), 1);
+        preview_and_save(&mut app, "1. d4 *", "White", Some(book));
+        let after_edit = app.snapshot().unwrap();
+        assert_eq!(study(&mut app, concede.clone()), closed);
+        assert_eq!(analysis(&app, &closed).unwrap(), origin);
+        assert_eq!(app.snapshot().unwrap(), after_edit);
+        let mut duplicate = concede;
+        duplicate["submission_id"] = "different-identity".into();
+        assert_eq!(study(&mut app, duplicate)["status"], "error");
+        assert_eq!(app.snapshot().unwrap(), after_edit);
+    }
+}
+
+#[test]
+fn marked_preview_declines_a_generated_save_larger_than_the_transport_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = open(
+        &directory.path().join("size.sqlite"),
+        Arc::new(AtomicI32::new(20_000)),
+        IntroductionLimits::default(),
+        0,
+    );
+    let limit = tempo::wire::MAX_CONTENT_COMMAND_BYTES;
+    let mut source = "[Site \"\"]\n1.e4 *".to_string();
+    let initial = content(&mut app, book_request("preview", &source, "White", None));
+    let mut save = book_request("save", &source, "White", None);
+    save["token"] = initial["token"].clone();
+    let padding = limit - serde_json::to_vec(&save).unwrap().len() - 4;
+    source.insert_str(7, &"a".repeat(padding));
+    let preview = content(&mut app, book_request("preview", &source, "White", None));
+    assert_eq!(preview["status"], "preview");
+    save["pgn"] = json!(source);
+    save["token"] = preview["token"].clone();
+    assert_eq!(serde_json::to_vec(&save).unwrap().len(), limit - 4);
+    let saved = content(&mut app, save);
+    let id = &saved["repertoires"][0]["id"];
+    let document = content(
+        &mut app,
+        json!({"command":"read_document","dataset_id":"opening-proof","repertoire_id":id}),
+    );
+    let revision = app.snapshot().unwrap().revision;
+    let extended = content(
+        &mut app,
+        json!({"command":"marked_preview","dataset_id":"opening-proof","repertoire_id":id,
+        "name":"White","learner_color":"white","anchor_fen":tempo_chess::START_FEN,
+        "base_revision":document["revision"],"lines":[["e2e4","e7e5","g1f3"]]}),
+    );
+    assert_eq!(extended["code"], "save_too_large");
+    assert!(extended.get("save_command").is_none());
+    assert_eq!(app.snapshot().unwrap().revision, revision);
+}

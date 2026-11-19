@@ -22,6 +22,7 @@ mod queue_source;
 mod receipts;
 mod repertoires;
 mod study_game_context;
+mod study_analysis_context;
 
 mod restore;
 mod resume;

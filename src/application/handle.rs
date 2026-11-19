@@ -40,6 +40,9 @@ impl Tempo {
             StudyCommand::GiveUp(command) => {
                 self.give_up(command).and_then(|value| self.project(value))
             }
+            StudyCommand::Concede(command) => {
+                self.concede(command).and_then(|value| self.project(value))
+            }
             StudyCommand::Skip(command) => self.skip(command).and_then(|value| self.project(value)),
             StudyCommand::Abandon(command) => {
                 self.abandon(command).and_then(|value| self.project(value))
