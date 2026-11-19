@@ -97,7 +97,7 @@ struct GapPage {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RelevanceRead {
+struct StudyAttemptRead {
     dataset_id: tempo_types::DatasetId,
     attempt_id: tempo_types::AttemptId,
 }
@@ -186,6 +186,7 @@ fn respond(
             | "/api/games/gap-analysis"
             | "/api/games/gap-explorer"
             | "/api/study/relevance"
+            | "/api/study/game-context"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
             (&Method::Get, "/api/games") => (200, app.game_history()),
@@ -232,8 +233,14 @@ fn respond(
             ),
             (&Method::Post, "/api/study/relevance") => (
                 200,
-                command::<RelevanceRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                command::<StudyAttemptRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
                     app.study_relevance_reason(&intent.dataset_id, &intent.attempt_id)
+                }),
+            ),
+            (&Method::Post, "/api/study/game-context") => (
+                200,
+                command::<StudyAttemptRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                    app.study_game_context(&intent.dataset_id, &intent.attempt_id)
                 }),
             ),
             (&Method::Post, "/api/games/import") => (
