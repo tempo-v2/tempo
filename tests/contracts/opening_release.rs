@@ -1229,6 +1229,130 @@ fn play_activity(app: &mut Tempo, activity: &Value, command: &str, id: &str, uci
     study(app, answer)
 }
 
+fn repair_context(app: &Tempo, activity: &Value) -> Value {
+    let dataset = activity["dataset_id"].as_str().unwrap().into();
+    let attempt = activity["attempt_id"].as_str().unwrap().into();
+    app.study_game_context(&dataset, &attempt).unwrap()["context"].clone()
+}
+
+#[test]
+fn repair_context_follows_the_issued_miss_and_preserves_study() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("game-context.sqlite");
+    let day = Arc::new(AtomicI32::new(20_004));
+    let limits = IntroductionLimits {
+        repertoire: 0,
+        tactics: 0,
+    };
+    let mut app = open(&db, day.clone(), limits, 0);
+    let (_, book) = preview_and_save(&mut app, "1. e4 e5 2. Nf3 *", "London", None);
+    let dataset = "opening-proof";
+    date_only_import(&mut app, "first", "2024.10.06", "1. e4 e5 2. Bc4 Nc6");
+    let first = study(&mut app, json!({"command":"next"}));
+    assert_eq!(first["lesson"]["move_san"], "Nf3");
+    let before = app.snapshot().unwrap();
+    let context = repair_context(&app, &first);
+    assert_eq!(context["played_san"], "Bc4");
+    assert_eq!(context["url"], Value::Null);
+    let moves = context["line"]["moves"].as_array().unwrap();
+    assert_eq!(
+        moves
+            .iter()
+            .map(|m| m["notation"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["1. e4", "1... e5", "2. Bc4"]
+    );
+    assert!(
+        moves.last().unwrap()["fen"]
+            .as_str()
+            .unwrap()
+            .contains("/2B1P3/")
+    );
+    assert_eq!(app.snapshot().unwrap(), before);
+    let attempt = first["attempt_id"].as_str().unwrap().into();
+    assert_eq!(
+        app.study_game_context(&"other".into(), &attempt).unwrap()["context"],
+        Value::Null
+    );
+
+    // A later Game Again at the same target cannot retarget an issued card.
+    day.store(20_005, Ordering::Relaxed);
+    date_only_import(&mut app, "second", "2024.10.07", "1. e4 e5 2. Nc3 Nc6");
+    drop(app);
+    let mut app = open(&db, day.clone(), limits, 1);
+    assert_eq!(repair_context(&app, &first), context);
+    let saved = play_activity(&mut app, &first, "acknowledge", "save-first", "g1f3");
+    assert_eq!(saved["status"], "complete");
+    assert_eq!(repair_context(&app, &first), Value::Null);
+    let second = study(&mut app, json!({"command":"next"}));
+    assert_eq!(repair_context(&app, &second)["played_san"], "Nc3");
+
+    let archive = app.export(&tempo::JsonSnapshotCodec).unwrap();
+    let mut restored = open(
+        &directory.path().join("restored.sqlite"),
+        day.clone(),
+        limits,
+        0,
+    );
+    restored
+        .restore("restored".into(), &archive, &tempo::JsonSnapshotCodec)
+        .unwrap();
+    let restored_repair = study(&mut restored, json!({"command":"next"}));
+    assert_eq!(restored_repair["corrective_repair"], true);
+    assert_eq!(repair_context(&restored, &restored_repair), Value::Null);
+
+    assert_eq!(
+        play_activity(&mut app, &second, "acknowledge", "save-second", "g1f3")["assessment"],
+        Value::Null
+    );
+    let progress = app.study_progress(None).unwrap().unwrap();
+    assert_eq!(
+        (progress.openings_introduced, progress.openings_limit),
+        (0, 0)
+    );
+    day.store(20_006, Ordering::Relaxed);
+    let blind = study(&mut app, json!({"command":"next"}));
+    assert_eq!(blind["activity"], "test");
+    assert_eq!(repair_context(&app, &blind), Value::Null);
+
+    let reset = content(
+        &mut app,
+        json!({"command":"reset_progress", "dataset_id":dataset,
+        "repertoire_id":book["repertoires"][0]["id"], "command_id":"reset-context"}),
+    );
+    assert_eq!(reset["status"], "progress_reset");
+    day.store(20_007, Ordering::Relaxed);
+    let game = date_only_import(&mut app, "after-reset", "2024.10.11", "1. e4 e5 2. d4 Nc6");
+    assert_eq!(game["results"][0]["effect"], "again_applied");
+    let fresh = study(&mut app, json!({"command":"next"}));
+    assert_eq!(repair_context(&app, &fresh)["played_san"], "d4");
+    assert_eq!(repair_context(&app, &first), Value::Null);
+}
+
+#[test]
+fn repair_context_omits_an_ambiguous_repeated_game_position() {
+    let directory = tempfile::tempdir().unwrap();
+    let day = Arc::new(AtomicI32::new(20_004));
+    let mut app = open(
+        &directory.path().join("game-context-repeat.sqlite"),
+        day,
+        IntroductionLimits::default(),
+        0,
+    );
+    preview_and_save(&mut app, "1. e4 e5 2. Nf3 *", "Book", None);
+    let report = date_only_import(
+        &mut app,
+        "repeat",
+        "2024.10.06",
+        "1. e4 e5 2. Bc4 Nc6 3. Bf1 Nb8 4. Bc4 Nc6",
+    );
+    assert_eq!(report["deviations"], 2);
+    assert_eq!(report["results"][0]["effect"], "again_applied");
+    let repair = study(&mut app, json!({"command":"next"}));
+    assert_eq!(repair["corrective_repair"], true);
+    assert_eq!(repair_context(&app, &repair), Value::Null);
+}
+
 #[test]
 fn date_only_game_again_restarts_exact_position_repair_and_three_day_recall() {
     let directory = tempfile::tempdir().unwrap();
@@ -1483,6 +1607,9 @@ fn a_saved_choice_selects_one_target_and_stays_resolved_after_reprocessing_and_r
         app.choose_game_correction(request("change-choice", &targets[1], 1))
             .is_err()
     );
+    let repair = study(&mut app, json!({"command":"next"}));
+    assert_eq!(repair["target_id"], targets[0]["target_id"]);
+    assert_eq!(repair_context(&app, &repair)["played_san"], "c4");
     let start = 20_002_u64 * 86_400_000;
     let reprocessed = app
         .reprocess_games(
