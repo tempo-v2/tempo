@@ -141,9 +141,11 @@ impl Prefix {
         for path in book.routes {
             let mut node = &mut root;
             for (position, played) in path {
-                let side = book.positions[&position].side;
-                node.position = Some((position, side));
+                let before = &book.positions[&position];
+                let after = &before.replies[&played];
+                node.position = Some((position, before.side));
                 node = node.replies.entry(played).or_default();
+                node.position = Some((after.clone(), book.positions[after].side));
             }
         }
         root
@@ -346,10 +348,10 @@ mod tests {
 
     #[test]
     fn modeled_reach_counts_first_arrival_and_keeps_missing_paths_unknown() {
-        let pgn = "1. Nf3 Nf6 (1... g6 2. g3 Nf6 3. Bg2) 2. g3 g6 3. Bg2 *";
+        let pgn = "1. Nf3 Nf6 (1... g6 2. g3 Nf6) 2. g3 g6 3. Bg2 *";
         let color = LearnerColor::White;
         let catalog = compile_repertoire(pgn, "book", "Book", color, "test").unwrap();
-        let targets = catalog
+        let targets: BTreeMap<_, _> = catalog
             .items
             .values()
             .filter_map(|item| match &item.definition.kind {
@@ -368,6 +370,11 @@ mod tests {
             .clone();
         let authored = AuthoredRepertoire::parse(pgn).unwrap();
         let paths = authored.routes.clone();
+        let alternate = &paths[1][3];
+        let endpoint = &authored.positions[&alternate.0].replies[&alternate.1];
+        assert_eq!(endpoint, &paths[0][4].0);
+        assert_eq!(targets.get(endpoint), Some(&target));
+        assert!(authored.positions[endpoint].replies.contains_key("f1g2"));
         let root = Prefix::from_book(authored);
         let book = ModelBook {
             pgn: pgn.into(),
@@ -393,5 +400,19 @@ mod tests {
         let mut reach = BTreeMap::new();
         root.project(&book, Some(1.0), &cache, &mut BTreeSet::new(), &mut reach);
         assert!((reach[&target].unwrap() - (0.4 * 0.5 + 0.3 * 0.6)).abs() < 1e-12);
+
+        let continued = AuthoredRepertoire::parse(
+            "1. Nf3 Nf6 (1... g6 2. g3 Nf6 3. Bg2) 2. g3 g6 3. Bg2 *",
+        )
+        .unwrap();
+        let mut continued_reach = BTreeMap::new();
+        Prefix::from_book(continued).project(
+            &book,
+            Some(1.0),
+            &cache,
+            &mut BTreeSet::new(),
+            &mut continued_reach,
+        );
+        assert_eq!(continued_reach, reach);
     }
 }
