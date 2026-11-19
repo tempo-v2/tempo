@@ -518,7 +518,7 @@ mod tests {
     use crate::{JsonSnapshotCodec, game_evidence::GameImport, local_runtime};
 
     struct BlockingDetector {
-        entered: SyncSender<()>,
+        entered: SyncSender<std::thread::ThreadId>,
         release: std::sync::Mutex<Receiver<()>>,
     }
 
@@ -537,7 +537,7 @@ mod tests {
             _input: &GameDetectionInput,
             _control: &dyn DetectionControl,
         ) -> DetectionOutcome {
-            self.entered.send(()).unwrap();
+            self.entered.send(std::thread::current().id()).unwrap();
             self.release.lock().unwrap().recv().unwrap();
             DetectionOutcome::Complete(Vec::new())
         }
@@ -565,14 +565,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replay_keeps_the_worker_slot_and_dataset_replacement_fences_delivery() {
+    fn wait_for_acknowledgement(app: &Tempo, jobs: &mut GameDetection) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while jobs.active.is_some() {
+            jobs.poll(app);
+            assert!(Instant::now() < deadline, "worker did not acknowledge");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn disposable_app() -> (tempfile::TempDir, Tempo) {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("detector.sqlite");
         local_runtime::init(&database).unwrap();
-        let mut app = local_runtime::open(&database).unwrap();
+        let app = local_runtime::open(&database).unwrap();
+        (directory, app)
+    }
+
+    fn seed_game(app: &mut Tempo, id: &str) -> DetectionRequest {
         let original_dataset = app.game_dataset().unwrap();
-        let empty = app.export(&JsonSnapshotCodec).unwrap();
         app.import_game_pgn(GameImport {
             dataset_id: original_dataset.clone(),
             command_id: "seed".to_owned(),
@@ -584,23 +595,22 @@ mod tests {
         .unwrap();
         let history = app.game_history().unwrap();
         let game = &history["results"][0];
-        let a = DetectionRequest {
+        DetectionRequest {
             schema_version: VERSION,
-            request_id: "a".into(),
+            request_id: id.into(),
             dataset_id: original_dataset,
             source: game["source"].as_str().unwrap().into(),
             game_id: game["game_id"].as_str().unwrap().into(),
             learner: "Learner".into(),
             detector_id: "barrier".into(),
-        };
-        let b = DetectionRequest {
-            request_id: "b".into(),
-            ..a.clone()
-        };
-        let c = DetectionRequest {
-            request_id: "c".into(),
-            ..a.clone()
-        };
+        }
+    }
+
+    fn barrier_detector() -> (
+        DetectorRegistry,
+        Receiver<std::thread::ThreadId>,
+        SyncSender<()>,
+    ) {
         let (entered, observe) = mpsc::sync_channel(1);
         let (release, wait) = mpsc::sync_channel(1);
         let mut registry = DetectorRegistry::default();
@@ -610,6 +620,109 @@ mod tests {
                 release: std::sync::Mutex::new(wait),
             })
             .unwrap();
+        (registry, observe, release)
+    }
+
+    #[test]
+    fn timeout_keeps_worker_occupied_until_acknowledgement() {
+        let (_directory, mut app) = disposable_app();
+        let a = seed_game(&mut app, "a");
+        let (registry, observe, release) = barrier_detector();
+        let mut jobs = GameDetection::new(
+            registry,
+            AnalysisOptions {
+                deadline: Duration::from_secs(2),
+                ..AnalysisOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(jobs.start(&app, a.clone()).status, 202);
+        let worker = observe.recv_timeout(Duration::from_secs(2)).unwrap();
+        let timeout = report(&app, &a, &mut jobs);
+        assert_eq!(timeout["status"], "timed_out");
+        for id in ["busy-1", "busy-2", "busy-3"] {
+            let reply = jobs.start(
+                &app,
+                DetectionRequest {
+                    request_id: id.into(),
+                    ..a.clone()
+                },
+            );
+            assert_eq!(reply.status, 409);
+            assert_eq!(reply.body["code"], "busy");
+            assert_eq!(reply.body["request_id"], id);
+        }
+        assert!(matches!(observe.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(jobs.start(&app, a.clone()).body, timeout);
+        assert!(jobs.active.is_some());
+
+        release.send(()).unwrap();
+        wait_for_acknowledgement(&app, &mut jobs);
+        assert_eq!(jobs.start(&app, a.clone()).body, timeout);
+        let b = DetectionRequest {
+            request_id: "b".into(),
+            ..a
+        };
+        assert_eq!(jobs.start(&app, b.clone()).status, 202);
+        assert_eq!(
+            observe.recv_timeout(Duration::from_secs(2)).unwrap(),
+            worker
+        );
+        release.send(()).unwrap();
+        assert_eq!(report(&app, &b, &mut jobs)["status"], "complete");
+        assert!(matches!(observe.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn late_success_does_not_replace_the_addressed_timeout() {
+        let (_directory, mut app) = disposable_app();
+        let a = seed_game(&mut app, "a");
+        let (registry, _observe, _release) = barrier_detector();
+        let (work, incoming) = mpsc::sync_channel(1);
+        let mut jobs = GameDetection {
+            registry,
+            options: AnalysisOptions {
+                deadline: Duration::ZERO,
+                ..AnalysisOptions::default()
+            },
+            work,
+            active: None,
+            retained: VecDeque::new(),
+        };
+
+        assert_eq!(jobs.start(&app, a.clone()).status, 202);
+        let task = incoming.try_recv().unwrap();
+        let timeout = report(&app, &a, &mut jobs);
+        assert_eq!(timeout["status"], "timed_out");
+        // Model delivery after the deadline of a success computed before it.
+        task.reply
+            .send(DetectionStatus::Complete {
+                learner_color: task.source.color,
+                occurrence_count: 3,
+                input_key: "fixture-input".into(),
+                analysis_key: "fixture-analysis".into(),
+                findings: Vec::new(),
+            })
+            .unwrap();
+        wait_for_acknowledgement(&app, &mut jobs);
+        assert_eq!(jobs.start(&app, a).body, timeout);
+    }
+
+    #[test]
+    fn replay_keeps_the_worker_slot_and_dataset_replacement_fences_delivery() {
+        let (_directory, mut app) = disposable_app();
+        let empty = app.export(&JsonSnapshotCodec).unwrap();
+        let a = seed_game(&mut app, "a");
+        let b = DetectionRequest {
+            request_id: "b".into(),
+            ..a.clone()
+        };
+        let c = DetectionRequest {
+            request_id: "c".into(),
+            ..a.clone()
+        };
+        let (registry, observe, release) = barrier_detector();
         let mut jobs = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
 
         assert_eq!(jobs.start(&app, a.clone()).status, 202);
@@ -636,6 +749,13 @@ mod tests {
         );
         assert_eq!(jobs.start(&app, a).body["status"], "source_unavailable");
         release.send(()).unwrap();
-        assert_eq!(report(&app, &b, &mut jobs)["status"], "source_unavailable");
+        wait_for_acknowledgement(&app, &mut jobs);
+        assert_eq!(report(&app, &b, &mut jobs), stale);
+        let current = seed_game(&mut app, "current");
+        assert_ne!(current.dataset_id, b.dataset_id);
+        assert_eq!(jobs.start(&app, current.clone()).status, 202);
+        observe.recv_timeout(Duration::from_secs(2)).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(report(&app, &current, &mut jobs)["status"], "complete");
     }
 }
