@@ -104,9 +104,6 @@ impl Tempo {
         }
         let records =
             parse_played_games(&request.pgn).map_err(|error| domain("invalid_game", error))?;
-        if records.len() > 500 {
-            return Err(invalid("Upload at most 500 games at a time."));
-        }
         let fetched = records.len();
         let at = self.components.clock.now().unix_ms;
         let games = records

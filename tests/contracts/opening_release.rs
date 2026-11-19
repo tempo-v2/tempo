@@ -2716,7 +2716,7 @@ fn conceding_a_scheduled_review_recovers_its_issued_position_once() {
 }
 
 #[test]
-fn marked_preview_declines_a_generated_save_larger_than_the_transport_limit() {
+fn marked_preview_returns_a_signed_save_for_a_large_document() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = open(
         &directory.path().join("size.sqlite"),
@@ -2724,18 +2724,11 @@ fn marked_preview_declines_a_generated_save_larger_than_the_transport_limit() {
         IntroductionLimits::default(),
         0,
     );
-    let limit = tempo::wire::MAX_CONTENT_COMMAND_BYTES;
-    let mut source = "[Site \"\"]\n1.e4 *".to_string();
-    let initial = content(&mut app, book_request("preview", &source, "White", None));
-    let mut save = book_request("save", &source, "White", None);
-    save["token"] = initial["token"].clone();
-    let padding = limit - serde_json::to_vec(&save).unwrap().len() - 4;
-    source.insert_str(7, &"a".repeat(padding));
+    let source = format!("[Site \"{}\"]\n1.e4 *", "a".repeat(2 * 1024 * 1024));
     let preview = content(&mut app, book_request("preview", &source, "White", None));
     assert_eq!(preview["status"], "preview");
-    save["pgn"] = json!(source);
+    let mut save = book_request("save", &source, "White", None);
     save["token"] = preview["token"].clone();
-    assert_eq!(serde_json::to_vec(&save).unwrap().len(), limit - 4);
     let saved = content(&mut app, save);
     let id = &saved["repertoires"][0]["id"];
     let document = content(
@@ -2749,7 +2742,10 @@ fn marked_preview_declines_a_generated_save_larger_than_the_transport_limit() {
         "name":"White","learner_color":"white","anchor_fen":tempo_chess::START_FEN,
         "base_revision":document["revision"],"lines":[["e2e4","e7e5","g1f3"]]}),
     );
-    assert_eq!(extended["code"], "save_too_large");
-    assert!(extended.get("save_command").is_none());
+    assert_eq!(extended["status"], "preview");
     assert_eq!(app.snapshot().unwrap().revision, revision);
+    let save = extended["save_command"].clone();
+    assert!(serde_json::to_vec(&save).unwrap().len() > 2 * 1024 * 1024);
+    assert_eq!(content(&mut app, save)["status"], "repertoires");
+    assert_eq!(app.snapshot().unwrap().revision.0, revision.0 + 1);
 }

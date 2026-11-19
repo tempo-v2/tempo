@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { connect } from 'node:net';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -275,4 +276,72 @@ test('SQLite rolls back a teaching acknowledgement if its receipt cannot be stor
     } finally {
         sql.close();
     }
+});
+
+test('large PGN commands reach repertoire, tactic, and Games consumers', { timeout: 30_000 }, async t => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'tempo-pgn-upload-'));
+    const database = path.join(dir, 'upload.sqlite');
+    execFileSync(binary, ['init', database]);
+    const host = await start(database);
+    t.after(async () => {
+        await host.stop();
+        await rm(dir, { recursive: true, force: true });
+    });
+    const post = async (route, command) => {
+        const response = await fetch(host.url + '/api/' + route, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(command),
+        });
+        return response.json();
+    };
+    const address = new URL(host.url);
+    const socket = connect(Number(address.port), address.hostname);
+    socket.setTimeout(5_000, () => socket.destroy(new Error('Timed out waiting for HTTP reply')));
+    socket.end([
+        'POST /api/repertoires HTTP/1.1',
+        'Host: ' + address.host,
+        'Content-Type: application/json',
+        'Content-Length: 2000',
+        'Connection: close',
+        '',
+        '{"command":"list"}',
+    ].join('\r\n'));
+    let truncatedReply = '';
+    for await (const chunk of socket) truncatedReply += chunk;
+    assert.match(truncatedReply, /Could not read the command/);
+
+    const { dataset_id } = await post('repertoires', { command: 'list' });
+    const padding = '[Site "' + 'a'.repeat(2 * 1024 * 1024) + '"]\n';
+    const input = { dataset_id, name: 'Large', learner_color: 'white', pgn: padding + '1.e4 e5 *' };
+    const preview = await post('repertoires', { command: 'preview', ...input });
+    assert.equal(preview.status, 'preview', JSON.stringify(preview));
+    const saved = await post('repertoires', { command: 'save', ...input, token: preview.token });
+    assert.equal(saved.status, 'repertoires', JSON.stringify(saved));
+
+    const repeated = 'Nf3 Nf6 Ng1 Ng8 '.repeat(128) + '*\n';
+    const tactics = await post('tactics', {
+        command: 'preview', dataset_id, pgn: padding + repeated + repeated.repeat(32),
+    });
+    assert.equal(tactics.status, 'tactics_preview', tactics.message);
+    assert.equal(tactics.rows.length, 33);
+    assert.ok(tactics.rows.every(row => row.status === 'selection_required' && row.routes[0].moves.length === 512));
+
+    const capture = {
+        dataset_id, pgn: padding + '[SetUp "1"]\n[FEN "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"]\n1.e4 *',
+    };
+    const capturePreview = await post('tactics', { command: 'preview', ...capture });
+    assert.equal(capturePreview.rows[0].status, 'valid', JSON.stringify(capturePreview));
+    const captureSave = await post('tactics', {
+        command: 'save', ...capture, token: capturePreview.token, selected: [0],
+    });
+    assert.equal(captureSave.status, 'tactics_saved', JSON.stringify(captureSave));
+
+    const game = '[White "Player"]\n[Black "Opponent"]\n[Result "1-0"]\n1.e4 e5 1-0\n\n';
+    const games = await post('games/import', {
+        command_id: 'large-pgn', dataset_id, learner: 'Player', pgn: padding + game.repeat(501),
+    });
+    assert.equal(games.fetched, 501, JSON.stringify(games));
+    assert.equal(games.errors.length, 0, JSON.stringify(games.errors));
+    assert.equal(games.new_games + games.duplicates, 501);
 });
