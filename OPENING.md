@@ -155,6 +155,10 @@ Completed windows survive restart. Retry remaining windows uses the existing
 job and its saved child receipts. Unlisted archives, truncated windows and
 provider failures appear in the window details.
 
+Accounts entered here stay recognized. Leave a provider blank to skip it
+for this import. The first explicit account configuration scopes personal
+game relevance and opponent gaps to the recognized identities.
+
 Only this explicit historic job may add a new Game Again for a qualifying
 unapplied miss from before a repertoire's starting reset. A later accepted
 reset stops the job's remaining learning effects for that repertoire. Regular
