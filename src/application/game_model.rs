@@ -1,6 +1,7 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id};
-use crate::game_model::{GapRequest, MODEL_KEY, PROFILE_LABEL, model_input_stamp};
+use crate::game_model::{GapRequest, model_input_stamp};
+use crate::maia::{MODEL_KEY, PROFILE_LABEL};
 use crate::{
     AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
 };
@@ -238,6 +239,8 @@ impl Tempo {
             name,
             color,
         } = self.checked_gap(&request)?;
+        let mut anchor_route = authored.positions[&request.position].prefix.clone();
+        anchor_route.push(request.actual_move.clone());
         let save_token = draft
             .pgn
             .as_ref()
@@ -286,6 +289,7 @@ impl Tempo {
         });
         Ok(json!({
             "draft": draft,
+            "anchor_route": anchor_route,
             "content_revision": revision,
             "save_token": save_token,
             "repertoire_name": name,

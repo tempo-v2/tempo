@@ -7,7 +7,7 @@ use crate::{
     AbandonCommand, AppError, SubmitCommand,
     app_error::{domain, study_input},
 };
-use tempo_chess::ChessFeedback;
+use tempo_chess::{ChessAnswer, ChessFeedback};
 use tempo_learning::{AssessmentInput, AssessmentSource, DailyLearning};
 use tempo_queue::OrderEvent;
 use tempo_store::{
@@ -17,38 +17,61 @@ use tempo_store::{
 use tempo_study::AttemptStatus;
 use tempo_types::Grade;
 
+enum Response {
+    Move(ChessAnswer),
+    Reveal,
+    Concede,
+}
+
 impl Tempo {
     /// Accept one answer, or return its previously committed result on retry.
     ///
     /// The grader decides correctness. A new terminal assessment is interpreted
     /// by Learning and saved in the same commit as the attempt and receipt.
     pub fn submit(&mut self, command: SubmitCommand) -> Result<AnswerResult, AppError> {
-        self.advance(command, false)
+        let fingerprint =
+            serde_json::to_string(&("answer", &command)).map_err(|e| domain("codec_error", e))?;
+        let address = AbandonCommand {
+            dataset_id: command.dataset_id,
+            attempt_id: command.attempt_id,
+            expected_revision: command.expected_revision,
+            submission_id: command.submission_id,
+        };
+        self.advance(address, Response::Move(command.answer), fingerprint)
     }
 
     pub(super) fn give_up(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
-        self.advance(
-            SubmitCommand {
-                dataset_id: command.dataset_id,
-                attempt_id: command.attempt_id,
-                expected_revision: command.expected_revision,
-                submission_id: command.submission_id.clone(),
-                answer: "".into(),
-            },
-            true,
-        )
+        // Installed releases used a blank-answer payload for the reveal fingerprint.
+        let legacy = SubmitCommand {
+            dataset_id: command.dataset_id.clone(),
+            attempt_id: command.attempt_id.clone(),
+            expected_revision: command.expected_revision,
+            submission_id: command.submission_id.clone(),
+            answer: "".into(),
+        };
+        let fingerprint =
+            serde_json::to_string(&("give_up", legacy)).map_err(|e| domain("codec_error", e))?;
+        self.advance(command, Response::Reveal, fingerprint)
     }
 
-    fn advance(&mut self, command: SubmitCommand, give_up: bool) -> Result<AnswerResult, AppError> {
+    pub(super) fn concede(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
+        let fingerprint =
+            serde_json::to_string(&("concede", &command)).map_err(|e| domain("codec_error", e))?;
+        self.advance(command, Response::Concede, fingerprint)
+    }
+
+    fn advance(
+        &mut self,
+        command: AbandonCommand,
+        response: Response,
+        fingerprint: String,
+    ) -> Result<AnswerResult, AppError> {
         let scope = StudyScope {
             attempt: Some(&command.attempt_id),
             submission: Some(&command.submission_id),
             ..StudyScope::default()
         };
         let snapshot = self.store.study_state(scope)?;
-        let action = if give_up { "give_up" } else { "answer" };
-        let fingerprint =
-            serde_json::to_string(&(action, &command)).map_err(|e| domain("codec_error", e))?;
         if let Some(result) = replay(&snapshot, &command.submission_id, &fingerprint)? {
             return study_result(result);
         }
@@ -60,24 +83,31 @@ impl Tempo {
                 "acknowledge this lesson after reproducing the shown move",
             ));
         }
-        let progress = if give_up {
-            tempo_study::give_up(
-                &old.attempt,
-                command.expected_revision,
-                ChessFeedback {
-                    correct: false,
-                    message: "The prescribed move is shown.".into(),
-                    autoplay: vec![],
-                },
-            )
-        } else {
-            tempo_study::submit(
+        if matches!(response, Response::Concede) && old.mode != ActivityMode::Test {
+            return Err(AppError::new(
+                "wrong_activity",
+                "Only a scheduled test can be conceded.",
+            ));
+        }
+        let reveal = || ChessFeedback {
+            correct: false,
+            message: "The prescribed move is shown.".into(),
+            autoplay: vec![],
+        };
+        let progress = match &response {
+            Response::Concede => {
+                tempo_study::concede(&old.attempt, command.expected_revision, reveal())
+            }
+            Response::Reveal => {
+                tempo_study::give_up(&old.attempt, command.expected_revision, reveal())
+            }
+            Response::Move(answer) => tempo_study::submit(
                 self.components.grader.as_ref(),
                 definition,
                 &old.attempt,
                 command.expected_revision,
-                &command.answer,
-            )
+                answer,
+            ),
         }
         .map_err(study_input)?;
         let accepted_at = progress.assessment.map(|_| self.components.clock.now());
@@ -86,13 +116,13 @@ impl Tempo {
                 .zip(progress.assessment)
                 .map(|(at, grade)| {
                     let decision_index = old.attempt.state.decision_index;
-                    let kind = match grade {
-                        Grade::Good => AcceptanceKind::Recall,
-                        Grade::Again if give_up => AcceptanceKind::Revealed { decision_index },
-                        Grade::Again => AcceptanceKind::WrongMove {
-                            uci: command.answer.uci.clone(),
+                    let kind = match (grade, &response) {
+                        (Grade::Good, _) => AcceptanceKind::Recall,
+                        (Grade::Again, Response::Move(answer)) => AcceptanceKind::WrongMove {
+                            uci: answer.uci.clone(),
                             decision_index,
                         },
+                        (Grade::Again, _) => AcceptanceKind::Revealed { decision_index },
                     };
                     ActivityAcceptance { at, kind }
                 })
@@ -173,7 +203,7 @@ impl Tempo {
         }
         let result = AnswerResult {
             attempt: progress.attempt,
-            feedback: Some(progress.feedback),
+            feedback: (!matches!(response, Response::Concede)).then_some(progress.feedback),
             assessment: progress
                 .assessment
                 .filter(|_| old.mode == ActivityMode::Test),

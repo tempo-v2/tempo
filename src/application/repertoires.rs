@@ -11,7 +11,7 @@ use crate::{
     commands::{RepertoireCommand, RepertoireInput},
     game_model::model_input_stamp,
     views::ErrorView,
-    wire::CONTENT_WIRE_VERSION,
+    wire::{CONTENT_WIRE_VERSION, MAX_CONTENT_COMMAND_BYTES},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -138,6 +138,75 @@ impl Tempo {
                     self.commit_catalog(&snapshot, &catalog, vec![], None, None)?;
                 }
                 list(&snapshot.dataset, &catalog)
+            }
+            RepertoireCommand::MarkedPreview {
+                dataset_id,
+                repertoire_id,
+                base_revision,
+                name,
+                learner_color,
+                anchor_fen,
+                anchor_route,
+                lines,
+            } => {
+                check_dataset(&snapshot, &dataset_id)?;
+                let source = if let Some(id) = repertoire_id.as_ref() {
+                    let document = self.store.repertoire_document(id)?;
+                    if document.dataset != dataset_id
+                        || Some(document.revision) != base_revision
+                        || document.revision != revision
+                    {
+                        return Err(stale_draft());
+                    }
+                    Some(document.pgn.ok_or_else(|| {
+                        AppError::new(
+                            "document_unavailable",
+                            "This repertoire needs a verified source PGN.",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                let draft = tempo_chess::draft_marked_lines(
+                    source.as_deref(),
+                    learner_color,
+                    &anchor_fen,
+                    anchor_route.as_deref(),
+                    &lines,
+                )
+                .map_err(|e| domain("invalid_marked_lines", e))?;
+                let input = RepertoireInput {
+                    dataset_id,
+                    repertoire_id,
+                    name,
+                    learner_color,
+                    pgn: draft.pgn,
+                };
+                let id = input.repertoire_id.clone().unwrap_or_else(|| {
+                    let digest = signature(&key, revision, "", &input);
+                    format!("repertoire-{}", &digest[..32])
+                });
+                let (_, incoming, plan) = prepare(&snapshot, &input, &id)?;
+                let token = document_preview(&key, revision, &id, &input);
+                let mut reply = preview(&snapshot, &incoming, &plan, token.clone());
+                let mut save = json!(input);
+                save["command"] = json!("save");
+                save["token"] = json!(token);
+                if serde_json::to_vec(&save)
+                    .map_err(|e| domain("codec_error", e))?
+                    .len()
+                    > MAX_CONTENT_COMMAND_BYTES
+                {
+                    return Err(AppError::new(
+                        "save_too_large",
+                        "These marked lines would produce a repertoire Save larger than the supported command size.",
+                    ));
+                }
+                reply["save_command"] = save;
+                reply["repertoire_id"] = json!(id);
+                reply["replacements"] = json!(draft.replacements);
+                reply["retired_routes"] = json!(draft.retired_routes);
+                Ok(reply)
             }
             RepertoireCommand::Preview(input) => {
                 let id = input.repertoire_id.clone().unwrap_or_else(|| {
