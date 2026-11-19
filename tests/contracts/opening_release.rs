@@ -1308,6 +1308,65 @@ fn repair_context(app: &Tempo, activity: &Value) -> Value {
 }
 
 #[test]
+fn study_progress_counts_pending_repairs_including_skips() {
+    let directory = tempfile::tempdir().unwrap();
+    let day = Arc::new(AtomicI32::new(20_004));
+    let mut app = open(
+        &directory.path().join("repair-progress.sqlite"),
+        day.clone(),
+        IntroductionLimits {
+            repertoire: 0,
+            tactics: 0,
+        },
+        0,
+    );
+    let (_, book) = preview_and_save(&mut app, "1. e4 e5 2. Nf3 *", "Opening", None);
+    let progress = |app: &Tempo| app.study_progress(None).unwrap().unwrap();
+
+    date_only_import(&mut app, "root-miss", "2024.10.06", "1. d4 d5");
+    date_only_import(&mut app, "later-miss", "2024.10.06", "1. e4 e5 2. Bc4");
+    assert_eq!(progress(&app).repairs_remaining, 2);
+    let first = study(&mut app, json!({"command":"next"}));
+    let before_skip = progress(&app);
+    assert_eq!(before_skip.repairs_remaining, 2);
+    assert!(
+        app.study_progress(Some(&before_skip.stamp))
+            .unwrap()
+            .is_none()
+    );
+    let skipped = study(&mut app, activity_command("skip", &first, "skip-repair"));
+    assert_eq!(skipped["status"], "abandoned");
+    let second = study(&mut app, json!({"command":"next"}));
+    assert_ne!(first["target_id"], second["target_id"]);
+    assert_eq!(progress(&app).repairs_remaining, 2);
+
+    let answer = second["lesson"]["move_uci"].as_str().unwrap();
+    let saved = play_activity(&mut app, &second, "acknowledge", "save-repair", answer);
+    assert_eq!(saved["status"], "complete");
+    assert_eq!(
+        app.study_progress(Some(&before_skip.stamp))
+            .unwrap()
+            .unwrap()
+            .repairs_remaining,
+        1
+    );
+    assert_eq!(
+        play_activity(&mut app, &second, "acknowledge", "save-repair", answer),
+        saved
+    );
+    assert_eq!(progress(&app).repairs_remaining, 1);
+    day.store(20_005, Ordering::Relaxed);
+    assert_eq!(progress(&app).due, 1);
+
+    date_only_import(&mut app, "new-root-miss", "2024.10.07", "1. c4 e5");
+    date_only_import(&mut app, "new-later-miss", "2024.10.07", "1. e4 e5 2. Nc3");
+    assert_eq!(progress(&app).repairs_remaining, 2);
+    let id = book["repertoires"][0]["id"].as_str().unwrap();
+    preview_and_save(&mut app, "1. d4 *", "Opening", Some(id));
+    assert_eq!(progress(&app).repairs_remaining, 0);
+}
+
+#[test]
 fn repair_context_follows_the_issued_miss_and_preserves_study() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("game-context.sqlite");
