@@ -8,6 +8,7 @@ use tempo::{
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{GameModel, GapRequest, ModelRequest},
+    gap_analysis::{GapAnalysis, GapAnalysisRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use tempo_store::SqliteStore;
@@ -32,6 +33,7 @@ pub(super) fn serve(
         refresh: GameJobs::start()?,
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database),
+        gap_analysis: GapAnalysis::new(database),
     };
     loop {
         games.refresh.poll(app);
@@ -59,6 +61,13 @@ struct Games {
     refresh: GameJobs,
     backfill: BackfillCoordinator,
     model: GameModel,
+    gap_analysis: GapAnalysis,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GapPage {
+    offset: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -149,6 +158,7 @@ fn respond(
             | "/api/games/model"
             | "/api/games/gaps"
             | "/api/games/gap-draft"
+            | "/api/games/gap-analysis"
             | "/api/study/relevance"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
@@ -171,7 +181,18 @@ fn respond(
                 command::<ModelRequest>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.model.start(app, intent)),
             ),
-            (&Method::Get, "/api/games/gaps") => (200, app.opponent_gaps()),
+            (&Method::Get, "/api/games/gaps") => (200, app.opponent_gaps(0)),
+            (&Method::Post, "/api/games/gaps") => (
+                200,
+                command::<GapPage>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|page| app.opponent_gaps(page.offset)),
+            ),
+            (&Method::Get, "/api/games/gap-analysis") => (200, Ok(games.gap_analysis.status())),
+            (&Method::Post, "/api/games/gap-analysis") => (
+                202,
+                command::<GapAnalysisRequest>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.gap_analysis.start(app, intent)),
+            ),
             (&Method::Post, "/api/games/gap-draft") => (
                 200,
                 command::<GapRequest>(&mut request, MAX_COMMAND_BYTES)
