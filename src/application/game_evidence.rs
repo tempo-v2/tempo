@@ -1,25 +1,56 @@
 //! Normalize game records and coordinate answer-safe comparison and persistence.
 
-use super::{Tempo, repertoires::learner_color};
+use super::{Tempo, content_preview::source_id, repertoires::learner_color};
 use crate::adapters::public_games::FetchedGames;
 use crate::game_evidence::{GameImport, GameReport, GameResult, check_id, fingerprint};
 use crate::{AppError, app_error::domain};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tempo_chess::{
-    ContentKind, DecisionAdherence, LearnerColor, PlayedGame, compare_active_repertoires,
-    parse_played_games,
+    AuthoredRepertoire, ContentKind, DecisionAdherence, LearnerColor, PlayedGame,
+    RepertoireAdherence, compare_authored_repertoires, parse_played_games,
 };
 use tempo_learning::{
     AssessmentInput, AssessmentSource, DailyLearning, GameReviewEffect, LearningState,
 };
 use tempo_store::{
-    AcceptedGames, AssessmentRecord, Commit, ComparedGame, GameChoice, GameChoiceTarget,
-    GameFailureKey, GameObservation, GameReceipt, GameRecord, GameSummary, PgnTiming,
-    RepertoireDisagreement, Write,
+    AcceptedGames, AssessmentRecord, Commit, ComparedGame, ComparedRelevance, GameChoice,
+    GameChoiceTarget, GameFailureKey, GameObservation, GameReceipt, GameRecord, GameSummary,
+    PgnTiming, RepertoireDisagreement, Write,
 };
-use tempo_types::{DatasetId, Grade, TargetId};
+use tempo_types::{DatasetId, Grade, Revision, TargetId};
+
+pub(super) struct GameBooks {
+    dataset: DatasetId,
+    revision: Revision,
+    colors: BTreeMap<String, LearnerColor>,
+    white: BTreeMap<String, AuthoredRepertoire>,
+    black: BTreeMap<String, AuthoredRepertoire>,
+    document_ids: BTreeMap<String, String>,
+}
+
+impl GameBooks {
+    pub(super) fn document_for_gap(&self, gap: &tempo_chess::OpponentGap) -> Option<&str> {
+        let book = self
+            .white
+            .get(&gap.repertoire_id)
+            .or_else(|| self.black.get(&gap.repertoire_id))?;
+        let position = book.positions.get(&gap.position)?;
+        if self.colors.get(&gap.repertoire_id) == Some(&position.side)
+            || position.replies.is_empty()
+            || position.replies.contains_key(&gap.actual_move)
+        {
+            return None;
+        }
+        self.document_ids
+            .get(&gap.repertoire_id)
+            .map(String::as_str)
+    }
+}
 
 impl Tempo {
     pub(crate) fn game_dataset(&self) -> Result<DatasetId, AppError> {
@@ -99,6 +130,7 @@ impl Tempo {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -109,6 +141,7 @@ impl Tempo {
         fingerprint: &str,
         learner: &str,
         fetched: FetchedGames,
+        backfill: Option<&crate::game_backfill::BackfillJob>,
     ) -> Result<GameReport, AppError> {
         let at = self.components.clock.now().unix_ms;
         let games = fetched
@@ -150,9 +183,34 @@ impl Tempo {
                 errors: fetched.errors,
                 ..GameReport::default()
             },
-            Some(at),
+            backfill.is_none().then_some(at),
             None,
             None,
+            backfill,
+        )
+    }
+
+    pub(crate) fn ingest_historical_pgns(
+        &mut self,
+        job: &crate::game_backfill::BackfillJob,
+        key: &str,
+        learner: &str,
+        games: Vec<GameRecord>,
+    ) -> Result<GameReport, AppError> {
+        let fetched = games.len();
+        self.compare_games(
+            &job.request.dataset_id,
+            (key, key),
+            learner,
+            games.into_iter().map(parse_stored_game).collect(),
+            GameReport {
+                fetched,
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            Some(job),
         )
     }
 
@@ -195,6 +253,23 @@ impl Tempo {
         )? {
             return Err(invalid("This corrective position has already been chosen."));
         }
+        let backfill = saved
+            .backfill_id
+            .as_deref()
+            .map(|id| self.read_backfill(&request.dataset_id, Some(id)))
+            .transpose()?
+            .flatten();
+        if saved.backfill_id.is_some() && backfill.is_none() {
+            return Err(invalid(
+                "The historical job for this choice is unavailable.",
+            ));
+        }
+        let chosen_version = choice
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target_id == request.target_id)
+            .expect("choice checked")
+            .version;
         let game = self
             .store
             .stored_game(&request.dataset_id, &request.source, &request.game_id)?
@@ -214,8 +289,10 @@ impl Tempo {
                 ply: request.ply,
                 target: request.target_id,
                 position: choice.position.clone(),
+                chosen_version,
             }),
             None,
+            backfill.as_ref(),
         )
     }
 
@@ -261,6 +338,7 @@ impl Tempo {
                 fetched,
                 ..Default::default()
             },
+            None,
             None,
             None,
             None,
@@ -339,6 +417,7 @@ impl Tempo {
                 None,
                 None,
                 Some(&plies),
+                None,
             )?;
         }
         if !reconciled.is_empty() {
@@ -372,6 +451,7 @@ impl Tempo {
         refresh_at: Option<u64>,
         selection: Option<&SelectedCorrection>,
         legacy_plies: Option<&BTreeSet<usize>>,
+        backfill: Option<&crate::game_backfill::BackfillJob>,
     ) -> Result<GameReport, AppError> {
         let learner = learner.trim().to_lowercase();
         if learner.is_empty() || learner.len() > 100 {
@@ -381,43 +461,22 @@ impl Tempo {
         if expected_dataset != &snapshot.dataset {
             return Err(invalid("The dataset changed during refresh."));
         }
-        let repertoires: BTreeSet<_> = snapshot
-            .catalog
-            .items
-            .values()
-            .filter(|item| item.active())
-            .filter_map(|item| match &item.definition.kind {
-                ContentKind::Repertoire { repertoire, .. } => Some(repertoire.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut books = BTreeMap::new();
+        let books = self.comparison_books(&snapshot, revision)?;
         let mut resets = BTreeMap::new();
-        for repertoire in repertoires {
-            let document = self.store.repertoire_document(&repertoire)?;
-            if document.dataset != snapshot.dataset || document.revision != revision {
-                return Err(invalid("A repertoire changed during refresh."));
+        let mut reset_generations = BTreeMap::new();
+        for repertoire in books.colors.keys() {
+            if backfill.is_some() {
+                let generation = self
+                    .store
+                    .repertoire_reset_generation(&snapshot.dataset, repertoire)?;
+                reset_generations.insert(repertoire.as_str(), generation);
+            } else {
+                let cutoff = self
+                    .store
+                    .repertoire_reset_at(&snapshot.dataset, repertoire)?;
+                resets.insert(repertoire.as_str(), cutoff);
             }
-            if let Some(item) = document.item {
-                books.insert(repertoire.clone(), (learner_color(&item), document.pgn));
-            }
-            let cutoff = self
-                .store
-                .repertoire_reset_at(&snapshot.dataset, &repertoire)?;
-            resets.insert(repertoire, cutoff);
         }
-        let documents = |color| {
-            books
-                .iter()
-                .filter_map(|(id, (side, pgn))| {
-                    (*side == color)
-                        .then(|| pgn.clone().map(|pgn| (id.clone(), pgn)))
-                        .flatten()
-                })
-                .collect()
-        };
-        let white_documents = documents(LearnerColor::White);
-        let black_documents = documents(LearnerColor::Black);
         let mut comparisons = Vec::new();
         let mut changes = BTreeMap::<TargetId, LearningState>::new();
         let mut accepted = BTreeSet::new();
@@ -446,11 +505,37 @@ impl Tempo {
                 }
             };
             let documents = match side {
-                LearnerColor::White => &white_documents,
-                LearnerColor::Black => &black_documents,
+                LearnerColor::White => &books.white,
+                LearnerColor::Black => &books.black,
             };
-            let decisions = compare_active_repertoires(&played, &snapshot.catalog, side, documents)
-                .map_err(|error| domain("invalid_comparison", error))?;
+            let decisions =
+                compare_authored_repertoires(&played, &snapshot.catalog, side, documents);
+            let mut relevance = ComparedRelevance::default();
+            let mut repertoires = Vec::new();
+            for (id, _) in books.colors.iter().filter(|(_, color)| **color == side) {
+                if let Some(document) = documents.get(id) {
+                    let (report, gaps) = document.compare(id, &played, side);
+                    relevance.gaps.extend(
+                        gaps.into_iter()
+                            .map(|gap| (gap, books.document_ids[id].clone())),
+                    );
+                    repertoires.push(report);
+                } else {
+                    repertoires.push(RepertoireAdherence {
+                        repertoire_id: id.clone(),
+                        source_available: false,
+                        first_departure: None,
+                        reentry_ply: None,
+                    });
+                }
+            }
+            let may_apply = |id: &str| match backfill {
+                Some(job) => job
+                    .resets
+                    .get(id)
+                    .is_some_and(|start| *start == reset_generations[id]),
+                None => self.after_game_reset(resets[id], &game, &played),
+            };
             let versions: Vec<_> = decisions
                 .iter()
                 .flat_map(|decision| {
@@ -475,7 +560,7 @@ impl Tempo {
                     _ => None,
                 })
                 .collect();
-            let comparison_id = hash(&json!([
+            let previous_comparison_id = hash(&json!([
                 "combined",
                 game.source,
                 game.id,
@@ -483,8 +568,15 @@ impl Tempo {
                 versions,
                 routes
             ]));
+            let comparison_id = hash(&json!([
+                "game-relevance",
+                previous_comparison_id,
+                repertoires,
+                backfill.map(|job| &job.id)
+            ]));
             if let Some(selection) = selection
                 && selection.comparison_id != comparison_id
+                && selection.comparison_id != previous_comparison_id
             {
                 return Err(invalid("The comparison changed. Compare the game again."));
             }
@@ -499,11 +591,24 @@ impl Tempo {
                 deviations: 0,
                 first_deviation_ply: None,
                 coverage_gaps: 0,
-                opponent_deviations: tempo_chess::opponent_deviations(&played, side, documents)
-                    .map_err(|error| domain("invalid_comparison", error))?,
+                opponent_deviations: relevance
+                    .gaps
+                    .keys()
+                    .filter(|gap| {
+                        !documents.values().any(|book| {
+                            book.positions
+                                .get(&gap.position)
+                                .is_some_and(|node| node.replies.contains_key(&gap.actual_move))
+                        })
+                    })
+                    .map(|gap| (&gap.position, &gap.actual_move))
+                    .collect::<BTreeSet<_>>()
+                    .len(),
                 correction_effect: Some(GameReviewEffect::RecordedOnly),
                 choices: vec![],
                 disagreements: vec![],
+                repertoires,
+                backfill_id: backfill.map(|job| job.id.clone()),
             };
             let repertoire_of =
                 |target: &TargetId| match &snapshot.catalog.items[target].definition.kind {
@@ -516,6 +621,12 @@ impl Tempo {
             let mut choice_groups = BTreeSet::new();
             let mut resolved = false;
             for decision in decisions {
+                for obs in &decision.observations {
+                    relevance
+                        .encounters
+                        .entry(obs.target.clone())
+                        .or_insert((obs.version, false));
+                }
                 for observation in decision
                     .observations
                     .iter()
@@ -539,6 +650,11 @@ impl Tempo {
                 };
                 summary.deviations += 1;
                 summary.first_deviation_ply.get_or_insert(decision.ply);
+                if let [only] = candidates.as_slice() {
+                    relevance
+                        .encounters
+                        .insert(only.target.clone(), (only.version, true));
+                }
                 if legacy_plies.is_some_and(|plies| !plies.contains(&decision.ply)) {
                     continue;
                 }
@@ -550,6 +666,20 @@ impl Tempo {
                         &decision.position.0,
                     )?
                 {
+                    for obs in &candidates {
+                        let key = GameFailureKey {
+                            source: game.source.clone(),
+                            game_id: game.id.clone(),
+                            target: obs.target.clone(),
+                            version: obs.version,
+                            chosen_position: Some(decision.position.0.clone()),
+                        };
+                        if self.store.game_target_chosen(&snapshot.dataset, &key)? {
+                            relevance
+                                .encounters
+                                .insert(obs.target.clone(), (obs.version, true));
+                        }
+                    }
                     if summary.correction_effect != Some(GameReviewEffect::AgainApplied) {
                         summary.correction_effect = Some(GameReviewEffect::AlreadyAddressed);
                     }
@@ -564,9 +694,15 @@ impl Tempo {
                     }
                     let chosen = candidates
                         .iter()
-                        .find(|obs| obs.target == selection.target)
+                        .find(|obs| {
+                            obs.target == selection.target
+                                && obs.version == selection.chosen_version
+                        })
                         .ok_or_else(|| invalid("Choose a current target from the comparison."))?;
                     resolved = true;
+                    relevance
+                        .encounters
+                        .insert(chosen.target.clone(), (chosen.version, true));
                     chosen
                 } else if let [only] = candidates.as_slice() {
                     only
@@ -575,12 +711,11 @@ impl Tempo {
                         .iter()
                         .filter_map(|obs| {
                             let repertoire_id = repertoire_of(&obs.target);
-                            self.after_game_reset(resets[&repertoire_id], &game, &played)
-                                .then(|| GameChoiceTarget {
-                                    repertoire_id,
-                                    target_id: obs.target.clone(),
-                                    version: obs.version,
-                                })
+                            may_apply(&repertoire_id).then(|| GameChoiceTarget {
+                                repertoire_id,
+                                target_id: obs.target.clone(),
+                                version: obs.version,
+                            })
                         })
                         .collect();
                     if !eligible.is_empty() && choice_groups.insert(decision.position.0.clone()) {
@@ -593,9 +728,11 @@ impl Tempo {
                     continue;
                 };
                 let repertoire = repertoire_of(&candidate.target);
-                if !self.after_game_reset(resets[&repertoire], &game, &played) {
+                if !may_apply(&repertoire) {
                     if selection.is_some() {
-                        return Err(invalid("This game predates the repertoire progress reset."));
+                        return Err(invalid(
+                            "The repertoire reset prevents further learning from this comparison.",
+                        ));
                     }
                     continue;
                 }
@@ -685,8 +822,14 @@ impl Tempo {
                 summary,
                 observations,
                 failures,
-                resolved_choice: selection
-                    .map(|selection| (comparison_id, selection.ply, selection.position.clone())),
+                resolved_choice: selection.map(|selection| {
+                    (
+                        selection.comparison_id.clone(),
+                        selection.ply,
+                        selection.position.clone(),
+                    )
+                }),
+                relevance: legacy_plies.is_none().then_some(relevance),
             });
         }
         for compared in &comparisons {
@@ -722,6 +865,77 @@ impl Tempo {
             },
         )?;
         report_from_receipt(stored)
+    }
+
+    pub(super) fn current_game_books(
+        &mut self,
+        dataset: &DatasetId,
+    ) -> Result<Arc<GameBooks>, AppError> {
+        let revision = self
+            .store
+            .game_content_revision(dataset)?
+            .ok_or_else(|| invalid("The active dataset changed."))?;
+        if let Some(cached) = &self.game_books
+            && &cached.dataset == dataset
+            && cached.revision == revision
+        {
+            return Ok(Arc::clone(cached));
+        }
+        let (snapshot, revision) = self.store.content_state()?;
+        if &snapshot.dataset != dataset {
+            return Err(invalid("The active dataset changed."));
+        }
+        self.comparison_books(&snapshot, revision)
+    }
+
+    fn comparison_books(
+        &mut self,
+        snapshot: &tempo_store::Snapshot,
+        revision: Revision,
+    ) -> Result<Arc<GameBooks>, AppError> {
+        if let Some(cached) = &self.game_books
+            && cached.dataset == snapshot.dataset
+            && cached.revision == revision
+        {
+            return Ok(Arc::clone(cached));
+        }
+        let mut books = GameBooks {
+            dataset: snapshot.dataset.clone(),
+            revision,
+            colors: BTreeMap::new(),
+            white: BTreeMap::new(),
+            black: BTreeMap::new(),
+            document_ids: BTreeMap::new(),
+        };
+        for item in snapshot.catalog.items.values().filter(|item| item.active()) {
+            let ContentKind::Repertoire { repertoire, .. } = &item.definition.kind else {
+                continue;
+            };
+            if books.colors.contains_key(repertoire) {
+                continue;
+            }
+            let doc = self.store.repertoire_document(repertoire)?;
+            if doc.dataset != snapshot.dataset || doc.revision != revision {
+                return Err(invalid("A repertoire changed during refresh."));
+            }
+            let color = learner_color(item);
+            books.colors.insert(repertoire.clone(), color);
+            if let Some(pgn) = doc.pgn {
+                let authored = AuthoredRepertoire::parse(&pgn)
+                    .map_err(|error| domain("invalid_comparison", error))?;
+                match color {
+                    LearnerColor::White => &mut books.white,
+                    LearnerColor::Black => &mut books.black,
+                }
+                .insert(repertoire.clone(), authored);
+                books
+                    .document_ids
+                    .insert(repertoire.clone(), source_id(&pgn));
+            }
+        }
+        let books = Arc::new(books);
+        self.game_books = Some(Arc::clone(&books));
+        Ok(books)
     }
 
     fn after_game_reset(
@@ -814,6 +1028,7 @@ pub struct SelectedCorrection {
     pub ply: usize,
     pub target: TargetId,
     pub position: String,
+    pub chosen_version: tempo_types::ContentVersion,
 }
 
 fn mainline_signature(game: &PlayedGame, white: &str, black: &str) -> String {

@@ -111,7 +111,7 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
     }
     let mut app = open(database)?;
     app.reconcile_legacy_game_requests()?;
-    http::serve(&mut app, &SqliteStore::open(database)?, ui, port)
+    http::serve(&mut app, &SqliteStore::open(database)?, database, ui, port)
 }
 
 fn stored_profile(store: &SqliteStore) -> LocalResult<String> {

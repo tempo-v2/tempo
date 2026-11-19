@@ -10,7 +10,9 @@ mod current_attempt;
 
 mod daily;
 mod export;
+mod game_backfill;
 mod game_evidence;
+mod game_model;
 mod handle;
 mod import_pgn;
 mod ingest_games;
@@ -61,6 +63,7 @@ pub struct Tempo {
     remaining_block: Vec<TargetId>,
     order_history: Vec<OrderEvent>,
     daily: Option<daily::DailyStudy>,
+    game_books: Option<std::sync::Arc<game_evidence::GameBooks>>,
 }
 impl Tempo {
     /// Assemble the application after checking stored policy and learning compatibility.
@@ -87,6 +90,7 @@ impl Tempo {
             remaining_block: vec![],
             order_history: vec![],
             daily: None,
+            game_books: None,
         })
     }
     /// Create the reproducible in-memory repertoire/tactic demonstration.

@@ -52,7 +52,7 @@ impl Tempo {
             ..StudyScope::default()
         })?;
         let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
-        let selection = self.daily_selection(&snapshot, at, extra);
+        let selection = self.daily_selection(&snapshot, at, extra)?;
         let active_correction = snapshot
             .active_attempt
             .as_ref()

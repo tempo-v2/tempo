@@ -136,7 +136,16 @@ impl GameJobs {
         })
     }
 
-    pub fn refresh(&mut self, app: &mut Tempo, request: GameRefresh) -> Result<Value, AppError> {
+    pub fn active(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn refresh(
+        &mut self,
+        app: &mut Tempo,
+        request: GameRefresh,
+        allow_fetch: bool,
+    ) -> Result<Value, AppError> {
         self.poll(app);
         check_id(&request.command_id)?;
         let key = fingerprint("refresh", &request)?;
@@ -158,6 +167,12 @@ impl GameJobs {
             return Err(AppError::new(
                 "stale_dataset",
                 "The active dataset changed.",
+            ));
+        }
+        if !allow_fetch {
+            return Err(AppError::new(
+                "game_refresh_busy",
+                "Historical Games import is running.",
             ));
         }
         let id = request.command_id.clone();
@@ -186,6 +201,7 @@ impl GameJobs {
                             &key,
                             &request.account,
                             fetched,
+                            None,
                         )
                     }) {
                         Ok(report) => {

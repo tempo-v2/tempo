@@ -36,3 +36,6 @@ pub use portable_snapshot::PortableSnapshot;
 pub use ports::{AttemptIds, ChessGrader, Clock, GameProvider, SnapshotCodec};
 
 pub mod game_evidence;
+
+pub mod game_backfill;
+pub mod game_model;

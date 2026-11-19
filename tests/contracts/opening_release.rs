@@ -1495,6 +1495,19 @@ fn a_saved_choice_selects_one_target_and_stays_resolved_after_reprocessing_and_r
         .unwrap();
     assert_eq!(reprocessed.fetched, 1);
     assert!(reprocessed.results[0].summary.choices.is_empty());
+    let store = SqliteStore::open(&db).unwrap();
+    let dataset = app.snapshot().unwrap().dataset;
+    let relevance = store.game_relevance(&dataset, "").unwrap();
+    let selected = TargetId::from(targets[0]["target_id"].as_str().unwrap());
+    let other = TargetId::from(targets[1]["target_id"].as_str().unwrap());
+    assert_eq!(
+        (relevance[&selected].exposure, relevance[&selected].misses),
+        (1, 1)
+    );
+    assert_eq!(
+        (relevance[&other].exposure, relevance[&other].misses),
+        (1, 0)
+    );
     let package = app.export(&tempo::JsonSnapshotCodec).unwrap();
     let mut restored = open(
         &directory.path().join("choices-restored.sqlite"),
@@ -2068,4 +2081,230 @@ fn importing_two_distinct_game_misses_commits_the_final_learning_transition() {
         .unwrap();
     assert_eq!(serde_json::to_value(replay).unwrap(), report);
     assert_eq!(app.snapshot().unwrap(), saved);
+}
+
+const RELEVANCE_BOOK: &str = "1. e4 e5 (1... c5 2. Nf3 d6 3. d4) 2. Nf3 Nc6 3. Bb5 *";
+
+fn observed_move(
+    app: &mut Tempo,
+    command_id: &str,
+    opponent: &str,
+    fen: &str,
+    san: &str,
+) -> tempo::game_evidence::GameReport {
+    let pgn = format!(
+        "[White \"learner\"]\n[Black \"{opponent}\"]\n[Date \"2024.10.02\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n\n{san} 1-0"
+    );
+    app.import_game_pgn(
+        serde_json::from_value(json!({
+            "command_id":command_id, "dataset_id":"opening-proof", "learner":"learner", "pgn":pgn,
+        }))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn correctly_played_positions_change_due_review_order_without_admitting_future_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let day = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits::default();
+    let first = directory.path().join("no-evidence.sqlite");
+    let mut baseline = open(&first, day.clone(), limits, 0);
+    preview_and_save(&mut baseline, RELEVANCE_BOOK, "One book", None);
+    for index in 0..5 {
+        let card = study(&mut baseline, json!({"command":"next"}));
+        assert_eq!(card["activity"], "teach");
+        assert_eq!(
+            play_activity(
+                &mut baseline,
+                &card,
+                "acknowledge",
+                &format!("introduce-{index}"),
+                card["lesson"]["move_uci"].as_str().unwrap()
+            )["status"],
+            "complete"
+        );
+    }
+    let before = baseline.snapshot().unwrap();
+    drop(baseline);
+    let ranked = directory.path().join("with-evidence.sqlite");
+    std::fs::copy(&first, &ranked).unwrap();
+    day.store(20_001, Ordering::Relaxed);
+    let mut baseline = open(&first, day.clone(), limits, 1);
+    let baseline_progress = baseline.study_progress(None).unwrap().unwrap();
+    let initially = study(&mut baseline, json!({"command":"next"}));
+    let ranked_targets: Vec<_> = before
+        .catalog
+        .items
+        .iter()
+        .filter(|(target, _)| initially["target_id"] != target.0)
+        .take(2)
+        .collect();
+    let (now_target, item) = ranked_targets[0];
+    let (future_target, later_item) = ranked_targets[1];
+
+    let mut app = open(&ranked, day.clone(), limits, 1);
+    let mut store = SqliteStore::open(&ranked).unwrap();
+    let mut future = before.learning[future_target].clone();
+    future.due = Some(StudyDay(20_002));
+    store
+        .commit(tempo_store::Commit {
+            expected_dataset: before.dataset.clone(),
+            expected_revision: before.revision,
+            writes: vec![tempo_store::Write::Learning {
+                target: future_target.clone(),
+                state: future,
+            }],
+        })
+        .unwrap();
+    let decision = &item.definition.decisions[0];
+    let first = observed_move(
+        &mut app,
+        "one-correct",
+        "first",
+        &decision.fen,
+        &item.lesson.as_ref().unwrap().san,
+    );
+    let duplicate = observed_move(
+        &mut app,
+        "same-correct",
+        "first",
+        &decision.fen,
+        &item.lesson.as_ref().unwrap().san,
+    );
+    assert_eq!(
+        (first.matches, first.new_games, duplicate.duplicates),
+        (1, 1, 1)
+    );
+    let again = observed_move(
+        &mut app,
+        "one-correct",
+        "first",
+        &decision.fen,
+        &item.lesson.as_ref().unwrap().san,
+    );
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&again).unwrap()
+    );
+    for (command, opponent) in [("two-correct", "second"), ("three-correct", "third")] {
+        observed_move(
+            &mut app,
+            command,
+            opponent,
+            &later_item.definition.decisions[0].fen,
+            &later_item.lesson.as_ref().unwrap().san,
+        );
+    }
+    let evidence = store.game_relevance(&before.dataset, "").unwrap();
+    assert_eq!(
+        (
+            evidence[now_target].exposure,
+            evidence[now_target].misses,
+            evidence[now_target].window_games
+        ),
+        (1, 0, 3)
+    );
+    assert_eq!(evidence[future_target].exposure, 2);
+    assert!(app.snapshot().unwrap().assessments.is_empty());
+    let with_evidence = app.study_progress(None).unwrap().unwrap();
+    assert_eq!(with_evidence.due + 1, baseline_progress.due);
+    drop(app);
+    let no_evidence = directory.path().join("removed-evidence.sqlite");
+    std::fs::copy(&ranked, &no_evidence).unwrap();
+    let mut app = open(&ranked, day.clone(), limits, 2);
+    let selected = study(&mut app, json!({"command":"next"}));
+    assert_eq!(selected["activity"], "test");
+    assert_eq!(selected["target_id"], now_target.0);
+    let id = selected["attempt_id"].as_str().unwrap().into();
+    assert_eq!(
+        app.study_relevance_reason(&before.dataset, &id).unwrap()["reason"],
+        "Reached in 1 of your last 3 games."
+    );
+    drop(app);
+    let mut app = open(&ranked, day.clone(), limits, 3);
+    assert_eq!(
+        study(&mut app, json!({"command":"next"}))["attempt_id"],
+        selected["attempt_id"]
+    );
+    assert_eq!(
+        app.study_relevance_reason(&before.dataset, &id).unwrap()["reason"],
+        "Reached in 1 of your last 3 games."
+    );
+
+    let mut filtered = SqliteStore::open(&no_evidence).unwrap();
+    filtered
+        .save_game_backfill_state(
+            &before.dataset,
+            "config",
+            "{}",
+            Some(&[("lichess".into(), "other".into())]),
+        )
+        .unwrap();
+    assert!(
+        filtered
+            .game_relevance(&before.dataset, "")
+            .unwrap()
+            .is_empty()
+    );
+    let mut filtered = open(&no_evidence, day, limits, 2);
+    assert_eq!(
+        filtered.study_progress(None).unwrap().unwrap().due,
+        with_evidence.due
+    );
+    assert_eq!(
+        study(&mut filtered, json!({"command":"next"}))["target_id"],
+        initially["target_id"]
+    );
+}
+
+#[test]
+fn deeper_game_positions_advance_their_own_eligible_frontier_in_either_branch() {
+    let directory = tempfile::tempdir().unwrap();
+    let day = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits::default();
+    let baseline = directory.path().join("branch-baseline.sqlite");
+    let mut app = open(&baseline, day.clone(), limits, 0);
+    preview_and_save(&mut app, RELEVANCE_BOOK, "Both branches", None);
+    let root = study(&mut app, json!({"command":"next"}));
+    assert_eq!(root["lesson"]["move_uci"], "e2e4");
+    assert_eq!(
+        play_activity(&mut app, &root, "acknowledge", "root", "e2e4")["status"],
+        "complete"
+    );
+    let snapshot = app.snapshot().unwrap();
+    drop(app);
+    let mut selected = Vec::new();
+    for (index, route) in snapshot.catalog.lines.iter().enumerate() {
+        let db = directory.path().join(format!("branch-{index}.sqlite"));
+        std::fs::copy(&baseline, &db).unwrap();
+        let mut app = open(&db, day.clone(), limits, 1);
+        let target = &snapshot.catalog.items[&route.targets[2]];
+        let report = observed_move(
+            &mut app,
+            "deeper",
+            "opponent",
+            &target.definition.decisions[0].fen,
+            &target.lesson.as_ref().unwrap().san,
+        );
+        assert_eq!(report.matches, 1);
+        let found = study(&mut app, json!({"command":"next"}));
+        assert_eq!(found["activity"], "teach");
+        assert_eq!(found["target_id"], route.targets[1].0);
+        let reason = app
+            .study_relevance_reason(
+                &snapshot.dataset,
+                &found["attempt_id"].as_str().unwrap().into(),
+            )
+            .unwrap();
+        assert_eq!(
+            reason["reason"],
+            "A later position was reached in 1 of your last 1 game."
+        );
+        assert!(!app.snapshot().unwrap().learning[&route.targets[2]].introduced);
+        selected.push(found["target_id"].clone());
+    }
+    assert_eq!(selected.len(), 2);
+    assert_ne!(selected[0], selected[1]);
 }
