@@ -1,5 +1,6 @@
 //! Repertoire authoring preference. Inputs are validated moves and learner-relative engine scores.
 use serde::Serialize;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use tempo_chess::{NearbyPosition, NearbyRepertoirePositions};
 
@@ -14,6 +15,8 @@ pub(crate) enum RepertoireScope {
 pub(crate) struct SimilarMove<'a> {
     pub uci: &'a str,
     pub position_count: usize,
+    #[serde(skip)]
+    closest_distance: u32,
 }
 
 #[derive(Default, Serialize)]
@@ -27,6 +30,19 @@ impl<'a> SimilarMoves<'a> {
         Self {
             current: rank_group(&nearby.current),
             other: rank_group(&nearby.other),
+        }
+    }
+
+    fn break_ties(&mut self, loss: impl Fn(&'a str) -> Option<u32>) {
+        for group in [&mut self.current, &mut self.other] {
+            group.sort_unstable_by_key(|mv| {
+                (
+                    Reverse(mv.position_count),
+                    loss(mv.uci).unwrap_or(u32::MAX),
+                    mv.closest_distance,
+                    mv.uci,
+                )
+            });
         }
     }
 
@@ -56,14 +72,13 @@ fn rank_group(nearby: &[NearbyPosition]) -> Vec<SimilarMove<'_>> {
         }
     }
     let mut ranked: Vec<_> = counts.into_iter().collect();
-    ranked.sort_unstable_by_key(|(uci, (count, distance))| {
-        (std::cmp::Reverse(*count), *distance, *uci)
-    });
+    ranked.sort_unstable_by_key(|(uci, (count, distance))| (Reverse(*count), *distance, *uci));
     ranked
         .into_iter()
-        .map(|(uci, (position_count, _))| SimilarMove {
+        .map(|(uci, (position_count, closest_distance))| SimilarMove {
             uci,
             position_count,
+            closest_distance,
         })
         .collect()
 }
@@ -83,22 +98,26 @@ pub(crate) enum Recommendation<'a> {
     },
 }
 
-pub(crate) fn recommend<'a>(
-    similar: &SimilarMoves<'a>,
+pub(crate) fn rank_and_recommend<'a>(
+    similar: &mut SimilarMoves<'a>,
     best: (&'a str, Option<i32>),
     scores: impl IntoIterator<Item = (&'a str, Option<i32>)>,
 ) -> Option<Recommendation<'a>> {
     let scores: BTreeMap<_, _> = scores.into_iter().collect();
-    let mut smallest_loss = None;
-    let mut incomplete = false;
-    for (scope, candidate) in similar.ordered() {
-        let loss = if candidate.uci == best.0 {
+    let loss = |uci| {
+        if uci == best.0 {
             Some(0)
         } else {
             best.1
-                .zip(scores.get(candidate.uci).copied().flatten())
+                .zip(scores.get(uci).copied().flatten())
                 .map(|(top, score)| top.saturating_sub(score).max(0) as u32)
-        };
+        }
+    };
+    similar.break_ties(loss);
+    let mut smallest_loss = None;
+    let mut incomplete = false;
+    for (scope, candidate) in similar.ordered() {
+        let loss = loss(candidate.uci);
         let Some(loss) = loss else {
             incomplete = true;
             continue;
@@ -157,7 +176,7 @@ mod tests {
             ],
             other: vec![position(1, &[("d2d4", true), ("e4d5", true)])],
         };
-        let ranked = SimilarMoves::rank(&nearby);
+        let mut ranked = SimilarMoves::rank(&nearby);
         assert_eq!(
             ranked
                 .ordered()
@@ -171,8 +190,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            recommend(
-                &ranked,
+            rank_and_recommend(
+                &mut ranked,
                 ("d2d4", Some(20)),
                 [("e4d5", Some(-70)), ("g1f3", Some(-29))]
             ),
@@ -184,8 +203,8 @@ mod tests {
             }),
         );
         assert_eq!(
-            recommend(
-                &ranked,
+            rank_and_recommend(
+                &mut ranked,
                 ("d2d4", Some(20)),
                 [("e4d5", Some(-70)), ("g1f3", Some(-31))]
             ),
@@ -199,6 +218,77 @@ mod tests {
     }
 
     #[test]
+    fn stockfish_breaks_support_ties_before_distance() {
+        let mut nearby = NearbyRepertoirePositions {
+            current: vec![
+                position(1, &[("f1e2", true)]),
+                position(2, &[("h2h3", true)]),
+                position(3, &[("c2c4", true)]),
+                position(4, &[("h2h4", true)]),
+            ],
+            other: vec![position(0, &[("c2c4", true)])],
+        };
+        let scores = [
+            ("f1e2", Some(117)),
+            ("h2h3", Some(123)),
+            ("h2h4", Some(118)),
+        ];
+        let mut ranked = SimilarMoves::rank(&nearby);
+        assert_eq!(
+            rank_and_recommend(&mut ranked, ("c2c4", Some(138)), scores),
+            Some(Recommendation::Similar {
+                uci: "c2c4",
+                scope: RepertoireScope::Current,
+                position_count: 1,
+                loss_centipawns: 0,
+            }),
+        );
+        assert_eq!(
+            ranked.current.iter().map(|mv| mv.uci).collect::<Vec<_>>(),
+            ["c2c4", "h2h3", "h2h4", "f1e2"]
+        );
+
+        nearby.current.push(position(5, &[("f1e2", true)]));
+        let mut ranked = SimilarMoves::rank(&nearby);
+        assert_eq!(
+            rank_and_recommend(&mut ranked, ("c2c4", Some(138)), scores),
+            Some(Recommendation::Similar {
+                uci: "f1e2",
+                scope: RepertoireScope::Current,
+                position_count: 2,
+                loss_centipawns: 21,
+            }),
+        );
+    }
+
+    #[test]
+    fn equal_scores_and_unscored_moves_keep_structural_order() {
+        let nearby = NearbyRepertoirePositions {
+            current: vec![
+                position(1, &[("f1e2", true)]),
+                position(2, &[("h2h3", true)]),
+                position(3, &[("c2c4", true)]),
+                position(4, &[("h2h4", true)]),
+            ],
+            other: vec![],
+        };
+        let mut ranked = SimilarMoves::rank(&nearby);
+        let result = rank_and_recommend(
+            &mut ranked,
+            ("d2d4", Some(138)),
+            [("h2h3", Some(123)), ("c2c4", Some(123))],
+        );
+        assert!(matches!(
+            result,
+            Some(Recommendation::Similar { uci: "h2h3", .. })
+        ));
+        assert_eq!(
+            ranked.current.iter().map(|mv| mv.uci).collect::<Vec<_>>(),
+            ["h2h3", "c2c4", "f1e2", "h2h4"]
+        );
+    }
+
+    #[test]
     fn thresholds_apply_to_the_closest_score_and_incomplete_scores_leave_fallback_blank() {
         let nearby = NearbyRepertoirePositions {
             current: vec![
@@ -207,10 +297,10 @@ mod tests {
             ],
             other: vec![],
         };
-        let ranked = SimilarMoves::rank(&nearby);
-        let decide = |loss| {
-            recommend(
-                &ranked,
+        let mut ranked = SimilarMoves::rank(&nearby);
+        let mut decide = |loss| {
+            rank_and_recommend(
+                &mut ranked,
                 ("d2d4", Some(-10)),
                 [("e4d5", Some(-230)), ("g1f3", Some(-10 - loss))],
             )
@@ -234,19 +324,19 @@ mod tests {
             })
         );
         assert_eq!(
-            recommend(
-                &ranked,
+            rank_and_recommend(
+                &mut ranked,
                 ("d2d4", Some(20)),
                 [("e4d5", Some(-150)), ("g1f3", None)]
             ),
             None
         );
         assert_eq!(
-            recommend(&ranked, ("d2d4", None), [("e4d5", Some(-150))]),
+            rank_and_recommend(&mut ranked, ("d2d4", None), [("e4d5", Some(-150))]),
             None
         );
         assert_eq!(
-            recommend(&ranked, ("g1f3", None), [("e4d5", Some(-150))]),
+            rank_and_recommend(&mut ranked, ("g1f3", None), [("e4d5", Some(-150))]),
             Some(Recommendation::Similar {
                 uci: "g1f3",
                 scope: RepertoireScope::Current,
@@ -255,7 +345,7 @@ mod tests {
             })
         );
         assert_eq!(
-            recommend(&SimilarMoves::default(), ("d2d4", Some(20)), []),
+            rank_and_recommend(&mut SimilarMoves::default(), ("d2d4", Some(20)), []),
             None
         );
     }

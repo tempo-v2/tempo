@@ -186,6 +186,8 @@ Opening a gap shows similar repertoire responses alongside a bounded
 Stockfish search. Nearby positions are ranked by pawn files, piece placement
 and castling rights. Tempo tries the most common reusable replies in the
 current repertoire first, then other saved repertoires for the same side.
+For replies backed by the same number of positions, a better comparable
+Stockfish evaluation wins the tie. Structural closeness breaks remaining ties.
 
 Tempo suggests the first reply within 50 centipawns of Stockfish's best.
 If the best comparable repertoire reply is 51–150 centipawns behind, the

@@ -4,7 +4,7 @@ use crate::{
     app_error::domain,
     game_evidence::check_id,
     game_model::GapRequest,
-    gap_recommendation::{SimilarMoves, recommend},
+    gap_recommendation::{SimilarMoves, rank_and_recommend},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -113,7 +113,7 @@ fn analyze(
         &input.catalog,
         NEARBY_PER_GROUP,
     );
-    let similar = nearby.as_ref().map(SimilarMoves::rank).unwrap_or_default();
+    let mut similar = nearby.as_ref().map(SimilarMoves::rank).unwrap_or_default();
     // Older open pages can continue reading the original three board examples.
     let neighbors = nearby.as_ref().ok().map(|groups| {
         let mut positions = BTreeMap::<_, BTreeSet<_>>::new();
@@ -158,8 +158,9 @@ fn analyze(
             .iter()
             .flatten()
             .map(|mv| (mv.uci.as_str(), mv.centipawns));
-        recommend(&similar, (&best.uci, best.centipawns), scores)
+        rank_and_recommend(&mut similar, (&best.uci, best.centipawns), scores)
     });
+    progress["similar_responses"] = json!(similar);
     progress["recommendation"] = json!(recommendation);
     if let Ok(result) = &mut engine
         && let Some(comparison) = result.comparison.take()
