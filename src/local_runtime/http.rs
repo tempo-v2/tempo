@@ -310,9 +310,9 @@ fn respond(
             ),
             (&Method::Post, "/api/games/refresh") => (
                 202,
-                command::<GameRefresh>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
-                    games.refresh.refresh(app, intent, !games.backfill.active())
-                }),
+                command::<GameRefresh>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.refresh.refresh(app, intent, !games.backfill.active()))
+                    .map(|reply| serde_json::json!(reply)),
             ),
             _ => (
                 405,
