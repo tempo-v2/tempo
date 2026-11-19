@@ -14,7 +14,7 @@ use tempo_chess::ContentItem;
 use tempo_learning::RestoredGameObligation;
 use tempo_queue::{
     DailyActivity, DailyCandidate, DailyChoice, DailyContext, DailyEvidence, DailyKind,
-    DailySelection, DailySession, Line,
+    DailySelection, DailySession, Line, RelevanceReason, TargetRelevance,
 };
 use tempo_store::{ActivityMode, AnswerResult, Snapshot, Store, StoredAttempt, StudyScope, Write};
 use tempo_study::{Attempt, AttemptStatus};
@@ -71,10 +71,28 @@ impl Tempo {
         snapshot: &Snapshot,
         at: StudyTime,
         extra_tactics: usize,
-    ) -> DailySelection {
+    ) -> Result<DailySelection, AppError> {
         let daily = self.daily.as_ref().expect("daily release");
         let mut admitted = (0, 0);
-        let mut evidence = DailyEvidence::default();
+        let mut evidence = DailyEvidence {
+            relevance: self
+                .store
+                .game_relevance(&snapshot.dataset, crate::game_model::MODEL_KEY)?
+                .into_iter()
+                .map(|(target, fact)| {
+                    (
+                        target,
+                        TargetRelevance {
+                            exposure: fact.exposure,
+                            misses: fact.misses,
+                            modeled_millionths: fact.modeled_millionths,
+                            window_games: fact.window_games,
+                        },
+                    )
+                })
+                .collect(),
+            ..DailyEvidence::default()
+        };
         let mut capture_priority = BTreeMap::new();
         let candidates = snapshot
             .catalog
@@ -169,7 +187,7 @@ impl Tempo {
             daily.tactic_themes.as_ref(),
             daily.starter_themes,
         );
-        daily.queue.select_with_evidence(
+        Ok(daily.queue.select_with_evidence(
             DailyContext {
                 seed,
                 today: at.day,
@@ -188,7 +206,20 @@ impl Tempo {
             order.as_ref(),
             &capture_priority,
             &evidence,
-        )
+        ))
+    }
+
+    pub fn study_relevance_reason(
+        &self,
+        dataset: &DatasetId,
+        attempt: &tempo_types::AttemptId,
+    ) -> Result<serde_json::Value, AppError> {
+        let reason = self
+            .store
+            .stored_attempt(attempt)?
+            .filter(|record| &record.attempt.dataset == dataset)
+            .and_then(|record| record.relevance_reason);
+        Ok(serde_json::json!({"reason": reason}))
     }
 
     pub(super) fn daily_summary(
@@ -251,6 +282,7 @@ impl Tempo {
             route: choice.route.clone(),
             first_introduction: choice.new_kind.is_some(),
             exercise_name: exercise_name(item),
+            relevance_reason: choice.relevance.map(relevance_reason),
             lesson: match mode {
                 ActivityMode::Teach => item.lesson.clone(),
                 ActivityMode::Repair => {
@@ -304,4 +336,34 @@ fn exercise_name(item: &ContentItem) -> Option<String> {
     // Repertoire labels are already public. Tactic catalog labels can reveal
     // motifs, so they are not public display names for blind exercises.
     (item.definition.is_repertoire() && !item.label.trim().is_empty()).then(|| item.label.clone())
+}
+
+fn relevance_reason(reason: RelevanceReason) -> String {
+    let evidence = reason.evidence;
+    if evidence.exposure > 0 {
+        let position = if reason.downstream {
+            "A later position was reached"
+        } else {
+            "Reached"
+        };
+        let games = if evidence.window_games == 1 {
+            "game"
+        } else {
+            "games"
+        };
+        format!(
+            "{position} in {} of your last {} {games}.",
+            evidence.exposure, evidence.window_games
+        )
+    } else {
+        let position = if reason.downstream {
+            "Modeled reach for a later position"
+        } else {
+            "Modeled reach"
+        };
+        format!(
+            "{position} · {:.1}% under Maia Rapid 1500.",
+            f64::from(evidence.modeled_millionths.unwrap_or(0)) / 10_000.0
+        )
+    }
 }

@@ -146,3 +146,32 @@ cp -n "$recovery_dir/backup.sqlite" "$recovery_dir/recovered.sqlite"
 Open [the recovered copy](http://127.0.0.1:41823). Confirm the expected study state before choosing a recovery file for routine use. Keep the original database and backup intact. An older backup contains only the learning present at the time it was made.
 
 Opening imports support standard-start orthodox games. Tactic capture accepts explicit setup instructions and selected game segments. It checks move legality and does not evaluate the solution with an engine.
+
+## Historical Games and Study relevance
+
+Games → Historical backfill takes public provider accounts and a fixed UTC date
+range. It reads bounded provider windows and dated, matching stored PGNs.
+Completed windows survive restart. Retry remaining windows uses the existing
+job and its saved child receipts. Unlisted archives, truncated windows and
+provider failures appear in the window details.
+
+Only this explicit historic job may add a new Game Again for a qualifying
+unapplied miss from before a repertoire's starting reset. A later accepted
+reset stops the job's remaining learning effects for that repertoire. Regular
+refresh and stored-game reprocessing keep their original reset rules.
+Distinct raw game and target identities retain their existing acceptance keys.
+
+The latest 200 eligible games supply personal position counts. A confirmed
+opponent gap opens the current repertoire at the position after the reply.
+Add a learner response to the draft, then use Preview and Save. Retained
+source PGNs are required to confirm authored replies and endpoints.
+
+To enable the local Rapid 1500 model, run `sh tempo/tools/maia/setup.sh PATH`
+with `PATH` set to the absolute path of a `maia` directory next to the
+active SQLite file. This uses Python 3.12, the pinned Maia-2 package, and
+its checksum-verified Rapid checkpoint. Choose Analyze Maia probabilities
+in Games. Inference persists full distributions as it progresses and can
+reuse them after interruption. An unavailable probability stays unknown.
+The displayed local coverage sums authored replies that have a saved learner
+response. Study also uses a separate modeled reach across authored routes
+where personal exposure is absent.

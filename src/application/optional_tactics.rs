@@ -21,7 +21,7 @@ impl Tempo {
         self.daily.as_ref().ok_or_else(unavailable)?;
         let at = self.components.clock.now();
         let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
-        let selection = self.daily_selection(&snapshot, at, extra);
+        let selection = self.daily_selection(&snapshot, at, extra)?;
         if selection.outstanding != 0 {
             return Err(AppError::new(
                 "daily_work_remaining",
@@ -89,7 +89,7 @@ impl Tempo {
         }
         let at = self.components.clock.now();
         let extra = self.store.tactics_extra(&dataset, at.day)?;
-        let selection = self.daily_selection(&snapshot, at, extra);
+        let selection = self.daily_selection(&snapshot, at, extra)?;
         if snapshot.active_attempt.is_some() || selection.outstanding != 0 {
             return Err(AppError::new(
                 "daily_work_remaining",
@@ -108,7 +108,7 @@ impl Tempo {
                     "The extra allowance cannot be increased.",
                 )
             })?,
-        );
+        )?;
         let response = self.daily_summary(dataset.clone(), extended);
         let reply = serde_json::to_string(&response).map_err(|e| domain("codec_error", e))?;
         self.store.extend_tactics_allowance(

@@ -5,7 +5,9 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path, time::Duration};
 use tempo::{
     AppError, Tempo,
+    game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_evidence::{GameImport, GameJobs, GameRefresh},
+    game_model::{GameModel, GapRequest, ModelRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use tempo_store::SqliteStore;
@@ -17,6 +19,7 @@ const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 pub(super) fn serve(
     app: &mut Tempo,
     profile_store: &SqliteStore,
+    database: &Path,
     ui: &Path,
     port: u16,
 ) -> LocalResult<()> {
@@ -25,9 +28,16 @@ pub(super) fn serve(
     let address = server.server_addr().to_string();
     let origin = format!("http://{address}");
     println!("Tempo study at {origin}");
-    let mut games = GameJobs::start()?;
+    let mut games = Games {
+        refresh: GameJobs::start()?,
+        backfill: BackfillCoordinator::start(app)?,
+        model: GameModel::new(database),
+    };
     loop {
-        games.poll(app);
+        games.refresh.poll(app);
+        if !games.refresh.active() {
+            games.backfill.poll(app);
+        }
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
@@ -43,6 +53,19 @@ pub(super) fn serve(
             eprintln!("Tempo HTTP: {error}");
         }
     }
+}
+
+struct Games {
+    refresh: GameJobs,
+    backfill: BackfillCoordinator,
+    model: GameModel,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelevanceRead {
+    dataset_id: tempo_types::DatasetId,
+    attempt_id: tempo_types::AttemptId,
 }
 
 struct Asset {
@@ -103,7 +126,7 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
 fn respond(
     app: &mut Tempo,
     profile_store: &SqliteStore,
-    games: &mut GameJobs,
+    games: &mut Games,
     mut request: Request,
     public: &BTreeMap<String, Asset>,
     address: &str,
@@ -121,10 +144,45 @@ fn respond(
             | "/api/games/refresh"
             | "/api/games/choose"
             | "/api/games/reprocess"
+            | "/api/games/backfill"
+            | "/api/games/backfill/retry"
+            | "/api/games/model"
+            | "/api/games/gaps"
+            | "/api/games/gap-draft"
+            | "/api/study/relevance"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
             (&Method::Get, "/api/games") => (200, app.game_history()),
-            (&Method::Get, "/api/games/job") => (200, Ok(games.poll(app))),
+            (&Method::Get, "/api/games/job") => (200, Ok(games.refresh.poll(app))),
+            (&Method::Get, "/api/games/backfill") => (200, Ok(games.backfill.status())),
+            (&Method::Post, "/api/games/backfill") => (
+                202,
+                command::<BackfillRequest>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.backfill.begin(app, intent)),
+            ),
+            (&Method::Post, "/api/games/backfill/retry") => (
+                202,
+                command::<BackfillRetry>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.backfill.retry(app, intent)),
+            ),
+            (&Method::Get, "/api/games/model") => (200, Ok(games.model.status())),
+            (&Method::Post, "/api/games/model") => (
+                202,
+                command::<ModelRequest>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.model.start(app, intent)),
+            ),
+            (&Method::Get, "/api/games/gaps") => (200, app.opponent_gaps()),
+            (&Method::Post, "/api/games/gap-draft") => (
+                200,
+                command::<GapRequest>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| app.game_gap_draft(intent)),
+            ),
+            (&Method::Post, "/api/study/relevance") => (
+                200,
+                command::<RelevanceRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                    app.study_relevance_reason(&intent.dataset_id, &intent.attempt_id)
+                }),
+            ),
             (&Method::Post, "/api/games/import") => (
                 200,
                 command::<GameImport>(&mut request, MAX_CONTENT_COMMAND_BYTES)
@@ -148,8 +206,9 @@ fn respond(
             ),
             (&Method::Post, "/api/games/refresh") => (
                 202,
-                command::<GameRefresh>(&mut request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.refresh(app, intent)),
+                command::<GameRefresh>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                    games.refresh.refresh(app, intent, !games.backfill.active())
+                }),
             ),
             _ => (
                 405,

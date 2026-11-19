@@ -26,7 +26,7 @@ pub(crate) enum Provider {
 }
 
 impl Provider {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Lichess => "Lichess",
             Self::ChessCom => "Chess.com",
@@ -53,6 +53,8 @@ pub(crate) struct FetchedGames {
     pub(crate) received: usize,
     pub(crate) games: Vec<Game>,
     pub(crate) errors: Vec<String>,
+    pub(crate) truncated: bool,
+    pub(crate) unlisted_archives: Vec<String>,
 }
 
 impl FetchedGames {
@@ -75,6 +77,7 @@ impl FetchedGames {
     fn cap(&mut self) {
         if self.games.len() > MAX_GAMES {
             self.games.truncate(MAX_GAMES);
+            self.truncated = true;
             self.errors
                 .push("This refresh exceeded 500 games. Use a shorter date range.".into());
         }
@@ -218,10 +221,11 @@ fn chess_com_archives(
     for archive in archive_urls(&base, range) {
         // Construct URLs locally so a changed or untrusted archive list
         // cannot broaden host, path, or requested month.
+        let month = &archive[archive.len() - 7..];
         if !archives.archives.contains(&archive) {
+            batch.unlisted_archives.push(month.into());
             continue;
         }
-        let month = &archive[archive.len() - 7..];
         let result = read(&archive)
             .and_then(|body| decode_chess_com(&body, account, range, month, &mut batch));
         if let Err(error) = result {
@@ -240,7 +244,7 @@ fn chess_com_archives(
     Ok(batch)
 }
 
-fn valid_account(account: &str) -> bool {
+pub(crate) fn valid_account(account: &str) -> bool {
     !account.is_empty()
         && account.len() <= 40
         && account
@@ -345,7 +349,8 @@ fn curl(
         .wait()
         .map_err(|_| provider_error("The system HTTPS client did not complete."))?;
     if output.len() > MAX_RESPONSE || status.code() == Some(63) {
-        return Err(provider_error(
+        return Err(AppError::new(
+            "provider_response_limit",
             "Provider response was too large. Use a shorter date range.",
         ));
     }
@@ -454,6 +459,7 @@ fn decode_lichess(body: &[u8], account: &str, range: &GameRange) -> FetchedGames
         .filter(|row| !row.iter().all(u8::is_ascii_whitespace));
     for (index, row) in rows.enumerate() {
         if index == MAX_GAMES {
+            batch.truncated = true;
             batch.errors.push(
                 "This refresh reached the Lichess export limit. Use a shorter date range.".into(),
             );
