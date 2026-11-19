@@ -11,7 +11,7 @@ use crate::{
     commands::{RepertoireCommand, RepertoireInput},
     game_model::model_input_stamp,
     views::ErrorView,
-    wire::{CONTENT_WIRE_VERSION, MAX_CONTENT_COMMAND_BYTES},
+    wire::CONTENT_WIRE_VERSION,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -192,16 +192,6 @@ impl Tempo {
                 let mut save = json!(input);
                 save["command"] = json!("save");
                 save["token"] = json!(token);
-                if serde_json::to_vec(&save)
-                    .map_err(|e| domain("codec_error", e))?
-                    .len()
-                    > MAX_CONTENT_COMMAND_BYTES
-                {
-                    return Err(AppError::new(
-                        "save_too_large",
-                        "These marked lines would produce a repertoire Save larger than the supported command size.",
-                    ));
-                }
                 reply["save_command"] = save;
                 reply["repertoire_id"] = json!(id);
                 reply["replacements"] = json!(draft.replacements);
