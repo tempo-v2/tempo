@@ -10,8 +10,8 @@ use std::{
 use tempo::{Clock, Components, CounterIds, IntroductionLimits, Tempo};
 use tempo_chess::{Catalog, LegalSequenceGrader};
 use tempo_learning::{DailyLearning, LearningPolicy};
-use tempo_store::{SqliteStore, Store};
-use tempo_types::{StudyDay, StudyTime, TargetId};
+use tempo_store::{ChoiceAttribution, SqliteStore, Store};
+use tempo_types::{ContentVersion, StudyDay, StudyTime, TargetId};
 
 type Day = Arc<AtomicI32>;
 
@@ -95,6 +95,98 @@ fn choose(app: &mut Tempo, original: &Value, choice: &Value, command_id: &str) {
         serde_json::to_value(report).unwrap()["results"][0]["effect"].as_str(),
         Some("again_applied" | "already_addressed")
     ));
+}
+
+#[test]
+fn startup_recovers_a_no_grade_choice_written_entirely_under_schema9() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("choice.sqlite");
+    // Schema 9 Tempo be6ca8f accepted the choice after an existing automatic Again.
+    // Schema 10 Tempo 598c2d3 reopened and reimported the same synthetic game.
+    std::fs::write(&db, include_bytes!("fixtures/schema9-choice.sqlite")).unwrap();
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/schema9-choice.json")).unwrap();
+    let command = || {
+        serde_json::from_value::<tempo::game_evidence::ChooseGameCorrection>(
+            fixture["command"].clone(),
+        )
+        .unwrap()
+    };
+    let choice = command();
+    let position = fixture["position"].as_str().unwrap();
+    let store = SqliteStore::open(&db).unwrap();
+    let migration = store.choice_migration_report().unwrap();
+    assert_eq!(
+        (
+            migration.recovered,
+            migration.unattributed,
+            migration.conflicting
+        ),
+        (1, 0, 0)
+    );
+    let dataset = &choice.dataset_id;
+    let choices = || {
+        store
+            .game_choices(dataset, &choice.source, &choice.game_id)
+            .unwrap()
+    };
+    assert_eq!(
+        choices()[position],
+        Some(ChoiceAttribution {
+            target: choice.target_id.clone(),
+            answer_version: ContentVersion(1)
+        })
+    );
+    let relevance = || store.game_relevance(dataset, "").unwrap()[&choice.target_id];
+    assert_eq!((relevance().exposure, relevance().misses), (1, 0));
+    let learning_before = store.snapshot().unwrap().learning;
+    let failures_before = store.game_failures(dataset).unwrap();
+    assert_eq!(failures_before.len(), 1);
+    assert_eq!(failures_before[0].chosen_position, None);
+    let receipt = || {
+        store
+            .game_receipt(
+                dataset,
+                &choice.command_id,
+                fixture["fingerprint"].as_str().unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+    };
+
+    let startup = |generation| {
+        let day = Arc::new(AtomicI32::new(20_004));
+        let mut app = open(&db, day, IntroductionLimits::default(), generation);
+        app.bootstrap_model_inputs().unwrap();
+        app.reconcile_legacy_game_requests().unwrap();
+        let repair = app.reconcile_choice_encounters().unwrap();
+        (app, repair)
+    };
+    let (mut app, repair) = startup(1);
+    assert_eq!(
+        (repair.examined, repair.repaired, repair.unresolved),
+        (1, 1, 0)
+    );
+    let replay = app.choose_game_correction(command()).unwrap();
+    assert_eq!(
+        serde_json::to_value(replay).unwrap(),
+        fixture["accepted_reply"]
+    );
+    assert_eq!((relevance().exposure, relevance().misses), (1, 1));
+    drop(app);
+
+    let (mut reopened, repair) = startup(2);
+    assert_eq!((repair.repaired, repair.unresolved), (0, 0));
+    date_only_import(
+        &mut reopened,
+        "reimport-after-repair",
+        "2024.10.06",
+        "1. c4 e5",
+    );
+    assert_eq!((relevance().exposure, relevance().misses), (1, 1));
+    assert_eq!(store.snapshot().unwrap().learning, learning_before);
+    assert_eq!(store.game_failures(dataset).unwrap(), failures_before);
+    assert_eq!(serde_json::to_value(receipt()).unwrap(), fixture["receipt"]);
 }
 
 #[test]

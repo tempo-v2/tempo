@@ -9,9 +9,9 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
-        mpsc::{Receiver, SyncSender, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tempo_chess::{AuthoredRepertoire, ContentKind, LearnerColor, PositionKey, legal_model_moves};
 use tempo_store::{
@@ -23,6 +23,11 @@ use tempo_types::{DatasetId, TargetId};
 pub(crate) const MODEL_KEY: &str = "maia2-0.11.0:65aae8465eed5e65df66a24ea7370715579f9e5435098d06fe18bdb1e267e997:rapid:1500:1500:cpu";
 pub(crate) const PROFILE_LABEL: &str = "Maia Rapid 1500";
 pub(crate) type Distribution = BTreeMap<String, f64>;
+const CACHE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,20 +114,45 @@ pub struct GameModel {
 #[derive(Default)]
 struct ModelJobs {
     explicit: Option<DatasetId>,
-    cached: Option<DatasetId>,
+    cached: Option<CachedProjection>,
     active_explicit: Option<DatasetId>,
     status: Status,
 }
 
+struct CachedProjection {
+    dataset: DatasetId,
+    failures: usize,
+    ready_at: Instant,
+}
+
 impl ModelJobs {
-    fn next(&mut self) -> Option<(DatasetId, ProjectionScope)> {
+    fn next(&mut self, now: Instant) -> Option<(DatasetId, ProjectionScope, usize)> {
         if let Some(dataset) = self.explicit.take() {
             self.active_explicit = Some(dataset.clone());
-            return Some((dataset, ProjectionScope::AllVerified));
+            return Some((dataset, ProjectionScope::AllVerified, 0));
+        }
+        if self.cached.as_ref()?.ready_at > now {
+            return None;
         }
         self.cached
             .take()
-            .map(|dataset| (dataset, ProjectionScope::Pending))
+            .map(|job| (job.dataset, ProjectionScope::Pending, job.failures))
+    }
+
+    fn retry_cached(&mut self, dataset: DatasetId, failures: usize, now: Instant) -> bool {
+        // A newer submission already covers the latest inputs and has its own retry budget.
+        if self.cached.is_some() {
+            return true;
+        }
+        let Some(delay) = CACHE_RETRY_DELAYS.get(failures) else {
+            return false;
+        };
+        self.cached = Some(CachedProjection {
+            dataset,
+            failures: failures + 1,
+            ready_at: now + *delay,
+        });
+        true
     }
 }
 
@@ -173,7 +203,11 @@ impl GameModel {
     }
 
     pub fn project_cached(&self, dataset: DatasetId) -> Result<(), AppError> {
-        self.jobs.lock().expect("model jobs").cached = Some(dataset);
+        self.jobs.lock().expect("model jobs").cached = Some(CachedProjection {
+            dataset,
+            failures: 0,
+            ready_at: Instant::now(),
+        });
         self.wake_worker()
     }
 
@@ -187,10 +221,18 @@ impl GameModel {
 
 fn model_worker(database: &Path, queued: Receiver<()>, jobs: &Mutex<ModelJobs>) {
     let directory = database.parent().unwrap_or(Path::new(".")).join("maia");
-    while queued.recv().is_ok() {
-        loop {
-            let next = jobs.lock().expect("model jobs").next();
-            let Some((dataset, scope)) = next else { break };
+    loop {
+        let (next, retry_delay) = {
+            let mut state = jobs.lock().expect("model jobs");
+            let now = Instant::now();
+            let next = state.next(now);
+            let retry_delay = state
+                .cached
+                .as_ref()
+                .map(|job| job.ready_at.saturating_duration_since(now));
+            (next, retry_delay)
+        };
+        if let Some((dataset, scope, failures)) = next {
             let explicit = scope == ProjectionScope::AllVerified;
             let outcome = run(database, &directory, &dataset, scope, |completed, total| {
                 if explicit {
@@ -214,14 +256,25 @@ fn model_worker(database: &Path, queued: Receiver<()>, jobs: &Mutex<ModelJobs>) 
                     };
                     state.status.error = error.map(|error| error.message);
                 }
-            } else {
-                match outcome {
-                    Ok((_, Some(error))) | Err(error) => {
-                        eprintln!("Tempo cached model projection: {error}")
-                    }
-                    Ok((_, None)) => {}
-                }
+            } else if let Ok((_, Some(error))) | Err(error) = outcome {
+                let retrying = jobs.lock().expect("model jobs").retry_cached(
+                    dataset,
+                    failures,
+                    Instant::now(),
+                );
+                let disposition = if retrying {
+                    "retry pending"
+                } else {
+                    "retries exhausted"
+                };
+                eprintln!("Tempo cached model projection ({disposition}): {error}");
             }
+        } else if let Some(delay) = retry_delay {
+            if queued.recv_timeout(delay) == Err(RecvTimeoutError::Disconnected) {
+                break;
+            }
+        } else if queued.recv().is_err() {
+            break;
         }
     }
 }
@@ -337,9 +390,15 @@ impl Prefix {
         let opponent = *side != book.color;
         for (played, next) in &self.replies {
             let child = if opponent {
-                probability
-                    .zip(cache.get(position).and_then(|moves| moves.get(played)))
-                    .map(|(path, local)| path * local)
+                let local = cache
+                    .get(position)
+                    .and_then(|moves| moves.get(played))
+                    .copied();
+                match (probability, local) {
+                    (Some(0.0), _) | (_, Some(0.0)) => Some(0.0),
+                    (Some(path), Some(local)) => Some(path * local),
+                    _ => None,
+                }
             } else {
                 probability
             };
@@ -557,6 +616,44 @@ mod tests {
     }
 
     #[test]
+    fn failed_cache_work_backs_off_and_yields_to_explicit_and_newer_work() {
+        let dataset = DatasetId::from("model-proof");
+        let newer = DatasetId::from("replacement");
+        let now = Instant::now();
+        let mut jobs = ModelJobs::default();
+        let mut failed_at = now;
+        for (failures, delay) in CACHE_RETRY_DELAYS.into_iter().enumerate() {
+            assert!(jobs.retry_cached(dataset.clone(), failures, failed_at));
+            assert_eq!(jobs.next(failed_at + delay / 2), None);
+            if failures == 0 {
+                jobs.explicit = Some(dataset.clone());
+                assert_eq!(
+                    jobs.next(failed_at),
+                    Some((dataset.clone(), ProjectionScope::AllVerified, 0))
+                );
+            }
+            failed_at += delay;
+            assert_eq!(
+                jobs.next(failed_at),
+                Some((dataset.clone(), ProjectionScope::Pending, failures + 1))
+            );
+        }
+        assert!(!jobs.retry_cached(dataset.clone(), CACHE_RETRY_DELAYS.len(), failed_at));
+        assert!(jobs.next(failed_at).is_none());
+
+        jobs.cached = Some(CachedProjection {
+            dataset: newer.clone(),
+            failures: 0,
+            ready_at: failed_at,
+        });
+        assert!(jobs.retry_cached(dataset, 1, failed_at));
+        assert_eq!(
+            jobs.next(failed_at),
+            Some((newer, ProjectionScope::Pending, 0))
+        );
+    }
+
+    #[test]
     fn cache_only_projection_publishes_partial_and_terminal_reach_without_python() {
         use crate::{Components, IntroductionLimits};
         use tempo_chess::Catalog;
@@ -711,10 +808,23 @@ mod tests {
         let mut reach = BTreeMap::new();
         root.project(&book, Some(1.0), &cache, &mut BTreeSet::new(), &mut reach);
         assert_eq!(reach[&target], None);
-        cache.insert(
-            paths[1][3].0.clone(),
-            BTreeMap::from([("g8f6".into(), 0.6)]),
-        );
+        let branch = &paths[0][1].0;
+        cache.get_mut(branch).unwrap().insert("g7g6".into(), 0.0);
+        reach.clear();
+        root.project(&book, Some(1.0), &cache, &mut BTreeSet::new(), &mut reach);
+        assert_eq!(reach[&target], Some(0.20));
+        let alternate = paths[1][3].0.clone();
+        let first = cache.remove(branch).unwrap();
+        cache.insert(alternate.clone(), BTreeMap::from([("g8f6".into(), 0.0)]));
+        // The branch distribution is absent, so the direct arrival is unknown.
+        // Inspect the alternative subtree in isolation to see its determined zero.
+        let alternative = &root.replies["g1f3"].replies["g7g6"];
+        reach.clear();
+        alternative.project(&book, None, &cache, &mut BTreeSet::new(), &mut reach);
+        assert_eq!(reach[&target], Some(0.0));
+        cache.insert(branch.clone(), first);
+        cache.get_mut(branch).unwrap().insert("g7g6".into(), 0.3);
+        cache.insert(alternate, BTreeMap::from([("g8f6".into(), 0.6)]));
         let mut reach = BTreeMap::new();
         root.project(&book, Some(1.0), &cache, &mut BTreeSet::new(), &mut reach);
         assert!((reach[&target].unwrap() - (0.4 * 0.5 + 0.3 * 0.6)).abs() < 1e-12);
