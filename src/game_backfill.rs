@@ -683,7 +683,7 @@ mod tests {
         // Lose the in-memory window before reporting it, then reset on this same timestamp.
         drop(job);
         reset(&mut app, "later-reset");
-        let (mut resumed, _provider, _response) = fixture_coordinator(&app);
+        let (mut resumed, provider, response) = fixture_coordinator(&app);
         for _ in 0..6 {
             resumed.poll(&mut app);
         }
@@ -706,6 +706,70 @@ mod tests {
                 .unwrap()
                 .len(),
             APPLY_BATCH
+        );
+
+        use tempo_store::Store;
+        let item = app
+            .snapshot()
+            .unwrap()
+            .catalog
+            .items
+            .into_values()
+            .next()
+            .unwrap();
+        let expected = before_reset.game_relevance(&dataset, "").unwrap()[&item.target].exposure;
+        app.import_game_pgn(from_value(json!({
+            "command_id":"other-pgn", "dataset_id":dataset, "learner":"other",
+            "pgn":"[White \"other\"]\n[Black \"opponent\"]\n[Date \"2024.10.03\"]\n\n1. e4 c5 1-0",
+        })).unwrap()).unwrap();
+        assert_eq!(
+            before_reset.game_relevance(&dataset, "").unwrap()[&item.target].exposure,
+            expected
+        );
+        let newer = BackfillRequest {
+            command_id: "another-identity".into(),
+            dataset_id: dataset.clone(),
+            from_ms: now - DAY,
+            to_ms: now,
+            lichess: None,
+            chess_com: Some("other".into()),
+        };
+        let added = resumed.begin(&mut app, newer.clone()).unwrap();
+        assert_eq!(resumed.begin(&mut app, newer.clone()).unwrap(), added);
+        let mut conflicting = newer;
+        conflicting.chess_com = Some("unrecognized".into());
+        assert!(resumed.begin(&mut app, conflicting).is_err());
+        assert_eq!(
+            before_reset.game_relevance(&dataset, "").unwrap()[&item.target].exposure,
+            expected + 1
+        );
+
+        resumed.poll(&mut app);
+        assert!(provider.try_recv().is_ok());
+        response
+            .send(Err(AppError::new(
+                "fixture_provider",
+                "provider unavailable",
+            )))
+            .unwrap();
+        resumed.poll(&mut app);
+        resumed.poll(&mut app);
+        assert_eq!(resumed.status()["windows"][0]["status"], "incomplete");
+        let retried = resumed
+            .retry(
+                &mut app,
+                BackfillRetry {
+                    dataset_id: dataset.clone(),
+                    job_id: "another-identity".into(),
+                    command_id: "retry-other".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(retried["windows"][0]["status"], "pending");
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.game_relevance(&dataset, "").unwrap()[&item.target].exposure,
+            expected + 1
         );
     }
 }

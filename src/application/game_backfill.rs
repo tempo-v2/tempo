@@ -65,7 +65,7 @@ impl Tempo {
                     .repertoire_reset_generation(&snapshot.dataset, id)?,
             );
         }
-        let accounts: Vec<_> = [
+        let accounts_to_recognize: Vec<_> = [
             ("lichess", &request.lichess),
             ("chess_com", &request.chess_com),
         ]
@@ -77,19 +77,23 @@ impl Tempo {
         })
         .collect();
         let job = BackfillJob::new(request, resets);
-        self.save_backfill(&job, Some(&accounts))?;
+        self.save_backfill(&job, Some(&accounts_to_recognize))?;
         Ok(job)
     }
 
     pub(crate) fn save_backfill(
         &mut self,
         job: &BackfillJob,
-        accounts: Option<&[(String, String)]>,
+        accounts_to_recognize: Option<&[(String, String)]>,
     ) -> Result<(), AppError> {
         let state =
             serde_json::to_string(job).map_err(|error| domain("invalid_backfill", error))?;
-        self.store
-            .save_game_backfill_state(&job.request.dataset_id, &job.id, &state, accounts)?;
+        self.store.save_game_backfill_state(
+            &job.request.dataset_id,
+            &job.id,
+            &state,
+            accounts_to_recognize,
+        )?;
         Ok(())
     }
 }

@@ -110,7 +110,13 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
         return Err("place the study database outside the public UI build".into());
     }
     let mut app = open(database)?;
+    app.bootstrap_model_inputs()?;
     app.reconcile_legacy_game_requests()?;
+    let encounters = app.reconcile_choice_encounters()?;
+    eprintln!(
+        "Choice encounters examined={}, repaired={}, unresolved={}",
+        encounters.examined, encounters.repaired, encounters.unresolved
+    );
     http::serve(&mut app, &SqliteStore::open(database)?, database, ui, port)
 }
 
@@ -122,6 +128,12 @@ fn stored_profile(store: &SqliteStore) -> LocalResult<String> {
 
 fn open(path: &Path) -> LocalResult<Tempo> {
     let store = SqliteStore::open(path)?;
+    if let Some(choices) = store.choice_migration_report() {
+        eprintln!(
+            "Choice provenance recovered={}, unattributed={}, conflicting={}",
+            choices.recovered, choices.unattributed, choices.conflicting
+        );
+    }
     let profile: Profile = serde_json::from_str(&stored_profile(&store)?)?;
     let mut app = Tempo::daily(
         Box::new(store),

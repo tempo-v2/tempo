@@ -11,16 +11,17 @@ use std::{
     sync::Arc,
 };
 use tempo_chess::{
-    AuthoredRepertoire, ContentKind, DecisionAdherence, LearnerColor, PlayedGame,
+    AuthoredRepertoire, ContentKind, DecisionAdherence, LearnerColor, PlayedDecision, PlayedGame,
     RepertoireAdherence, compare_authored_repertoires, parse_played_games,
 };
 use tempo_learning::{
     AssessmentInput, AssessmentSource, DailyLearning, GameReviewEffect, LearningState,
 };
 use tempo_store::{
-    AcceptedGames, AssessmentRecord, Commit, ComparedGame, ComparedRelevance, GameChoice,
-    GameChoiceTarget, GameFailureKey, GameObservation, GameReceipt, GameRecord, GameSummary,
-    PgnTiming, RepertoireDisagreement, Write,
+    AcceptedGameChoice, AcceptedGames, AssessmentRecord, ChoiceAttribution, Commit, ComparedGame,
+    ComparedRelevance, EncounterRepair, GameChoice, GameChoiceTarget, GameChoices, GameEncounters,
+    GameFailureKey, GameObservation, GameReceipt, GameRecord, GameSummary, PgnTiming,
+    RepertoireDisagreement, StoreError, Write,
 };
 use tempo_types::{DatasetId, Grade, Revision, TargetId};
 
@@ -31,6 +32,13 @@ pub(super) struct GameBooks {
     white: BTreeMap<String, AuthoredRepertoire>,
     black: BTreeMap<String, AuthoredRepertoire>,
     document_ids: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+pub struct EncounterRepairReport {
+    pub examined: usize,
+    pub repaired: usize,
+    pub unresolved: usize,
 }
 
 impl GameBooks {
@@ -245,12 +253,11 @@ impl Tempo {
                         .any(|candidate| candidate.target_id == request.target_id)
             })
             .ok_or_else(|| invalid("Choose a target from the saved miss."))?;
-        if self.store.game_choice_resolved(
-            &request.dataset_id,
-            &request.source,
-            &request.game_id,
-            &choice.position,
-        )? {
+        if self
+            .store
+            .game_choices(&request.dataset_id, &request.source, &request.game_id)?
+            .contains_key(&choice.position)
+        {
             return Err(invalid("This corrective position has already been chosen."));
         }
         let backfill = saved
@@ -441,6 +448,82 @@ impl Tempo {
         Ok(())
     }
 
+    /// Repair choice-bearing encounters using current Chess facts, without an acceptance command.
+    pub fn reconcile_choice_encounters(&mut self) -> Result<EncounterRepairReport, AppError> {
+        let mut report = EncounterRepairReport::default();
+        let mut cursor = None;
+        let (mut snapshot, mut revision) = self.store.content_state()?;
+        let mut books = self.comparison_books(&snapshot, revision)?;
+        let mut retries = 0;
+        loop {
+            let keys = self
+                .store
+                .choice_encounter_keys(&snapshot.dataset, cursor.as_ref())?;
+            if keys.is_empty() {
+                return Ok(report);
+            }
+            let mut repairs = Vec::new();
+            let mut unresolved = 0;
+            for key in &keys {
+                let Some((game, played)) = self
+                    .store
+                    .stored_game(&snapshot.dataset, &key.source, &key.game_id)?
+                    .and_then(|game| parse_stored_game(game).ok())
+                else {
+                    unresolved += 1;
+                    continue;
+                };
+                let Some(side) = learner_side(&game, &key.learner) else {
+                    unresolved += 1;
+                    continue;
+                };
+                let documents = match side {
+                    LearnerColor::White => &books.white,
+                    LearnerColor::Black => &books.black,
+                };
+                let choices =
+                    self.store
+                        .game_choices(&snapshot.dataset, &key.source, &key.game_id)?;
+                if choices.values().any(Option::is_none) {
+                    unresolved += 1;
+                }
+                let decisions =
+                    compare_authored_repertoires(&played, &snapshot.catalog, side, documents);
+                let encounters = encounter_projection(&decisions, &choices);
+                repairs.push(EncounterRepair {
+                    key: key.clone(),
+                    choices,
+                    encounters,
+                });
+            }
+            match self
+                .store
+                .repair_choice_encounters(&snapshot.dataset, revision, &repairs)
+            {
+                Ok(changed) => {
+                    report.examined += keys.len();
+                    report.repaired += changed;
+                    report.unresolved += unresolved;
+                    cursor = keys.into_iter().last();
+                    retries = 0;
+                }
+                Err(StoreError::Conflict(_)) if retries < 3 => {
+                    let (current, new_revision) = self.store.content_state()?;
+                    if current.dataset != snapshot.dataset {
+                        return Err(invalid(
+                            "The dataset changed during encounter reconciliation.",
+                        ));
+                    }
+                    snapshot = current;
+                    revision = new_revision;
+                    books = self.comparison_books(&snapshot, revision)?;
+                    retries += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     fn compare_games(
         &mut self,
         expected_dataset: &DatasetId,
@@ -490,13 +573,9 @@ impl Tempo {
                     continue;
                 }
             };
-            let side = match (
-                game.white.to_lowercase() == learner,
-                game.black.to_lowercase() == learner,
-            ) {
-                (true, false) => LearnerColor::White,
-                (false, true) => LearnerColor::Black,
-                _ => {
+            let side = match learner_side(&game, &learner) {
+                Some(side) => side,
+                None => {
                     report.errors.push(format!(
                         "Game {}: The learner does not identify exactly one player.",
                         index + 1
@@ -510,7 +589,14 @@ impl Tempo {
             };
             let decisions =
                 compare_authored_repertoires(&played, &snapshot.catalog, side, documents);
-            let mut relevance = ComparedRelevance::default();
+            let prior_choices =
+                self.store
+                    .game_choices(&snapshot.dataset, &game.source, &game.id)?;
+            let mut relevance = ComparedRelevance {
+                prior_choices,
+                content_revision: revision,
+                ..ComparedRelevance::default()
+            };
             let mut repertoires = Vec::new();
             for (id, _) in books.colors.iter().filter(|(_, color)| **color == side) {
                 if let Some(document) = documents.get(id) {
@@ -620,13 +706,7 @@ impl Tempo {
             let mut failures = Vec::new();
             let mut choice_groups = BTreeSet::new();
             let mut resolved = false;
-            for decision in decisions {
-                for obs in &decision.observations {
-                    relevance
-                        .encounters
-                        .entry(obs.target.clone())
-                        .or_insert((obs.version, false));
-                }
+            for decision in &decisions {
                 for observation in decision
                     .observations
                     .iter()
@@ -637,7 +717,7 @@ impl Tempo {
                         .or_default()
                         .push(decision.ply);
                 }
-                let candidates = match decision.adherence {
+                let candidates = match &decision.adherence {
                     DecisionAdherence::Matched => {
                         summary.matches += 1;
                         continue;
@@ -650,36 +730,10 @@ impl Tempo {
                 };
                 summary.deviations += 1;
                 summary.first_deviation_ply.get_or_insert(decision.ply);
-                if let [only] = candidates.as_slice() {
-                    relevance
-                        .encounters
-                        .insert(only.target.clone(), (only.version, true));
-                }
                 if legacy_plies.is_some_and(|plies| !plies.contains(&decision.ply)) {
                     continue;
                 }
-                if selection.is_none()
-                    && self.store.game_choice_resolved(
-                        &snapshot.dataset,
-                        &game.source,
-                        &game.id,
-                        &decision.position.0,
-                    )?
-                {
-                    for obs in &candidates {
-                        let key = GameFailureKey {
-                            source: game.source.clone(),
-                            game_id: game.id.clone(),
-                            target: obs.target.clone(),
-                            version: obs.version,
-                            chosen_position: Some(decision.position.0.clone()),
-                        };
-                        if self.store.game_target_chosen(&snapshot.dataset, &key)? {
-                            relevance
-                                .encounters
-                                .insert(obs.target.clone(), (obs.version, true));
-                        }
-                    }
+                if relevance.prior_choices.contains_key(&decision.position.0) {
                     if summary.correction_effect != Some(GameReviewEffect::AgainApplied) {
                         summary.correction_effect = Some(GameReviewEffect::AlreadyAddressed);
                     }
@@ -700,9 +754,6 @@ impl Tempo {
                         })
                         .ok_or_else(|| invalid("Choose a current target from the comparison."))?;
                     resolved = true;
-                    relevance
-                        .encounters
-                        .insert(chosen.target.clone(), (chosen.version, true));
                     chosen
                 } else if let [only] = candidates.as_slice() {
                     only
@@ -781,7 +832,7 @@ impl Tempo {
                     prior,
                     &input,
                     key.version,
-                    decision.previous_move,
+                    decision.previous_move.clone(),
                 )
                 .map_err(|error| domain("learning_error", error))?;
                 if legacy_plies.is_none() {
@@ -802,6 +853,21 @@ impl Tempo {
             if selection.is_some() && !resolved {
                 return Err(invalid("This miss is no longer available."));
             }
+            let resolved_choice = selection.map(|selection| AcceptedGameChoice {
+                comparison_id: selection.comparison_id.clone(),
+                ply: selection.ply,
+                position: selection.position.clone(),
+                attribution: ChoiceAttribution {
+                    target: selection.target.clone(),
+                    answer_version: selection.chosen_version,
+                },
+            });
+            let mut projection_choices = relevance.prior_choices.clone();
+            if let Some(choice) = &resolved_choice {
+                projection_choices
+                    .insert(choice.position.clone(), Some(choice.attribution.clone()));
+            }
+            relevance.encounters = encounter_projection(&decisions, &projection_choices);
             summary.disagreements = disagreements
                 .into_iter()
                 .map(|(repertoire_id, plies)| RepertoireDisagreement {
@@ -822,13 +888,7 @@ impl Tempo {
                 summary,
                 observations,
                 failures,
-                resolved_choice: selection.map(|selection| {
-                    (
-                        selection.comparison_id.clone(),
-                        selection.ply,
-                        selection.position.clone(),
-                    )
-                }),
+                resolved_choice,
                 relevance: legacy_plies.is_none().then_some(relevance),
             });
         }
@@ -987,6 +1047,47 @@ impl Tempo {
             }
         }
         Ok(())
+    }
+}
+
+fn encounter_projection(decisions: &[PlayedDecision], choices: &GameChoices) -> GameEncounters {
+    let mut encounters = GameEncounters::new();
+    for decision in decisions {
+        for observed in &decision.observations {
+            encounters
+                .entry(observed.target.clone())
+                .or_insert((observed.version, false));
+        }
+        let DecisionAdherence::Miss { candidates } = &decision.adherence else {
+            continue;
+        };
+        let attributed = match candidates.as_slice() {
+            [only] => Some(only),
+            _ => choices
+                .get(&decision.position.0)
+                .and_then(Option::as_ref)
+                .and_then(|selection| {
+                    candidates.iter().find(|candidate| {
+                        candidate.target == selection.target
+                            && candidate.version == selection.answer_version
+                    })
+                }),
+        };
+        if let Some(attributed) = attributed {
+            encounters.insert(attributed.target.clone(), (attributed.version, true));
+        }
+    }
+    encounters
+}
+
+fn learner_side(game: &GameRecord, learner: &str) -> Option<LearnerColor> {
+    match (
+        game.white.to_lowercase() == learner,
+        game.black.to_lowercase() == learner,
+    ) {
+        (true, false) => Some(LearnerColor::White),
+        (false, true) => Some(LearnerColor::Black),
+        _ => None,
     }
 }
 

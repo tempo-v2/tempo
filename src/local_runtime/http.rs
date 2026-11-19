@@ -2,7 +2,13 @@
 use super::{LocalResult, tactic_settings};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    net::Ipv4Addr,
+    path::Path,
+    time::{Duration, Instant},
+};
 use tempo::{
     AppError, Tempo,
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
@@ -32,10 +38,26 @@ pub(super) fn serve(
     let mut games = Games {
         refresh: GameJobs::start()?,
         backfill: BackfillCoordinator::start(app)?,
-        model: GameModel::new(database),
+        model: GameModel::new(database)?,
         gap_analysis: GapAnalysis::new(database),
     };
+    let mut model_marker = None;
+    let mut next_model_check = Instant::now();
     loop {
+        if Instant::now() >= next_model_check {
+            let scheduled = (|| -> LocalResult<()> {
+                let marker = profile_store.model_content_marker()?;
+                if model_marker.as_ref() != Some(&marker) {
+                    games.model.project_cached(marker.0.clone())?;
+                    model_marker = Some(marker);
+                }
+                Ok(())
+            })();
+            if let Err(error) = scheduled {
+                eprintln!("Tempo model scheduling: {error}");
+            }
+            next_model_check = Instant::now() + Duration::from_millis(250);
+        }
         games.refresh.poll(app);
         if !games.refresh.active() {
             games.backfill.poll(app);
@@ -175,7 +197,7 @@ fn respond(
                 command::<BackfillRetry>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.backfill.retry(app, intent)),
             ),
-            (&Method::Get, "/api/games/model") => (200, Ok(games.model.status())),
+            (&Method::Get, "/api/games/model") => (200, games.model.status(app)),
             (&Method::Post, "/api/games/model") => (
                 202,
                 command::<ModelRequest>(&mut request, MAX_COMMAND_BYTES)

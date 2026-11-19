@@ -9,6 +9,7 @@ use crate::{
     AppError,
     app_error::domain,
     commands::{RepertoireCommand, RepertoireInput},
+    game_model::model_input_stamp,
     views::ErrorView,
     wire::CONTENT_WIRE_VERSION,
 };
@@ -16,11 +17,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempo_chess::{
-    Catalog, ChangeKind, ContentItem, ContentKind, ContentPlan, LearnerColor, compile_repertoire,
-    plan_repertoire_replacement,
+    AuthoredRepertoire, Catalog, ChangeKind, ContentItem, ContentKind, ContentPlan, LearnerColor,
+    compile_repertoire, plan_repertoire_replacement,
 };
 use tempo_learning::{DailyLearning, LearningState};
-use tempo_store::{ContentReceipt, ContentSource, RepertoireReset, Snapshot, Write};
+use tempo_store::{ContentReceipt, ContentSource, RepertoireReset, Snapshot, Write, model_targets};
 use tempo_types::DatasetId;
 
 #[derive(Serialize)]
@@ -155,6 +156,13 @@ impl Tempo {
                     return Err(stale_preview());
                 }
                 let (source, _, plan) = prepare(&snapshot, &input, id)?;
+                let authored = AuthoredRepertoire::parse(&input.pgn)
+                    .map_err(|error| domain("invalid_pgn", error))?;
+                let model_input = model_input_stamp(
+                    &authored,
+                    input.learner_color,
+                    model_targets(&plan.catalog, id),
+                );
                 let reply = list(&snapshot.dataset, &plan.catalog);
                 let encoded = reply.to_string();
                 let receipt = ContentReceipt {
@@ -186,6 +194,8 @@ impl Tempo {
                         id: &source,
                         pgn: &input.pgn,
                         repertoire_id: id,
+                        expected_content_revision: revision_in_token,
+                        model_input: &model_input,
                     }),
                     Some(receipt),
                 )?;
