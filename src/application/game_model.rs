@@ -7,8 +7,8 @@ use crate::{
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempo_chess::{
-    AuthoredRepertoire, ContentKind, GapDraft, LearnerColor, PositionKey, compile_repertoire,
-    legal_move_labels,
+    AuthoredRepertoire, ContentKind, GapDraft, LearnerColor, PositionKey, SavedRepertoireResponse,
+    compile_repertoire, legal_move_labels,
 };
 use tempo_store::{ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets};
 use tempo_types::Revision;
@@ -192,6 +192,7 @@ impl Tempo {
         request: GapRequest,
     ) -> Result<GapAnalysisInput, AppError> {
         let dataset = request.dataset_id.clone();
+        let repertoire_id = request.repertoire_id.clone();
         let (draft, revision) = self.gap_position(request)?;
         let (snapshot, current_revision) = self.store.content_state()?;
         if snapshot.dataset != dataset || current_revision != revision {
@@ -200,18 +201,31 @@ impl Tempo {
                 "The repertoire changed. Open the gap again.",
             ));
         }
-        let mut catalog = BTreeMap::<PositionKey, Vec<String>>::new();
+        let mut catalog = BTreeMap::<PositionKey, Vec<SavedRepertoireResponse>>::new();
+        let mut repertoire_names = BTreeMap::new();
         for item in snapshot.catalog.items.values().filter(|item| item.active()) {
-            if let ContentKind::Repertoire { position, .. } = &item.definition.kind {
+            if let ContentKind::Repertoire {
+                position,
+                repertoire,
+            } = &item.definition.kind
+            {
+                repertoire_names
+                    .entry(repertoire.clone())
+                    .or_insert_with(|| item.label.clone());
                 catalog
                     .entry(position.clone())
                     .or_default()
-                    .push(item.label.clone());
+                    .push(SavedRepertoireResponse {
+                        repertoire_id: repertoire.clone(),
+                        answer: item.definition.decisions[0].expected.clone(),
+                    });
             }
         }
         Ok(GapAnalysisInput {
             draft,
             catalog,
+            repertoire_id,
+            repertoire_names,
             revision,
         })
     }
