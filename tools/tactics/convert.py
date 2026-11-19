@@ -15,6 +15,7 @@ LEGACY_REVISION = "366cc346976570cb7ab7de518957d2cd9eee46e1"
 PACK_NAMESPACE = "lichess-puzzle"
 CARD_NAMESPACE = "tempo1-card"
 MEMBERSHIP_PREFIX = "tempo1:catalog-metadata:"
+SOURCE_DIFFICULTIES = {"easy", "medium", "hard", "focused", "advanced"}
 THEME_LIST = Path(__file__).resolve().parents[2] / "src/application/tactic_themes.json"
 
 
@@ -77,7 +78,7 @@ def normalized_membership(pack, row, position, known_themes):
     theme, difficulty, ordinal = (pack.get(field) for field in ("theme", "difficulty", "ordinal"))
     if not isinstance(theme, str) or theme not in known_themes:
         return None, "unknown pack theme"
-    if difficulty not in ("easy", "medium", "hard") or type(ordinal) is not int or ordinal <= 0:
+    if difficulty not in SOURCE_DIFFICULTIES or type(ordinal) is not int or ordinal <= 0:
         return None, "invalid pack difficulty or ordinal"
     deck = pack.get("id")
     if deck != f"{theme}-{difficulty}-{ordinal:02d}":

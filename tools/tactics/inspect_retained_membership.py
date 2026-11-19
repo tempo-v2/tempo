@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 
-from convert import MEMBERSHIP_PREFIX, THEME_LIST, read_catalog
+from convert import MEMBERSHIP_PREFIX, SOURCE_DIFFICULTIES, THEME_LIST, read_catalog
 
 ORIGIN_PREFIX = "tempo1:catalog:puzzle:"
 
@@ -19,7 +19,7 @@ def membership(entry, themes):
         theme, difficulty = fields["Motif"], fields["Difficulty"]
         deck, position = fields["DeckId"], fields["DeckPosition"]
         pack, raw_ordinal = deck.rsplit("-", 1)
-        if theme not in themes or difficulty not in ("easy", "medium", "hard"):
+        if theme not in themes or difficulty not in SOURCE_DIFFICULTIES:
             return None
         ordinal = int(raw_ordinal)
         if pack != f"{theme}-{difficulty}" or ordinal <= 0 or type(position) is not int or position <= 0:
@@ -78,6 +78,7 @@ def main():
             print(json.dumps({
                 "target": target, "version": item["version"], "state": state,
                 "retained": sorted(known), "source_ids": sorted(source_ids),
+                "outside_current_queue_policy": sorted(fact for fact in known if fact[1] in {"focused", "advanced"}),
                 "source_membership_not_retained": sorted(confirmed - known),
             }))
     print(json.dumps({"summary": {key: counts[key] for key in ("known", "missing", "malformed", "conflicting")}}))
