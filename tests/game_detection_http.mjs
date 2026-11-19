@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
+import { databaseRows } from './support/game_detection_readback.mjs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -42,16 +43,6 @@ async function request(host, route, body) {
         body: JSON.stringify(body),
     });
     return { status: response.status, body: await response.json() };
-}
-
-function databaseRows(database) {
-    const db = new DatabaseSync(database, { readOnly: true });
-    try {
-        return db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
-            .all().map(({ name }) => [name, db.prepare('SELECT * FROM "' + name.replaceAll('"', '""') + '"').all()]);
-    } finally {
-        db.close();
-    }
 }
 
 test('external fixture scans an accepted Black-start game through the daily host without durable effects',

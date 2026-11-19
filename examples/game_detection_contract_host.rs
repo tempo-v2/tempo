@@ -12,6 +12,7 @@ use tempo_chess::{
 struct Fixture {
     scenario: String,
     alternate: bool,
+    label: String,
 }
 
 impl GameDetector for Fixture {
@@ -25,7 +26,7 @@ impl GameDetector for Fixture {
             .into(),
             revision: if self.alternate { "2" } else { "1" }.into(),
             configuration_fingerprint: self.scenario.clone(),
-            label: "External contract fixture".into(),
+            label: self.label.clone(),
         }
     }
 
@@ -48,6 +49,22 @@ impl GameDetector for Fixture {
                 .is_some_and(|board| board.fen().ends_with(" 12"))
         {
             std::thread::sleep(Duration::from_millis(1200));
+        }
+        if self.scenario == "repeated" {
+            let first = timeline.first().expect("timeline starts with a position");
+            return DetectionOutcome::Complete(
+                timeline
+                    .iter()
+                    .filter(|board| board.position() == first.position())
+                    .map(|board| DetectedMoment {
+                        occurrence: board.offset(),
+                        code: "test-repeated-position".into(),
+                        subjects: Vec::new(),
+                        candidate_move: board.next_move().map(|answer| answer.uci.clone()),
+                        explanation: "Occurrence of the initial position.".into(),
+                    })
+                    .collect(),
+            );
         }
         match self.scenario.as_str() {
             "empty" => DetectionOutcome::Complete(Vec::new()),
@@ -82,18 +99,29 @@ impl GameDetector for Fixture {
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let [database, ui, port, scenario] = args.as_slice() else {
-        return Err("usage: game_detection_contract_host DATABASE UI_DIST PORT SCENARIO".into());
+    let [database, ui, port, scenario, labels @ ..] = args.as_slice() else {
+        return Err(
+            "usage: game_detection_contract_host DATABASE UI_DIST PORT SCENARIO [LABEL]".into(),
+        );
     };
+    if labels.len() > 1 {
+        return Err("expected at most one fixture label".into());
+    }
+    let label = labels
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "External contract fixture".into());
     let mut registry = DetectorRegistry::default();
     registry.register(Fixture {
         scenario: scenario.clone(),
         alternate: false,
+        label,
     })?;
     if scenario == "delayed" {
         registry.register(Fixture {
             scenario: "alternate".into(),
             alternate: true,
+            label: "External contract fixture".into(),
         })?;
     }
     let options = if scenario == "slow" {
