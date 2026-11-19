@@ -908,6 +908,78 @@ fn captures_interrupt_only_the_next_selection_and_cost_no_introductions() {
 }
 
 #[test]
+fn gap_preview_signs_only_responses_that_preserve_existing_answers_and_learning() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = open(
+        &directory.path().join("gap-response.sqlite"),
+        Arc::new(AtomicI32::new(20_000)),
+        IntroductionLimits::default(),
+        0,
+    );
+    let (_, book) = preview_and_save(
+        &mut app,
+        "1. e4 e5 (1... d5 2. exd5) 2. Nf3 *",
+        "Book",
+        None,
+    );
+    let id = book["repertoires"][0]["id"].as_str().unwrap();
+    for index in 0..3 {
+        let lesson = study(&mut app, json!({"command":"next"}));
+        assert_eq!(lesson["activity"], "teach", "{lesson}");
+        let mut ack = activity_command("acknowledge", &lesson, &format!("gap-teach-{index}"));
+        ack["answer"] = json!({"uci":lesson["lesson"]["move_uci"]});
+        assert_eq!(study(&mut app, ack)["status"], "complete");
+    }
+    preview_and_save(&mut app, SHORT, "Book", Some(id));
+    date_only_import(&mut app, "scandinavian-gap", "2024.10.06", "1. e4 d5 2. d4");
+    let gaps = app.opponent_gaps(0).unwrap();
+    let gap = &gaps["gaps"][0];
+    assert_eq!(gap["actual_san"], "d5");
+    let address = json!({
+        "dataset_id":"opening-proof", "repertoire_id":id, "position":gap["position"],
+        "actual_move":gap["actual_move"], "document_revision":gap["document_revision"],
+    });
+    let draft = app
+        .game_gap_draft(serde_json::from_value(address.clone()).unwrap())
+        .unwrap();
+    assert_eq!(draft["response_move_labels"]["e4d5"], "exd5");
+    assert!(draft["save_token"].is_null());
+    let mut request = address;
+    let revision = draft["content_revision"].as_u64().unwrap();
+    request["base_revision"] = json!(revision - 1);
+    request["response"] = json!("e4d5");
+    let rejected = app.game_gap_draft(serde_json::from_value(request.clone()).unwrap());
+    assert_eq!(rejected.unwrap_err().code, "stale_draft");
+
+    request["base_revision"] = json!(revision);
+    request["response"] = json!("d2d4");
+    let before = app.snapshot().unwrap();
+    let rejected = app.game_gap_draft(serde_json::from_value(request.clone()).unwrap());
+    assert_eq!(rejected.unwrap_err().code, "unsafe_gap_response");
+    assert_eq!(app.snapshot().unwrap(), before);
+
+    request["response"] = json!("e4d5");
+    let proposed = app
+        .game_gap_draft(serde_json::from_value(request).unwrap())
+        .unwrap();
+    assert_eq!(app.snapshot().unwrap(), before);
+    let mut save = book_request(
+        "save",
+        proposed["draft"]["pgn"].as_str().unwrap(),
+        "Book",
+        Some(id),
+    );
+    save["token"] = proposed["save_token"].clone();
+    let receipt = content(&mut app, save.clone());
+    assert_eq!(receipt["status"], "repertoires", "{receipt}");
+    let accepted = app.snapshot().unwrap();
+    assert_eq!(before.learning, accepted.learning);
+    assert_eq!(before.assessments, accepted.assessments);
+    assert_eq!(content(&mut app, save), receipt);
+    assert_eq!(app.snapshot().unwrap(), accepted);
+}
+
+#[test]
 fn current_pgn_read_and_edit_keep_the_full_document_and_its_content_fence() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("current-pgn.sqlite");

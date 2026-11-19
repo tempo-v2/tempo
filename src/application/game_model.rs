@@ -1,7 +1,9 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id, repertoires::learner_color};
 use crate::game_model::{GapRequest, MODEL_KEY, PROFILE_LABEL, model_input_stamp};
-use crate::{AppError, app_error::domain, gap_analysis::GapAnalysisInput};
+use crate::{
+    AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempo_chess::{
@@ -129,6 +131,15 @@ impl Tempo {
                 "The active dataset changed.",
             ));
         }
+        if request
+            .base_revision
+            .is_some_and(|revision| revision != doc.revision)
+        {
+            return Err(AppError::new(
+                "stale_draft",
+                "The repertoire changed. Reopen the gap before saving.",
+            ));
+        }
         let (Some(pgn), Some(item)) = (doc.pgn, doc.item) else {
             return Err(AppError::new(
                 "unavailable_repertoire",
@@ -210,6 +221,23 @@ impl Tempo {
             name,
             color,
         } = self.checked_gap(&request)?;
+        let save_token = draft
+            .pgn
+            .as_ref()
+            .map(|pgn| {
+                self.gap_response_token(
+                    &RepertoireInput {
+                        dataset_id: request.dataset_id.clone(),
+                        repertoire_id: Some(request.repertoire_id.clone()),
+                        name: name.clone(),
+                        learner_color: color,
+                        pgn: pgn.clone(),
+                    },
+                    &request.repertoire_id,
+                    revision,
+                )
+            })
+            .transpose()?;
         let before = legal_move_labels(&format!("{} 0 1", request.position.0))
             .map_err(|error| domain("invalid_gap_position", error))?;
         let after =
@@ -242,6 +270,7 @@ impl Tempo {
         Ok(json!({
             "draft": draft,
             "content_revision": revision,
+            "save_token": save_token,
             "repertoire_name": name,
             "learner_color": match color { LearnerColor::White => "white", LearnerColor::Black => "black" },
             "actual_san": before.get(&request.actual_move),

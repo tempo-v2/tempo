@@ -168,7 +168,8 @@ Distinct raw game and target identities retain their existing acceptance keys.
 The latest 200 eligible games supply personal position counts. A confirmed
 opponent gap opens the current repertoire at the position after the reply.
 Play a legal response and choose Save response. Tempo previews the addition
-against the current document, saves it and loads the next gap. Retained
+against the current document and only signs changes that preserve existing
+answers and learning. After saving, Tempo loads the next gap. Retained
 source PGNs are required to confirm authored replies and endpoints.
 
 To enable the local Rapid 1500 model, run `sh tempo/tools/maia/setup.sh PATH`

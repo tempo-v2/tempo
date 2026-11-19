@@ -22,7 +22,7 @@ use tempo_chess::{
 };
 use tempo_learning::{DailyLearning, LearningState};
 use tempo_store::{ContentReceipt, ContentSource, RepertoireReset, Snapshot, Write, model_targets};
-use tempo_types::DatasetId;
+use tempo_types::{DatasetId, Revision};
 
 #[derive(Serialize)]
 struct Summary {
@@ -37,6 +37,42 @@ impl Tempo {
     pub fn handle_repertoire(&mut self, command: RepertoireCommand) -> Value {
         self.repertoire(command)
             .unwrap_or_else(|error| json!(ErrorView::for_content(error)))
+    }
+
+    /// Authorize an append-only gap draft against the same content snapshot
+    /// that the signed Save will commit.
+    pub(super) fn gap_response_token(
+        &self,
+        input: &RepertoireInput,
+        id: &str,
+        base_revision: Revision,
+    ) -> Result<String, AppError> {
+        let key = self
+            .daily
+            .as_ref()
+            .ok_or_else(|| AppError::new("unsupported", "Use the local study release."))?
+            .preview_key;
+        let (snapshot, revision) = self.store.content_state()?;
+        check_dataset(&snapshot, &input.dataset_id)?;
+        if revision != base_revision {
+            return Err(stale_draft());
+        }
+        let (_, _, plan) = prepare(&snapshot, input, id)?;
+        if plan.changes.iter().any(|change| {
+            change.kind == ChangeKind::Semantic
+                || (snapshot
+                    .catalog
+                    .items
+                    .get(&change.target)
+                    .is_some_and(ContentItem::active)
+                    && !plan.catalog.items[&change.target].active())
+        }) {
+            return Err(AppError::new(
+                "unsafe_gap_response",
+                "This response would change existing repertoire positions or learning.",
+            ));
+        }
+        Ok(document_preview(&key, revision, id, input))
     }
 
     fn repertoire(&mut self, command: RepertoireCommand) -> Result<Value, AppError> {

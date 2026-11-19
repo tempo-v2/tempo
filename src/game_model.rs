@@ -18,7 +18,7 @@ use tempo_store::{
     BookProjection, ModelInputStamp, ModelTargets, ProjectionBook, ProjectionScope,
     REACH_MODEL_KEY, SqliteStore, Store, StoreError,
 };
-use tempo_types::{DatasetId, TargetId};
+use tempo_types::{DatasetId, Revision, TargetId};
 
 pub(crate) const MODEL_KEY: &str = "maia2-0.11.0:65aae8465eed5e65df66a24ea7370715579f9e5435098d06fe18bdb1e267e997:rapid:1500:1500:cpu";
 pub(crate) const PROFILE_LABEL: &str = "Maia Rapid 1500";
@@ -44,6 +44,7 @@ pub struct GapRequest {
     pub actual_move: String,
     pub document_revision: String,
     pub response: Option<String>,
+    pub base_revision: Option<Revision>,
 }
 
 struct ModelBook {
