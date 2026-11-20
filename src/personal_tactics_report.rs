@@ -264,7 +264,14 @@ pub(crate) fn read(
         };
         games.insert((summary.source.clone(), summary.id.clone()), summary);
     }
-    let decisions = store.tactical_decisions(dataset, GAME_TACTICS_REPORT, version)?;
+    let mut decisions = store.tactical_decisions(dataset, GAME_TACTICS_REPORT, version)?;
+    // The report runs off the write owner. A game import can change the selected
+    // learner between the reads, so bind each finding to the captured perspective.
+    decisions.retain(|row| {
+        games
+            .get(&(row.source.clone(), row.game_id.clone()))
+            .is_some_and(|game| game.learner == row.learner)
+    });
     let mut per_game: BTreeMap<(&str, &str), Vec<_>> = BTreeMap::new();
     for row in &decisions {
         per_game
