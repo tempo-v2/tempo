@@ -25,7 +25,10 @@ use tempo_store::{
 use tempo_study::{Exercise, start_selected_exercise};
 use tempo_types::{DatasetId, StudyTime};
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+// Study's browser wire requires exact whole numbers.
+pub(crate) const MAX_STUDY_COUNT: usize = 9_007_199_254_740_991u64 as usize;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IntroductionLimits {
     pub repertoire: usize,
@@ -48,6 +51,23 @@ pub(super) struct DailyStudy {
     pub(super) queue: DailySession,
     pub(super) preview_key: [u8; 32],
     pub(super) more_tactics: usize,
+    pub(super) settings_revision: Option<String>,
+}
+
+impl DailyStudy {
+    pub(super) fn repertoire_limit(&self) -> usize {
+        self.limits.repertoire.min(MAX_STUDY_COUNT)
+    }
+
+    pub(super) fn tactics_limit(&self, extra: usize) -> usize {
+        self.limits.tactics.saturating_add(extra).min(MAX_STUDY_COUNT)
+    }
+
+    pub(super) fn next_tactics_allowance(&self, extra: usize) -> Option<usize> {
+        extra
+            .checked_add(self.more_tactics)
+            .filter(|&total| self.more_tactics > 0 && total <= MAX_STUDY_COUNT)
+    }
 }
 
 impl Tempo {
@@ -67,8 +87,26 @@ impl Tempo {
             queue: DailySession::default(),
             preview_key,
             more_tactics,
+            settings_revision: None,
         });
         Ok(app)
+    }
+
+    /// Apply committed local profile preferences to future Study decisions.
+    pub fn set_local_study_preferences(
+        &mut self,
+        limits: IntroductionLimits,
+        more_tactics: usize,
+        themes: Option<TacticThemes>,
+    ) {
+        if let Some(daily) = &mut self.daily {
+            let settings = serde_json::json!([limits, more_tactics, themes]);
+            daily.settings_revision = Some(blake3::hash(settings.to_string().as_bytes()).to_string());
+            daily.limits = limits;
+            daily.more_tactics = more_tactics;
+            daily.tactic_themes = themes;
+            daily.starter_themes = true;
+        }
     }
 
     pub(super) fn daily_selection(
@@ -177,8 +215,8 @@ impl Tempo {
             context: DailyContext {
                 seed,
                 today: at.day,
-                repertoire_limit: daily.limits.repertoire,
-                tactics_limit: daily.limits.tactics.saturating_add(extra_tactics),
+                repertoire_limit: daily.repertoire_limit(),
+                tactics_limit: daily.tactics_limit(extra_tactics),
             },
             candidates: &candidates,
             routes: &routes,
@@ -212,8 +250,9 @@ impl Tempo {
         &self,
         dataset_id: DatasetId,
         selection: DailySelection,
+        extra_tactics: usize,
     ) -> StudyView {
-        let more = self.daily.as_ref().expect("daily release").more_tactics;
+        let daily = self.daily.as_ref().expect("daily release");
         let done = selection.outstanding == 0;
         StudyView::Empty(EmptyView {
             schema_version: STUDY_WIRE_VERSION,
@@ -226,8 +265,10 @@ impl Tempo {
             repertoire_remaining: selection.repertoire_remaining,
             tactics_remaining: selection.tactics_remaining,
             can_practice_tactics: done && selection.practice.is_some(),
-            can_learn_more_tactics: done && selection.unseen_tactics && more > 0,
-            learn_more_count: more,
+            can_learn_more_tactics: done
+                && selection.unseen_tactics
+                && daily.next_tactics_allowance(extra_tactics).is_some(),
+            learn_more_count: daily.more_tactics.min(MAX_STUDY_COUNT),
         })
     }
 

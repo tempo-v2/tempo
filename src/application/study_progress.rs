@@ -1,5 +1,5 @@
 //! Read-only daily progress, independently of issuance and saved command replies.
-use super::Tempo;
+use super::{Tempo, daily::MAX_STUDY_COUNT};
 use crate::AppError;
 use serde::{Deserialize, Serialize};
 use tempo_store::StudyScope;
@@ -11,6 +11,9 @@ pub struct ProgressStamp {
     pub dataset_id: DatasetId,
     pub day: StudyDay,
     pub revision: Revision,
+    /// Preferences can change independently of a Study write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_revision: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +47,7 @@ impl Tempo {
             if known.day == at.day
                 && known.dataset_id == current.dataset
                 && known.revision == current.revision
+                && known.settings_revision == daily.settings_revision
             {
                 return Ok(None);
             }
@@ -67,16 +71,17 @@ impl Tempo {
                 day: at.day,
                 dataset_id: snapshot.dataset,
                 revision: snapshot.revision,
+                settings_revision: daily.settings_revision.clone(),
             },
             due: selection.due_count,
             reteach: selection.reteach_count,
             repairs_remaining: selection.repairs_remaining,
             active_correction,
             openings_introduced: selection.repertoire_admitted,
-            openings_limit: daily.limits.repertoire,
+            openings_limit: daily.repertoire_limit(),
             tactics_introduced: selection.tactics_admitted,
-            tactics_limit: daily.limits.tactics.saturating_add(extra),
-            extra_tactics: extra,
+            tactics_limit: daily.tactics_limit(extra),
+            extra_tactics: extra.min(MAX_STUDY_COUNT),
         }))
     }
 }

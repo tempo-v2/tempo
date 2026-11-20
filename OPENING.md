@@ -37,7 +37,7 @@ The default daily allowances are ten new opening positions and twenty new tactic
 
 Use **Tactic capture** to paste or upload a PGN. A single-line FEN snippet starts at the solver position. For a complete game, select the variation and move range. Preview the solver board and select which valid records to save. Tempo validates legality. Setup-bearing snippets can use the `TempoSetupPlies` tag or the preview's setup option.
 
-**Practice tactics** uses puzzles you have already learned and leaves their due dates alone. **Learn 10 more tactics today** adds to today's allowance. To customize that increment, pass it as the final argument to `tempo configure DATABASE OPENINGS TACTICS MORE_TACTICS`.
+**Practice tactics** uses puzzles you have already learned and leaves their due dates alone. **Learn more tactics today** adds the amount shown in **Settings → Tactics** to today's allowance.
 
 ## Development in the assembled workspace
 
@@ -117,24 +117,20 @@ set `TEMPO_KEEP_DEV_SERVERS=1` for this managed installation.
 
 The runtime uses the upstream Rust FSRS crate pinned at `6.6.2` with its default parameter vector and 0.90 desired retention. The versioned policy and calendar settings are in SQLite. Actual reviews use the elapsed study days since the last accepted review. The scheduler rounds its returned intervals to whole study days, bounded from 1 to 36,500 days. A teaching acknowledgement schedules tomorrow's first blind review without creating FSRS memory.
 
-Open **Tactics settings** from Study to change the daily introduction limit and
-the themes used for new tactics. The saved selection takes effect on the next
-new puzzle. Tempo rotates across selected themes and works through the original
-easy, medium, and hard packs for each theme. **Any tactic** includes the full
-catalog and personal captures. Existing attempts and due reviews retain their
-Study state.
+Open **Settings** from Study to change the board appearance and sound for this
+browser. Desktop Settings also controls daily opening and tactic introductions,
+the extra tactics added on request, and which themes supply new tactics. Saving
+applies to future selections on desktop and phone. Tempo rotates across selected
+themes and works through the original easy, medium, and hard packs for each
+theme. **Any tactic** includes the full catalog and personal captures.
+**Automatic** uses starter themes when the catalog includes them and otherwise
+uses any tactic. Existing attempts and due reviews retain their Study state.
 
 When rolling back to checkpoint 04 after saving a theme selection, stop Tempo
 and make a current SQLite backup first. Checkpoint 04 can read the current
 database after removing only the new profile field with
 `UPDATE store_state SET local_profile=json_remove(local_profile,'$.tactic_themes') WHERE singleton=1;`.
 Keep the current database for the rollback so it includes later Study progress.
-
-For explicit installed maintenance, use the executable pinned by the LaunchAgent. This checkpoint 10 example sets 10 opening introductions, 20 tactics introductions and a 10-tactic extra increment. Apply the settings through the managed lifecycle.
-
-```sh
-.local/usable-release/checkpoints/10-repertoire-contract/tempo configure .local/usable-release/study.sqlite 10 20 10
-```
 
 ## Personal captures
 

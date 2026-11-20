@@ -1,7 +1,7 @@
 //! File-backed composition for the matched local study release.
 mod http;
 mod import;
-mod tactic_settings;
+mod study_settings;
 
 use crate::game_detection::{AnalysisOptions, DetectorRegistry, GameDetection};
 use crate::{AttemptIds, Clock, DailyComponents, IntroductionLimits, TacticThemes, Tempo};
@@ -49,6 +49,16 @@ impl Default for Profile {
     }
 }
 
+impl Profile {
+    fn apply_study_settings(&self, app: &mut Tempo) {
+        app.set_local_study_preferences(
+            self.introductions,
+            self.more_tactics,
+            self.tactic_themes.clone(),
+        );
+    }
+}
+
 pub fn init(path: &Path) -> LocalResult<()> {
     let mut profile = Profile::default();
     getrandom::getrandom(&mut profile.preview_key)
@@ -63,29 +73,6 @@ pub fn init(path: &Path) -> LocalResult<()> {
         Some(&serde_json::to_string(&profile)?),
     )?;
     println!("Created dataset {} at {}", dataset.0, path.display());
-    Ok(())
-}
-
-pub fn configure(
-    path: &Path,
-    repertoire: usize,
-    tactics: usize,
-    more: Option<usize>,
-) -> LocalResult<()> {
-    let store = SqliteStore::open(path)?;
-    let previous = stored_profile(&store)?;
-    let mut profile: Profile = serde_json::from_str(&previous)?;
-    profile.introductions = IntroductionLimits {
-        repertoire,
-        tactics,
-    };
-    if let Some(more) = more {
-        profile.more_tactics = more;
-    }
-    store.update_local_profile(&previous, &serde_json::to_string(&profile)?)?;
-    println!(
-        "Saved daily introduction limits of {repertoire} opening positions and {tactics} tactics. Restart Tempo to apply them."
-    );
     Ok(())
 }
 
@@ -163,7 +150,7 @@ pub(crate) fn open(path: &Path) -> LocalResult<Tempo> {
         profile.preview_key,
         profile.more_tactics,
     )?;
-    app.set_local_tactic_preferences(profile.introductions.tactics, profile.tactic_themes);
+    profile.apply_study_settings(&mut app);
     Ok(app)
 }
 

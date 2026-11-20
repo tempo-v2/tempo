@@ -73,7 +73,8 @@ impl Tempo {
                 _ => Err(AppError::new("submission_conflict", "receipt kind differs")),
             };
         }
-        let increase = self.daily.as_ref().ok_or_else(unavailable)?.more_tactics;
+        let daily = self.daily.as_ref().ok_or_else(unavailable)?;
+        let increase = daily.more_tactics;
         if increase == 0 {
             return Err(unavailable());
         }
@@ -99,17 +100,14 @@ impl Tempo {
         if !selection.unseen_tactics {
             return Err(unavailable());
         }
-        let extended = self.daily_selection(
-            &snapshot,
-            at,
-            extra.checked_add(increase).ok_or_else(|| {
-                AppError::new(
-                    "allowance_exhausted",
-                    "The extra allowance cannot be increased.",
-                )
-            })?,
-        )?;
-        let response = self.daily_summary(dataset.clone(), extended);
+        let new_extra = daily.next_tactics_allowance(extra).ok_or_else(|| {
+            AppError::new(
+                "allowance_exhausted",
+                "The extra allowance cannot be increased.",
+            )
+        })?;
+        let extended = self.daily_selection(&snapshot, at, new_extra)?;
+        let response = self.daily_summary(dataset.clone(), extended, new_extra);
         let reply = serde_json::to_string(&response).map_err(|e| domain("codec_error", e))?;
         self.store.extend_tactics_allowance(
             &dataset,

@@ -46,7 +46,9 @@ pub use tactics_collection::{TacticsRead, TacticsReadReply};
 mod teach;
 
 pub use daily::IntroductionLimits;
+pub(crate) use daily::MAX_STUDY_COUNT;
 pub use tactic_preferences::{TacticThemes, tactic_themes};
+pub(crate) use tactic_preferences::TacticTheme;
 
 use crate::{
     AppError, Components, DailyComponents, app_error::domain, components::FixtureOperations,

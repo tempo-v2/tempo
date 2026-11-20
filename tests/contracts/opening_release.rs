@@ -876,7 +876,7 @@ fn captures_interrupt_only_the_next_selection_and_cost_no_introductions() {
     drop(app);
 
     let mut app = open(&db, day.clone(), limits, 1);
-    app.set_local_tactic_preferences(0, Some(tempo::TacticThemes::starter()));
+    app.set_local_study_preferences(limits, 1, Some(tempo::TacticThemes::starter()));
     assert_eq!(study(&mut app, json!({"command":"next"})), issued);
     let skip = activity_command("skip", &issued, "skip-legacy");
     assert_eq!(study(&mut app, skip)["status"], "abandoned");
@@ -893,7 +893,11 @@ fn captures_interrupt_only_the_next_selection_and_cost_no_introductions() {
     let mut answer = activity_command("answer", &next, "solve-capture");
     answer["answer"] = json!({"uci":"e2e4"});
     assert_eq!(study(&mut app, answer)["assessment"], "good");
-    app.set_local_tactic_preferences(1, Some(tempo::TacticThemes::starter()));
+    app.set_local_study_preferences(
+        IntroductionLimits { tactics: 1, ..limits },
+        1,
+        Some(tempo::TacticThemes::starter()),
+    );
     assert_eq!(
         study(&mut app, json!({"command":"study_status"}))["tactics_remaining"],
         1

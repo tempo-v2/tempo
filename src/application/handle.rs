@@ -62,7 +62,7 @@ impl Tempo {
         let at = self.components.clock.now();
         let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
         let selection = self.daily_selection(&snapshot, at, extra)?;
-        Ok(self.daily_summary(snapshot.dataset, selection))
+        Ok(self.daily_summary(snapshot.dataset, selection, extra))
     }
 
     fn next_view(&mut self) -> Result<StudyView, AppError> {
@@ -85,7 +85,7 @@ impl Tempo {
                 let result = self.issue_daily(&snapshot, at, choice)?;
                 return self.project(result);
             }
-            return Ok(self.daily_summary(snapshot.dataset, selection));
+            return Ok(self.daily_summary(snapshot.dataset, selection, extra));
         }
         match self.next_exercise()? {
             Some(value) => self.project(value),

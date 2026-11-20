@@ -1,12 +1,10 @@
 //! Project original pack membership into an order for new tactics only.
-use super::{Tempo, tactic_catalog_facts::tactic_pack_candidates};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::LazyLock,
 };
 use tempo_queue::TacticPackCandidate;
-use tempo_store::StudyScope;
 use tempo_types::{StudyDay, TargetId};
 
 const STARTER: [&str; 7] = [
@@ -70,38 +68,6 @@ impl TacticThemes {
     }
 }
 
-impl Tempo {
-    pub fn set_local_tactic_preferences(&mut self, limit: usize, themes: Option<TacticThemes>) {
-        if let Some(daily) = &mut self.daily {
-            daily.limits.tactics = limit;
-            daily.tactic_themes = themes;
-            daily.starter_themes = true;
-        }
-    }
-
-    pub fn local_tactic_themes(
-        &self,
-    ) -> Result<(tempo_types::DatasetId, TacticThemes), crate::AppError> {
-        let snapshot = self.store.study_state(StudyScope {
-            catalog: true,
-            ..StudyScope::default()
-        })?;
-        let (catalog, learning) = snapshot.complete_catalog()?;
-        let themes = self
-            .daily
-            .as_ref()
-            .and_then(|daily| daily.tactic_themes.clone())
-            .unwrap_or_else(|| {
-                if has_starter_packs(tactic_pack_candidates(catalog, learning)) {
-                    TacticThemes::starter()
-                } else {
-                    TacticThemes::Any
-                }
-            });
-        Ok((snapshot.dataset, themes))
-    }
-}
-
 fn has_starter_packs<'a>(mut candidates: impl Iterator<Item = TacticPackCandidate<'a>>) -> bool {
     candidates.any(|candidate| {
         candidate
@@ -140,6 +106,7 @@ pub(super) fn new_tactic_order<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::tactic_catalog_facts::tactic_pack_candidates;
     use crate::Tempo;
     use tempo_learning::LearningState;
     use tempo_store::Snapshot;
