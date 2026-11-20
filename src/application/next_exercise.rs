@@ -57,6 +57,10 @@ impl Tempo {
         let state = learning.get(&started.attempt.target).ok_or_else(|| {
             AppError::new("invalid_learning", "selected target has no learning state")
         })?;
+        let opponent_lead_in = catalog
+            .items
+            .get(&started.attempt.target)
+            .and_then(tempo_chess::ContentItem::verified_opponent_lead_in);
         let row = StoredAttempt {
             attempt: started.attempt,
             issued_at: at,
@@ -68,6 +72,7 @@ impl Tempo {
             exercise_name: None,
             relevance_reason: None,
             lesson: None,
+            opponent_lead_in,
             acceptance: None,
             revealed_decision: None,
         };

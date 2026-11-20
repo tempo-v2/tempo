@@ -37,6 +37,14 @@ impl StudyView {
         self
     }
 
+    /// Older strict Study clients did not request this presentation field.
+    pub fn without_opponent_lead_in(mut self) -> Self {
+        if let Self::Attempt(view) = &mut self {
+            view.opponent_lead_in = None;
+        }
+        self
+    }
+
     pub(crate) fn attempt(
         value: AnswerResult,
         board: PositionDisplay,
@@ -64,6 +72,14 @@ impl StudyView {
             },
             corrective_repair: (record.mode == tempo_store::ActivityMode::Repair).then_some(true),
             lesson,
+            opponent_lead_in: if attempt.status == AttemptStatus::Active
+                && attempt.state.decision_index == 0
+                && attempt.revision.0 == 0
+            {
+                record.opponent_lead_in.clone()
+            } else {
+                None
+            },
             exercise_name: record.exercise_name.clone(),
             history,
             dataset_id: attempt.dataset,

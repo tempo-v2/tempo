@@ -24,10 +24,12 @@ struct SourcePuzzle {
     solution: Vec<String>,
     label: String,
     provenance: Vec<String>,
+    #[serde(default)]
+    opponent_lead_in: Option<tempo_chess::OpponentLeadIn>,
 }
 
 pub(super) struct Batch {
-    catalog: Catalog,
+    pub(super) catalog: Catalog,
     identities: Vec<SourceIdentity>,
 }
 
@@ -37,19 +39,39 @@ impl Batch {
         if pack.schema_version != 1 {
             return Err("unsupported tactic transfer schema version".into());
         }
-        let records = pack
+        let (records, context): (Vec<_>, Vec<_>) = pack
             .puzzles
             .into_iter()
-            .map(|row| TacticRecord {
-                namespace: row.namespace,
-                source_id: row.source_id,
-                solver_fen: row.solver_fen,
-                solution: row.solution,
-                label: row.label,
-                provenance: row.provenance,
+            .map(|row| {
+                (
+                    TacticRecord {
+                        namespace: row.namespace,
+                        source_id: row.source_id,
+                        solver_fen: row.solver_fen,
+                        solution: row.solution,
+                        label: row.label,
+                        provenance: row.provenance,
+                    },
+                    row.opponent_lead_in,
+                )
             })
-            .collect::<Vec<_>>();
-        let catalog = compile_tactics(&records)?;
+            .unzip();
+        let mut catalog = compile_tactics(&records)?;
+        for (record, lead_in) in records.iter().zip(context) {
+            if let Some(lead_in) = lead_in {
+                let target = record.target_id();
+                let verified = tempo_chess::OpponentLeadIn::verified(
+                    &lead_in.before_fen,
+                    &lead_in.uci,
+                    &record.solver_fen,
+                );
+                catalog
+                    .items
+                    .get_mut(&target)
+                    .expect("compiled target")
+                    .opponent_lead_in = verified;
+            }
+        }
         let mut identities = records
             .into_iter()
             .map(|row| SourceIdentity {

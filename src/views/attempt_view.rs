@@ -19,6 +19,9 @@ pub struct AttemptView {
     pub corrective_repair: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lesson: Option<LessonView>,
+    /// Display-only context for a ready, unplayed first decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opponent_lead_in: Option<tempo_chess::OpponentLeadIn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional public display text. Consumers may render or omit it.
     pub exercise_name: Option<String>,

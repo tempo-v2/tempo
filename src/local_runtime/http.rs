@@ -304,6 +304,7 @@ fn respond(
     // Older open tabs have strict v5 reply validators. The opt-in changes
     // display only, independent of submission identity and saved receipts.
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
+    let opponent_lead_in = header(&request, "X-Tempo-Study-Lead-In") == Some("1");
     if matches!(
         request.url(),
         "/api/games/detectors" | "/api/games/detection" | "/api/games/detection-result"
@@ -554,6 +555,11 @@ fn respond(
             reply
         } else {
             reply.without_move_details()
+        };
+        let reply = if opponent_lead_in {
+            reply
+        } else {
+            reply.without_opponent_lead_in()
         };
         request.respond(body(
             "application/json; charset=utf-8",

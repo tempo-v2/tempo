@@ -55,6 +55,8 @@ class Candidate:
             "solution": self.checked["solution"],
             "label": self.label,
             "provenance": self.provenance,
+            **({"opponent_lead_in": {"before_fen": self.fen, "uci": self.setup}}
+               if self.setup is not None else {}),
         }
 
 

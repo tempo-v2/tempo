@@ -262,7 +262,7 @@ impl Tempo {
             || self.components.ids.next_id(),
         )
         .map_err(|error| domain("invalid_content", error))?;
-        let record = StoredAttempt {
+        let mut record = StoredAttempt {
             attempt: attempt.clone(),
             issued_at: at,
             issued_revision: Some(snapshot.revision),
@@ -293,8 +293,14 @@ impl Tempo {
                 }
                 _ => None,
             },
+            opponent_lead_in: None,
             acceptance: None,
             revealed_decision: None,
+        };
+        record.opponent_lead_in = if mode == ActivityMode::Repair {
+            self.repair_lead_in(&record, item)
+        } else {
+            item.verified_opponent_lead_in()
         };
         let scope = StudyScope {
             target: Some(&item.target),

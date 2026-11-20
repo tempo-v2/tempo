@@ -1,6 +1,8 @@
 //! File-backed composition for the matched local study release.
 mod http;
 mod import;
+mod study_lead_ins;
+pub use study_lead_ins::backfill_study_lead_ins;
 mod tactic_settings;
 
 use crate::game_detection::{AnalysisOptions, DetectorRegistry, GameDetection};

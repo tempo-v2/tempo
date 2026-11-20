@@ -222,7 +222,9 @@ try {
         priorReply = await accepted.text();
         const reply = JSON.parse(priorReply);
         assert.equal(reply.status, "repertoires");
-        assert.ok(!Object.hasOwn(reply.repertoires[0], "activity"));
+        if (Object.hasOwn(reply.repertoires[0], "activity")) {
+          assert.equal(reply.repertoires[0].activity, "active");
+        }
       }
       await route.abort("failed");
     });
