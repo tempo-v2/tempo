@@ -1,12 +1,10 @@
-mod local_runtime;
-
 use std::{
     error::Error,
     io::{self, BufRead, Write},
     path::Path,
 };
 use tempo::{
-    AppError, Tempo,
+    AppError, Tempo, local_runtime,
     wire::{StudyCommand, StudyView},
 };
 

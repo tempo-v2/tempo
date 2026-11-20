@@ -11,11 +11,19 @@ impl Tempo {
     /// earlier events from this batch.
     /// Accept already-fetched games. Provider I/O happens outside this application object.
     pub fn ingest_games(&mut self, games: &[Game]) -> Result<usize, AppError> {
+        if self.fixture.is_none() {
+            return Err(AppError::new(
+                "unsupported_capability",
+                "Use Games to compare accepted games in Daily Study.",
+            ));
+        }
         let mut count = 0;
         for game in games {
             let snapshot = self.store.snapshot()?;
             let deviations = self
-                .components
+                .fixture
+                .as_ref()
+                .expect("fixture app")
                 .comparator
                 .compare(&game.pgn, &snapshot.catalog)
                 .map_err(|e| domain("game_comparison_error", e))?;

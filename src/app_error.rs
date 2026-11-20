@@ -35,11 +35,12 @@ impl From<StoreError> for AppError {
             StoreError::Unavailable(_) => "store_unavailable",
             StoreError::Conflict(_) => "store_conflict",
             StoreError::Invalid(_) => "store_invalid",
+            StoreError::Unsupported(_) => "unsupported_capability",
         };
         Self {
             code: code.into(),
             message: value.to_string(),
-            retryable: !matches!(value, StoreError::Invalid(_)),
+            retryable: !matches!(value, StoreError::Invalid(_) | StoreError::Unsupported(_)),
         }
     }
 }
@@ -63,6 +64,16 @@ pub(crate) fn study_input(error: StudyError) -> AppError {
 mod tests {
     use super::AppError;
     use tempo_store::StoreError;
+
+    #[test]
+    fn game_history_on_study_fixture_reports_a_nonretryable_capability_error() {
+        let app = crate::Tempo::demo().unwrap();
+        let before = app.snapshot().unwrap();
+        let error = app.game_history().unwrap_err();
+        assert_eq!(error.code, "unsupported_capability");
+        assert!(!error.retryable);
+        assert_eq!(app.snapshot().unwrap(), before);
+    }
 
     #[test]
     fn adapter_failures_keep_recovery_distinct_from_invalid_input() {

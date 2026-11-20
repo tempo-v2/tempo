@@ -1,7 +1,7 @@
 //! Read current attempt progress without grading or writing new learning.
 use super::Tempo;
 use crate::AppError;
-use tempo_store::{AnswerResult, Snapshot, StudyScope};
+use tempo_store::{AnswerResult, StudyScope, StudyState};
 use tempo_types::AttemptId;
 
 impl Tempo {
@@ -9,7 +9,7 @@ impl Tempo {
     // last feedback message or emit the attempt's assessment a second time.
     pub(super) fn resume_from(
         &self,
-        snapshot: &Snapshot,
+        snapshot: &StudyState,
         id: &AttemptId,
     ) -> Result<AnswerResult, AppError> {
         let record = self.current(snapshot, &snapshot.dataset, id)?;

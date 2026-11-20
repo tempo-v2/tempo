@@ -101,12 +101,51 @@ pub(crate) fn check_id(id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RefreshAcknowledgement {
+    Running {
+        dataset_id: DatasetId,
+        command_id: String,
+    },
+    Complete {
+        dataset_id: DatasetId,
+        command_id: String,
+        report: GameReport,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PendingRefresh {
+    dataset_id: DatasetId,
+    command_id: String,
+    fingerprint: String,
+}
+
+impl PendingRefresh {
+    fn running(&self) -> RefreshAcknowledgement {
+        RefreshAcknowledgement::Running {
+            dataset_id: self.dataset_id.clone(),
+            command_id: self.command_id.clone(),
+        }
+    }
+
+    fn failed(&self, error: String) -> Value {
+        json!({
+            "status": "failed",
+            "dataset_id": self.dataset_id,
+            "command_id": self.command_id,
+            "error": error,
+        })
+    }
+}
+
 /// A single serial worker keeps provider I/O off the Study request loop.
 pub struct GameJobs {
     commands: SyncSender<GameRefresh>,
     results: Receiver<RefreshResult>,
     status: Value,
-    pending: Option<(String, String)>,
+    pending: Option<PendingRefresh>,
 }
 
 impl GameJobs {
@@ -140,33 +179,42 @@ impl GameJobs {
         self.pending.is_some()
     }
 
+    /// Acknowledge this exact command without settling or replacing an unrelated job.
     pub fn refresh(
         &mut self,
-        app: &mut Tempo,
+        app: &Tempo,
         request: GameRefresh,
         allow_fetch: bool,
-    ) -> Result<Value, AppError> {
-        self.poll(app);
+    ) -> Result<RefreshAcknowledgement, AppError> {
         check_id(&request.command_id)?;
-        let key = fingerprint("refresh", &request)?;
-        if let Some((id, pending_key)) = &self.pending {
-            if id == &request.command_id && pending_key == &key {
-                return Ok(self.status.clone());
-            }
-            return Err(AppError::new(
-                "game_refresh_busy",
-                "A game refresh is already running.",
-            ));
-        }
-        if let Some(report) = app.replay_game(&request.dataset_id, &request.command_id, &key)? {
-            self.status =
-                json!({"status":"complete","command_id":request.command_id,"report":report});
-            return Ok(self.status.clone());
-        }
         if app.game_dataset()? != request.dataset_id {
             return Err(AppError::new(
                 "stale_dataset",
                 "The active dataset changed.",
+            ));
+        }
+        let key = fingerprint("refresh", &request)?;
+        if let Some(report) = app.replay_game(&request.dataset_id, &request.command_id, &key)? {
+            return Ok(RefreshAcknowledgement::Complete {
+                dataset_id: request.dataset_id,
+                command_id: request.command_id,
+                report,
+            });
+        }
+        if let Some(pending) = &self.pending {
+            if pending.dataset_id == request.dataset_id && pending.command_id == request.command_id
+            {
+                if pending.fingerprint == key {
+                    return Ok(pending.running());
+                }
+                return Err(AppError::new(
+                    "store_conflict",
+                    "Game command ID was reused with different inputs.",
+                ));
+            }
+            return Err(AppError::new(
+                "game_refresh_busy",
+                "A game refresh is already running.",
             ));
         }
         if !allow_fetch {
@@ -175,50 +223,56 @@ impl GameJobs {
                 "Historical Games import is running.",
             ));
         }
-        let id = request.command_id.clone();
+        let pending = PendingRefresh {
+            dataset_id: request.dataset_id.clone(),
+            command_id: request.command_id.clone(),
+            fingerprint: key,
+        };
         self.commands.try_send(request).map_err(|_| {
             AppError::new(
                 "game_refresh_unavailable",
                 "The background refresh worker is unavailable.",
             )
         })?;
-        self.status = json!({"status":"running","command_id":id});
-        self.pending = Some((id, key));
-        Ok(self.status.clone())
+        let reply = pending.running();
+        self.status = json!(reply);
+        self.pending = Some(pending);
+        Ok(reply)
     }
 
     /// Apply fetched records on the single application owner, after network I/O.
     pub fn poll(&mut self, app: &mut Tempo) -> Value {
-        if let Some((_, key)) = &self.pending {
+        if let Some(pending) = &self.pending {
             self.status = match self.results.try_recv() {
-                Ok((request, fetched)) => {
-                    let key = key.clone();
-                    self.pending = None;
-                    match fetched.and_then(|fetched| {
-                        app.ingest_provider_games(
-                            &request.dataset_id,
-                            &request.command_id,
-                            &key,
-                            &request.account,
-                            fetched,
-                            None,
-                        )
-                    }) {
-                        Ok(report) => {
-                            json!({"status":"complete","command_id":request.command_id,"report":report})
-                        }
-                        Err(error) => {
-                            json!({"status":"failed","command_id":request.command_id,"error":error.message})
-                        }
-                    }
-                }
+                Ok((request, fetched)) => match fetched.and_then(|fetched| {
+                    app.ingest_provider_games(
+                        &pending.dataset_id,
+                        &pending.command_id,
+                        &pending.fingerprint,
+                        &request.account,
+                        fetched,
+                        None,
+                    )
+                }) {
+                    Ok(report) => json!(RefreshAcknowledgement::Complete {
+                        dataset_id: pending.dataset_id.clone(),
+                        command_id: pending.command_id.clone(),
+                        report,
+                    }),
+                    Err(error) => pending.failed(error.message),
+                },
                 Err(TryRecvError::Empty) => return self.status.clone(),
                 Err(TryRecvError::Disconnected) => {
-                    self.pending = None;
-                    json!({"status":"failed","error":"The background refresh worker stopped."})
+                    pending.failed("The background refresh worker stopped.".into())
                 }
             };
+            self.pending = None;
         }
         self.status.clone()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    mod refresh_replay;
 }

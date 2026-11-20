@@ -14,6 +14,9 @@ import sys
 LEGACY_REVISION = "366cc346976570cb7ab7de518957d2cd9eee46e1"
 PACK_NAMESPACE = "lichess-puzzle"
 CARD_NAMESPACE = "tempo1-card"
+MEMBERSHIP_PREFIX = "tempo1:catalog-metadata:"
+SOURCE_DIFFICULTIES = {"easy", "medium", "hard", "focused", "advanced"}
+THEME_LIST = Path(__file__).resolve().parents[2] / "src/application/tactic_themes.json"
 
 
 @dataclass
@@ -30,6 +33,7 @@ class Candidate:
     reason: str | None = None
     card_id: str | None = None
     checked: dict | None = None
+    membership_issues: list = field(default_factory=list)
 
     def manifest(self):
         return {
@@ -39,6 +43,7 @@ class Candidate:
             "reason": self.reason,
             "raw_locations": self.locations,
             "linked_card_id": self.card_id,
+            "membership_issues": self.membership_issues,
             "incoming_target": self.checked.get("target") if self.checked else None,
         }
 
@@ -68,6 +73,25 @@ def git_blob(repo, path):
     ).stdout
 
 
+def normalized_membership(pack, row, position, known_themes):
+    """Use explicit pack and row facts; the legacy spelling is checked at ingress."""
+    theme, difficulty, ordinal = (pack.get(field) for field in ("theme", "difficulty", "ordinal"))
+    if not isinstance(theme, str) or theme not in known_themes:
+        return None, "unknown pack theme"
+    if difficulty not in SOURCE_DIFFICULTIES or type(ordinal) is not int or ordinal <= 0:
+        return None, "invalid pack difficulty or ordinal"
+    deck = pack.get("id")
+    if deck != f"{theme}-{difficulty}-{ordinal:02d}":
+        return None, "pack ID conflicts with its declared membership"
+    expected = {"Motif": theme, "Difficulty": difficulty, "DeckId": deck, "DeckPosition": position}
+    if any(key not in row for key in expected):
+        return None, "source row is missing membership fields"
+    if type(row["DeckPosition"]) is not int or any(row[key] != val for key, val in expected.items()):
+        return None, "source row conflicts with its catalog position or pack"
+    metadata = {key: value for key, value in row.items() if key not in {"FEN", "Moves"}}
+    return MEMBERSHIP_PREFIX + json.dumps(metadata, sort_keys=True), None
+
+
 def read_catalog(repo, selected_packs=None, observed=None, catalog_dir=None):
     def read(path):
         if catalog_dir is not None:
@@ -82,6 +106,8 @@ def read_catalog(repo, selected_packs=None, observed=None, catalog_dir=None):
     evidence = []
     asset_hashes = {}
     definitions = {}
+    memberships_by_source = {}
+    known_themes = {entry["id"] for entry in json.loads(THEME_LIST.read_text())}
     if catalog["version"] != 1:
         raise ValueError("unsupported pinned tactics-catalog version")
     known_packs = {pack["id"] for pack in catalog["packs"]}
@@ -108,10 +134,10 @@ def read_catalog(repo, selected_packs=None, observed=None, catalog_dir=None):
             provenance = [f"tempo1:catalog:puzzle:{display_id}", f"tempo1:pack:{pack['id']}"]
             if row.get("GameUrl"):
                 provenance.append(row["GameUrl"])
-            if catalog_dir is not None:
-                definitions[display_id] = (row.get("FEN"), row.get("Moves"))
-                metadata = {key: value for key, value in row.items() if key not in {"FEN", "Moves"}}
-                provenance.append("tempo1:catalog-metadata:" + json.dumps(metadata, sort_keys=True))
+            definitions[display_id] = (row.get("FEN"), row.get("Moves"))
+            membership, issue = normalized_membership(pack, row, index_in_pack + 1, known_themes)
+            if membership is not None:
+                provenance.append(membership)
             if observed is None:
                 location = f"raw-packaged/{path}#{index_in_pack}"
             else:
@@ -122,7 +148,23 @@ def read_catalog(repo, selected_packs=None, observed=None, catalog_dir=None):
             candidate = Candidate(PACK_NAMESPACE, display_id, [location], label=f"{pack['theme']} · {display_id}",
                                   provenance=provenance)
             parse_content(candidate, row.get("FEN"), row.get("Moves"), setup_first=True)
-            candidates.append(candidate)
+            if issue:
+                candidate.membership_issues.append({"location": location, "reason": issue})
+            previous = memberships_by_source.get(display_id)
+            same_definition = previous and (
+                previous.fen, previous.moves, previous.setup
+            ) == (candidate.fen, candidate.moves, candidate.setup)
+            if display_id and same_definition and previous.status == candidate.status == "eligible":
+                previous.locations.extend(candidate.locations)
+                previous.provenance = sorted(set(previous.provenance + candidate.provenance))
+                previous.membership_issues.extend(candidate.membership_issues)
+            else:
+                if previous:
+                    conflict = {"location": location, "reason": "conflicting definitions for one source puzzle"}
+                    previous.membership_issues.append(conflict)
+                    candidate.membership_issues.append(conflict)
+                memberships_by_source[display_id] = candidate
+                candidates.append(candidate)
     if observed is not None:
         files = {
             "raw-catalog-evidence.json": json_bytes({

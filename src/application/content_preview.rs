@@ -3,13 +3,13 @@ use super::Tempo;
 use crate::{AppError, app_error::study_input};
 use serde::Serialize;
 use tempo_chess::Catalog;
-use tempo_store::{Commit, ContentReceipt, ContentSource, Snapshot, StoredAttempt, Write};
+use tempo_store::{Commit, ContentReceipt, ContentSource, ContentState, StoredAttempt, Write};
 use tempo_types::{DatasetId, Revision};
 
 impl Tempo {
     pub(super) fn commit_catalog(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &ContentState,
         catalog: &Catalog,
         mut writes: Vec<Write>,
         source: Option<ContentSource<'_>>,
@@ -52,7 +52,7 @@ impl Tempo {
     }
 }
 
-pub(super) fn check_dataset(snapshot: &Snapshot, dataset: &DatasetId) -> Result<(), AppError> {
+pub(super) fn check_dataset(snapshot: &ContentState, dataset: &DatasetId) -> Result<(), AppError> {
     if &snapshot.dataset != dataset {
         return Err(stale_dataset());
     }

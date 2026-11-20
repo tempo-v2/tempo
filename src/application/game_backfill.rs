@@ -40,7 +40,7 @@ impl Tempo {
         &mut self,
         request: BackfillRequest,
     ) -> Result<BackfillJob, AppError> {
-        let (snapshot, _) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
         if snapshot.dataset != request.dataset_id {
             return Err(AppError::new(
                 "stale_dataset",
