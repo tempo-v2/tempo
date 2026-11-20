@@ -3,7 +3,7 @@ use super::Tempo;
 use crate::{AppError, app_error::domain};
 use serde_json::{Value, json};
 use tempo_chess::ContentKind;
-use tempo_store::{AcceptanceKind, ActivityMode, StudyScope};
+use tempo_store::{AcceptanceKind, ActivityMode, StoredAttempt, StudyScope};
 use tempo_study::AttemptStatus;
 use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision};
 
@@ -36,34 +36,29 @@ impl Tempo {
                 "The issued exercise changed.",
             ));
         }
-        if record.mode == ActivityMode::Test
-            && !(attempt.status == AttemptStatus::Complete
-                || (attempt.status == AttemptStatus::Abandoned
-                    && attempt.terminal == Some(Grade::Again)))
-        {
-            return Err(AppError::new(
-                "analysis_requires_concession",
-                "End this review before opening analysis.",
-            ));
-        }
-        if record.mode == ActivityMode::Practice
-            && attempt.status == AttemptStatus::Active
-            && attempt.terminal.is_none()
-        {
-            return Err(AppError::new(
-                "analysis_requires_reveal",
-                "Reveal this practice move before opening analysis.",
-            ));
-        }
+        analysis_disclosure(record)?;
+        // A completed exercise's cursor is one past its last decision.
+        let index = if attempt.status == AttemptStatus::Complete {
+            attempt.state.decision_index.saturating_sub(1)
+        } else {
+            attempt.state.decision_index
+        };
+        self.project_study_analysis(record, index)
+    }
+
+    pub(super) fn project_study_analysis(
+        &self,
+        record: &StoredAttempt,
+        index: usize,
+    ) -> Result<Value, AppError> {
+        let attempt = &record.attempt;
+        let dataset = &attempt.dataset;
+        let attempt_id = &attempt.id;
+        let version = attempt.content_version;
         let issued = self
             .store
             .issued_item(dataset, &attempt.target, version)?
             .ok_or_else(|| AppError::new("stale_content", "The issued content is unavailable."))?;
-        // On a completed exercise the cursor is one past the last decision.
-        let index = attempt
-            .state
-            .decision_index
-            .min(issued.definition.decisions.len().saturating_sub(1));
         let decision = issued
             .definition
             .decisions
@@ -91,7 +86,31 @@ impl Tempo {
             "fen": decision.fen, "color": issued.definition.learner_color().map_err(|e| domain("invalid_content", e))?,
             "datasetId": dataset, "repertoireId": repertoire, "name": record.exercise_name,
             "prescribedUci": decision.expected.uci, "playedUci": played,
-            "attemptId": attempt_id, "revision": revision, "contentVersion": version,
+            "attemptId": attempt_id, "revision": attempt.revision, "contentVersion": version,
         }))
     }
+}
+
+pub(super) fn analysis_disclosure(record: &StoredAttempt) -> Result<(), AppError> {
+    let attempt = &record.attempt;
+    if record.mode == ActivityMode::Test
+        && !(attempt.status == AttemptStatus::Complete
+            || (attempt.status == AttemptStatus::Abandoned
+                && attempt.terminal == Some(Grade::Again)))
+    {
+        return Err(AppError::new(
+            "analysis_requires_concession",
+            "End this review before opening analysis.",
+        ));
+    }
+    if record.mode == ActivityMode::Practice
+        && attempt.status == AttemptStatus::Active
+        && attempt.terminal.is_none()
+    {
+        return Err(AppError::new(
+            "analysis_requires_reveal",
+            "Reveal this practice move before opening analysis.",
+        ));
+    }
+    Ok(())
 }
