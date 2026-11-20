@@ -223,12 +223,22 @@ impl Tempo {
                         .occurrence
                         .try_into()
                         .map_err(|_| AppError::new("invalid_game", "Game is too long."))?;
-                    let issued = if personal && plan.is_some() {
-                        self.store.issued_tactical_request_for_turn(
+                    let motif = assessment.kind.code();
+                    let address = if personal {
+                        tempo_store::TacticalRequestAddress::Decision { ply }
+                    } else {
+                        tempo_store::TacticalRequestAddress::Finding {
+                            ply,
+                            motif,
+                            producer_id: &finding.producer.id,
+                        }
+                    };
+                    let issued = if plan.is_some() {
+                        self.store.issued_tactical_request(
                             &dataset,
                             game,
                             GAME_TACTICS_REPORT,
-                            ply,
+                            address,
                         )?
                     } else {
                         None
@@ -240,8 +250,14 @@ impl Tempo {
                             .items
                             .get(&plan.target)
                             .expect("planned puzzle exists");
-                        (plan.target == issued.target && current.version == issued.version)
-                            .then(|| issued.clone())
+                        let proposed = TacticalPuzzleRef {
+                            target: plan.target.clone(),
+                            version: current.version,
+                        };
+                        // An issued Finding keeps its original binding. Preserve
+                        // this immutable report's proposal for acceptance replay.
+                        // Decision reports already expose a revised issue as superseded.
+                        (!personal || proposed == *issued).then_some(proposed)
                     } else if let Some(plan) = plan {
                         catalog = plan.content.catalog;
                         let item = catalog
@@ -281,7 +297,7 @@ impl Tempo {
                     observations.push(TacticalObservation {
                         producer: Some(finding.producer.clone()),
                         ply,
-                        motif: assessment.kind.code().into(),
+                        motif: motif.into(),
                         outcome: serde_json::to_value(assessment.outcome)
                             .expect("typed outcome")
                             .as_str()

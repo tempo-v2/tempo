@@ -1195,3 +1195,215 @@ fn a_revised_tactic_preserves_the_issued_attempt_without_introducing_new_learnin
             .is_empty()
     );
 }
+
+const TWO_CAPTURES: &str = "k7/3n4/8/8/3Q3r/8/8/1K6 w - - 0 1";
+
+struct ChoiceEvaluator {
+    revision: &'static str,
+    best: &'static str,
+}
+
+impl TacticalEvaluator for ChoiceEvaluator {
+    fn descriptor(&self) -> EvaluationProvenance {
+        EvaluationProvenance {
+            engine: "Consumer fixture".into(),
+            engine_version: self.revision.into(),
+            configuration_fingerprint: self.best.into(),
+        }
+    }
+
+    fn evaluate(
+        &self,
+        request: &TacticalEvaluationRequest,
+        _: &dyn DetectionControl,
+    ) -> Result<RootEvaluation, EvaluationFailure> {
+        Ok(RootEvaluation {
+            provenance: self.descriptor(),
+            depth: 12,
+            nodes: 50_000,
+            roots: request
+                .legal_moves
+                .iter()
+                .map(|uci| RootScore {
+                    uci: uci.clone(),
+                    bound: ScoreBound::Exact,
+                    score: EvaluationScore::Centipawns(if uci == self.best { 1000 } else { 0 }),
+                })
+                .collect(),
+        })
+    }
+}
+
+fn choice_host(revision: &'static str, best: &'static str) -> (GameDetection, TacticalJobs) {
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(
+            HangingMaterialDetector::new(
+                ChoiceEvaluator { revision, best },
+                HangingMaterialConfig::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let detection = GameDetection::new(
+        registry,
+        AnalysisOptions {
+            deadline: Duration::from_secs(5),
+            retained_results: 8,
+        },
+    )
+    .unwrap();
+    let jobs = TacticalJobs::new(&detection, &["hanging-material"]);
+    (detection, jobs)
+}
+
+fn import_two_captures(app: &mut Tempo) {
+    app.import_game_pgn(GameImport {
+        dataset_id: app.game_dataset().unwrap(),
+        command_id: "rescan-two-captures".into(),
+        learner: "Learner".into(),
+        repertoire_id: None,
+        pgn: format!(
+            "[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"{TWO_CAPTURES}\"]\n[Result \"0-1\"]\n\n1. Kc1 0-1"
+        ),
+    })
+    .unwrap();
+}
+
+#[test]
+fn revised_issued_or_fulfilled_finding_does_not_introduce_an_alternate_due_puzzle() {
+    for already_fulfilled in [false, true] {
+        let (directory, mut app) = disposable();
+        import_two_captures(&mut app);
+        let (mut detection, mut jobs) = choice_host("v1", "d4d7");
+        let original_report = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+        let issued = app.next_exercise().unwrap().unwrap();
+        let answer_command = if already_fulfilled {
+            let saved = answer(&mut app, &issued, "d4d7", "fulfilled-before-rescan");
+            assert!(app.next_exercise().unwrap().is_none());
+            Some(saved)
+        } else {
+            None
+        };
+        let before = app.snapshot().unwrap();
+
+        let (mut detection, mut jobs) = choice_host("v2", "d4h4");
+        let revised = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+        let old_row = &original_report["observations"][0];
+        let new_row = &revised["observations"][0];
+        assert_eq!(new_row["request_id"], old_row["request_id"]);
+        assert_eq!(new_row["puzzle"], old_row["puzzle"]);
+        assert_eq!(new_row["fulfilled"], already_fulfilled);
+        assert_eq!(
+            new_row["details"]["assessment"]["puzzle"]["answer"]["uci"],
+            "d4h4"
+        );
+        let after = app.snapshot().unwrap();
+        assert_eq!(after.catalog, before.catalog);
+        assert_eq!(after.content_history, before.content_history);
+        assert_eq!(after.attempts, before.attempts);
+        assert_eq!(after.active_attempt, before.active_attempt);
+        assert_eq!(after.learning, before.learning);
+        assert_eq!(after.assessments, before.assessments);
+
+        let fixed_time = app.components.clock.now();
+        drop(app);
+        let mut app = local_runtime::open(&directory.path().join("tactics.sqlite")).unwrap();
+        app.components.clock = Box::new(FixedClock(fixed_time));
+        if let Some(saved) = answer_command {
+            assert_eq!(
+                app.submit(saved).unwrap().attempt.status,
+                tempo_study::AttemptStatus::Complete
+            );
+            assert_eq!(app.snapshot().unwrap().assessments, before.assessments);
+        } else {
+            let resumed = app.next_exercise().unwrap().unwrap();
+            assert_eq!(resumed.attempt, issued.attempt);
+            answer(&mut app, &resumed, "d4d7", "fulfilled-after-rescan");
+        }
+        assert!(app.next_exercise().unwrap().is_none());
+    }
+}
+
+#[test]
+#[ignore = "unissued replacement remains blocked on durable automatic-introduction ownership"]
+fn revised_unissued_finding_cannot_leave_obsolete_due_puzzle() {
+    let (directory, mut app) = disposable();
+    import_two_captures(&mut app);
+    let (mut detection, mut jobs) = choice_host("v1", "d4d7");
+    let original = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    let original_target = app
+        .snapshot()
+        .unwrap()
+        .catalog
+        .items
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let (mut detection, mut jobs) = choice_host("v2", "d4h4");
+    let revised = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    assert_eq!(
+        revised["observations"][0]["request_id"],
+        original["observations"][0]["request_id"]
+    );
+    let next = app.next_exercise().unwrap().unwrap();
+    assert_ne!(next.attempt.target, original_target);
+    answer(&mut app, &next, "d4h4", "revised-answer");
+    assert!(
+        app.next_exercise().unwrap().is_none(),
+        "the obsolete puzzle still appears in ordinary due selection"
+    );
+}
+
+#[test]
+fn a_tactical_request_does_not_record_whether_it_introduced_prior_learning() {
+    use crate::{JsonSnapshotCodec, SnapshotCodec};
+
+    let (directory, mut source) = disposable();
+    let fixed_time = source.components.clock.now();
+    import_two_captures(&mut source);
+    let (mut detector, mut jobs) = choice_host("v1", "d4d7");
+    scan(&directory, &mut source, &mut detector, &mut jobs, 1);
+    let codec = JsonSnapshotCodec;
+    let mut captured = codec.decode(&source.export(&codec).unwrap()).unwrap();
+    captured.game_evidence = Default::default();
+    let target = captured.catalog.items.keys().next().unwrap().clone();
+    assert!(captured.learning[&target].introduced);
+
+    let snapshot_after_scan = |snapshot: &crate::PortableSnapshot| {
+        let dataset: DatasetId = "restored-before-scan".into();
+        let (directory, mut app) = disposable();
+        app.components.clock = Box::new(FixedClock(fixed_time));
+        app.restore(dataset.clone(), &codec.encode(snapshot).unwrap(), &codec)
+            .unwrap();
+        import_two_captures(&mut app);
+        let (mut detector, mut jobs) = choice_host("v1", "d4d7");
+        let report = scan(&directory, &mut app, &mut detector, &mut jobs, 1);
+        let request = app
+            .store
+            .pending_tactical_requests(&dataset)
+            .unwrap()
+            .remove(0);
+        let saved = app.snapshot().unwrap();
+        assert!(saved.attempts.is_empty());
+        assert!(saved.assessments.is_empty());
+        (
+            report,
+            request,
+            saved.catalog,
+            saved.learning,
+            saved.content_history,
+        )
+    };
+
+    // A portable dataset may already hold valid, ungraded learning without
+    // importing the original request's or attempt's identity.
+    let mut unseen = captured.clone();
+    unseen.learning.insert(target, Default::default());
+    assert_eq!(
+        snapshot_after_scan(&captured),
+        snapshot_after_scan(&unseen),
+        "the request and Learning state cannot distinguish a pre-existing ungraded introduction"
+    );
+}
