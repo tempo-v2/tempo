@@ -43,7 +43,12 @@ pub(super) fn serve(
     };
     println!("Tempo study at {}", surfaces.origin);
     let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
-    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &["hanging-material"]);
+    let detector = if detection.tactical_descriptor("personal-tactics").is_some() {
+        "personal-tactics"
+    } else {
+        "hanging-material"
+    };
+    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
     let mut games = Games {
         refresh: GameJobs::start()?,
         detection,
@@ -344,13 +349,78 @@ fn respond(
             )
             .with_status_code(StatusCode(status)),
         )?;
+    } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/position" {
+        let result = command::<crate::personal_tactics_report::PositionRequest>(
+            &mut request,
+            MAX_COMMAND_BYTES,
+        )
+        .and_then(|read| {
+            crate::personal_tactics_report::read_position(
+                profile_store,
+                games.tactics.report_version(),
+                read,
+            )
+        });
+        let (status, value) = match result {
+            Ok(value) => (200, value),
+            Err(error) => (
+                400,
+                serde_json::json!({"code":error.code,"message":error.message}),
+            ),
+        };
+        request.respond(
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&value)?,
+            )
+            .with_status_code(StatusCode(status)),
+        )?;
+    } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/report" {
+        let result = command::<crate::personal_tactics_report::ReportRequest>(
+            &mut request,
+            MAX_COMMAND_BYTES,
+        )
+        .and_then(|read| {
+            crate::personal_tactics_report::read(
+                profile_store,
+                games.tactics.report_version(),
+                read,
+            )
+        });
+        let (status, value) = match result {
+            Ok(value) => (200, value),
+            Err(error) => (
+                400,
+                serde_json::json!({"code":error.code,"message":error.message}),
+            ),
+        };
+        request.respond(
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&value)?,
+            )
+            .with_status_code(StatusCode(status)),
+        )?;
     } else if request.url() == "/api/games/tactics" {
         let (status, value) = if request.method() == &Method::Post {
             let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
+            let report_discovery = header(&request, "X-Tempo-Tactics-Report") == Some("2");
             match command::<crate::tactical_jobs::TacticalRead>(&mut request, MAX_COMMAND_BYTES)
                 .and_then(|read| games.tactics.read(app, profile_store, read, wait_reason))
             {
-                Ok(value) => (200, value),
+                Ok(mut value) => {
+                    if !report_discovery && games.tactics.has_personal_report() {
+                        value = serde_json::json!({"schema_version": 1, "dataset_id": value["dataset_id"],
+                            "status": "unavailable", "message": "Reload Tempo to view personal tactical analysis."});
+                    }
+                    if report_discovery
+                        && games.tactics.has_personal_report()
+                        && value["status"] != "unavailable"
+                    {
+                        value["report_schema"] = serde_json::json!(2);
+                    }
+                    (200, value)
+                }
                 Err(error) => (
                     400,
                     serde_json::json!({"schema_version":1,"status":"error","code":error.code,"message":error.message}),

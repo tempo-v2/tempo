@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempo_chess::{
-    DetectorIdentity, TacticalAssessment, TacticalOutcome, parse_played_games, plan_tactical_puzzle,
+    DetectorIdentity, TacticalAssessment, TacticalOutcome, parse_played_games,
+    plan_personal_puzzle, plan_tactical_puzzle,
 };
 use tempo_learning::DailyLearning;
 use tempo_store::{
@@ -19,7 +20,7 @@ use tempo_store::{
 use tempo_types::DatasetId;
 
 // A report groups game tactics across upgrades and changes in its detector set.
-const GAME_TACTICS_REPORT: &str = "game-tactics";
+pub(crate) const GAME_TACTICS_REPORT: &str = "game-tactics";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct TacticalDetails {
@@ -135,7 +136,7 @@ impl Tempo {
     ) -> Result<TacticalAcceptance, AppError> {
         let dataset = self.validate_tactical_source(game, completion)?;
         let needs_puzzle = matches!(&completion.status, DetectionStatus::Complete { findings, .. }
-            if findings.iter().any(|finding| finding.moment.tactical.as_ref().is_some_and(|assessment| assessment.puzzle.is_some())));
+            if findings.iter().any(|finding| finding.moment.tactical.as_ref().is_some_and(|assessment| assessment.puzzle.is_some() || assessment.personal.as_ref().is_some_and(|evidence| evidence.puzzle.is_some()))));
         let snapshot = needs_puzzle
             .then(|| self.store.content_state())
             .transpose()?;
@@ -188,25 +189,60 @@ impl Tempo {
                             "The position analysis omitted its typed assessment.",
                         )
                     })?;
-                    inconclusive |= assessment.outcome == TacticalOutcome::Uncertain;
-                    let train = if assessment.outcome == TacticalOutcome::MissedGoodCapture {
-                        let puzzle = assessment.puzzle.as_ref().ok_or_else(|| {
+                    inconclusive |= assessment.outcome == TacticalOutcome::Uncertain
+                        || assessment
+                            .standalone_analysis
+                            .as_ref()
+                            .is_some_and(|value| {
+                                !matches!(value, tempo_chess::EvaluationStatus::Complete { .. })
+                            });
+                    let provenance = [format!(
+                        "game-tactic:{}:{}:{}:{}",
+                        game.game.source, game.game.id, game.learner, moment.occurrence
+                    )];
+                    let personal = assessment.kind == tempo_chess::TacticalKind::PersonalTactics;
+                    let plan = if personal {
+                        let evidence = assessment.personal.as_ref().ok_or_else(|| {
                             AppError::new(
                                 "invalid_tactical_result",
-                                "A confirmed miss has no validated puzzle.",
+                                "The personal detector omitted its evidence.",
                             )
                         })?;
-                        let provenance = vec![format!(
-                            "game-tactic:{}:{}:{}:{}",
-                            game.game.source, game.game.id, game.learner, moment.occurrence
-                        )];
-                        let plan = plan_tactical_puzzle(
-                            &catalog,
-                            &puzzle.fen,
-                            &puzzle.answer,
-                            &provenance,
-                        )
-                        .map_err(|e| domain("invalid_tactical_puzzle", e))?;
+                        evidence
+                            .puzzle
+                            .as_ref()
+                            .map(|puzzle| plan_personal_puzzle(&catalog, puzzle, &provenance))
+                    } else {
+                        assessment.puzzle.as_ref().map(|puzzle| {
+                            plan_tactical_puzzle(&catalog, &puzzle.fen, &puzzle.answer, &provenance)
+                        })
+                    }
+                    .transpose()
+                    .map_err(|e| domain("invalid_tactical_puzzle", e))?;
+                    let ply = moment
+                        .occurrence
+                        .try_into()
+                        .map_err(|_| AppError::new("invalid_game", "Game is too long."))?;
+                    let issued = if personal && plan.is_some() {
+                        self.store.issued_tactical_request_for_turn(
+                            &dataset,
+                            game,
+                            GAME_TACTICS_REPORT,
+                            ply,
+                        )?
+                    } else {
+                        None
+                    };
+                    let train = if let Some((plan, issued)) = plan.as_ref().zip(issued.as_ref()) {
+                        let current = plan
+                            .content
+                            .catalog
+                            .items
+                            .get(&plan.target)
+                            .expect("planned puzzle exists");
+                        (plan.target == issued.target && current.version == issued.version)
+                            .then(|| issued.clone())
+                    } else if let Some(plan) = plan {
                         catalog = plan.content.catalog;
                         let item = catalog
                             .items
@@ -244,10 +280,7 @@ impl Tempo {
                     };
                     observations.push(TacticalObservation {
                         producer: Some(finding.producer.clone()),
-                        ply: moment
-                            .occurrence
-                            .try_into()
-                            .map_err(|_| AppError::new("invalid_game", "Game is too long."))?,
+                        ply,
                         motif: serde_json::to_value(assessment.kind)
                             .expect("typed motif")
                             .as_str()
@@ -261,6 +294,11 @@ impl Tempo {
                         details_json: serde_json::to_string(&details)
                             .expect("serializable tactical details"),
                         train,
+                        request_scope: if personal {
+                            tempo_store::TacticalRequestScope::Decision
+                        } else {
+                            tempo_store::TacticalRequestScope::Finding
+                        },
                     });
                 }
                 (

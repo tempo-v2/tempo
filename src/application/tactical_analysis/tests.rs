@@ -13,7 +13,7 @@ use tempo_chess::{
     HangingMaterialConfig, HangingMaterialDetector, RootEvaluation, RootScore, ScoreBound,
     TacticRecord, TacticalEvaluationRequest, TacticalEvaluator, compile_tactics,
 };
-use tempo_store::ActivityMode;
+use tempo_store::{ActivityMode, Store};
 
 const HANGING: &str = "7k/n7/8/8/8/8/8/R5K1 w - - 0 1";
 
@@ -776,6 +776,7 @@ fn independent_mate_finding_needs_no_hanging_capture_and_skips_only_later_member
                 accepted_moves: vec![ChessAnswer::from("f7f8")],
                 puzzle: None,
                 equivalence_cp: 0,
+                personal: None,
             };
             DetectionOutcome::Complete(vec![DetectedMoment {
                 occurrence: position.occurrence().offset(),
@@ -896,4 +897,88 @@ fn adding_an_earlier_detector_preserves_the_fulfilled_occurrence() {
     let after = app.snapshot().unwrap();
     assert_eq!(after.learning, original.learning);
     assert_eq!(after.assessments, original.assessments);
+}
+
+#[test]
+fn personal_findings_flow_through_games_and_study_and_reuse_the_previous_request() {
+    let (directory, mut app) = disposable();
+    let store = tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
+    let dataset = app.game_dataset().unwrap();
+    let sample = |name, control, line| {
+        format!(
+            "[White \"Learner\"]\n[Black \"{name}\"]\n[WhiteElo \"1499\"]\n[BlackElo \"1500\"]\n[TimeControl \"{control}\"]\n[SetUp \"1\"]\n[FEN \"{HANGING}\"]\n\n1. {line}"
+        )
+    };
+    let pgn = format!(
+        "{}\n\n{}",
+        sample("Missed", "60", "Kg2 0-1"),
+        sample("Played", "60+0", "Rxa7 1-0")
+    );
+    assert_eq!(
+        app.import_game_pgn(GameImport {
+            dataset_id: dataset.clone(),
+            command_id: "personal-two".into(),
+            learner: "Learner".into(),
+            repertoire_id: None,
+            pgn
+        })
+        .unwrap()
+        .new_games,
+        2
+    );
+    let (mut old_detector, mut old_jobs) = host("legacy", "good");
+    scan(&directory, &mut app, &mut old_detector, &mut old_jobs, 2);
+    let original_requests = store.pending_tactical_requests(&dataset).unwrap();
+    let [previous] = original_requests.as_slice() else {
+        panic!("expected one legacy request")
+    };
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(tempo_chess::PersonalTacticsDetector(Evaluator {
+            revision: "personal",
+            outcome: "good",
+        }))
+        .unwrap();
+    let mut detector = GameDetection::new(
+        registry,
+        AnalysisOptions {
+            deadline: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut jobs = TacticalJobs::new(&detector, &["personal-tactics"]);
+    scan(&directory, &mut app, &mut detector, &mut jobs, 2);
+    let requests = store.pending_tactical_requests(&dataset).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].id, previous.id);
+    assert_eq!(requests[0].target, previous.target);
+    let query = json!({"dataset_id": dataset, "filters": {"clock":{"seconds":60,"increment":0},
+        "speed":"bullet","learner_rating":1450,"motif":"hanging_material"}});
+    let report = crate::personal_tactics_report::read(
+        &store,
+        jobs.report_version(),
+        serde_json::from_value(query).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["filtered_games"], 2);
+    assert_eq!(report["clocks"].as_array().unwrap().len(), 1);
+    assert_eq!(report["loss_comparison"]["with_miss"]["losses"], 1);
+    assert_eq!(report["loss_comparison"]["without_miss"]["wins"], 1);
+    assert_eq!(report["games"].as_array().unwrap().len(), 2);
+    let active = app.next_exercise().unwrap().unwrap();
+    assert_eq!(active.attempt.target, previous.target);
+    let saved = answer(&mut app, &active, "a1a7", "personal-answer");
+    drop(app);
+    let mut reopened = local_runtime::open(&directory.path().join("tactics.sqlite")).unwrap();
+    assert_eq!(
+        reopened.submit(saved).unwrap().attempt.status,
+        tempo_study::AttemptStatus::Complete
+    );
+    assert!(
+        store
+            .pending_tactical_requests(&dataset)
+            .unwrap()
+            .is_empty()
+    );
 }

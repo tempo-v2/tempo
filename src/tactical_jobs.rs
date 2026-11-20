@@ -70,6 +70,7 @@ pub(crate) struct TacticalJobs {
     sequence: u64,
     last_error: Option<String>,
     continuing: Option<i64>,
+    enrolled_archive: Option<DatasetId>,
 }
 
 impl TacticalJobs {
@@ -115,6 +116,7 @@ impl TacticalJobs {
             sequence: 0,
             last_error: None,
             continuing: None,
+            enrolled_archive: None,
         }
     }
 
@@ -211,6 +213,10 @@ impl TacticalJobs {
             return Ok(());
         }
         let descriptor = self.descriptor.as_ref().expect("configured detector");
+        if descriptor.id == "personal-tactics" && self.enrolled_archive.as_ref() != Some(&dataset) {
+            store.enroll_verified_archive(&dataset)?;
+            self.enrolled_archive = Some(dataset.clone());
+        }
         let version = &self.version;
         let continuing = store.next_position_analysis(&dataset, version, self.continuing)?;
         let task = if continuing
@@ -277,6 +283,16 @@ impl TacticalJobs {
         self.continuing = Some(task.game.cursor.ordinal);
         self.active = Some((task, request_id));
         Ok(())
+    }
+
+    pub(crate) fn has_personal_report(&self) -> bool {
+        self.descriptor
+            .as_ref()
+            .is_some_and(|member| member.id == "personal-tactics")
+    }
+
+    pub(crate) fn report_version(&self) -> &str {
+        &self.version
     }
 
     pub(crate) fn command(

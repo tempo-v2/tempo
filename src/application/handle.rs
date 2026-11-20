@@ -156,7 +156,7 @@ impl Tempo {
             })
             .transpose()?;
         let history = (attempt.state.decision_index > 0)
-            .then(|| tempo_chess::revealed_line(&issued.definition, attempt.state.decision_index))
+            .then(|| tempo_chess::revealed_attempt_line(&issued.definition, &attempt.state))
             .transpose()
             .map_err(|error| domain("invalid_content", error))?;
         Ok(StudyView::attempt(
