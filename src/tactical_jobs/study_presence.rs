@@ -52,8 +52,8 @@ impl StudyPresence {
     }
 
     /// Returns whether an accepted update adds a blocker that may interrupt analysis.
-    /// An unseen release may have overtaken its activation in the network.
-    /// Repeated releases from a known inactive tab leave its deadline alone.
+    /// Each new inactive report is a release, even if it overtook its
+    /// activation in the network. The sequence fences duplicates and reordering.
     pub(super) fn report(
         &mut self,
         report: PresenceReport,
@@ -80,24 +80,17 @@ impl StudyPresence {
         if prior.is_none() && self.tabs.len() >= MAX_TABS {
             return Err("Too many Study tabs are reporting presence.");
         }
-        let active = report.state == PresenceState::Active;
-        let changed_deadline = active || prior.is_none_or(|tab| tab.state == PresenceState::Active);
-        let prior_deadline = prior.map_or(now, |tab| tab.blocked_until);
-        let blocked_until = if changed_deadline {
-            now + QUIET_PERIOD
-        } else {
-            prior_deadline
-        };
+        let adds_blocker = prior.is_none_or(|tab| tab.blocked_until <= now);
         self.tabs.insert(
             report.tab,
             Tab {
                 state: report.state,
                 sequence: report.sequence,
                 reported: now,
-                blocked_until,
+                blocked_until: now + QUIET_PERIOD,
             },
         );
-        Ok(changed_deadline && prior_deadline <= now)
+        Ok(adds_blocker)
     }
 
     pub(super) fn command(&mut self, now: Instant) {
@@ -148,7 +141,7 @@ mod tests {
         assert_eq!(presence.waiting(time(70)), Some(StudyWait::Active));
         presence.report(report(2, 3, Inactive), time(71)).unwrap();
         presence.report(report(2, 2, Active), time(72)).unwrap();
-        presence.report(report(2, 4, Inactive), time(73)).unwrap();
+        presence.report(report(2, 3, Inactive), time(73)).unwrap();
         assert_eq!(presence.waiting(time(100)), Some(StudyWait::QuietPeriod));
         assert_eq!(presence.waiting(time(101)), None);
         assert!(presence.report(report(2, 5, Active), time(102)).unwrap());
@@ -169,6 +162,19 @@ mod tests {
         );
         assert_eq!(presence.waiting(time(69)), Some(StudyWait::QuietPeriod));
         assert_eq!(presence.waiting(time(70)), None);
+        // The same tab returned to Study and its next release also overtook activation.
+        assert!(
+            presence
+                .report(report(1, 4, PresenceState::Inactive), time(80))
+                .unwrap()
+        );
+        assert!(
+            !presence
+                .report(report(1, 3, PresenceState::Active), time(81))
+                .unwrap()
+        );
+        assert_eq!(presence.waiting(time(109)), Some(StudyWait::QuietPeriod));
+        assert_eq!(presence.waiting(time(110)), None);
     }
 
     #[test]
