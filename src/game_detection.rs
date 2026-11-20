@@ -12,8 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tempo_chess::{
-    DetectionControl, DetectionOutcome, DetectionStop, DetectorDescriptor, GameDetectionInput,
-    GameDetector, LearnerColor, ValidatedMoment, parse_played_games, validate_detected_moments,
+    DetectionControl, DetectionOutcome, DetectionStop, DetectorDescriptor, DetectorIdentity,
+    GameDetectionInput, GameDetector, LearnerColor, PositionFinding, ValidatedMoment,
+    parse_played_games, validate_detected_moments,
 };
 use tempo_types::DatasetId;
 
@@ -70,13 +71,13 @@ impl DetectorRegistry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DetectionRequest {
-    schema_version: u8,
-    request_id: String,
+    pub(crate) schema_version: u8,
+    pub(crate) request_id: String,
     pub(crate) dataset_id: DatasetId,
     pub(crate) source: String,
     pub(crate) game_id: String,
     pub(crate) learner: String,
-    detector_id: String,
+    pub(crate) detector_id: String,
 }
 
 #[derive(Deserialize)]
@@ -87,9 +88,9 @@ pub(crate) struct DetectionRead {
     dataset_id: DatasetId,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum DetectionStatus {
+pub(crate) enum DetectionStatus {
     Running,
     Complete {
         learner_color: LearnerColor,
@@ -106,16 +107,30 @@ enum DetectionStatus {
     SourceUnavailable,
 }
 
-#[derive(Serialize)]
-struct DetectionFinding {
+#[derive(Clone, Serialize)]
+pub(crate) struct DetectionFinding {
+    #[serde(skip)]
+    pub(crate) producer: DetectorIdentity,
+    #[serde(skip)]
+    pub(crate) skipped: Vec<DetectorIdentity>,
     finding_id: String,
     #[serde(flatten)]
-    moment: ValidatedMoment,
+    pub(crate) moment: ValidatedMoment,
 }
 
 pub(crate) struct DetectionReply {
     pub(crate) status: u16,
     pub(crate) body: Value,
+}
+
+/// A typed, source-validated completion for an explicitly composed application
+/// consumer. Reading or previewing a detector result still has no side effects.
+pub(crate) struct DetectionCompletion {
+    pub(crate) analyses: Vec<DetectorIdentity>,
+    pub(crate) position: Option<tempo_store::TacticalPositionRun>,
+    pub(crate) request: DetectionRequest,
+    pub(crate) source: AcceptedDetectionSource,
+    pub(crate) status: DetectionStatus,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -125,11 +140,15 @@ pub(crate) struct AcceptedDetectionSource {
 }
 
 struct Stop {
+    deeper: bool,
     deadline: Instant,
     cancelled: AtomicBool,
 }
 
 impl DetectionControl for Stop {
+    fn deeper_search(&self) -> bool {
+        self.deeper
+    }
     fn check(&self) -> Result<(), DetectionStop> {
         if self.cancelled.load(Ordering::Relaxed) {
             Err(DetectionStop::Cancelled)
@@ -142,6 +161,8 @@ impl DetectionControl for Stop {
 }
 
 struct Work {
+    position_detectors: Vec<RegisteredDetector>,
+    position: Option<tempo_store::TacticalPositionRun>,
     request: DetectionRequest,
     source: Arc<AcceptedDetectionSource>,
     detector: RegisteredDetector,
@@ -150,6 +171,8 @@ struct Work {
 }
 
 struct Entry {
+    analyses: Vec<DetectorIdentity>,
+    position: Option<tempo_store::TacticalPositionRun>,
     request: DetectionRequest,
     source: Arc<AcceptedDetectionSource>,
     descriptor: DetectorDescriptor,
@@ -166,7 +189,17 @@ impl Entry {
             "game_id": self.request.game_id,
             "detector": descriptor_json(&self.descriptor),
         });
-        let status = serde_json::to_value(&self.status).expect("serializable detection status");
+        let mut status = serde_json::to_value(&self.status).expect("serializable detection status");
+        // Wire 1 is a display-only preview, consumed by older strict clients.
+        // Typed training evidence is accepted through the application command
+        // and exposed by its separate versioned history read.
+        if let Some(findings) = status.get_mut("findings").and_then(Value::as_array_mut) {
+            for finding in findings {
+                if let Some(fields) = finding.as_object_mut() {
+                    fields.remove("tactical");
+                }
+            }
+        }
         body.as_object_mut()
             .unwrap()
             .extend(status.as_object().unwrap().clone());
@@ -203,6 +236,42 @@ pub(crate) struct GameDetection {
 }
 
 impl GameDetection {
+    #[cfg(test)]
+    pub(crate) fn descriptor(&self, id: &str) -> Option<DetectorDescriptor> {
+        self.registry
+            .0
+            .get(id)
+            .map(|entry| entry.descriptor.clone())
+    }
+
+    pub(crate) fn tactical_descriptor(&self, id: &str) -> Option<DetectorDescriptor> {
+        self.registry
+            .0
+            .get(id)
+            .filter(|entry| entry.detector.produces_tactical_assessments())
+            .map(|entry| entry.descriptor.clone())
+    }
+
+    pub(crate) fn idle(&self) -> bool {
+        self.active.is_none()
+    }
+
+    pub(crate) fn completion(&mut self, app: &Tempo, id: &str) -> Option<DetectionCompletion> {
+        self.poll(app);
+        self.revalidate_retained(app, id);
+        let entry = self.lookup(id)?;
+        if matches!(entry.status, DetectionStatus::Running) {
+            return None;
+        }
+        Some(DetectionCompletion {
+            analyses: entry.analyses.clone(),
+            position: entry.position,
+            request: entry.request.clone(),
+            source: (*entry.source).clone(),
+            status: entry.status.clone(),
+        })
+    }
+
     pub(crate) fn new(
         registry: DetectorRegistry,
         options: AnalysisOptions,
@@ -211,10 +280,12 @@ impl GameDetection {
         std::thread::Builder::new()
             .name("tempo-game-detection".into())
             .spawn(move || {
+                let mut cached = None;
                 while let Ok(task) = incoming.recv() {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| detect(&task)))
-                            .unwrap_or(DetectionStatus::Failed);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        detect(&task, &mut cached)
+                    }))
+                    .unwrap_or(DetectionStatus::Failed);
                     let _ = task.reply.send(result);
                 }
             })?;
@@ -245,6 +316,24 @@ impl GameDetection {
     }
 
     pub(crate) fn start(&mut self, app: &Tempo, request: DetectionRequest) -> DetectionReply {
+        self.start_work(app, request, None, &[])
+    }
+
+    pub(crate) fn cancel_background(&mut self) {
+        if let Some(active) = &self.active
+            && active.entry.position.is_some()
+        {
+            active.stop.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn start_work(
+        &mut self,
+        app: &Tempo,
+        request: DetectionRequest,
+        position: Option<tempo_store::TacticalPositionRun>,
+        analyses: &[DetectorIdentity],
+    ) -> DetectionReply {
         let error =
             |status, code| addressed_error(status, code, &request.request_id, &request.dataset_id);
         if request.schema_version != VERSION
@@ -261,10 +350,18 @@ impl GameDetection {
         {
             return error(400, "invalid_request");
         }
+        let mut analyses = analyses.to_vec();
+        analyses.sort();
+        if analyses.windows(2).any(|pair| pair[0].id == pair[1].id) {
+            return error(400, "duplicate_position_detector");
+        }
         self.poll(app);
         self.revalidate_retained(app, &request.request_id);
         if let Some(entry) = self.lookup(&request.request_id) {
-            return if entry.request == request {
+            return if entry.request == request
+                && entry.position == position
+                && entry.analyses == analyses
+            {
                 entry.reply()
             } else {
                 error(409, "conflict")
@@ -278,6 +375,22 @@ impl GameDetection {
             };
             return error(404, code);
         };
+        let Some(position_detectors) = analyses
+            .iter()
+            .map(|member| {
+                self.registry
+                    .0
+                    .get(&member.id)
+                    .filter(|entry| entry.descriptor.identity() == *member)
+                    .cloned()
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return error(404, "unknown_position_detector");
+        };
+        if position.is_some() && position_detectors.is_empty() {
+            return error(400, "empty_analysis_set");
+        }
         if self.active.is_some() {
             return error(409, "busy");
         }
@@ -297,11 +410,14 @@ impl GameDetection {
             return error(503, "unavailable");
         };
         let stop = Arc::new(Stop {
+            deeper: position.is_some_and(|run| run.deeper),
             deadline,
             cancelled: AtomicBool::new(false),
         });
         let (reply, result) = mpsc::sync_channel(1);
         let entry = Entry {
+            analyses,
+            position,
             request: request.clone(),
             source: source.clone(),
             descriptor: detector.descriptor.clone(),
@@ -310,6 +426,8 @@ impl GameDetection {
         if self
             .work
             .try_send(Work {
+                position,
+                position_detectors,
                 request,
                 source,
                 detector,
@@ -445,24 +563,60 @@ fn stopped(stop: DetectionStop) -> DetectionStatus {
     }
 }
 
-fn detect(task: &Work) -> DetectionStatus {
+type CachedDetection = (Arc<AcceptedDetectionSource>, GameDetectionInput, String);
+
+fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus {
     if let Err(stop) = task.stop.check() {
         return stopped(stop);
     }
-    let Ok(mut games) = parse_played_games(&task.source.pgn) else {
-        return DetectionStatus::SourceUnavailable;
-    };
-    if games.len() != 1 {
-        return DetectionStatus::SourceUnavailable;
+    if !cached
+        .as_ref()
+        .is_some_and(|(source, _, _)| **source == *task.source)
+    {
+        let Ok(mut games) = parse_played_games(&task.source.pgn) else {
+            return DetectionStatus::SourceUnavailable;
+        };
+        if games.len() != 1 {
+            return DetectionStatus::SourceUnavailable;
+        }
+        let Some(Ok(game)) = games.pop() else {
+            return DetectionStatus::SourceUnavailable;
+        };
+        let input = GameDetectionInput::new(game.timeline(), task.source.color);
+        let key = input.fingerprint();
+        *cached = Some((task.source.clone(), input, key));
     }
-    let Some(Ok(game)) = games.pop() else {
-        return DetectionStatus::SourceUnavailable;
-    };
-    let input = GameDetectionInput::new(game.timeline(), task.source.color);
+    let (_, input, input_key) = cached.as_ref().expect("cached source");
     if let Err(stop) = task.stop.check() {
         return stopped(stop);
     }
-    let outcome = task.detector.detector.detect(&input, task.stop.as_ref());
+    let detector = &task.detector.detector;
+    let outcome = if let Some(run) = task.position {
+        tempo_chess::scan_position(
+            input,
+            run.ply as usize,
+            task.position_detectors
+                .iter()
+                .map(|entry| entry.detector.as_ref()),
+            task.stop.as_ref(),
+        )
+    } else {
+        match detector.detect(input, task.stop.as_ref()) {
+            DetectionOutcome::Complete(moments) => DetectionOutcome::Complete(
+                moments
+                    .into_iter()
+                    .map(|moment| PositionFinding {
+                        producer: task.detector.descriptor.identity(),
+                        moment,
+                        skipped: vec![],
+                    })
+                    .collect(),
+            ),
+            DetectionOutcome::Unsupported => DetectionOutcome::Unsupported,
+            DetectionOutcome::Stopped(reason) => DetectionOutcome::Stopped(reason),
+            DetectionOutcome::Failed(error) => DetectionOutcome::Failed(error),
+        }
+    };
     if let Err(stop) = task.stop.check() {
         return stopped(stop);
     }
@@ -472,35 +626,72 @@ fn detect(task: &Work) -> DetectionStatus {
         DetectionOutcome::Stopped(stop) => return stopped(stop),
         DetectionOutcome::Failed(_) => return DetectionStatus::Failed,
     };
-    let Ok(moments) = validate_detected_moments(&input, claims) else {
-        return DetectionStatus::InvalidResult;
-    };
-    let input_key = input.fingerprint();
     let descriptor = &task.detector.descriptor;
-    let analysis_key = digest(&json!([
-        VERSION,
-        task.request.dataset_id,
-        task.request.source,
-        task.request.game_id,
-        input_key,
-        descriptor.id,
-        descriptor.revision,
-        descriptor.configuration_fingerprint,
-    ]));
-    let findings = moments
-        .into_iter()
-        .map(|moment| DetectionFinding {
-            finding_id: digest(&json!([analysis_key, moment.semantic_fingerprint()])),
-            moment,
-        })
-        .collect();
+    let analysis_key = if task.position.is_none() {
+        digest(&json!([
+            VERSION,
+            task.request.dataset_id,
+            task.request.source,
+            task.request.game_id,
+            input_key,
+            descriptor.id,
+            descriptor.revision,
+            descriptor.configuration_fingerprint
+        ]))
+    } else {
+        digest(&json!([
+            VERSION,
+            task.request.dataset_id,
+            task.request.source,
+            task.request.game_id,
+            input_key,
+            task.position_detectors
+                .iter()
+                .map(|member| member.descriptor.identity())
+                .collect::<Vec<_>>()
+        ]))
+    };
+    let mut by_producer = BTreeMap::<DetectorIdentity, Vec<_>>::new();
+    let mut skipped = vec![];
+    for finding in claims {
+        if task
+            .position
+            .is_some_and(|run| finding.moment.occurrence != run.ply as usize)
+        {
+            return DetectionStatus::InvalidResult;
+        }
+        skipped.extend(finding.skipped);
+        by_producer
+            .entry(finding.producer)
+            .or_default()
+            .push(finding.moment);
+    }
+    let mut findings = Vec::new();
+    for (producer, claims) in by_producer {
+        let Ok(moments) = validate_detected_moments(input, claims) else {
+            return DetectionStatus::InvalidResult;
+        };
+        for moment in moments {
+            let key = if task.position.is_none() {
+                json!([analysis_key, moment.semantic_fingerprint()])
+            } else {
+                json!([analysis_key, producer, moment.semantic_fingerprint()])
+            };
+            findings.push(DetectionFinding {
+                finding_id: digest(&key),
+                producer: producer.clone(),
+                skipped: skipped.clone(),
+                moment,
+            });
+        }
+    }
     if let Err(stop) = task.stop.check() {
         return stopped(stop);
     }
     DetectionStatus::Complete {
         learner_color: input.learner(),
         occurrence_count: input.timeline().occurrences().len(),
-        input_key,
+        input_key: input_key.clone(),
         analysis_key,
         findings,
     }
@@ -583,14 +774,17 @@ mod tests {
     }
 
     fn seed_game(app: &mut Tempo, id: &str) -> DetectionRequest {
+        seed_line(app, id, "1.e4 e5 1-0")
+    }
+
+    fn seed_line(app: &mut Tempo, id: &str, line: &str) -> DetectionRequest {
         let original_dataset = app.game_dataset().unwrap();
         app.import_game_pgn(GameImport {
             dataset_id: original_dataset.clone(),
             command_id: "seed".to_owned(),
             learner: "Learner".to_owned(),
             repertoire_id: None,
-            pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[Result \"1-0\"]\n1.e4 e5 1-0\n"
-                .into(),
+            pgn: format!("[White \"Learner\"]\n[Black \"Opponent\"]\n[Result \"1-0\"]\n{line}\n"),
         })
         .unwrap();
         let history = app.game_history().unwrap();
@@ -604,6 +798,142 @@ mod tests {
             learner: "Learner".into(),
             detector_id: "barrier".into(),
         }
+    }
+
+    #[test]
+    fn queued_detector_set_reuses_one_search_inside_the_real_host() {
+        use std::sync::atomic::AtomicUsize;
+        use tempo_chess::{
+            EvaluationFailure, EvaluationProvenance, EvaluationStatus, PositionPass,
+            RootEvaluation, TacticalEvaluationRequest, TacticalEvaluator,
+        };
+
+        struct Engine(Arc<AtomicUsize>);
+        impl TacticalEvaluator for Engine {
+            fn descriptor(&self) -> EvaluationProvenance {
+                EvaluationProvenance {
+                    engine: "fixture".into(),
+                    engine_version: "1".into(),
+                    configuration_fingerprint: "shared".into(),
+                }
+            }
+            fn evaluate(
+                &self,
+                request: &TacticalEvaluationRequest,
+                _: &dyn DetectionControl,
+            ) -> Result<RootEvaluation, EvaluationFailure> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert!(request.legal_moves.contains(&"g1f3".into()));
+                assert_eq!(request.moves, ["e2e4", "e7e5"]);
+                assert_ne!(request.fen, request.start_fen);
+                Err(EvaluationFailure::Incomplete)
+            }
+        }
+
+        struct Probe(&'static str, Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl GameDetector for Probe {
+            fn descriptor(&self) -> DetectorDescriptor {
+                DetectorDescriptor {
+                    id: self.0.into(),
+                    label: self.0.into(),
+                    revision: "1".into(),
+                    configuration_fingerprint: "fixture".into(),
+                }
+            }
+
+            fn detect(&self, _: &GameDetectionInput, _: &dyn DetectionControl) -> DetectionOutcome {
+                panic!("a position task called the whole-game detector")
+            }
+
+            fn detect_position(
+                &self,
+                position: &PositionPass<'_>,
+                control: &dyn DetectionControl,
+            ) -> DetectionOutcome {
+                assert_eq!(position.occurrence().next_move().unwrap().uci, "g1f3");
+                assert_eq!(
+                    position
+                        .played_prefix()
+                        .map(|answer| answer.uci.as_str())
+                        .collect::<Vec<_>>(),
+                    ["e2e4", "e7e5"]
+                );
+                self.1.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    position.piece_at("e4").unwrap().role,
+                    tempo_chess::PieceRole::Pawn
+                );
+                assert!(
+                    position
+                        .legal_moves()
+                        .iter()
+                        .any(|answer| answer.uci == "g1f3")
+                );
+                assert_eq!(
+                    position.compare(&Engine(self.2.clone()), control).unwrap(),
+                    EvaluationStatus::Incomplete { evaluation: None }
+                );
+                DetectionOutcome::Complete(vec![tempo_chess::DetectedMoment {
+                    occurrence: position.occurrence().offset(),
+                    code: "same_motif".into(),
+                    subjects: vec![],
+                    candidate_move: Some("g1f3".into()),
+                    explanation: self.0.into(),
+                    tactical: None,
+                }])
+            }
+        }
+
+        let (_directory, mut app) = disposable_app();
+        let request = seed_line(&mut app, "shared", "1.e4 e5 2.Nf3 1-0");
+        let probes = Arc::new(AtomicUsize::new(0));
+        let searches = Arc::new(AtomicUsize::new(0));
+        let mut registry = DetectorRegistry::default();
+        for id in ["barrier", "second"] {
+            registry
+                .register(Probe(id, probes.clone(), searches.clone()))
+                .unwrap();
+        }
+        let mut jobs = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+        let members = ["barrier", "second"].map(|id| jobs.descriptor(id).unwrap().identity());
+        let mut obsolete = members.clone();
+        obsolete[1].revision = "0".into();
+        let run = Some(tempo_store::TacticalPositionRun {
+            id: 1,
+            ply: 2,
+            deeper: false,
+        });
+        assert_eq!(
+            jobs.start_work(&app, request.clone(), run, &obsolete)
+                .status,
+            404
+        );
+        assert_ne!(
+            crate::application::tactical_analysis::analysis_version(&members),
+            crate::application::tactical_analysis::analysis_version(&obsolete),
+        );
+        let delivery = jobs.start_work(&app, request.clone(), run, &members);
+        assert_eq!(delivery.status, 202);
+        let reply = report(&app, &request, &mut jobs);
+        assert_eq!(reply["status"], "complete");
+        let DetectionStatus::Complete { findings, .. } =
+            jobs.completion(&app, &request.request_id).unwrap().status
+        else {
+            panic!("expected a completed position")
+        };
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.producer.clone())
+                .collect::<Vec<_>>(),
+            members
+        );
+        assert_ne!(
+            reply["findings"][0]["finding_id"],
+            reply["findings"][1]["finding_id"]
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!(searches.load(Ordering::SeqCst), 1);
     }
 
     fn barrier_detector() -> (

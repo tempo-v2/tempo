@@ -3,12 +3,52 @@ use crate::{AppError, app_error::domain};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::sync::{
+    Mutex, MutexGuard,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::{
     collections::BTreeSet,
     path::Path,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+static ENGINE_SLOT: Mutex<()> = Mutex::new(());
+static BACKGROUND_OWNS_SLOT: AtomicBool = AtomicBool::new(false);
+static FOREGROUND: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn foreground_waiting() -> bool {
+    FOREGROUND.load(Ordering::SeqCst) != 0
+}
+
+pub(crate) struct BackgroundSlot {
+    _slot: MutexGuard<'static, ()>,
+}
+impl Drop for BackgroundSlot {
+    fn drop(&mut self) {
+        BACKGROUND_OWNS_SLOT.store(false, Ordering::SeqCst);
+    }
+}
+pub(crate) fn background_slot() -> Option<BackgroundSlot> {
+    let slot = ENGINE_SLOT.try_lock().ok()?;
+    BACKGROUND_OWNS_SLOT.store(true, Ordering::SeqCst);
+    Some(BackgroundSlot { _slot: slot })
+}
+
+struct Foreground;
+impl Foreground {
+    fn request() -> Self {
+        FOREGROUND.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        FOREGROUND.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 pub(crate) struct EngineCandidate {
     pub(crate) uci: String,
@@ -32,6 +72,31 @@ pub(crate) fn stockfish(
     shortlist: &[&str],
     candidate_count: usize,
 ) -> Result<EngineResult, AppError> {
+    let _request = Foreground::request();
+    let started = Instant::now();
+    let _slot = loop {
+        match ENGINE_SLOT.try_lock() {
+            Ok(slot) => break slot,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(AppError::new(
+                    "engine_unavailable",
+                    "Engine slot unavailable.",
+                ));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if started.elapsed() >= Duration::from_secs(2) {
+            return Err(if BACKGROUND_OWNS_SLOT.load(Ordering::SeqCst) {
+                AppError::new(
+                    "background_engine_busy",
+                    "Background analysis is still releasing Stockfish.",
+                )
+            } else {
+                AppError::new("engine_busy", "Stockfish is working on another request.")
+            });
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let binary = [
         "/opt/homebrew/bin/stockfish",
         "/usr/local/bin/stockfish",
