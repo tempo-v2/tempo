@@ -132,6 +132,7 @@ fn analyze(
         &input.draft.fen,
         &input.draft.legal_moves,
         &shortlist,
+        3,
     );
     let recommendation = engine.as_ref().ok().and_then(|result| {
         let best = result

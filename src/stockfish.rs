@@ -30,6 +30,7 @@ pub(crate) fn stockfish(
     fen: &str,
     legal_moves: &[String],
     shortlist: &[&str],
+    candidate_count: usize,
 ) -> Result<EngineResult, AppError> {
     let binary = [
         "/opt/homebrew/bin/stockfish",
@@ -60,6 +61,7 @@ pub(crate) fn stockfish(
             binary,
             fen,
         ])
+        .arg(candidate_count.to_string())
         .args(shortlist)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -83,7 +85,7 @@ pub(crate) fn stockfish(
         .map(|move_result| move_result.uci.as_str())
         .collect();
     if reply.candidates.is_empty()
-        || reply.candidates.len() > 3
+        || reply.candidates.len() > candidate_count
         || reply.candidates.len() != unique.len()
         || reply
             .candidates

@@ -20,7 +20,7 @@ use tempo_chess::{
     legal_model_moves,
 };
 use tempo_store::{SqliteStore, Store};
-use tempo_types::DatasetId;
+use tempo_types::{DatasetId, Revision};
 mod repertoires;
 use repertoires::BookPositions;
 
@@ -36,6 +36,13 @@ enum Source {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReviewVersion {
+    revision: Revision,
+    document_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceRequest {
     request_id: String,
     fen: String,
@@ -47,6 +54,8 @@ pub struct EvidenceRequest {
     ratings: Ratings,
     #[serde(default)]
     pins: Vec<String>,
+    candidate_count: Option<usize>,
+    review_version: Option<ReviewVersion>,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +140,25 @@ impl PositionEvidence {
                 "Choose up to sixteen legal candidate moves.",
             ));
         }
+        if request
+            .candidate_count
+            .is_some_and(|count| request.source != Source::Stockfish || !(1..=5).contains(&count))
+        {
+            return Err(AppError::new(
+                "invalid_candidate_count",
+                "Choose one to five Stockfish lines.",
+            ));
+        }
+        if request.review_version.is_some()
+            && (request.source != Source::Repertoire
+                || request.repertoire_id.is_none()
+                || request.dataset_id.is_none())
+        {
+            return Err(AppError::new(
+                "invalid_review_scope",
+                "Choose a game review and its repertoire.",
+            ));
+        }
         let id = request.request_id.clone();
         let source = request.source;
         let reply = json!({"status":"running","fen":request.fen,"request_id":id,"source":source});
@@ -209,7 +237,13 @@ impl Services {
         match r.source {
             Source::Stockfish => {
                 let pins = r.pins.iter().map(String::as_str).collect::<Vec<_>>();
-                let result = stockfish(&self.directory, &r.fen, &job.legal, &pins)?;
+                let result = stockfish(
+                    &self.directory,
+                    &r.fen,
+                    &job.legal,
+                    &pins,
+                    r.candidate_count.unwrap_or(3),
+                )?;
                 let complete = result.comparison.is_some() || pins.is_empty();
                 Ok(
                     json!({"engine":result.engine,"comparison_complete":complete,"candidates":result.comparison.unwrap_or(result.candidates)}),
@@ -272,10 +306,11 @@ impl Services {
                         r.learner_color,
                     )?);
                 }
-                let data = books
-                    .as_ref()
-                    .expect("loaded book positions")
-                    .compare(&r.fen, &job.key)?;
+                let data = books.as_ref().expect("loaded book positions").compare(
+                    &r.fen,
+                    &job.key,
+                    r.review_version.as_ref(),
+                )?;
                 if store.model_content_marker()? != marker {
                     return Err(AppError::new(
                         "stale_repertoire",
@@ -320,6 +355,8 @@ mod tests {
                     learner_color: None,
                     ratings: Ratings::default(),
                     pins: vec![],
+                    candidate_count: None,
+                    review_version: None,
                 },
             }
         };

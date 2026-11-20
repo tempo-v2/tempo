@@ -1,4 +1,5 @@
 //! Revision-scoped authored moves and structural comparisons.
+use super::ReviewVersion;
 use crate::{AppError, app_error::domain, gap_recommendation::SimilarMoves};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -14,6 +15,8 @@ pub(super) struct BookPositions {
     pub(super) scope: (Option<String>, Option<LearnerColor>),
     catalog: BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>,
     names: BTreeMap<String, String>,
+    document_id: Option<String>,
+    selected_authored: Option<AuthoredRepertoire>,
 }
 impl BookPositions {
     pub(super) fn load(
@@ -23,9 +26,12 @@ impl BookPositions {
         learner_color: Option<LearnerColor>,
     ) -> Result<Self, AppError> {
         let mut color = learner_color;
+        let mut document_id = None;
+        let mut selected_authored = None;
         if let Some(id) = repertoire_id {
-            let item = store
-                .repertoire_document(id)?
+            let document = store.repertoire_document(id)?;
+            document_id = document.source_id;
+            let item = document
                 .item
                 .ok_or_else(|| AppError::new("unknown_repertoire", "Repertoire unavailable."))?;
             color = Some(
@@ -78,11 +84,7 @@ impl BookPositions {
             if let Some(pgn) = doc.pgn {
                 let authored =
                     AuthoredRepertoire::parse(&pgn).map_err(|e| domain("invalid_repertoire", e))?;
-                for (key, node) in authored
-                    .positions
-                    .into_iter()
-                    .filter(|(_, n)| n.side != side)
-                {
+                for (key, node) in authored.positions.iter().filter(|(_, n)| n.side != side) {
                     for mv in node.replies.keys() {
                         catalog
                             .entry(key.clone())
@@ -93,6 +95,9 @@ impl BookPositions {
                             });
                     }
                 }
+                if Some(repertoire.as_str()) == repertoire_id {
+                    selected_authored = Some(authored);
+                }
             }
         }
         Ok(Self {
@@ -100,10 +105,28 @@ impl BookPositions {
             scope: (repertoire_id.map(str::to_owned), learner_color),
             catalog,
             names,
+            document_id,
+            selected_authored,
         })
     }
-    pub(super) fn compare(&self, fen: &str, key: &PositionKey) -> Result<Value, AppError> {
+    pub(super) fn compare(
+        &self,
+        fen: &str,
+        key: &PositionKey,
+        expected: Option<&ReviewVersion>,
+    ) -> Result<Value, AppError> {
         let id = self.scope.0.as_deref().unwrap_or("");
+        if let Some(expected) = expected {
+            if expected.revision != self.marker.1
+                || self.document_id.as_ref() != Some(&expected.document_id)
+                || self.selected_authored.is_none()
+            {
+                return Err(AppError::new(
+                    "stale_repertoire",
+                    "The repertoire changed. Reload the game comparison.",
+                ));
+            }
+        }
         let nearby = nearby_repertoire_positions(fen, id, &self.catalog, 8)
             .map_err(|e| domain("invalid_position", e))?;
         let exact = self
@@ -113,9 +136,22 @@ impl BookPositions {
             .flatten()
             .map(|entry| json!({"uci":entry.answer.uci,"repertoire_id":entry.repertoire_id}))
             .collect::<Vec<_>>();
-        Ok(
-            json!({"exact":exact,"nearby":nearby,"similar_responses":SimilarMoves::rank(&nearby),
-            "repertoire_names":self.names,"content_revision":self.marker.1}),
-        )
+        let mut data = json!({"exact":exact,"nearby":nearby,"similar_responses":SimilarMoves::rank(&nearby),
+            "repertoire_names":self.names,"content_revision":self.marker.1});
+        if expected.is_some() {
+            data["dataset_id"] = json!(self.marker.0);
+            data["repertoire_id"] = json!(id);
+            data["document_id"] = json!(self.document_id);
+            // Game review compares the authored document at both learner and opponent positions.
+            let moves: Vec<_> = self
+                .selected_authored
+                .as_ref()
+                .and_then(|book| book.positions.get(key))
+                .into_iter()
+                .flat_map(|node| node.replies.keys())
+                .collect();
+            data["prepared_uci"] = json!(moves);
+        }
+        Ok(data)
     }
 }
