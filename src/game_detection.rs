@@ -70,13 +70,13 @@ impl DetectorRegistry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DetectionRequest {
-    schema_version: u8,
-    request_id: String,
+    pub(crate) schema_version: u8,
+    pub(crate) request_id: String,
     pub(crate) dataset_id: DatasetId,
     pub(crate) source: String,
     pub(crate) game_id: String,
     pub(crate) learner: String,
-    detector_id: String,
+    pub(crate) detector_id: String,
 }
 
 #[derive(Deserialize)]
@@ -87,9 +87,9 @@ pub(crate) struct DetectionRead {
     dataset_id: DatasetId,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum DetectionStatus {
+pub(crate) enum DetectionStatus {
     Running,
     Complete {
         learner_color: LearnerColor,
@@ -106,16 +106,26 @@ enum DetectionStatus {
     SourceUnavailable,
 }
 
-#[derive(Serialize)]
-struct DetectionFinding {
+#[derive(Clone, Serialize)]
+pub(crate) struct DetectionFinding {
     finding_id: String,
     #[serde(flatten)]
-    moment: ValidatedMoment,
+    pub(crate) moment: ValidatedMoment,
 }
 
 pub(crate) struct DetectionReply {
     pub(crate) status: u16,
     pub(crate) body: Value,
+}
+
+/// A typed, source-validated completion for an explicitly composed application
+/// consumer. Reading or previewing a detector result still has no side effects.
+pub(crate) struct DetectionCompletion {
+    pub(crate) position: Option<tempo_store::TacticalPositionRun>,
+    pub(crate) request: DetectionRequest,
+    pub(crate) source: AcceptedDetectionSource,
+    pub(crate) descriptor: DetectorDescriptor,
+    pub(crate) status: DetectionStatus,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -125,11 +135,15 @@ pub(crate) struct AcceptedDetectionSource {
 }
 
 struct Stop {
+    deeper: bool,
     deadline: Instant,
     cancelled: AtomicBool,
 }
 
 impl DetectionControl for Stop {
+    fn deeper_search(&self) -> bool {
+        self.deeper
+    }
     fn check(&self) -> Result<(), DetectionStop> {
         if self.cancelled.load(Ordering::Relaxed) {
             Err(DetectionStop::Cancelled)
@@ -142,6 +156,7 @@ impl DetectionControl for Stop {
 }
 
 struct Work {
+    position: Option<tempo_store::TacticalPositionRun>,
     request: DetectionRequest,
     source: Arc<AcceptedDetectionSource>,
     detector: RegisteredDetector,
@@ -150,6 +165,7 @@ struct Work {
 }
 
 struct Entry {
+    position: Option<tempo_store::TacticalPositionRun>,
     request: DetectionRequest,
     source: Arc<AcceptedDetectionSource>,
     descriptor: DetectorDescriptor,
@@ -166,7 +182,17 @@ impl Entry {
             "game_id": self.request.game_id,
             "detector": descriptor_json(&self.descriptor),
         });
-        let status = serde_json::to_value(&self.status).expect("serializable detection status");
+        let mut status = serde_json::to_value(&self.status).expect("serializable detection status");
+        // Wire 1 is a display-only preview, consumed by older strict clients.
+        // Typed training evidence is accepted through the application command
+        // and exposed by its separate versioned history read.
+        if let Some(findings) = status.get_mut("findings").and_then(Value::as_array_mut) {
+            for finding in findings {
+                if let Some(fields) = finding.as_object_mut() {
+                    fields.remove("tactical");
+                }
+            }
+        }
         body.as_object_mut()
             .unwrap()
             .extend(status.as_object().unwrap().clone());
@@ -203,6 +229,33 @@ pub(crate) struct GameDetection {
 }
 
 impl GameDetection {
+    pub(crate) fn descriptor(&self, id: &str) -> Option<DetectorDescriptor> {
+        self.registry
+            .0
+            .get(id)
+            .map(|entry| entry.descriptor.clone())
+    }
+
+    pub(crate) fn idle(&self) -> bool {
+        self.active.is_none()
+    }
+
+    pub(crate) fn completion(&mut self, app: &Tempo, id: &str) -> Option<DetectionCompletion> {
+        self.poll(app);
+        self.revalidate_retained(app, id);
+        let entry = self.lookup(id)?;
+        if matches!(entry.status, DetectionStatus::Running) {
+            return None;
+        }
+        Some(DetectionCompletion {
+            position: entry.position,
+            request: entry.request.clone(),
+            source: (*entry.source).clone(),
+            descriptor: entry.descriptor.clone(),
+            status: entry.status.clone(),
+        })
+    }
+
     pub(crate) fn new(
         registry: DetectorRegistry,
         options: AnalysisOptions,
@@ -211,10 +264,12 @@ impl GameDetection {
         std::thread::Builder::new()
             .name("tempo-game-detection".into())
             .spawn(move || {
+                let mut cached = None;
                 while let Ok(task) = incoming.recv() {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| detect(&task)))
-                            .unwrap_or(DetectionStatus::Failed);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        detect(&task, &mut cached)
+                    }))
+                    .unwrap_or(DetectionStatus::Failed);
                     let _ = task.reply.send(result);
                 }
             })?;
@@ -245,6 +300,23 @@ impl GameDetection {
     }
 
     pub(crate) fn start(&mut self, app: &Tempo, request: DetectionRequest) -> DetectionReply {
+        self.start_work(app, request, None)
+    }
+
+    pub(crate) fn cancel_background(&mut self) {
+        if let Some(active) = &self.active
+            && active.entry.position.is_some()
+        {
+            active.stop.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn start_work(
+        &mut self,
+        app: &Tempo,
+        request: DetectionRequest,
+        position: Option<tempo_store::TacticalPositionRun>,
+    ) -> DetectionReply {
         let error =
             |status, code| addressed_error(status, code, &request.request_id, &request.dataset_id);
         if request.schema_version != VERSION
@@ -297,11 +369,13 @@ impl GameDetection {
             return error(503, "unavailable");
         };
         let stop = Arc::new(Stop {
+            deeper: position.is_some_and(|run| run.deeper),
             deadline,
             cancelled: AtomicBool::new(false),
         });
         let (reply, result) = mpsc::sync_channel(1);
         let entry = Entry {
+            position,
             request: request.clone(),
             source: source.clone(),
             descriptor: detector.descriptor.clone(),
@@ -310,6 +384,7 @@ impl GameDetection {
         if self
             .work
             .try_send(Work {
+                position,
                 request,
                 source,
                 detector,
@@ -445,24 +520,39 @@ fn stopped(stop: DetectionStop) -> DetectionStatus {
     }
 }
 
-fn detect(task: &Work) -> DetectionStatus {
+type CachedDetection = (Arc<AcceptedDetectionSource>, GameDetectionInput, String);
+
+fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus {
     if let Err(stop) = task.stop.check() {
         return stopped(stop);
     }
-    let Ok(mut games) = parse_played_games(&task.source.pgn) else {
-        return DetectionStatus::SourceUnavailable;
-    };
-    if games.len() != 1 {
-        return DetectionStatus::SourceUnavailable;
+    if !cached
+        .as_ref()
+        .is_some_and(|(source, _, _)| **source == *task.source)
+    {
+        let Ok(mut games) = parse_played_games(&task.source.pgn) else {
+            return DetectionStatus::SourceUnavailable;
+        };
+        if games.len() != 1 {
+            return DetectionStatus::SourceUnavailable;
+        }
+        let Some(Ok(game)) = games.pop() else {
+            return DetectionStatus::SourceUnavailable;
+        };
+        let input = GameDetectionInput::new(game.timeline(), task.source.color);
+        let key = input.fingerprint();
+        *cached = Some((task.source.clone(), input, key));
     }
-    let Some(Ok(game)) = games.pop() else {
-        return DetectionStatus::SourceUnavailable;
-    };
-    let input = GameDetectionInput::new(game.timeline(), task.source.color);
+    let (_, input, input_key) = cached.as_ref().expect("cached source");
     if let Err(stop) = task.stop.check() {
         return stopped(stop);
     }
-    let outcome = task.detector.detector.detect(&input, task.stop.as_ref());
+    let detector = &task.detector.detector;
+    let outcome = if let Some(run) = task.position {
+        detector.detect_position(input, run.ply as usize, task.stop.as_ref())
+    } else {
+        detector.detect(input, task.stop.as_ref())
+    };
     if let Err(stop) = task.stop.check() {
         return stopped(stop);
     }
@@ -472,10 +562,9 @@ fn detect(task: &Work) -> DetectionStatus {
         DetectionOutcome::Stopped(stop) => return stopped(stop),
         DetectionOutcome::Failed(_) => return DetectionStatus::Failed,
     };
-    let Ok(moments) = validate_detected_moments(&input, claims) else {
+    let Ok(moments) = validate_detected_moments(input, claims) else {
         return DetectionStatus::InvalidResult;
     };
-    let input_key = input.fingerprint();
     let descriptor = &task.detector.descriptor;
     let analysis_key = digest(&json!([
         VERSION,
@@ -500,7 +589,7 @@ fn detect(task: &Work) -> DetectionStatus {
     DetectionStatus::Complete {
         learner_color: input.learner(),
         occurrence_count: input.timeline().occurrences().len(),
-        input_key,
+        input_key: input_key.clone(),
         analysis_key,
         findings,
     }

@@ -3,12 +3,41 @@ use crate::{AppError, app_error::domain};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::sync::{
+    Mutex, MutexGuard,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::{
     collections::BTreeSet,
     path::Path,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+static ENGINE_SLOT: Mutex<()> = Mutex::new(());
+static FOREGROUND: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn foreground_waiting() -> bool {
+    FOREGROUND.load(Ordering::SeqCst) != 0
+}
+
+pub(crate) fn background_slot() -> Option<MutexGuard<'static, ()>> {
+    ENGINE_SLOT.try_lock().ok()
+}
+
+struct Foreground;
+impl Foreground {
+    fn request() -> Self {
+        FOREGROUND.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        FOREGROUND.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 pub(crate) struct EngineCandidate {
     pub(crate) uci: String,
@@ -32,6 +61,10 @@ pub(crate) fn stockfish(
     shortlist: &[&str],
     candidate_count: usize,
 ) -> Result<EngineResult, AppError> {
+    let _request = Foreground::request();
+    let _slot = ENGINE_SLOT
+        .lock()
+        .map_err(|_| AppError::new("engine_unavailable", "Engine slot unavailable."))?;
     let binary = [
         "/opt/homebrew/bin/stockfish",
         "/usr/local/bin/stockfish",

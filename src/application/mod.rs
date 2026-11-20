@@ -40,6 +40,7 @@ pub use study_progress::{ProgressStamp, StudyProgress};
 mod tactic_capture;
 pub(crate) mod tactic_catalog_facts;
 mod tactic_preferences;
+pub(crate) mod tactical_analysis;
 mod tactics_collection;
 pub use tactics_collection::{TacticsRead, TacticsReadReply};
 
