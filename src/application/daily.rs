@@ -276,6 +276,7 @@ impl Tempo {
         let record = StoredAttempt {
             attempt: attempt.clone(),
             issued_at: at,
+            issued_revision: Some(snapshot.revision),
             issued_miss_revision: snapshot.learning[&item.target].miss_revision,
             mode,
             route: choice.route.clone(),
@@ -304,6 +305,7 @@ impl Tempo {
                 _ => None,
             },
             acceptance: None,
+            revealed_decision: None,
         };
         let scope = StudyScope {
             target: Some(&item.target),

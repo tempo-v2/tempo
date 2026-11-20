@@ -61,6 +61,7 @@ impl Tempo {
         let row = StoredAttempt {
             attempt: started.attempt,
             issued_at: at,
+            issued_revision: Some(snapshot.revision),
             issued_miss_revision: state.miss_revision,
             mode: tempo_store::ActivityMode::Test,
             route: None,
@@ -69,6 +70,7 @@ impl Tempo {
             relevance_reason: None,
             lesson: None,
             acceptance: None,
+            revealed_decision: None,
         };
         self.commit(
             &snapshot,

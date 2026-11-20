@@ -12,7 +12,7 @@ use tempo_learning::{AssessmentInput, AssessmentSource, DailyLearning};
 use tempo_queue::OrderEvent;
 use tempo_store::{
     AcceptanceKind, ActivityAcceptance, ActivityMode, AnswerResult, AssessmentKey,
-    AssessmentRecord, Receipt, ReceiptResult, StoredAttempt, StudyScope, Write,
+    AssessmentRecord, Receipt, ReceiptResult, RevealedDecision, StoredAttempt, StudyScope, Write,
 };
 use tempo_study::AttemptStatus;
 use tempo_types::Grade;
@@ -130,9 +130,17 @@ impl Tempo {
         } else {
             old.acceptance.clone()
         };
+        // Incorrect feedback authorizes the issued response at this cursor.
+        // Concession also yields that transition before its inline reply is suppressed.
+        let revealed_decision = (!progress.feedback.correct)
+            .then_some(RevealedDecision {
+                decision_index: old.attempt.state.decision_index,
+            })
+            .or(old.revealed_decision);
         let updated = StoredAttempt {
             attempt: progress.attempt.clone(),
             acceptance,
+            revealed_decision,
             ..old.clone()
         };
         let mut writes = vec![Write::Progress(updated)];

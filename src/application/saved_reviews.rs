@@ -3,7 +3,7 @@ use super::{Tempo, study_analysis_context::analysis_disclosure};
 use crate::{AppError, app_error::domain};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tempo_store::{ReviewCommandKey, ReviewPosition, ReviewWrite};
+use tempo_store::{AcceptanceKind, ReviewCommandKey, ReviewPosition, ReviewWrite};
 use tempo_study::AttemptStatus;
 use tempo_types::{AttemptId, ContentVersion, DatasetId};
 
@@ -149,17 +149,36 @@ impl Tempo {
             .saved_review_context(dataset, id)?
             .ok_or_else(|| AppError::new("unknown_review", "This saved mark is unavailable."))?;
         let source = &context.source;
+        let legacy_acceptance = source.issued_revision.is_none()
+            && source
+                .acceptance
+                .as_ref()
+                .is_some_and(|acceptance| match acceptance.kind {
+                    AcceptanceKind::WrongMove { decision_index, .. }
+                    | AcceptanceKind::Revealed { decision_index } => {
+                        decision_index == context.decision_index
+                    }
+                    _ => false,
+                });
+        let exact_reveal = source
+            .revealed_decision
+            .is_some_and(|proof| proof.decision_index == context.decision_index)
+            || context.legacy_source_feedback
+            || legacy_acceptance;
         let source_disclosed = source.mode.guided()
             || source.attempt.status == AttemptStatus::Complete
             || (source.attempt.status == AttemptStatus::Abandoned
                 && analysis_disclosure(source).is_ok()
-                && (context.decision_index < source.attempt.state.decision_index
-                    || context.source_revealed_decision));
+                && (context.decision_index < source.attempt.state.decision_index || exact_reveal));
+        let later_disclosed = context.later_completed
+            || context
+                .later_abandoned_reveal
+                .is_some_and(|proof| proof.decision_index >= context.decision_index);
         if context
             .active
             .as_ref()
             .is_some_and(|active| !active.mode.guided())
-            || !(source_disclosed || context.later_completed)
+            || !(source_disclosed || later_disclosed)
         {
             return Ok(json!({"status": "study_required", "id": id}));
         }
