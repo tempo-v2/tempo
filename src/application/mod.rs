@@ -23,6 +23,7 @@ mod receipts;
 mod repertoires;
 mod study_game_context;
 mod study_analysis_context;
+pub use study_analysis_context::StudyAnalysisLine;
 
 mod restore;
 mod resume;

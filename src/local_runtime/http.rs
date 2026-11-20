@@ -207,6 +207,7 @@ fn respond(
             | "/api/study/relevance"
             | "/api/study/game-context"
             | "/api/study/analysis-context"
+            | "/api/study/analysis-line"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
             (&Method::Post, "/api/analysis/evidence") => (
@@ -274,6 +275,13 @@ fn respond(
                 200,
                 command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
                     app.study_analysis_context(&intent.dataset_id, &intent.attempt_id, intent.revision, intent.content_version)
+                }),
+            ),
+            (&Method::Post, "/api/study/analysis-line") => (
+                200,
+                command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                    app.study_analysis_line(&intent.dataset_id, &intent.attempt_id, intent.revision, intent.content_version)
+                        .map(|line| serde_json::json!(line))
                 }),
             ),
             (&Method::Post, "/api/study/game-context") => (
