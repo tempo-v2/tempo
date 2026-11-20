@@ -218,6 +218,7 @@ impl PhoneStudy {
             Method::Post => matches!(
                 request.url(),
                 "/api/study"
+                    | "/api/study/presence"
                     | "/api/study-progress"
                     | "/api/study/relevance"
                     | "/api/study/game-context"
@@ -316,10 +317,12 @@ fn respond(
     // display only, independent of submission identity and saved receipts.
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     let opponent_context = header(&request, "X-Tempo-Study-Opponent-Moves") == Some("1");
-    if request.method() == &Method::Post && request.url() == "/api/study" {
-        games.tactics.study_activity(&mut games.detection);
-    }
-    if request.method() == &Method::Post && request.url() == "/api/games/tactics/command" {
+    if request.method() == &Method::Post && request.url() == "/api/study/presence" {
+        let result = command(&mut request, 1024)
+            .and_then(|report| games.tactics.study_presence(report, &mut games.detection));
+        let status = if result.is_ok() { 204 } else { 400 };
+        request.respond(Response::empty(StatusCode(status)))?;
+    } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/command" {
         let result =
             command::<crate::tactical_jobs::TacticalCommand>(&mut request, MAX_COMMAND_BYTES)
                 .and_then(|intent| {
@@ -343,8 +346,9 @@ fn respond(
         )?;
     } else if request.url() == "/api/games/tactics" {
         let (status, value) = if request.method() == &Method::Post {
+            let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
             match command::<crate::tactical_jobs::TacticalRead>(&mut request, MAX_COMMAND_BYTES)
-                .and_then(|read| games.tactics.read(app, profile_store, read))
+                .and_then(|read| games.tactics.read(app, profile_store, read, wait_reason))
             {
                 Ok(value) => (200, value),
                 Err(error) => (
@@ -621,7 +625,12 @@ fn respond(
         ))?;
     } else if request.method() == &Method::Post && request.url() == "/api/study" {
         let reply = command::<StudyCommand>(&mut request, MAX_COMMAND_BYTES)
-            .map(|intent| app.handle(intent))
+            .map(|intent| {
+                if !matches!(intent, StudyCommand::StudyStatus) {
+                    games.tactics.study_activity(&mut games.detection);
+                }
+                app.handle(intent)
+            })
             .unwrap_or_else(Into::into);
         let reply = if move_details {
             reply

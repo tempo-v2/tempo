@@ -96,12 +96,22 @@ test("phone Study retains its shared commands and denies desktop routes after in
   assert.equal((await send(host, "/api/games")).status, 200);
 
   const before = databaseRows(database);
+  const presence = { tab: "7a791296-6215-4d60-ae7c-58bab00ce975", sequence: 1, state: "active" };
+  assert.deepEqual(await send(host, "/api/study/presence", {
+    method: "POST", headers: phoneHeaders, payload: presence,
+  }), { status: 204, body: "" });
+  assert.equal((await send(host, "/api/study/presence", {
+    method: "POST", headers: phoneHeaders, payload: { ...presence, sequence: 0 },
+  })).status, 400);
+  assert.equal((await send(host, "/api/study/presence", {
+    method: "POST", headers: { ...phoneHeaders, Origin: "https://another.ts.net:8443" }, payload: presence,
+  })).status, 403);
   for (const [route, method] of [
     ["/api/games/detectors", "GET"], ["/api/games/detection", "POST"],
     ["/api/games/detection-result", "POST"], ["/api/games/library", "POST"],
     ["/api/games/review", "POST"], ["/api/games/import", "POST"],
     ["/api/repertoires", "POST"], ["/api/study/analysis-context", "POST"],
-    ["/api/study", "PUT"], ["/api/study", "GET"],
+    ["/api/study", "PUT"], ["/api/study", "GET"], ["/api/study/presence", "GET"],
   ]) assert.equal((await send(host, route, { method, headers: phoneHeaders, payload: {} })).status, 404, route);
   for (const changes of [
     { Host: "another.ts.net:8443" }, { "X-Forwarded-Host": "another.ts.net:8443" },

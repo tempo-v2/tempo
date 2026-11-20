@@ -141,6 +141,7 @@ fn read(app: &Tempo, jobs: &TacticalJobs, store: &tempo_store::SqliteStore) -> V
             dataset_id: app.game_dataset().unwrap(),
             before: None,
         },
+        false,
     )
     .unwrap()
 }
