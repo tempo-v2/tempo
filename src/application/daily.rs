@@ -16,11 +16,12 @@ use tempo_chess::ContentItem;
 use tempo_learning::{DailyAction, ImmediateRecallMode};
 use tempo_queue::{
     DailyActivity, DailyAdmissions, DailyCandidate, DailyChoice, DailyContext, DailyEvidence,
-    DailyKind, DailySelection, DailySelectionInput, DailySession, ImmediateRecall, Line,
-    RelevanceReason, TargetRelevance,
+    DailyKind, DailyOrderingEffect, DailySelection, DailySelectionInput, DailySession,
+    ImmediateRecall, Line, RelevanceReason, TargetRelevance,
 };
 use tempo_store::{
-    ActivityMode, AnswerResult, Commit, Store, StoredAttempt, StudyScope, StudyState, Write,
+    ActivityMode, AnswerResult, Commit, Store, StoredAttempt, StudyOrderingWrite, StudyScope,
+    StudyState, Write,
 };
 use tempo_study::{Exercise, start_selected_exercise};
 use tempo_types::{DatasetId, StudyTime};
@@ -345,19 +346,21 @@ impl Tempo {
             Write::Issue(record),
             Write::Active(Some(attempt.id.clone())),
         ];
-        if let Some(request_id) = choice.immediate_request {
-            self.store.commit_immediate_recall(
-                Commit {
-                    expected_revision: snapshot.revision,
-                    expected_dataset: snapshot.dataset.clone(),
-                    writes,
-                },
-                scope,
-                request_id,
-            )?;
-        } else {
-            self.commit_study(snapshot, writes, scope)?;
-        }
+        let ordering = match choice.ordering {
+            DailyOrderingEffect::Preserve => StudyOrderingWrite::Preserve,
+            DailyOrderingEffect::OweRegularReview => StudyOrderingWrite::OweRegularReview,
+            DailyOrderingEffect::SatisfyRegularReview => StudyOrderingWrite::SatisfyRegularReview,
+        };
+        self.store.commit_daily_issuance(
+            Commit {
+                expected_revision: snapshot.revision,
+                expected_dataset: snapshot.dataset.clone(),
+                writes,
+            },
+            scope,
+            choice.immediate_request,
+            ordering,
+        )?;
         self.daily
             .as_mut()
             .expect("daily release")
