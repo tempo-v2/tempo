@@ -208,6 +208,9 @@ impl Tempo {
                 "The repertoire changed. Open the gap again.",
             ));
         }
+        if snapshot.suspended_repertoires.contains(&repertoire_id) {
+            return Err(super::repertoires::suspended_repertoire());
+        }
         let mut catalog = BTreeMap::<PositionKey, Vec<SavedRepertoireResponse>>::new();
         let mut repertoire_names = BTreeMap::new();
         for item in snapshot.catalog.items.values().filter(|item| item.active()) {

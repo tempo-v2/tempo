@@ -19,15 +19,15 @@ use tempo_learning::{
 };
 use tempo_store::{
     AcceptedGameChoice, AcceptedGames, AssessmentRecord, ChoiceAttribution, Commit, ComparedGame,
-    ComparedRelevance, EncounterRepair, GameChoice, GameChoiceTarget, GameChoices, GameEncounters,
-    GameFailureKey, GameObservation, GameReceipt, GameRecord, GameSummary, PgnTiming,
-    RepertoireDisagreement, StoreError, Write,
+    ComparedRelevance, EncounterRepair, GameChoice, GameChoiceTarget, GameChoices,
+    GameComparisonBasis, GameEncounters, GameFailureKey, GameHistoryEntry, GameObservation,
+    GameReceipt, GameRecord, GameSummary, PgnTiming, RepertoireDisagreement, StoreError, Write,
 };
-use tempo_types::{DatasetId, Grade, Revision, TargetId};
+use tempo_types::{DatasetId, Grade, TargetId};
 
 pub(super) struct GameBooks {
     dataset: DatasetId,
-    revision: Revision,
+    basis: GameComparisonBasis,
     catalog: Catalog,
     colors: BTreeMap<String, LearnerColor>,
     white: BTreeMap<String, AuthoredRepertoire>,
@@ -43,6 +43,38 @@ pub struct EncounterRepairReport {
 }
 
 impl GameBooks {
+    fn choice_scope_changed(&self, entry: &GameHistoryEntry) -> bool {
+        let summary = &entry.summary;
+        if summary.choices.is_empty() {
+            return false;
+        }
+        // Earlier comparisons can lack the complete compared repertoire set.
+        // An unavailable recorded candidate still makes those choices stale.
+        let unavailable = summary.choices.iter().any(|choice| {
+            choice
+                .candidates
+                .iter()
+                .any(|candidate| !self.colors.contains_key(&candidate.repertoire_id))
+        });
+        if unavailable || summary.repertoires.is_empty() {
+            return unavailable;
+        }
+        let Some(side) = player_side(&entry.white, &entry.black, &summary.learner) else {
+            return true;
+        };
+        let recorded: BTreeSet<_> = summary
+            .repertoires
+            .iter()
+            .map(|book| &book.repertoire_id)
+            .collect();
+        let current: BTreeSet<_> = self
+            .colors
+            .iter()
+            .filter_map(|(id, color)| (*color == side).then_some(id))
+            .collect();
+        recorded != current
+    }
+
     pub(super) fn document_for_gap(&self, gap: &tempo_chess::OpponentGap) -> Option<&str> {
         let book = self
             .white
@@ -66,17 +98,35 @@ impl Tempo {
         Ok(self.store.study_state(Default::default())?.dataset)
     }
 
-    pub fn game_history(&self) -> Result<Value, AppError> {
+    pub fn game_history(&mut self) -> Result<Value, AppError> {
         let history = self.store.game_history()?;
+        let books = if history
+            .results
+            .iter()
+            .any(|entry| !entry.summary.choices.is_empty())
+        {
+            Some(self.current_game_books(&history.dataset)?)
+        } else {
+            None
+        };
         let results: Vec<_> = history
             .results
             .into_iter()
             .map(|entry| {
+                let scope_changed = books
+                    .as_ref()
+                    .is_some_and(|books| books.choice_scope_changed(&entry));
                 let mut result = json!(GameResult {
                     comparison_id: Some(entry.comparison_id),
-                    effect: entry.summary.correction_effect.unwrap_or(GameReviewEffect::RecordedOnly),
+                    effect: entry
+                        .summary
+                        .correction_effect
+                        .unwrap_or(GameReviewEffect::RecordedOnly),
                     summary: entry.summary,
                 });
+                if scope_changed {
+                    result["correction_choice_status"] = json!("compare_again");
+                }
                 result["players"] = json!({
                     "white":entry.white, "black":entry.black, "played_date_ms":entry.played_date_ms
                 });
@@ -457,8 +507,8 @@ impl Tempo {
         let mut report = EncounterRepairReport::default();
         let mut cursor = None;
         let mut snapshot = self.store.content_state()?;
-        let mut revision = snapshot.content_revision;
-        let mut books = self.comparison_books(&snapshot, revision)?;
+        let mut basis = snapshot.game_comparison_basis();
+        let mut books = self.comparison_books(&snapshot)?;
         let mut retries = 0;
         loop {
             let keys = self
@@ -503,7 +553,7 @@ impl Tempo {
             }
             match self
                 .store
-                .repair_choice_encounters(&snapshot.dataset, revision, &repairs)
+                .repair_choice_encounters(&snapshot.dataset, basis, &repairs)
             {
                 Ok(changed) => {
                     report.examined += keys.len();
@@ -514,15 +564,15 @@ impl Tempo {
                 }
                 Err(StoreError::Conflict(_)) if retries < 3 => {
                     let current = self.store.content_state()?;
-                    let new_revision = current.content_revision;
+                    let new_basis = current.game_comparison_basis();
                     if current.dataset != snapshot.dataset {
                         return Err(invalid(
                             "The dataset changed during encounter reconciliation.",
                         ));
                     }
                     snapshot = current;
-                    revision = new_revision;
-                    books = self.comparison_books(&snapshot, revision)?;
+                    basis = new_basis;
+                    books = self.comparison_books(&snapshot)?;
                     retries += 1;
                 }
                 Err(error) => return Err(error.into()),
@@ -547,11 +597,11 @@ impl Tempo {
             return Err(invalid("Choose the learner with their exact player name."));
         }
         let snapshot = self.store.content_state()?;
-        let revision = snapshot.content_revision;
+        let basis = snapshot.game_comparison_basis();
         if expected_dataset != &snapshot.dataset {
             return Err(invalid("The dataset changed during refresh."));
         }
-        let books = self.comparison_books(&snapshot, revision)?;
+        let books = self.comparison_books(&snapshot)?;
         let mut resets = BTreeMap::new();
         let mut reset_generations = BTreeMap::new();
         for repertoire in books.colors.keys() {
@@ -604,7 +654,7 @@ impl Tempo {
                     .game_choices(&snapshot.dataset, &game.source, &game.id)?;
             let mut relevance = ComparedRelevance {
                 prior_choices,
-                content_revision: revision,
+                basis,
                 ..ComparedRelevance::default()
             };
             let mut repertoires = Vec::new();
@@ -941,38 +991,37 @@ impl Tempo {
         &mut self,
         dataset: &DatasetId,
     ) -> Result<Arc<GameBooks>, AppError> {
-        let revision = self
+        let basis = self
             .store
-            .game_content_revision(dataset)?
+            .game_comparison_basis(dataset)?
             .ok_or_else(|| invalid("The active dataset changed."))?;
         if let Some(cached) = &self.game_books
             && &cached.dataset == dataset
-            && cached.revision == revision
+            && cached.basis == basis
         {
             return Ok(Arc::clone(cached));
         }
         let snapshot = self.store.content_state()?;
-        let revision = snapshot.content_revision;
         if &snapshot.dataset != dataset {
             return Err(invalid("The active dataset changed."));
         }
-        self.comparison_books(&snapshot, revision)
+        self.comparison_books(&snapshot)
     }
 
     fn comparison_books(
         &mut self,
         snapshot: &tempo_store::ContentState,
-        revision: Revision,
     ) -> Result<Arc<GameBooks>, AppError> {
+        let basis = snapshot.game_comparison_basis();
         if let Some(cached) = &self.game_books
             && cached.dataset == snapshot.dataset
-            && cached.revision == revision
+            && cached.basis == basis
         {
             return Ok(Arc::clone(cached));
         }
         let mut books = GameBooks {
             dataset: snapshot.dataset.clone(),
-            revision,
+            basis,
             catalog: Catalog::default(),
             colors: BTreeMap::new(),
             white: BTreeMap::new(),
@@ -994,7 +1043,7 @@ impl Tempo {
                 continue;
             }
             let doc = self.store.repertoire_document(repertoire)?;
-            if doc.dataset != snapshot.dataset || doc.revision != revision {
+            if doc.dataset != snapshot.dataset || doc.revision != basis.content || doc.suspended {
                 return Err(invalid("A repertoire changed during refresh."));
             }
             let color = item
@@ -1083,17 +1132,17 @@ fn encounter_projection(decisions: &[PlayedDecision], choices: &GameChoices) -> 
         let DecisionAdherence::Miss { candidates } = &decision.adherence else {
             continue;
         };
-        let attributed = match candidates.as_slice() {
-            [only] => Some(only),
-            _ => choices
-                .get(&decision.position.0)
-                .and_then(Option::as_ref)
-                .and_then(|selection| {
-                    candidates.iter().find(|candidate| {
-                        candidate.target == selection.target
-                            && candidate.version == selection.answer_version
-                    })
-                }),
+        let attributed = match choices.get(&decision.position.0) {
+            Some(choice) => choice.as_ref().and_then(|selection| {
+                candidates.iter().find(|candidate| {
+                    candidate.target == selection.target
+                        && candidate.version == selection.answer_version
+                })
+            }),
+            None => match candidates.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            },
         };
         if let Some(attributed) = attributed {
             encounters.insert(attributed.target.clone(), (attributed.version, true));
@@ -1103,9 +1152,13 @@ fn encounter_projection(decisions: &[PlayedDecision], choices: &GameChoices) -> 
 }
 
 pub(super) fn learner_side(game: &GameRecord, learner: &str) -> Option<LearnerColor> {
+    player_side(&game.white, &game.black, learner)
+}
+
+fn player_side(white: &str, black: &str, learner: &str) -> Option<LearnerColor> {
     match (
-        game.white.to_lowercase() == learner,
-        game.black.to_lowercase() == learner,
+        white.to_lowercase() == learner,
+        black.to_lowercase() == learner,
     ) {
         (true, false) => Some(LearnerColor::White),
         (false, true) => Some(LearnerColor::Black),

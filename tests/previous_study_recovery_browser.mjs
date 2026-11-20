@@ -70,7 +70,7 @@ function count(snapshot, table) {
 function assertReplayPreservedRows(after, before) {
   const oldTables = new Set(before.map(([name]) => name));
   for (const [name, rows] of after.filter(([name]) => !oldTables.has(name))) {
-    assert.equal(name, "repertoire_suspensions");
+    assert.ok(["repertoire_suspensions", "game_participation_revisions"].includes(name));
     assert.deepEqual(rows, []);
   }
   assert.deepEqual(after.filter(([name]) => oldTables.has(name)), before);

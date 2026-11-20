@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     AppError,
-    app_error::domain,
+    app_error::{domain, study_input},
     commands::{RepertoireCommand, RepertoireInput},
     game_model::model_input_stamp,
     views::ErrorView,
@@ -22,8 +22,8 @@ use tempo_chess::{
 };
 use tempo_learning::{DailyLearning, LearningState};
 use tempo_store::{
-    ContentReceipt, ContentSource, ContentState, RepertoireActivity, RepertoireActivityResult,
-    RepertoireReset, Write, model_targets,
+    ContentReceipt, ContentSource, ContentState, RepertoireActivity, RepertoireActivityCommand,
+    RepertoireActivityRead, RepertoireActivityResult, RepertoireReset, Write, model_targets,
 };
 use tempo_types::{DatasetId, Revision};
 
@@ -330,10 +330,26 @@ impl Tempo {
                 "A repertoire activity command identity is required.",
             ));
         }
-        match self
-            .store
-            .set_repertoire_activity(dataset, repertoire, command_id, activity)?
-        {
+        let command = RepertoireActivityCommand {
+            dataset,
+            repertoire,
+            command_id,
+            activity,
+        };
+        let result = match self.store.repertoire_activity(&command)? {
+            RepertoireActivityRead::Settled(result) => result,
+            RepertoireActivityRead::Pending { revision, active } => {
+                let abandoned = active
+                    .as_deref()
+                    .filter(|_| activity == RepertoireActivity::Suspended)
+                    .map(|attempt| tempo_study::abandon(attempt, attempt.revision))
+                    .transpose()
+                    .map_err(study_input)?;
+                self.store
+                    .set_repertoire_activity(&command, revision, abandoned)?
+            }
+        };
+        match result {
             RepertoireActivityResult::Applied => {}
             RepertoireActivityResult::StaleDataset => {
                 return Err(super::content_preview::stale_dataset());

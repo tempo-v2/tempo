@@ -3084,3 +3084,146 @@ fn repertoire_suspension_excludes_game_checks_and_retains_prior_gap_evidence() {
         london
     );
 }
+
+#[test]
+fn repertoire_suspension_leaves_another_books_signed_edit_valid() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("suspend-open-draft.sqlite");
+    let mut app = open(
+        &db,
+        Arc::new(AtomicI32::new(20_000)),
+        IntroductionLimits::default(),
+        0,
+    );
+    let (_, created) = preview_and_save(&mut app, SHORT, "Italian", None);
+    let italian = created["repertoires"][0]["id"].as_str().unwrap();
+    let (_, books) = preview_and_save(&mut app, "1. d4 d5 2. Bf4 *", "London", None);
+    let london = books["repertoires"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "London")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let document = content(
+        &mut app,
+        json!({
+            "command":"read_document", "dataset_id":"opening-proof", "repertoire_id":italian,
+        }),
+    );
+    let mut input = book_request(
+        "edit_preview",
+        "1. e4 e5 2. Bc4 Nc6 3. Nf3 *",
+        "Italian",
+        Some(italian),
+    );
+    input["base_revision"] = document["revision"].clone();
+    let before = content(&mut app, input.clone());
+    assert_eq!(before["status"], "preview", "{before}");
+
+    assert_eq!(
+        content(
+            &mut app,
+            activity_change(london, "suspend-neighbor", "suspended")
+        )["status"],
+        "activity_set"
+    );
+    assert_eq!(content(&mut app, input.clone()), before);
+    input.as_object_mut().unwrap().remove("base_revision");
+    input["command"] = json!("save");
+    input["token"] = before["token"].clone();
+    let saved = content(&mut app, input);
+    assert_eq!(saved["status"], "repertoires", "{saved}");
+}
+
+#[test]
+fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("suspend-chosen-book.sqlite");
+    let mut app = open(
+        &db,
+        Arc::new(AtomicI32::new(20_000)),
+        IntroductionLimits::default(),
+        0,
+    );
+    let (_, created) = preview_and_save(&mut app, SHORT, "Italian", None);
+    let italian = created["repertoires"][0]["id"].as_str().unwrap();
+    let (_, books) = preview_and_save(&mut app, "1. d4 d5 2. Bf4 *", "London", None);
+    let london = books["repertoires"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "London")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let played = "1. c4 e5";
+    let report = date_only_import(&mut app, "compare-overlap", "2024.10.01", played);
+    let result = &report["results"][0];
+    let choice = &result["choices"][0];
+    let candidates = choice["candidates"].as_array().unwrap();
+    let target = |book: &str| {
+        let id = candidates
+            .iter()
+            .find(|candidate| candidate["repertoire_id"] == book)
+            .unwrap()["target_id"]
+            .as_str()
+            .unwrap();
+        TargetId::from(id)
+    };
+    let italian_target = target(italian);
+    let london_target = target(london);
+    assert_eq!(candidates.len(), 2, "{choice}");
+
+    let suspend = activity_change(london, "suspend-unresolved", "suspended");
+    assert_eq!(content(&mut app, suspend)["status"], "activity_set");
+    let history = app.game_history().unwrap();
+    assert_eq!(
+        history["results"][0]["correction_choice_status"],
+        "compare_again"
+    );
+    assert_eq!(
+        history["results"][0]["choices"][0]["candidates"]
+            .as_array()
+            .unwrap(),
+        candidates
+    );
+    let resume = activity_change(london, "resume-unresolved", "active");
+    assert_eq!(content(&mut app, resume)["status"], "activity_set");
+    assert!(app.game_history().unwrap()["results"][0]["correction_choice_status"].is_null());
+
+    app.choose_game_correction(serde_json::from_value(json!({
+        "command_id":"choose-london", "dataset_id":"opening-proof", "learner":"learner",
+        "source":result["source"], "game_id":result["game_id"], "comparison_id":result["comparison_id"],
+        "ply":choice["ply"], "target_id":london_target,
+    })).unwrap()).unwrap();
+    let store = SqliteStore::open(&db).unwrap();
+    let misses = || {
+        let facts = store
+            .game_relevance(&"opening-proof".into(), tempo_store::REACH_MODEL_KEY)
+            .unwrap();
+        (facts[&italian_target].misses, facts[&london_target].misses)
+    };
+    assert_eq!(misses(), (0, 1));
+    let before = app.snapshot().unwrap();
+    assert_eq!(
+        content(
+            &mut app,
+            activity_change(london, "suspend-chosen", "suspended")
+        )["status"],
+        "activity_set"
+    );
+    assert_eq!(app.reconcile_choice_encounters().unwrap().repaired, 0);
+    assert_eq!(misses(), (0, 1));
+    date_only_import(&mut app, "reprocess-suspended", "2024.10.01", played);
+    assert_eq!(misses(), (0, 1));
+    assert_eq!(
+        content(&mut app, activity_change(london, "resume-chosen", "active"))["status"],
+        "activity_set"
+    );
+    assert_eq!(misses(), (0, 1));
+    let after = app.snapshot().unwrap();
+    assert_eq!(after.assessments, before.assessments);
+    assert_eq!(after.learning, before.learning);
+}
