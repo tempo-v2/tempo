@@ -6,24 +6,33 @@ the concept you need. A file contains its purpose, usage guidance, implementatio
 and a `#[cfg(test)] mod tests` example where the concept has its own public behavior.
 The longer cross-component journeys stay in [tests/contracts.rs](tests/contracts.rs).
 
-## Run local tactics
+## Run the local release
 
-The [local tactics guide](TACTICS.md) covers building the React page, importing
-existing Tempo puzzles into a fresh SQLite practice dataset, and launching the
-loopback host. Browser session logic lives in the separate tempo-ui checkout and uses the
-version 3 Study views.
+Use the [Mac development and service guide](OPENING.md) and the compatible
+component pins in the Planning release ledger. Normal `tempo serve` composes
+`DailyComponents` with SQLite, the Study clock and the built Tempo UI. The
+browser consumes Study wire 5 and signed content wire 4.
+
+The detector registry starts empty. For a disposable external-detector
+consumer, build `game_detection_contract_host` and pass the temporary database,
+built UI path, loopback port and scenario. The example calls the same
+[public host entry](src/local_runtime.rs) as production. The
+[HTTP proof](tests/game_detection_http.mjs) checks the addressed game, distinct
+outcomes and stable durable state. The companion browser proof lives in Tempo UI.
 
 ## Choose the entry point
 
 | When you need to… | Reach for | Source and nearby example |
 | --- | --- | --- |
-| Assemble policies and adapters | `Components`, then `Tempo::new` | [components.rs](src/components.rs) replaces only the queue; [application/mod.rs](src/application/mod.rs) owns private application state and constructor checks. |
+| Assemble production Daily Study | `DailyComponents` and `Tempo::daily` | [daily.rs](src/application/daily.rs) uses Learning availability, DailySession and Study issuance. |
+| Assemble the standalone fixture | `Components` and `Tempo::new` | [components.rs](src/components.rs) supplies fixture queue, parser and comparator ports. |
 | Begin study, or continue the active attempt | `Tempo::next_exercise` | [next_exercise.rs](src/application/next_exercise.rs) demonstrates that another Next resumes without issuing a competing attempt. |
 | Reload persisted progress | `Tempo::resume` | [resume.rs](src/application/resume.rs) demonstrates a read with no new assessment or write. |
 | Answer the displayed learner decision | `SubmitCommand` → `Tempo::submit` | [submit_command.rs](src/commands/submit_command.rs) constructs a retryable action; [submit.rs](src/application/submit.rs) shows progress, learning, assessment and receipt saved together. |
 | Stop an attempt | `AbandonCommand` → `Tempo::abandon` | [abandon_command.rs](src/commands/abandon_command.rs) supplies revision/identity without an answer; [abandon.rs](src/application/abandon.rs) clears the active pointer. |
 | Report a standard-profile external miss | `AgainCommand` → `Tempo::again` | [again_command.rs](src/commands/again_command.rs) rejects analysis against the wrong definition; [again.rs](src/application/again.rs) updates learning without fabricating a human attempt. |
-| Update repertoire or tactics content | `Tempo::import_pgn` or `Tempo::apply_catalog` | [import_pgn.rs](src/application/import_pgn.rs) applies both through one atomic content-change operation. |
+| Update production repertoire or tactics content | Signed Preview and Save or the validated tactic transfer | [repertoires.rs](src/application/repertoires.rs) and [tactic_capture.rs](src/application/tactic_capture.rs) preserve content and Learning fences. |
+| Read a detector's observations for a stored game | Games detection discovery, start and result routes | [game_detection.rs](src/game_detection.rs) owns bounded ephemeral delivery. Chess checks legal occurrences and reports. |
 | Process fixture-profile games | `Tempo::ingest_games` | [ingest_games.rs](src/application/ingest_games.rs) demonstrates replay-aware ingestion. The count includes processed deviations that were already committed. |
 | Transfer content and learning to an empty dataset | `Tempo::export`, `Tempo::restore` | [export.rs](src/application/export.rs) shows a read-only export; [restore.rs](src/application/restore.rs) restores under a new dataset identity. |
 | Dispatch one decoded UI intent | `wire::StudyCommand` → `Tempo::handle` | [study_command.rs](src/commands/study_command.rs) decodes the versioned envelope; [handle.rs](src/application/handle.rs) returns typed replies even on application failure. |

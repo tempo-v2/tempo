@@ -3,6 +3,8 @@ mod http;
 mod import;
 mod tactic_settings;
 
+use crate::game_detection::{AnalysisOptions, DetectorRegistry, GameDetection};
+use crate::{AttemptIds, Clock, DailyComponents, IntroductionLimits, TacticThemes, Tempo};
 use chrono::{DateTime, NaiveDate};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -12,13 +14,8 @@ use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tempo::{AttemptIds, Clock, Components, IntroductionLimits, TacticThemes, Tempo};
-use tempo_chess::{
-    Catalog, ChessError, ContentParser, Deviation, GameComparator, ImportRequest,
-    LegalSequenceGrader,
-};
+use tempo_chess::{Catalog, LegalSequenceGrader};
 use tempo_learning::DailyLearning;
-use tempo_queue::StableQueue;
 use tempo_store::SqliteStore;
 use tempo_types::{AttemptId, DatasetId, StudyDay, StudyTime};
 
@@ -106,6 +103,23 @@ pub fn backfill_personal_tactics(path: &Path, apply: bool) -> LocalResult<()> {
 }
 
 pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
+    serve_with_detectors(
+        database,
+        ui,
+        port,
+        DetectorRegistry::default(),
+        AnalysisOptions::default(),
+    )
+}
+
+/// Serve the real daily app with an explicitly composed detector registry.
+pub fn serve_with_detectors(
+    database: &Path,
+    ui: &Path,
+    port: u16,
+    detectors: DetectorRegistry,
+    analysis_options: AnalysisOptions,
+) -> LocalResult<()> {
     if fs::canonicalize(database)?.starts_with(fs::canonicalize(ui)?) {
         return Err("place the study database outside the public UI build".into());
     }
@@ -117,7 +131,14 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
         "Choice encounters examined={}, repaired={}, unresolved={}",
         encounters.examined, encounters.repaired, encounters.unresolved
     );
-    http::serve(&mut app, &SqliteStore::open(database)?, database, ui, port)
+    http::serve(
+        &mut app,
+        &SqliteStore::open(database)?,
+        database,
+        ui,
+        port,
+        GameDetection::new(detectors, analysis_options)?,
+    )
 }
 
 fn stored_profile(store: &SqliteStore) -> LocalResult<String> {
@@ -126,7 +147,7 @@ fn stored_profile(store: &SqliteStore) -> LocalResult<String> {
         .ok_or_else(|| "this database has no Tempo V2 study profile".into())
 }
 
-fn open(path: &Path) -> LocalResult<Tempo> {
+pub(crate) fn open(path: &Path) -> LocalResult<Tempo> {
     let store = SqliteStore::open(path)?;
     if let Some(choices) = store.choice_migration_report() {
         eprintln!(
@@ -152,40 +173,16 @@ fn random_id() -> LocalResult<String> {
     Ok(format!("{:032x}", u128::from_be_bytes(bytes)))
 }
 
-fn components(timezone: Tz) -> LocalResult<Components> {
-    Ok(Components {
-        queue: Box::new(StableQueue),
+fn components(timezone: Tz) -> LocalResult<DailyComponents> {
+    Ok(DailyComponents {
         learning: Box::new(DailyLearning::default()),
         grader: Box::new(LegalSequenceGrader),
-        parser: Box::new(NoGenericImport),
-        comparator: Box::new(NoGameComparison),
         clock: Box::new(LocalClock(timezone)),
         ids: Box::new(LocalIds {
             run: random_id()?,
             sequence: 0,
         }),
     })
-}
-
-/// Daily PGN enters through the signed content commands.
-struct NoGenericImport;
-
-impl ContentParser for NoGenericImport {
-    fn parse(&self, _: &ImportRequest) -> Result<Catalog, ChessError> {
-        Err(ChessError::InvalidContent(
-            "Generic PGN import is unavailable in the daily runtime.".into(),
-        ))
-    }
-}
-
-struct NoGameComparison;
-
-impl GameComparator for NoGameComparison {
-    fn compare(&self, _: &str, _: &Catalog) -> Result<Vec<Deviation>, ChessError> {
-        Err(ChessError::InvalidContent(
-            "Game comparison is unavailable in this release.".into(),
-        ))
-    }
 }
 
 struct LocalClock(Tz);

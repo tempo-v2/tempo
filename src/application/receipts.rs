@@ -1,10 +1,10 @@
 //! Replay immutable results before applying current-state checks to new work.
 use crate::AppError;
-use tempo_store::{AnswerResult, ReceiptResult, Snapshot};
+use tempo_store::{AnswerResult, ReceiptResult, StudyState};
 use tempo_types::SubmissionId;
 
 pub(super) fn replay(
-    snapshot: &Snapshot,
+    snapshot: &StudyState,
     id: &SubmissionId,
     command: &str,
 ) -> Result<Option<ReceiptResult>, AppError> {

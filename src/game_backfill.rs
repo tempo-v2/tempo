@@ -590,7 +590,7 @@ fn invalid(message: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Components, FixedClock, IntroductionLimits};
+    use crate::{DailyComponents, FixedClock, IntroductionLimits};
     use serde_json::{from_value, json};
     use tempo_chess::{Catalog, LegalSequenceGrader};
     use tempo_learning::{DailyLearning, LearningPolicy};
@@ -621,13 +621,13 @@ mod tests {
     }
 
     fn dataset_boundary_app(path: &std::path::Path) -> Tempo {
-        let components = Components {
+        let components = DailyComponents {
             clock: Box::new(FixedClock(StudyTime {
                 day: StudyDay(20_000),
                 unix_ms: 20_000 * DAY,
             })),
             learning: Box::new(DailyLearning::default()),
-            ..Components::fixtures()
+            ..DailyComponents::fixtures()
         };
         let store = SqliteStore::create(
             path,
@@ -810,13 +810,13 @@ mod tests {
         let open_app = |store| {
             Tempo::daily(
                 Box::new(store),
-                Components {
+                DailyComponents {
                     clock: Box::new(FixedClock(StudyTime {
                         day: StudyDay(20_000),
                         unix_ms: now,
                     })),
                     learning: Box::new(DailyLearning::default()),
-                    ..Components::fixtures()
+                    ..DailyComponents::fixtures()
                 },
                 IntroductionLimits::default(),
                 [42; 32],
@@ -938,14 +938,14 @@ mod tests {
         .unwrap();
         let mut app = Tempo::daily(
             Box::new(store),
-            Components {
+            DailyComponents {
                 clock: Box::new(FixedClock(StudyTime {
                     day: StudyDay(day as i32),
                     unix_ms: now,
                 })),
                 grader: Box::new(LegalSequenceGrader),
                 learning: Box::new(learning),
-                ..Components::fixtures()
+                ..DailyComponents::fixtures()
             },
             IntroductionLimits::default(),
             [42; 32],

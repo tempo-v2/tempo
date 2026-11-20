@@ -11,8 +11,13 @@ mod current_attempt;
 mod daily;
 mod export;
 mod game_backfill;
+mod game_detection;
 mod game_evidence;
+mod game_library;
+pub use game_library::GameLibraryRead;
 mod game_model;
+mod game_review;
+pub use game_review::{GameReviewLine, GameReviewRead};
 mod handle;
 mod import_pgn;
 mod ingest_games;
@@ -21,8 +26,8 @@ mod optional_tactics;
 mod queue_source;
 mod receipts;
 mod repertoires;
-mod study_game_context;
 mod study_analysis_context;
+mod study_game_context;
 
 mod restore;
 mod resume;
@@ -30,7 +35,7 @@ mod study_progress;
 mod submit;
 pub use study_progress::{ProgressStamp, StudyProgress};
 mod tactic_capture;
-mod tactic_catalog_facts;
+pub(crate) mod tactic_catalog_facts;
 mod tactic_preferences;
 mod tactics_collection;
 pub use tactics_collection::{TacticsRead, TacticsReadReply};
@@ -40,9 +45,11 @@ mod teach;
 pub use daily::IntroductionLimits;
 pub use tactic_preferences::{TacticThemes, tactic_themes};
 
-use crate::{AppError, Components, app_error::domain};
+use crate::{
+    AppError, Components, DailyComponents, app_error::domain, components::FixtureOperations,
+};
 use tempo_queue::OrderEvent;
-use tempo_store::{Commit, MemoryStore, Snapshot, Store, StudyScope, Write};
+use tempo_store::{Commit, MemoryStore, Snapshot, Store, StudyScope, StudyState, Write};
 use tempo_types::TargetId;
 
 /// Coordinate domain decisions and commit the resulting operation atomically.
@@ -62,7 +69,8 @@ use tempo_types::TargetId;
 /// ```
 pub struct Tempo {
     store: Box<dyn Store>,
-    components: Components,
+    components: DailyComponents,
+    fixture: Option<FixtureOperations>,
     remaining_block: Vec<TargetId>,
     order_history: Vec<OrderEvent>,
     daily: Option<daily::DailyStudy>,
@@ -71,6 +79,15 @@ pub struct Tempo {
 impl Tempo {
     /// Assemble the application after checking stored policy and learning compatibility.
     pub fn new(store: Box<dyn Store>, components: Components) -> Result<Self, AppError> {
+        let (common, fixture) = components.split();
+        Self::assemble(store, common, Some(fixture))
+    }
+
+    fn assemble(
+        store: Box<dyn Store>,
+        components: DailyComponents,
+        fixture: Option<FixtureOperations>,
+    ) -> Result<Self, AppError> {
         let snapshot = store.study_state(StudyScope {
             catalog: true,
             ..StudyScope::default()
@@ -81,7 +98,8 @@ impl Tempo {
                 "stored learning policy differs from selected implementation",
             ));
         }
-        for state in snapshot.learning.values() {
+        let (_, learning) = snapshot.complete_catalog()?;
+        for state in learning.values() {
             components
                 .learning
                 .validate_state(state)
@@ -90,6 +108,7 @@ impl Tempo {
         Ok(Self {
             store,
             components,
+            fixture,
             remaining_block: vec![],
             order_history: vec![],
             daily: None,
@@ -113,7 +132,7 @@ impl Tempo {
     }
     fn commit_study(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &StudyState,
         writes: Vec<Write>,
         scope: StudyScope<'_>,
     ) -> Result<(), AppError> {
@@ -128,10 +147,15 @@ impl Tempo {
         Ok(())
     }
 
-    fn commit(&mut self, snapshot: &Snapshot, writes: Vec<Write>) -> Result<(), AppError> {
+    fn commit(
+        &mut self,
+        dataset: &tempo_types::DatasetId,
+        revision: tempo_types::Revision,
+        writes: Vec<Write>,
+    ) -> Result<(), AppError> {
         self.store.commit(Commit {
-            expected_revision: snapshot.revision,
-            expected_dataset: snapshot.dataset.clone(),
+            expected_revision: revision,
+            expected_dataset: dataset.clone(),
             writes,
         })?;
         Ok(())

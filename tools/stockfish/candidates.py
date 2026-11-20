@@ -48,12 +48,12 @@ if not board.is_valid():
 
 with chess.engine.SimpleEngine.popen_uci(sys.argv[1], timeout=3) as engine:
     engine.configure({"Threads": 1, "Hash": 16})
-    lines = engine.analyse(board, chess.engine.Limit(time=0.4, nodes=40_000), multipv=3)
+    lines = engine.analyse(board, chess.engine.Limit(time=0.4, nodes=40_000), multipv=min(int(sys.argv[3]), board.legal_moves.count()))
     candidates = [project(board, line) for line in lines]
     comparison = None
-    if sys.argv[3:]:
+    if sys.argv[4:]:
         roots = list(dict.fromkeys(
-            [line["pv"][0] for line in lines] + [board.parse_uci(uci) for uci in sys.argv[3:]]
+            [line["pv"][0] for line in lines] + [board.parse_uci(uci) for uci in sys.argv[4:]]
         ))
         try:
             comparison = compare(engine, board, roots)
