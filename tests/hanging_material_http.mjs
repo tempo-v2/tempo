@@ -201,9 +201,13 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     assert.notEqual(scanResponsiveness, null, "must measure Study while analysis is running");
     assert.equal(history.statistics.observations, 5);
     assert.deepEqual(history.statistics.outcomes, {
-      declined_inferior_capture: 1, good_alternative: 1, missed_good_capture: 1,
-      took_good_capture: 1, took_inferior_capture: 1,
+      missed_good_capture: 1, took_good_capture: 1, winning_mate: 3,
     });
+    for (const row of history.observations.filter(row => row.outcome === "winning_mate")) {
+      assert.deepEqual(row.details.skipped_analyses, ["hanging-material"]);
+      assert.deepEqual(row.details.assessment.candidates, []);
+      assert.equal(row.details.assessment.standalone_analysis, null);
+    }
     const missed = history.observations.find(row => row.outcome === "missed_good_capture");
     assert.equal(missed.ply, 0);
     assert.equal(missed.details.assessment.puzzle.answer.uci, "d4e5");
@@ -220,6 +224,7 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
         ...(process.env.TEMPO_CHROMIUM ? { executablePath: process.env.TEMPO_CHROMIUM } : {}) });
       const page = await browser.newPage({ viewport: { width: 1440, height: 1080 } });
       await page.goto(host.url + "#games");
+      await page.getByText("Game analysis", { exact: true }).click();
       const panel = page.getByRole("region", { name: "Hanging-piece history" });
       await panel.getByText("5 games checked", { exact: false }).waitFor();
       await panel.getByRole("button").filter({ hasText: "Missed capture" }).click();
