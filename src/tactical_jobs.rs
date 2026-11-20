@@ -32,6 +32,7 @@ pub(crate) enum TacticalCommand {
         dataset_id: DatasetId,
         source: String,
         game_id: String,
+        learner: String,
     },
     Pause {
         dataset_id: DatasetId,
@@ -161,7 +162,7 @@ impl TacticalJobs {
             return Ok(());
         }
         let descriptor = self.descriptor.as_ref().expect("configured detector");
-        let version = analysis_version(descriptor);
+        let version = analysis_version(&[descriptor.identity()]);
         let continuing = store.next_position_analysis(&dataset, &version, self.continuing)?;
         let task = if continuing
             .as_ref()
@@ -191,7 +192,7 @@ impl TacticalJobs {
                     &dataset,
                     &game,
                     &version,
-                    &[descriptor.id.clone()],
+                    &[descriptor.identity()],
                     &plies,
                 )?;
             }
@@ -240,7 +241,8 @@ impl TacticalJobs {
                 dataset_id,
                 source,
                 game_id,
-            } => store.queue_game_analysis(&dataset_id, &source, &game_id)?,
+                learner,
+            } => store.queue_game_analysis(&dataset_id, &source, &game_id, &learner)?,
             TacticalCommand::Pause { dataset_id } => {
                 store.set_analysis_paused(&dataset_id, true)?;
                 detection.cancel_background();
@@ -280,12 +282,14 @@ impl TacticalJobs {
         } else {
             "ready"
         });
-        reply["games"] =
-            json!(store.recent_analysis_games(&read.dataset_id, &analysis_version(descriptor))?);
+        reply["games"] = json!(store.recent_analysis_games(
+            &read.dataset_id,
+            &analysis_version(&[descriptor.identity()])
+        )?);
         reply["paused"] = json!(store.analysis_paused(&read.dataset_id)?);
         reply["waiting_for_idle"] = json!(!self.idle());
         reply["detector"] = json!(descriptor);
-        reply["analysis_version"] = json!(analysis_version(descriptor));
+        reply["analysis_version"] = json!(analysis_version(&[descriptor.identity()]));
         reply["last_error"] = json!(self.last_error);
         reply["active_game"] = json!(self.active.as_ref().map(|(task, _)| json!({
             "source":task.game.game.source,"game_id":task.game.game.id,"learner":task.game.learner

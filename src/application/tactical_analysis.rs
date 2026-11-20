@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempo_chess::{
-    DetectorDescriptor, TacticalAssessment, TacticalOutcome, parse_played_games,
+    DetectorDescriptor, DetectorIdentity, TacticalAssessment, TacticalOutcome, parse_played_games,
     plan_tactical_puzzle,
 };
 use tempo_learning::DailyLearning;
@@ -32,13 +32,10 @@ pub(crate) struct TacticalDetails {
     pub(crate) skipped_analyses: Vec<String>,
 }
 
-pub(crate) fn analysis_version(descriptor: &DetectorDescriptor) -> String {
-    let input = json!([
-        "tactical-acceptance-v1-single-answer",
-        descriptor.id,
-        descriptor.revision,
-        descriptor.configuration_fingerprint
-    ]);
+pub(crate) fn analysis_version(analyses: &[DetectorIdentity]) -> String {
+    let mut members = analyses.to_vec();
+    members.sort();
+    let input = json!(["tactical-acceptance-v2-position-set", members]);
     blake3::hash(input.to_string().as_bytes())
         .to_hex()
         .to_string()
@@ -108,7 +105,7 @@ impl Tempo {
             game_id: game.game.id.clone(),
             learner: game.learner.clone(),
             detector: completion.descriptor.id.clone(),
-            analysis_version: analysis_version(&completion.descriptor),
+            analysis_version: analysis_version(&completion.analyses),
             game_fingerprint: game.game.mainline_signature.clone(),
             analyzed_at_ms: self.components.clock.now().unix_ms,
             decisions_scanned: 0,
@@ -180,11 +177,13 @@ impl Tempo {
                         .try_into()
                         .map_err(|_| AppError::new("invalid_game", "Game is too long."))?;
                 }
+                let mut inconclusive = false;
                 for finding in findings {
                     let moment = &finding.moment;
                     let Some(assessment) = &moment.tactical else {
                         continue;
                     };
+                    inconclusive |= assessment.outcome == TacticalOutcome::Uncertain;
                     let train = if assessment.outcome == TacticalOutcome::MissedGoodCapture {
                         let puzzle = assessment.puzzle.as_ref().ok_or_else(|| {
                             AppError::new(
@@ -233,12 +232,17 @@ impl Tempo {
                         assessment: assessment.clone(),
                         opponent_lead_in: moment.opponent_lead_in.clone(),
                         skipped_analyses: if assessment.outcome == TacticalOutcome::WinningMate {
-                            vec![completion.descriptor.id.clone()]
+                            completion
+                                .analyses
+                                .iter()
+                                .map(|member| member.id.clone())
+                                .collect()
                         } else {
                             Vec::new()
                         },
                     };
                     observations.push(TacticalObservation {
+                        producer: Some(finding.producer.clone()),
                         ply: moment
                             .occurrence
                             .try_into()
@@ -258,7 +262,14 @@ impl Tempo {
                         train,
                     });
                 }
-                (TacticalAnalysisStatus::Complete, None)
+                (
+                    if inconclusive {
+                        TacticalAnalysisStatus::Inconclusive
+                    } else {
+                        TacticalAnalysisStatus::Complete
+                    },
+                    None,
+                )
             }
             DetectionStatus::TimedOut => (
                 TacticalAnalysisStatus::TimedOut,
@@ -300,7 +311,7 @@ impl Tempo {
             game_id: game.game.id.clone(),
             learner: game.learner.clone(),
             detector: completion.descriptor.id.clone(),
-            analysis_version: analysis_version(&completion.descriptor),
+            analysis_version: analysis_version(&completion.analyses),
             game_fingerprint: game.game.mainline_signature.clone(),
             analyzed_at_ms: at.unix_ms,
             decisions_scanned,
@@ -336,7 +347,7 @@ impl Tempo {
                 "Reload the current game archive.",
             ));
         }
-        let version = analysis_version(descriptor);
+        let version = analysis_version(&[descriptor.identity()]);
         let statistics = self
             .store
             .tactical_statistics(dataset, &descriptor.id, &version)?;
