@@ -130,7 +130,6 @@ pub(crate) struct DetectionCompletion {
     pub(crate) position: Option<tempo_store::TacticalPositionRun>,
     pub(crate) request: DetectionRequest,
     pub(crate) source: AcceptedDetectionSource,
-    pub(crate) descriptor: DetectorDescriptor,
     pub(crate) status: DetectionStatus,
 }
 
@@ -269,7 +268,6 @@ impl GameDetection {
             position: entry.position,
             request: entry.request.clone(),
             source: (*entry.source).clone(),
-            descriptor: entry.descriptor.clone(),
             status: entry.status.clone(),
         })
     }

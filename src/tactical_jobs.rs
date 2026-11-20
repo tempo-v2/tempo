@@ -265,7 +265,9 @@ impl TacticalJobs {
             TacticalCommand::Resume { dataset_id } => {
                 store.set_analysis_paused(&dataset_id, false)?
             }
-            TacticalCommand::Retry { dataset_id } => store.retry_position_analysis(&dataset_id)?,
+            TacticalCommand::Retry { dataset_id } => {
+                store.retry_position_analysis(&dataset_id, &self.version)?
+            }
         }
         self.next_check = Instant::now();
         Ok(json!({"accepted":true}))
@@ -289,8 +291,7 @@ impl TacticalJobs {
                 "message":"Hanging-material analysis needs the configured Stockfish and Python chess environment."}),
             );
         };
-        let mut reply =
-            app.tactical_history(&read.dataset_id, descriptor, &self.version, read.before)?;
+        let mut reply = app.tactical_history(&read.dataset_id, &self.version, read.before)?;
         reply["schema_version"] = json!(1);
         reply["dataset_id"] = json!(read.dataset_id);
         reply["status"] = json!(if self.active.is_some() || self.ready.is_some() {

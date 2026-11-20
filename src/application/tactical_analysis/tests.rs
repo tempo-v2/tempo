@@ -7,6 +7,7 @@ use crate::{
     tactical_jobs::{TacticalJobs, TacticalRead},
 };
 use std::time::{Duration, Instant};
+use tempo_chess::DetectorDescriptor;
 use tempo_chess::{
     DetectionControl, EvaluationFailure, EvaluationProvenance, EvaluationScore,
     HangingMaterialConfig, HangingMaterialDetector, RootEvaluation, RootScore, ScoreBound,
@@ -823,4 +824,75 @@ fn independent_mate_finding_needs_no_hanging_capture_and_skips_only_later_member
         serde_json::json!(["z-unvisited"])
     );
     assert!(finding["puzzle"].is_null());
+}
+
+#[test]
+fn adding_an_earlier_detector_preserves_the_fulfilled_occurrence() {
+    use tempo_chess::{DetectionOutcome, GameDetectionInput, GameDetector, PositionPass};
+    struct EmptyCheck;
+    impl GameDetector for EmptyCheck {
+        fn descriptor(&self) -> DetectorDescriptor {
+            DetectorDescriptor {
+                id: "earlier-analysis".into(),
+                revision: "1".into(),
+                label: "Earlier analysis".into(),
+                configuration_fingerprint: "fixture".into(),
+            }
+        }
+        fn produces_tactical_assessments(&self) -> bool {
+            true
+        }
+        fn detect(&self, _: &GameDetectionInput, _: &dyn DetectionControl) -> DetectionOutcome {
+            DetectionOutcome::Unsupported
+        }
+        fn detect_position(
+            &self,
+            _: &PositionPass<'_>,
+            _: &dyn DetectionControl,
+        ) -> DetectionOutcome {
+            DetectionOutcome::Complete(vec![])
+        }
+    }
+
+    let (directory, mut app) = disposable();
+    let (mut detection, mut jobs) = host("1", "miss");
+    import(&mut app, "Stable finding", "1. Kg2 Kg7");
+    let initial = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    let issued = app.next_exercise().unwrap().unwrap();
+    answer(&mut app, &issued, "a1a7", "settle-before-set-change");
+    let original = app.snapshot().unwrap();
+    drop(jobs);
+    drop(detection);
+
+    let mut registry = DetectorRegistry::default();
+    registry.register(EmptyCheck).unwrap();
+    registry
+        .register(
+            HangingMaterialDetector::new(
+                Evaluator {
+                    revision: "1",
+                    outcome: "miss",
+                },
+                HangingMaterialConfig::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut detection = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+    let mut jobs = TacticalJobs::new(&detection, &["earlier-analysis", "hanging-material"]);
+    let revised = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    assert_ne!(revised["analysis_version"], initial["analysis_version"]);
+    assert_eq!(
+        revised["observations"][0]["id"],
+        initial["observations"][0]["id"]
+    );
+    assert_eq!(
+        revised["observations"][0]["request_id"],
+        initial["observations"][0]["request_id"]
+    );
+    assert_eq!(revised["observations"][0]["fulfilled"], true);
+    assert_eq!(revised["statistics"]["pending_requests"], 0);
+    let after = app.snapshot().unwrap();
+    assert_eq!(after.learning, original.learning);
+    assert_eq!(after.assessments, original.assessments);
 }

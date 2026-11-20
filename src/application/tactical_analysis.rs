@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempo_chess::{
-    DetectorDescriptor, DetectorIdentity, TacticalAssessment, TacticalOutcome, parse_played_games,
-    plan_tactical_puzzle,
+    DetectorIdentity, TacticalAssessment, TacticalOutcome, parse_played_games, plan_tactical_puzzle,
 };
 use tempo_learning::DailyLearning;
 use tempo_store::{
@@ -18,6 +17,9 @@ use tempo_store::{
     TacticalObservation, TacticalPuzzleRef, Write,
 };
 use tempo_types::DatasetId;
+
+// A report groups game tactics across upgrades and changes in its detector set.
+const GAME_TACTICS_REPORT: &str = "game-tactics";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct TacticalDetails {
@@ -104,7 +106,7 @@ impl Tempo {
             source: game.game.source.clone(),
             game_id: game.game.id.clone(),
             learner: game.learner.clone(),
-            detector: completion.descriptor.id.clone(),
+            report: GAME_TACTICS_REPORT.into(),
             analysis_version: analysis_version(&completion.analyses),
             game_fingerprint: game.game.mainline_signature.clone(),
             analyzed_at_ms: self.components.clock.now().unix_ms,
@@ -309,7 +311,7 @@ impl Tempo {
             source: game.game.source.clone(),
             game_id: game.game.id.clone(),
             learner: game.learner.clone(),
-            detector: completion.descriptor.id.clone(),
+            report: GAME_TACTICS_REPORT.into(),
             analysis_version: analysis_version(&completion.analyses),
             game_fingerprint: game.game.mainline_signature.clone(),
             analyzed_at_ms: at.unix_ms,
@@ -337,7 +339,6 @@ impl Tempo {
     pub(crate) fn tactical_history(
         &self,
         dataset: &DatasetId,
-        descriptor: &DetectorDescriptor,
         version: &str,
         before: Option<u64>,
     ) -> Result<Value, AppError> {
@@ -349,10 +350,10 @@ impl Tempo {
         }
         let statistics = self
             .store
-            .tactical_statistics(dataset, &descriptor.id, version)?;
+            .tactical_statistics(dataset, GAME_TACTICS_REPORT, version)?;
         let page =
             self.store
-                .tactical_observations(dataset, &descriptor.id, version, before, 30)?;
+                .tactical_observations(dataset, GAME_TACTICS_REPORT, version, before, 30)?;
         let mut observations = Vec::new();
         for stored in page.observations {
             let details: TacticalDetails = serde_json::from_str(&stored.observation.details_json)
