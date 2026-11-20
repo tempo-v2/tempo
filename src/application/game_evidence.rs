@@ -1282,8 +1282,20 @@ fn uploaded_record(game: &PlayedGame, fetched_ms: u64) -> Result<GameRecord, Str
         .into_iter()
         .filter_map(|key| tag(key).map(|value| format!("[{key} \"{value}\"]\n")))
         .collect::<String>();
+    let mut report_tags = String::new();
+    if let Some(clock) = tag("TimeControl").and_then(tempo_chess::GameTimeControl::from_tag) {
+        report_tags.push_str(&format!(
+            "[TimeControl \"{}+{}\"]\n",
+            clock.seconds, clock.increment
+        ));
+    }
+    for key in ["WhiteElo", "BlackElo"] {
+        if let Some(rating) = tag(key).and_then(|value| value.parse::<u32>().ok()) {
+            report_tags.push_str(&format!("[{key} \"{rating}\"]\n"));
+        }
+    }
     let pgn = format!(
-        "[White {}]\n[Black {}]\n[Result {}]\n{setup}{date_tag}{opening_tags}\n{}\n",
+        "[White {}]\n[Black {}]\n[Result {}]\n{setup}{date_tag}{opening_tags}{report_tags}\n{}\n",
         json!(white),
         json!(black),
         json!(game.result),

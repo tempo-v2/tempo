@@ -43,8 +43,12 @@ pub(super) fn serve(
     };
     println!("Tempo study at {}", surfaces.origin);
     let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
-    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &["hanging-material"]);
+    let detector = detection
+        .complete_decision_detector()
+        .unwrap_or("hanging-material");
+    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
     let mut games = Games {
+        tactics_report: TacticalReportWorker::start(database)?,
         refresh: GameJobs::start()?,
         detection,
         tactics,
@@ -95,7 +99,83 @@ pub(super) fn serve(
     }
 }
 
+struct TacticalReportWork {
+    request: Request,
+    read: crate::personal_tactics_report::ReportRequest,
+    version: String,
+}
+
+/// Keep archive aggregation out of the serialized foreground Study owner.
+struct TacticalReportWorker(std::sync::mpsc::SyncSender<TacticalReportWork>);
+
+impl TacticalReportWorker {
+    fn start(database: &Path) -> LocalResult<Self> {
+        let store = SqliteStore::open(database)?;
+        let (sender, work) = std::sync::mpsc::sync_channel::<TacticalReportWork>(1);
+        std::thread::Builder::new()
+            .name("tempo-tactics-report".into())
+            .spawn(move || {
+                while let Ok(task) = work.recv() {
+                    let result =
+                        crate::personal_tactics_report::read(&store, &task.version, task.read);
+                    if let Err(error) = report_response(task.request, result) {
+                        eprintln!("Tempo tactical report: {error}");
+                    }
+                }
+            })?;
+        Ok(Self(sender))
+    }
+
+    fn submit(&self, mut request: Request, version: &str) -> LocalResult<()> {
+        let read = match command(&mut request, MAX_COMMAND_BYTES) {
+            Ok(read) => read,
+            Err(error) => return report_response(request, Err(error)),
+        };
+        let task = TacticalReportWork {
+            request,
+            read,
+            version: version.to_owned(),
+        };
+        match self.0.try_send(task) {
+            Ok(()) => Ok(()),
+            Err(
+                std::sync::mpsc::TrySendError::Full(task)
+                | std::sync::mpsc::TrySendError::Disconnected(task),
+            ) => report_response(
+                task.request,
+                Err(AppError::new(
+                    "report_busy",
+                    "The tactics report is busy. Try again.",
+                )),
+            ),
+        }
+    }
+}
+
+fn report_response(request: Request, result: Result<Value, AppError>) -> LocalResult<()> {
+    let (status, value) = match result {
+        Ok(value) => (200, value),
+        Err(error) if error.code == "report_busy" => (
+            503,
+            serde_json::json!({"code":error.code,"message":error.message}),
+        ),
+        Err(error) => (
+            400,
+            serde_json::json!({"code":error.code,"message":error.message}),
+        ),
+    };
+    request.respond(
+        body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&value)?,
+        )
+        .with_status_code(StatusCode(status)),
+    )?;
+    Ok(())
+}
+
 struct Games {
+    tactics_report: TacticalReportWorker,
     refresh: GameJobs,
     detection: GameDetection,
     tactics: crate::tactical_jobs::TacticalJobs,
@@ -344,13 +424,56 @@ fn respond(
             )
             .with_status_code(StatusCode(status)),
         )?;
+    } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/position" {
+        let result = command::<crate::personal_tactics_report::PositionRequest>(
+            &mut request,
+            MAX_COMMAND_BYTES,
+        )
+        .and_then(|read| {
+            crate::personal_tactics_report::read_position(
+                profile_store,
+                games.tactics.report_version(),
+                read,
+            )
+        });
+        let (status, value) = match result {
+            Ok(value) => (200, value),
+            Err(error) => (
+                400,
+                serde_json::json!({"code":error.code,"message":error.message}),
+            ),
+        };
+        request.respond(
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&value)?,
+            )
+            .with_status_code(StatusCode(status)),
+        )?;
+    } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/report" {
+        games
+            .tactics_report
+            .submit(request, games.tactics.report_version())?;
     } else if request.url() == "/api/games/tactics" {
         let (status, value) = if request.method() == &Method::Post {
             let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
+            let report_discovery = header(&request, "X-Tempo-Tactics-Report") == Some("2");
             match command::<crate::tactical_jobs::TacticalRead>(&mut request, MAX_COMMAND_BYTES)
                 .and_then(|read| games.tactics.read(app, profile_store, read, wait_reason))
             {
-                Ok(value) => (200, value),
+                Ok(mut value) => {
+                    if !report_discovery && games.tactics.has_personal_report() {
+                        value = serde_json::json!({"schema_version": 1, "dataset_id": value["dataset_id"],
+                            "status": "unavailable", "message": "Reload Tempo to view personal tactical analysis."});
+                    }
+                    if report_discovery
+                        && games.tactics.has_personal_report()
+                        && value["status"] != "unavailable"
+                    {
+                        value["report_schema"] = serde_json::json!(2);
+                    }
+                    (200, value)
+                }
                 Err(error) => (
                     400,
                     serde_json::json!({"schema_version":1,"status":"error","code":error.code,"message":error.message}),

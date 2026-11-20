@@ -101,12 +101,9 @@ impl Tempo {
                     .as_ref()
                     .and_then(|id| state.attempts.get(id))
                     .is_some_and(|record| record.attempt.target == target);
-                let board = project_position(
-                    &item.definition,
-                    &tempo_chess::ChessState { decision_index: 0 },
-                    false,
-                )
-                .map_err(|error| domain("invalid_content", error))?;
+                let board =
+                    project_position(&item.definition, &tempo_chess::ChessState::at(0), false)
+                        .map_err(|error| domain("invalid_content", error))?;
                 let solution = (show_solution && !blocked)
                     .then(|| revealed_line(&item.definition, item.definition.decisions.len()))
                     .transpose()

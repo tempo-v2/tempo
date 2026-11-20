@@ -13,7 +13,7 @@ use tempo_chess::{
     HangingMaterialConfig, HangingMaterialDetector, RootEvaluation, RootScore, ScoreBound,
     TacticRecord, TacticalEvaluationRequest, TacticalEvaluator, compile_tactics,
 };
-use tempo_store::ActivityMode;
+use tempo_store::{ActivityMode, Store};
 
 const HANGING: &str = "7k/n7/8/8/8/8/8/R5K1 w - - 0 1";
 
@@ -47,14 +47,12 @@ impl TacticalEvaluator for Evaluator {
                 .map(|uci| RootScore {
                     uci: uci.clone(),
                     bound: ScoreBound::Exact,
-                    score: EvaluationScore::Centipawns(if uci == "a1a7" {
-                        if self.outcome == "inferior" {
-                            -1000
-                        } else {
-                            1000
-                        }
-                    } else {
-                        0
+                    score: EvaluationScore::Centipawns(match (self.outcome, uci.as_str()) {
+                        ("different", "d4e5") => 1000,
+                        ("different", _) => 0,
+                        ("inferior", "a1a7") => -1000,
+                        (_, "a1a7") => 1000,
+                        _ => 0,
                     }),
                 })
                 .collect(),
@@ -776,6 +774,7 @@ fn independent_mate_finding_needs_no_hanging_capture_and_skips_only_later_member
                 accepted_moves: vec![ChessAnswer::from("f7f8")],
                 puzzle: None,
                 equivalence_cp: 0,
+                personal: None,
             };
             DetectionOutcome::Complete(vec![DetectedMoment {
                 occurrence: position.occurrence().offset(),
@@ -810,6 +809,33 @@ fn independent_mate_finding_needs_no_hanging_capture_and_skips_only_later_member
     );
     let fen = "7k/5Q2/6K1/8/8/8/8/8 w - - 0 1";
     assert!(tempo_chess::hanging_captures(fen).unwrap().is_empty());
+    let played =
+        tempo_chess::parse_played_games(&format!("[SetUp \"1\"]\n[FEN \"{fen}\"]\n\n1. Qf8# 1-0"))
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+    let input = GameDetectionInput::new(played.timeline(), tempo_chess::LearnerColor::White);
+    struct Running;
+    impl DetectionControl for Running {
+        fn check(&self) -> Result<(), tempo_chess::DetectionStop> {
+            Ok(())
+        }
+    }
+    let control = Running;
+    let producer = MateCheck("mate-analysis");
+    let DetectionOutcome::Complete(mut claims) =
+        tempo_chess::scan_position(&input, 0, [&producer as &dyn GameDetector], &control)
+    else {
+        panic!("mate fixture should complete");
+    };
+    let mut claim = claims.pop().unwrap().moment;
+    assert!(tempo_chess::validate_detected_moments(&input, vec![claim.clone()]).is_ok());
+    claim.tactical.as_mut().unwrap().personal = Some(tempo_chess::PersonalTacticsEvidence {
+        candidates: vec![],
+        puzzle: None,
+    });
+    assert!(tempo_chess::validate_detected_moments(&input, vec![claim]).is_err());
     let dataset_id = app.game_dataset().unwrap();
     app.import_game_pgn(GameImport {
         dataset_id, command_id: "mate-without-capture".into(), learner: "Learner".into(), repertoire_id: None,
@@ -896,4 +922,217 @@ fn adding_an_earlier_detector_preserves_the_fulfilled_occurrence() {
     let after = app.snapshot().unwrap();
     assert_eq!(after.learning, original.learning);
     assert_eq!(after.assessments, original.assessments);
+}
+
+#[test]
+fn personal_findings_flow_through_games_and_study_and_reuse_the_previous_request() {
+    use tempo_chess::{
+        DetectionOutcome, GameDetectionInput, GameDetector, PositionPass, TacticalEvidenceFormat,
+    };
+    struct Renamed(tempo_chess::PersonalTacticsDetector<Evaluator>);
+    impl GameDetector for Renamed {
+        fn descriptor(&self) -> DetectorDescriptor {
+            DetectorDescriptor {
+                id: "z-archive".into(),
+                label: "Display name changed".into(),
+                ..self.0.descriptor()
+            }
+        }
+        fn tactical_evidence_format(&self) -> Option<TacticalEvidenceFormat> {
+            self.0.tactical_evidence_format()
+        }
+        fn detect(
+            &self,
+            input: &GameDetectionInput,
+            control: &dyn DetectionControl,
+        ) -> DetectionOutcome {
+            self.0.detect(input, control)
+        }
+        fn detect_position(
+            &self,
+            position: &PositionPass<'_>,
+            control: &dyn DetectionControl,
+        ) -> DetectionOutcome {
+            self.0.detect_position(position, control)
+        }
+    }
+    struct Earlier;
+    impl GameDetector for Earlier {
+        fn descriptor(&self) -> DetectorDescriptor {
+            DetectorDescriptor {
+                id: "a-earlier".into(),
+                label: "Secondary".into(),
+                revision: "1".into(),
+                configuration_fingerprint: "fixture".into(),
+            }
+        }
+        fn produces_tactical_assessments(&self) -> bool {
+            true
+        }
+        fn detect(&self, _: &GameDetectionInput, _: &dyn DetectionControl) -> DetectionOutcome {
+            DetectionOutcome::Complete(vec![])
+        }
+        fn detect_position(
+            &self,
+            _: &PositionPass<'_>,
+            _: &dyn DetectionControl,
+        ) -> DetectionOutcome {
+            DetectionOutcome::Complete(vec![])
+        }
+    }
+    let (directory, mut app) = disposable();
+    let store = tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
+    let dataset = app.game_dataset().unwrap();
+    let sample = |name, control, line| {
+        format!(
+            "[White \"Learner\"]\n[Black \"{name}\"]\n[WhiteElo \"1499\"]\n[BlackElo \"1500\"]\n[TimeControl \"{control}\"]\n[SetUp \"1\"]\n[FEN \"{HANGING}\"]\n\n1. {line}"
+        )
+    };
+    let pgn = format!(
+        "{}\n\n{}",
+        sample("Missed", "60", "Kg2 0-1"),
+        sample("Played", "60+0", "Rxa7 1-0")
+    );
+    assert_eq!(
+        app.import_game_pgn(GameImport {
+            dataset_id: dataset.clone(),
+            command_id: "personal-two".into(),
+            learner: "Learner".into(),
+            repertoire_id: None,
+            pgn
+        })
+        .unwrap()
+        .new_games,
+        2
+    );
+    let (mut old_detector, mut old_jobs) = host("legacy", "good");
+    scan(&directory, &mut app, &mut old_detector, &mut old_jobs, 2);
+    let original_requests = store.pending_tactical_requests(&dataset).unwrap();
+    let [previous] = original_requests.as_slice() else {
+        panic!("expected one legacy request")
+    };
+    let mut registry = DetectorRegistry::default();
+    registry.register(Earlier).unwrap();
+    registry
+        .register(Renamed(tempo_chess::PersonalTacticsDetector(Evaluator {
+            revision: "personal",
+            outcome: "good",
+        })))
+        .unwrap();
+    let duplicate = registry
+        .register(tempo_chess::PersonalTacticsDetector(Evaluator {
+            revision: "competing",
+            outcome: "good",
+        }))
+        .unwrap_err();
+    assert_eq!(duplicate.code, "duplicate_complete_decision_detector");
+    let mut detector = GameDetection::new(
+        registry,
+        AnalysisOptions {
+            deadline: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(detector.complete_decision_detector(), Some("z-archive"));
+    let mut jobs = TacticalJobs::new(&detector, &["a-earlier", "z-archive"]);
+    assert!(jobs.has_personal_report());
+    scan(&directory, &mut app, &mut detector, &mut jobs, 2);
+    let requests = store.pending_tactical_requests(&dataset).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].id, previous.id);
+    assert_eq!(requests[0].target, previous.target);
+    let query = json!({"dataset_id": dataset, "filters": {"clock":{"seconds":60,"increment":0},
+        "speed":"bullet","learner_rating":1450,"motif":"hanging_material"}});
+    let report = crate::personal_tactics_report::read(
+        &store,
+        jobs.report_version(),
+        serde_json::from_value(query).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["filtered_games"], 2);
+    assert_eq!(report["clocks"].as_array().unwrap().len(), 1);
+    assert_eq!(report["loss_comparison"]["with_miss"]["losses"], 1);
+    assert_eq!(report["loss_comparison"]["without_miss"]["wins"], 1);
+    assert_eq!(report["games"].as_array().unwrap().len(), 2);
+    let active = app.next_exercise().unwrap().unwrap();
+    assert_eq!(active.attempt.target, previous.target);
+    let saved = answer(&mut app, &active, "a1a7", "personal-answer");
+    drop(app);
+    let mut reopened = local_runtime::open(&directory.path().join("tactics.sqlite")).unwrap();
+    assert_eq!(
+        reopened.submit(saved).unwrap().attempt.status,
+        tempo_study::AttemptStatus::Complete
+    );
+    assert!(
+        store
+            .pending_tactical_requests(&dataset)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_revised_tactic_preserves_the_issued_attempt_without_introducing_new_learning() {
+    let (directory, mut app) = disposable();
+    let store = tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
+    let dataset = app.game_dataset().unwrap();
+    app.import_game_pgn(GameImport { dataset_id: dataset.clone(), command_id: "rescan".into(), learner: "Learner".into(), repertoire_id: None,
+        pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"7k/n7/8/4q3/3P4/8/8/R5K1 w - - 0 1\"]\n\n1. Kg2 0-1".into(),
+    }).unwrap();
+    let (mut old_detector, mut old_jobs) = host("before", "good");
+    scan(&directory, &mut app, &mut old_detector, &mut old_jobs, 1);
+    let issued = app.next_exercise().unwrap().unwrap();
+    let prior = app.store.content_state().unwrap();
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(tempo_chess::PersonalTacticsDetector(Evaluator {
+            revision: "revised",
+            outcome: "different",
+        }))
+        .unwrap();
+    let mut detector = GameDetection::new(
+        registry,
+        AnalysisOptions {
+            deadline: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut jobs = TacticalJobs::new(&detector, &["personal-tactics"]);
+    scan(&directory, &mut app, &mut detector, &mut jobs, 1);
+    let after = app.store.content_state().unwrap();
+    assert_eq!(after.catalog, prior.catalog);
+    assert_eq!(after.learning, prior.learning);
+    assert!(
+        store
+            .has_pending_tactical_request_for_attempt(&dataset, &issued.attempt.id)
+            .unwrap()
+    );
+    assert_eq!(
+        app.next_exercise().unwrap().unwrap().attempt,
+        issued.attempt
+    );
+    let report_request = || serde_json::from_value(json!({"dataset_id":dataset})).unwrap();
+    let before_skip =
+        crate::personal_tactics_report::read(&store, jobs.report_version(), report_request())
+            .unwrap();
+    assert_eq!(before_skip["detail"]["training"]["status"], "superseded");
+    app.skip(crate::AbandonCommand {
+        dataset_id: dataset.clone(),
+        attempt_id: issued.attempt.id,
+        expected_revision: issued.attempt.revision,
+        submission_id: "skip-superseded".into(),
+    })
+    .unwrap();
+    let after_skip =
+        crate::personal_tactics_report::read(&store, jobs.report_version(), report_request())
+            .unwrap();
+    assert!(after_skip["detail"]["training"].is_null());
+    assert!(
+        store
+            .pending_tactical_requests(&dataset)
+            .unwrap()
+            .is_empty()
+    );
 }
