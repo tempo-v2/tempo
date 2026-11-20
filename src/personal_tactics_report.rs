@@ -434,9 +434,21 @@ fn find_break(games: &[&Game], daily: bool, bins: [usize; 4]) -> Option<Value> {
         if days.len() < 5 {
             continue;
         }
-        let samples: Vec<_> = days.values().collect();
+        let mut arms = BTreeMap::<Stratum<'_>, [bool; 2]>::new();
+        for day in days.values() {
+            for (&key, entries) in day {
+                let matched = arms.entry(key).or_default();
+                for (found, entry) in matched.iter_mut().zip(entries) {
+                    *found |= entry[0] > 0;
+                }
+            }
+        }
+        for day in days.values_mut() {
+            day.retain(|key, _| arms[key] == [true, true]);
+        }
+        let samples: Vec<_> = days.values().filter(|day| !day.is_empty()).collect();
         let (effect, counts) = difference(samples.iter().copied());
-        if counts.iter().any(|&n| n < 30) || effect <= 0.0 {
+        if samples.len() < 5 || counts.iter().any(|&n| n < 30) || effect <= 0.0 {
             continue;
         }
         // Sample whole playing dates together, retaining the rating and clock strata.
@@ -459,7 +471,7 @@ fn find_break(games: &[&Game], daily: bool, bins: [usize; 4]) -> Option<Value> {
         let lower = distribution[distribution.len() / 40];
         if lower > 0.0 {
             return Some(
-                json!({"min":min,"difference":effect,"lower":lower,"upper":distribution[distribution.len()*39/40],"counts":counts,"days":days.len()}),
+                json!({"min":min,"difference":effect,"lower":lower,"upper":distribution[distribution.len()*39/40],"counts":counts,"days":samples.len()}),
             );
         }
     }
@@ -492,4 +504,69 @@ where
             * (early + late) as f64;
     }
     (weighted / (counts[0] + counts[1]).max(1) as f64, counts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(day: u32, result: LearnerGameResult, prior: usize, clock: u32) -> Game {
+        Game {
+            source: "fixture".into(),
+            id: String::new(),
+            learner: "player".into(),
+            result,
+            clock: Some(GameTimeControl {
+                seconds: clock,
+                increment: 0,
+            }),
+            learner_rating: Some(1200),
+            opponent_rating: Some(1245),
+            local_day: NaiveDate::from_ymd_opt(2026, 11, day),
+            weekday: None,
+            hour: None,
+            prior_today: Some(prior),
+            prior_hour: Some(prior),
+            fully_analyzed: true,
+        }
+    }
+
+    #[test]
+    fn a_break_comparison_needs_matching_clocks_and_support_across_playing_days() {
+        let matching: Vec<_> = (1..=6)
+            .flat_map(|day| {
+                (0..6).flat_map(move |_| {
+                    [
+                        sample(day, LearnerGameResult::Win, 0, 60),
+                        sample(day, LearnerGameResult::Loss, 12, 60),
+                    ]
+                })
+            })
+            .collect();
+        let matched =
+            find_break(&matching.iter().collect::<Vec<_>>(), true, [0, 10, 20, 40]).unwrap();
+        assert_eq!(matched["min"], 10);
+        assert_eq!(matched["days"], 6);
+        assert_eq!(matched["counts"], json!([36, 36]));
+        let different_clocks: Vec<_> = matching
+            .into_iter()
+            .map(|mut game| {
+                if game.result == LearnerGameResult::Loss {
+                    game.clock = Some(GameTimeControl {
+                        seconds: 180,
+                        increment: 2,
+                    });
+                }
+                game
+            })
+            .collect();
+        assert!(
+            find_break(
+                &different_clocks.iter().collect::<Vec<_>>(),
+                true,
+                [0, 10, 20, 40]
+            )
+            .is_none()
+        );
+    }
 }

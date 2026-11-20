@@ -95,12 +95,16 @@ impl Tempo {
         revision: Revision,
         version: ContentVersion,
     ) -> Result<StudyAnalysisLine, AppError> {
-        let (_, issued) = self.authorized_analysis(dataset, attempt_id, revision, version)?;
+        let (record, issued) = self.authorized_analysis(dataset, attempt_id, revision, version)?;
         let definition = &issued.definition;
         match &definition.kind {
             ContentKind::Tactic { .. } => {
-                let line = revealed_line(definition, definition.decisions.len())
-                    .map_err(|error| domain("invalid_content", error))?;
+                let line = if record.attempt.state.played_mate.is_some() {
+                    tempo_chess::revealed_attempt_line(definition, &record.attempt.state)
+                } else {
+                    revealed_line(definition, definition.decisions.len())
+                }
+                .map_err(|error| domain("invalid_content", error))?;
                 Ok(StudyAnalysisLine::FullLine(line))
             }
             ContentKind::Repertoire {
