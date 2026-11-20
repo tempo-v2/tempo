@@ -25,8 +25,8 @@ pub mod wire;
 pub use adapters::{CounterIds, FixedClock, FixtureGames, JsonSnapshotCodec, UnavailableGames};
 pub use app_error::AppError;
 pub use application::{
-    GameLibraryRead, GameReviewLine, GameReviewRead, IntroductionLimits, ProgressStamp, StudyProgress, TacticThemes,
-    TacticsRead, TacticsReadReply, Tempo, tactic_themes,
+    GameLibraryRead, GameReviewLine, GameReviewRead, IntroductionLimits, ProgressStamp,
+    StudyAnalysisLine, StudyProgress, TacticThemes, TacticsRead, TacticsReadReply, Tempo, tactic_themes,
 };
 pub use commands::{AbandonCommand, AgainCommand, SubmitCommand};
 pub use components::{Components, DailyComponents};
