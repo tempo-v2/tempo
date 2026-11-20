@@ -43,7 +43,7 @@ pub(super) fn serve(
     };
     println!("Tempo study at {}", surfaces.origin);
     let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
-    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection);
+    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &["hanging-material"]);
     let mut games = Games {
         refresh: GameJobs::start()?,
         detection,

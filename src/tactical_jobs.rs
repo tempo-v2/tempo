@@ -11,7 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tempo_chess::{DetectorDescriptor, parse_played_games};
+use tempo_chess::{DetectorDescriptor, DetectorIdentity, parse_played_games};
 use tempo_store::{SqliteStore, TacticalPositionTask};
 use tempo_types::DatasetId;
 
@@ -47,6 +47,8 @@ pub(crate) enum TacticalCommand {
 
 pub(crate) struct TacticalJobs {
     descriptor: Option<DetectorDescriptor>,
+    analyses: Vec<DetectorIdentity>,
+    version: String,
     active: Option<(TacticalPositionTask, String)>,
     ready: Option<(TacticalPositionTask, DetectionCompletion)>,
     next_check: Instant,
@@ -59,8 +61,18 @@ pub(crate) struct TacticalJobs {
 }
 
 impl TacticalJobs {
-    pub(crate) fn new(detection: &GameDetection) -> Self {
-        let descriptor = detection.descriptor("hanging-material");
+    pub(crate) fn new(detection: &GameDetection, selected: &[&str]) -> Self {
+        let configured = selected
+            .iter()
+            .map(|id| detection.tactical_descriptor(id))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        let descriptor = configured.first().cloned();
+        let analyses: Vec<_> = configured
+            .iter()
+            .map(DetectorDescriptor::identity)
+            .collect();
+        let version = analysis_version(&analyses);
         let idle_on_ac = Arc::new(AtomicBool::new(false));
         if descriptor.is_some() {
             let sensor = Arc::downgrade(&idle_on_ac);
@@ -76,6 +88,8 @@ impl TacticalJobs {
         }
         Self {
             descriptor,
+            analyses,
+            version,
             active: None,
             ready: None,
             next_check: Instant::now(),
@@ -162,15 +176,15 @@ impl TacticalJobs {
             return Ok(());
         }
         let descriptor = self.descriptor.as_ref().expect("configured detector");
-        let version = analysis_version(&[descriptor.identity()]);
-        let continuing = store.next_position_analysis(&dataset, &version, self.continuing)?;
+        let version = &self.version;
+        let continuing = store.next_position_analysis(&dataset, version, self.continuing)?;
         let task = if continuing
             .as_ref()
             .is_some_and(|task| Some(task.game.cursor.ordinal) == self.continuing)
         {
             continuing
         } else {
-            if let Some(game) = store.next_analysis_enrollment(&dataset, &version)? {
+            if let Some(game) = store.next_analysis_enrollment(&dataset, version)? {
                 let learner = crate::application::tactical_analysis::game_learner(&game)?;
                 let mut parsed = parse_played_games(&game.game.pgn)
                     .map_err(|error| crate::app_error::domain("invalid_game", error))?;
@@ -191,12 +205,12 @@ impl TacticalJobs {
                 store.expand_analysis_enrollment(
                     &dataset,
                     &game,
-                    &version,
-                    &[descriptor.identity()],
+                    version,
+                    &self.analyses,
                     &plies,
                 )?;
             }
-            store.next_position_analysis(&dataset, &version, None)?
+            store.next_position_analysis(&dataset, version, None)?
         };
         let Some(task) = task else {
             self.continuing = None;
@@ -274,7 +288,8 @@ impl TacticalJobs {
                 "message":"Hanging-material analysis needs the configured Stockfish and Python chess environment."}),
             );
         };
-        let mut reply = app.tactical_history(&read.dataset_id, descriptor, read.before)?;
+        let mut reply =
+            app.tactical_history(&read.dataset_id, descriptor, &self.version, read.before)?;
         reply["schema_version"] = json!(1);
         reply["dataset_id"] = json!(read.dataset_id);
         reply["status"] = json!(if self.active.is_some() || self.ready.is_some() {
@@ -282,14 +297,11 @@ impl TacticalJobs {
         } else {
             "ready"
         });
-        reply["games"] = json!(store.recent_analysis_games(
-            &read.dataset_id,
-            &analysis_version(&[descriptor.identity()])
-        )?);
+        reply["games"] = json!(store.recent_analysis_games(&read.dataset_id, &self.version)?);
         reply["paused"] = json!(store.analysis_paused(&read.dataset_id)?);
         reply["waiting_for_idle"] = json!(!self.idle());
         reply["detector"] = json!(descriptor);
-        reply["analysis_version"] = json!(analysis_version(&[descriptor.identity()]));
+        reply["analysis_version"] = json!(self.version);
         reply["last_error"] = json!(self.last_error);
         reply["active_game"] = json!(self.active.as_ref().map(|(task, _)| json!({
             "source":task.game.game.source,"game_id":task.game.game.id,"learner":task.game.learner

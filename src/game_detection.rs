@@ -235,10 +235,19 @@ pub(crate) struct GameDetection {
 }
 
 impl GameDetection {
+    #[cfg(test)]
     pub(crate) fn descriptor(&self, id: &str) -> Option<DetectorDescriptor> {
         self.registry
             .0
             .get(id)
+            .map(|entry| entry.descriptor.clone())
+    }
+
+    pub(crate) fn tactical_descriptor(&self, id: &str) -> Option<DetectorDescriptor> {
+        self.registry
+            .0
+            .get(id)
+            .filter(|entry| entry.detector.produces_tactical_assessments())
             .map(|entry| entry.descriptor.clone())
     }
 
@@ -761,14 +770,17 @@ mod tests {
     }
 
     fn seed_game(app: &mut Tempo, id: &str) -> DetectionRequest {
+        seed_line(app, id, "1.e4 e5 1-0")
+    }
+
+    fn seed_line(app: &mut Tempo, id: &str, line: &str) -> DetectionRequest {
         let original_dataset = app.game_dataset().unwrap();
         app.import_game_pgn(GameImport {
             dataset_id: original_dataset.clone(),
             command_id: "seed".to_owned(),
             learner: "Learner".to_owned(),
             repertoire_id: None,
-            pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[Result \"1-0\"]\n1.e4 e5 1-0\n"
-                .into(),
+            pgn: format!("[White \"Learner\"]\n[Black \"Opponent\"]\n[Result \"1-0\"]\n{line}\n"),
         })
         .unwrap();
         let history = app.game_history().unwrap();
@@ -807,9 +819,9 @@ mod tests {
                 _: &dyn DetectionControl,
             ) -> Result<RootEvaluation, EvaluationFailure> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                assert!(request.legal_moves.contains(&"e2e4".into()));
-                assert!(request.moves.is_empty());
-                assert_eq!(request.fen, request.start_fen);
+                assert!(request.legal_moves.contains(&"g1f3".into()));
+                assert_eq!(request.moves, ["e2e4", "e7e5"]);
+                assert_ne!(request.fen, request.start_fen);
                 Err(EvaluationFailure::Incomplete)
             }
         }
@@ -834,17 +846,24 @@ mod tests {
                 position: &PositionPass<'_>,
                 control: &dyn DetectionControl,
             ) -> DetectionOutcome {
-                assert_eq!(position.occurrence().next_move().unwrap().uci, "e2e4");
+                assert_eq!(position.occurrence().next_move().unwrap().uci, "g1f3");
+                assert_eq!(
+                    position
+                        .played_prefix()
+                        .map(|answer| answer.uci.as_str())
+                        .collect::<Vec<_>>(),
+                    ["e2e4", "e7e5"]
+                );
                 self.1.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(
-                    position.piece_at("e2").unwrap().role,
+                    position.piece_at("e4").unwrap().role,
                     tempo_chess::PieceRole::Pawn
                 );
                 assert!(
                     position
                         .legal_moves()
                         .iter()
-                        .any(|answer| answer.uci == "e2e4")
+                        .any(|answer| answer.uci == "g1f3")
                 );
                 assert_eq!(
                     position.compare(&Engine(self.2.clone()), control).unwrap(),
@@ -854,7 +873,7 @@ mod tests {
                     occurrence: position.occurrence().offset(),
                     code: "same_motif".into(),
                     subjects: vec![],
-                    candidate_move: Some("e2e4".into()),
+                    candidate_move: Some("g1f3".into()),
                     explanation: self.0.into(),
                     tactical: None,
                 }])
@@ -862,7 +881,7 @@ mod tests {
         }
 
         let (_directory, mut app) = disposable_app();
-        let request = seed_game(&mut app, "shared");
+        let request = seed_line(&mut app, "shared", "1.e4 e5 2.Nf3 1-0");
         let probes = Arc::new(AtomicUsize::new(0));
         let searches = Arc::new(AtomicUsize::new(0));
         let mut registry = DetectorRegistry::default();
@@ -877,7 +896,7 @@ mod tests {
         obsolete[1].revision = "0".into();
         let run = Some(tempo_store::TacticalPositionRun {
             id: 1,
-            ply: 0,
+            ply: 2,
             deeper: false,
         });
         assert_eq!(

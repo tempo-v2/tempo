@@ -180,9 +180,12 @@ impl Tempo {
                 let mut inconclusive = false;
                 for finding in findings {
                     let moment = &finding.moment;
-                    let Some(assessment) = &moment.tactical else {
-                        continue;
-                    };
+                    let assessment = moment.tactical.as_ref().ok_or_else(|| {
+                        AppError::new(
+                            "invalid_tactical_result",
+                            "The position analysis omitted its typed assessment.",
+                        )
+                    })?;
                     inconclusive |= assessment.outcome == TacticalOutcome::Uncertain;
                     let train = if assessment.outcome == TacticalOutcome::MissedGoodCapture {
                         let puzzle = assessment.puzzle.as_ref().ok_or_else(|| {
@@ -339,6 +342,7 @@ impl Tempo {
         &self,
         dataset: &DatasetId,
         descriptor: &DetectorDescriptor,
+        version: &str,
         before: Option<u64>,
     ) -> Result<Value, AppError> {
         if &self.game_dataset()? != dataset {
@@ -347,13 +351,12 @@ impl Tempo {
                 "Reload the current game archive.",
             ));
         }
-        let version = analysis_version(&[descriptor.identity()]);
         let statistics = self
             .store
-            .tactical_statistics(dataset, &descriptor.id, &version)?;
+            .tactical_statistics(dataset, &descriptor.id, version)?;
         let page =
             self.store
-                .tactical_observations(dataset, &descriptor.id, &version, before, 30)?;
+                .tactical_observations(dataset, &descriptor.id, version, before, 30)?;
         let mut observations = Vec::new();
         for stored in page.observations {
             let details: TacticalDetails = serde_json::from_str(&stored.observation.details_json)
@@ -363,6 +366,7 @@ impl Tempo {
                 "learner": stored.learner, "ply": stored.observation.ply,
                 "outcome": details.assessment.outcome,
                 "details": details, "puzzle": stored.observation.train,
+                "producer": stored.observation.producer,
                 "request_id": stored.request_id, "fulfilled": stored.fulfilled,
                 "analysis_version": stored.analysis_version,
             }));

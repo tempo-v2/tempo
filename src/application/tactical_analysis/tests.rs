@@ -80,7 +80,7 @@ fn host(revision: &'static str, outcome: &'static str) -> (GameDetection, Tactic
         },
     )
     .unwrap();
-    let jobs = TacticalJobs::new(&detection);
+    let jobs = TacticalJobs::new(&detection, &["hanging-material"]);
     (detection, jobs)
 }
 
@@ -396,6 +396,9 @@ fn failed_and_timed_out_scans_do_not_block_other_games_or_create_false_misses() 
         timed_out: bool,
     }
     impl GameDetector for FailFirst {
+        fn produces_tactical_assessments(&self) -> bool {
+            true
+        }
         fn descriptor(&self) -> DetectorDescriptor {
             self.inner.descriptor()
         }
@@ -457,7 +460,7 @@ fn failed_and_timed_out_scans_do_not_block_other_games_or_create_false_misses() 
             },
         )
         .unwrap();
-        let mut jobs = TacticalJobs::new(&detection);
+        let mut jobs = TacticalJobs::new(&detection, &["hanging-material"]);
         let report = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
         let failure = if timed_out {
             "timed_out_games"
@@ -570,7 +573,7 @@ fn real_stockfish_position_reaches_study_with_source_move() {
         },
     )
     .unwrap();
-    let mut jobs = TacticalJobs::new(&detection);
+    let mut jobs = TacticalJobs::new(&detection, &["hanging-material"]);
     jobs.force_idle_for_test();
     let dataset = app.game_dataset().unwrap();
     app.import_game_pgn(GameImport {
@@ -620,5 +623,68 @@ fn real_stockfish_position_reaches_study_with_source_move() {
         started.elapsed(),
         task_poll,
         study_read
+    );
+}
+
+#[test]
+fn admitted_detector_set_persists_each_producer_through_the_durable_worker() {
+    use tempo_chess::{DetectionOutcome, GameDetectionInput, GameDetector, PositionPass};
+
+    struct Second(HangingMaterialDetector<Evaluator>);
+    impl GameDetector for Second {
+        fn descriptor(&self) -> DetectorDescriptor {
+            let mut descriptor = self.0.descriptor();
+            descriptor.id = "test-second-analysis".into();
+            descriptor
+        }
+        fn produces_tactical_assessments(&self) -> bool {
+            true
+        }
+        fn detect(
+            &self,
+            input: &GameDetectionInput,
+            control: &dyn DetectionControl,
+        ) -> DetectionOutcome {
+            self.0.detect(input, control)
+        }
+        fn detect_position(
+            &self,
+            position: &PositionPass<'_>,
+            control: &dyn DetectionControl,
+        ) -> DetectionOutcome {
+            self.0.detect_position(position, control)
+        }
+    }
+    let (directory, mut app) = disposable();
+    let engine = || {
+        HangingMaterialDetector::new(
+            Evaluator {
+                revision: "1",
+                outcome: "capture",
+            },
+            HangingMaterialConfig::default(),
+        )
+        .unwrap()
+    };
+    let mut registry = DetectorRegistry::default();
+    registry.register(engine()).unwrap();
+    registry.register(Second(engine())).unwrap();
+    let mut detection = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+    let mut jobs = TacticalJobs::new(&detection, &["hanging-material", "test-second-analysis"]);
+    import(&mut app, "Two producers", "1. Rxa7 Kg8");
+    let report = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    assert_eq!(report["statistics"]["decisions_scanned"], 1);
+    assert_eq!(report["statistics"]["outcomes"]["took_good_capture"], 2);
+    let ids: std::collections::BTreeSet<_> = report["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["producer"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["hanging-material", "test-second-analysis"]
+            .into_iter()
+            .collect()
     );
 }
