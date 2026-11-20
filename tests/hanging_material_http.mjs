@@ -231,6 +231,10 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
       assert.equal(await board.getAttribute("data-fen"), captureFen);
       assert.match(await panel.innerText(), /You played h3/);
       assert.match(await panel.innerText(), /queen e5/);
+      await panel.getByRole("button", {name:"dxe5", exact:true}).first().click();
+      assert.notEqual(await board.getAttribute("data-fen"), captureFen);
+      await panel.getByRole("button", {name:"Reset board", exact:true}).click();
+      assert.equal(await board.getAttribute("data-fen"), captureFen);
       if (process.env.TEMPO_HTTP_SCREENSHOTS) {
         const image = join(process.env.TEMPO_HTTP_SCREENSHOTS, "hanging_history.png");
         await mkdir(dirname(image), { recursive: true });
