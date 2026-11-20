@@ -2692,6 +2692,8 @@ fn conceding_a_scheduled_review_recovers_its_issued_position_once() {
         let origin = analysis(&app, &closed).unwrap();
         assert_eq!(origin["fen"], view["display_fen"]);
         assert_eq!(origin["prescribedUci"], "e2e4");
+        assert_eq!(origin["analysisLine"]["scope"], "full_line");
+        assert_eq!(origin["analysisLine"]["line"]["moves"][0]["notation"], "1. e4");
         assert_eq!(
             origin["playedUci"],
             if already_missed {
@@ -2706,13 +2708,57 @@ fn conceding_a_scheduled_review_recovers_its_issued_position_once() {
         preview_and_save(&mut app, "1. d4 *", "White", Some(book));
         let after_edit = app.snapshot().unwrap();
         assert_eq!(study(&mut app, concede.clone()), closed);
-        assert_eq!(analysis(&app, &closed).unwrap(), origin);
+        let mut edited = analysis(&app, &closed).unwrap();
+        let mut origin = origin;
+        assert_eq!(edited["analysisLine"]["scope"], "issued_move");
+        assert_eq!(edited["analysisLine"]["line"]["moves"][0]["notation"], "1. e4");
+        edited.as_object_mut().unwrap().remove("analysisLine");
+        origin.as_object_mut().unwrap().remove("analysisLine");
+        assert_eq!(edited, origin);
         assert_eq!(app.snapshot().unwrap(), after_edit);
         let mut duplicate = concede;
         duplicate["submission_id"] = "different-identity".into();
         assert_eq!(study(&mut app, duplicate)["status"], "error");
         assert_eq!(app.snapshot().unwrap(), after_edit);
     }
+}
+
+#[test]
+fn study_analysis_exports_all_puzzle_plies_after_concession() {
+    use tempo_types::{AttemptId, ContentVersion, DatasetId, Revision};
+
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("tactic-analysis.sqlite");
+    let today = Arc::new(AtomicI32::new(20_000));
+    let mut app = open(&db, today, IntroductionLimits::default(), 0);
+    let black = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+    let pgn = snippet("Black puzzle", black, "1... c5 2. Nf3 d6 3. d4");
+    transfer_tactics(&mut app, &pgn, &[0], "fixture");
+    let view = study(&mut app, json!({"command":"next"}));
+    assert_eq!(view["activity"], "test");
+    assert!(view.get("analysisLine").is_none());
+    let context = |app: &Tempo, view: &Value| {
+        app.study_analysis_context(
+            &DatasetId::from(view["dataset_id"].as_str().unwrap()),
+            &AttemptId::from(view["attempt_id"].as_str().unwrap()),
+            Revision(view["revision"].as_u64().unwrap()),
+            ContentVersion(view["content_version"].as_u64().unwrap()),
+        )
+    };
+    assert_eq!(context(&app, &view).unwrap_err().code, "analysis_requires_concession");
+    let closed = study(&mut app, activity_command("concede", &view, "puzzle-analysis"));
+    assert_eq!(closed["assessment"], "again");
+    let before = app.snapshot().unwrap();
+    let origin = context(&app, &closed).unwrap();
+    assert_eq!(origin["color"], "black");
+    let line = &origin["analysisLine"]["line"];
+    assert_eq!(origin["analysisLine"]["scope"], "full_line");
+    assert!(line["start_fen"].as_str().unwrap().contains(" b "));
+    let moves: Vec<_> = line["moves"].as_array().unwrap().iter()
+        .map(|ply| ply["notation"].as_str().unwrap())
+        .collect();
+    assert_eq!(moves, ["1... c5", "2. Nf3", "2... d6", "3. d4"]);
+    assert_eq!(app.snapshot().unwrap(), before);
 }
 
 #[test]

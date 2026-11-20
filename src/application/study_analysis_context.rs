@@ -1,8 +1,10 @@
-//! Disclose one issued decision to the separate analysis page, after any required concession.
+//! Disclose an issued decision and its analysis line after any required concession.
 use super::Tempo;
 use crate::{AppError, app_error::domain};
 use serde_json::{Value, json};
-use tempo_chess::ContentKind;
+use tempo_chess::{
+    ChessDefinition, ContentKind, RevealedLine, first_matching_repertoire_line, revealed_line,
+};
 use tempo_store::{AcceptanceKind, ActivityMode, StudyScope};
 use tempo_study::AttemptStatus;
 use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision};
@@ -87,11 +89,59 @@ impl Tempo {
                 _ => None,
             }
         });
+        let analysis_line = self.study_analysis_line(dataset, &issued.definition)?;
         Ok(json!({
             "fen": decision.fen, "color": issued.definition.learner_color().map_err(|e| domain("invalid_content", e))?,
             "datasetId": dataset, "repertoireId": repertoire, "name": record.exercise_name,
             "prescribedUci": decision.expected.uci, "playedUci": played,
             "attemptId": attempt_id, "revision": revision, "contentVersion": version,
+            "analysisLine": analysis_line,
         }))
+    }
+
+    fn study_analysis_line(
+        &self,
+        dataset: &DatasetId,
+        definition: &ChessDefinition,
+    ) -> Result<Value, AppError> {
+        let (scope, authored) = match &definition.kind {
+            ContentKind::Tactic { .. } => ("full_line", None),
+            ContentKind::Repertoire {
+                repertoire,
+                position,
+            } => {
+                // The current document adds context only if it still contains the
+                // issued answer. Older or document-free content can export that answer.
+                let authored: Option<RevealedLine> = self
+                    .store
+                    .repertoire_document(repertoire)
+                    .ok()
+                    .filter(|document| &document.dataset == dataset)
+                    .and_then(|document| document.pgn)
+                    .and_then(|pgn| {
+                        first_matching_repertoire_line(
+                            &pgn,
+                            position,
+                            &definition.decisions[0].expected.uci,
+                        )
+                        .ok()
+                        .flatten()
+                    });
+                (
+                    if authored.is_some() {
+                        "full_line"
+                    } else {
+                        "issued_move"
+                    },
+                    authored,
+                )
+            }
+        };
+        let line = match authored {
+            Some(line) => line,
+            None => revealed_line(definition, definition.decisions.len())
+                .map_err(|error| domain("invalid_content", error))?,
+        };
+        Ok(json!({"scope": scope, "line": line}))
     }
 }
