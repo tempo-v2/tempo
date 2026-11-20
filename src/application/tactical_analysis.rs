@@ -1,0 +1,354 @@
+//! Accept typed game observations and their puzzle requests in one transaction.
+use super::Tempo;
+use crate::{
+    AppError,
+    app_error::domain,
+    game_detection::{DetectionCompletion, DetectionStatus},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use tempo_chess::{
+    DetectorDescriptor, TacticalAssessment, TacticalOutcome, parse_played_games,
+    plan_tactical_puzzle,
+};
+use tempo_learning::DailyLearning;
+use tempo_store::{
+    Commit, TacticalAcceptance, TacticalAnalysis, TacticalAnalysisStatus, TacticalGame,
+    TacticalObservation, TacticalPuzzleRef, Write,
+};
+use tempo_types::DatasetId;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct TacticalDetails {
+    pub(crate) schema_version: u8,
+    pub(crate) fen: String,
+    pub(crate) position: String,
+    pub(crate) side_to_move: tempo_chess::LearnerColor,
+    pub(crate) assessment: TacticalAssessment,
+}
+
+pub(crate) fn analysis_version(descriptor: &DetectorDescriptor) -> String {
+    let input = json!([
+        "tactical-acceptance-v1-single-answer",
+        descriptor.id,
+        descriptor.revision,
+        descriptor.configuration_fingerprint
+    ]);
+    blake3::hash(input.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+impl Tempo {
+    pub(crate) fn pending_tactical_game(
+        &self,
+        descriptor: &DetectorDescriptor,
+    ) -> Result<Option<TacticalGame>, AppError> {
+        let dataset = self.game_dataset()?;
+        Ok(self
+            .store
+            .pending_tactical_analyses(
+                &dataset,
+                &descriptor.id,
+                &analysis_version(descriptor),
+                None,
+                1,
+            )?
+            .into_iter()
+            .next())
+    }
+
+    fn validate_tactical_source(
+        &self,
+        game: &TacticalGame,
+        completion: &DetectionCompletion,
+    ) -> Result<DatasetId, AppError> {
+        let dataset = self.game_dataset()?;
+        if completion.request.dataset_id != dataset {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The analyzed dataset has changed.",
+            ));
+        }
+        let current = self
+            .store
+            .stored_game(&dataset, &game.game.source, &game.game.id)?
+            .ok_or_else(|| AppError::new("stale_source", "The analyzed game is unavailable."))?;
+        if current.mainline_signature != game.game.mainline_signature
+            || current.pgn != completion.source.pgn
+            || completion.request.source != game.game.source
+            || completion.request.game_id != game.game.id
+            || completion.request.learner != game.learner
+        {
+            return Err(AppError::new(
+                "stale_source",
+                "The analyzed game has changed.",
+            ));
+        }
+        Ok(dataset)
+    }
+
+    /// Persist an application composition failure without applying any of the
+    /// rejected puzzle, learning, or observation changes. A failed game must not
+    /// block the remaining archive, and its result must not look like an empty
+    /// successful scan.
+    pub(crate) fn record_tactical_failure(
+        &mut self,
+        game: &TacticalGame,
+        completion: &DetectionCompletion,
+        error: &AppError,
+    ) -> Result<TacticalAcceptance, AppError> {
+        let dataset = self.validate_tactical_source(game, completion)?;
+        let snapshot = self.store.study_state(Default::default())?;
+        if snapshot.dataset != dataset {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The analyzed dataset has changed.",
+            ));
+        }
+        let analysis = TacticalAnalysis {
+            source: game.game.source.clone(),
+            game_id: game.game.id.clone(),
+            learner: game.learner.clone(),
+            detector: completion.descriptor.id.clone(),
+            analysis_version: analysis_version(&completion.descriptor),
+            game_fingerprint: game.game.mainline_signature.clone(),
+            analyzed_at_ms: self.components.clock.now().unix_ms,
+            decisions_scanned: 0,
+            status: TacticalAnalysisStatus::Failed,
+            error: Some(format!(
+                "The tactical result could not be accepted: {}: {}",
+                error.code, error.message
+            )),
+            observations: Vec::new(),
+        };
+        Ok(self.store.commit_tactical_analysis(
+            Commit {
+                expected_revision: snapshot.revision,
+                expected_dataset: dataset,
+                writes: Vec::new(),
+            },
+            &analysis,
+        )?)
+    }
+
+    pub(crate) fn accept_tactical_analysis(
+        &mut self,
+        game: &TacticalGame,
+        completion: &DetectionCompletion,
+    ) -> Result<TacticalAcceptance, AppError> {
+        let dataset = self.validate_tactical_source(game, completion)?;
+        let snapshot = self.store.content_state()?;
+        if snapshot.dataset != dataset {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The analyzed dataset has changed.",
+            ));
+        }
+        let at = self.components.clock.now();
+        let mut catalog = snapshot.catalog.clone();
+        let mut learning = BTreeMap::new();
+        let mut observations = Vec::new();
+        let mut decisions_scanned = 0;
+        let (status, error) = match &completion.status {
+            DetectionStatus::Complete {
+                findings,
+                learner_color,
+                ..
+            } => {
+                let mut games = parse_played_games(&completion.source.pgn)
+                    .map_err(|e| domain("invalid_game", e))?;
+                if games.len() != 1 {
+                    return Err(AppError::new("invalid_game", "Expected one analyzed game."));
+                }
+                let played = games
+                    .pop()
+                    .ok_or_else(|| AppError::new("invalid_game", "Missing analyzed game."))?
+                    .map_err(|e| domain("invalid_game", e))?;
+                decisions_scanned = played
+                    .timeline()
+                    .occurrences()
+                    .iter()
+                    .filter(|p| p.side_to_move() == *learner_color && p.next_move().is_some())
+                    .count()
+                    .try_into()
+                    .map_err(|_| AppError::new("invalid_game", "Game is too long."))?;
+                for finding in findings {
+                    let moment = &finding.moment;
+                    let Some(assessment) = &moment.tactical else {
+                        continue;
+                    };
+                    let train = if assessment.outcome == TacticalOutcome::MissedGoodCapture {
+                        let puzzle = assessment.puzzle.as_ref().ok_or_else(|| {
+                            AppError::new(
+                                "invalid_tactical_result",
+                                "A confirmed miss has no validated puzzle.",
+                            )
+                        })?;
+                        let provenance = vec![format!(
+                            "game-tactic:{}:{}:{}:{}",
+                            game.game.source, game.game.id, game.learner, moment.occurrence
+                        )];
+                        let plan = plan_tactical_puzzle(
+                            &catalog,
+                            &puzzle.fen,
+                            &puzzle.answer,
+                            &provenance,
+                        )
+                        .map_err(|e| domain("invalid_tactical_puzzle", e))?;
+                        catalog = plan.content.catalog;
+                        let item = catalog
+                            .items
+                            .get(&plan.target)
+                            .expect("planned puzzle exists");
+                        let prior = learning
+                            .get(&plan.target)
+                            .or_else(|| snapshot.learning.get(&plan.target))
+                            .cloned()
+                            .unwrap_or_default();
+                        if !prior.introduced {
+                            let introduced = DailyLearning::introduce_capture(&prior, at)
+                                .map_err(|e| domain("learning_error", e))?;
+                            learning.insert(plan.target.clone(), introduced);
+                        }
+                        Some(TacticalPuzzleRef {
+                            target: plan.target,
+                            version: item.version,
+                        })
+                    } else {
+                        None
+                    };
+                    let details = TacticalDetails {
+                        schema_version: 1,
+                        fen: moment.fen.clone(),
+                        position: moment.position.0.clone(),
+                        side_to_move: moment.side_to_move,
+                        assessment: assessment.clone(),
+                    };
+                    observations.push(TacticalObservation {
+                        ply: moment
+                            .occurrence
+                            .try_into()
+                            .map_err(|_| AppError::new("invalid_game", "Game is too long."))?,
+                        motif: serde_json::to_value(assessment.kind)
+                            .expect("typed motif")
+                            .as_str()
+                            .expect("enum string")
+                            .into(),
+                        outcome: serde_json::to_value(assessment.outcome)
+                            .expect("typed outcome")
+                            .as_str()
+                            .expect("enum string")
+                            .into(),
+                        details_json: serde_json::to_string(&details)
+                            .expect("serializable tactical details"),
+                        train,
+                    });
+                }
+                (TacticalAnalysisStatus::Complete, None)
+            }
+            DetectionStatus::TimedOut => (
+                TacticalAnalysisStatus::TimedOut,
+                Some("The bounded game scan timed out.".into()),
+            ),
+            DetectionStatus::Unsupported => (
+                TacticalAnalysisStatus::Unsupported,
+                Some("The detector does not support this game.".into()),
+            ),
+            DetectionStatus::SourceUnavailable => {
+                return Err(AppError::new(
+                    "stale_source",
+                    "The analyzed source has changed.",
+                ));
+            }
+            DetectionStatus::Running => {
+                return Err(AppError::new(
+                    "analysis_running",
+                    "The game scan has not completed.",
+                ));
+            }
+            _ => (
+                TacticalAnalysisStatus::Failed,
+                Some("The detector did not produce a complete valid result.".into()),
+            ),
+        };
+        let mut writes = Vec::new();
+        if catalog != snapshot.catalog {
+            writes.push(Write::Catalog(catalog));
+        }
+        writes.extend(
+            learning
+                .into_iter()
+                .map(|(target, state)| Write::Learning { target, state }),
+        );
+        let analysis = TacticalAnalysis {
+            source: game.game.source.clone(),
+            game_id: game.game.id.clone(),
+            learner: game.learner.clone(),
+            detector: completion.descriptor.id.clone(),
+            analysis_version: analysis_version(&completion.descriptor),
+            game_fingerprint: game.game.mainline_signature.clone(),
+            analyzed_at_ms: at.unix_ms,
+            decisions_scanned,
+            status,
+            error,
+            observations,
+        };
+        let accepted = self.store.commit_tactical_analysis(
+            Commit {
+                expected_revision: snapshot.revision,
+                expected_dataset: snapshot.dataset,
+                writes,
+            },
+            &analysis,
+        )?;
+        if let Some(daily) = &mut self.daily {
+            for target in &accepted.new_request_targets {
+                daily.queue.clear_deferral(target);
+            }
+        }
+        Ok(accepted)
+    }
+
+    pub(crate) fn tactical_history(
+        &self,
+        dataset: &DatasetId,
+        descriptor: &DetectorDescriptor,
+        before: Option<u64>,
+    ) -> Result<Value, AppError> {
+        if &self.game_dataset()? != dataset {
+            return Err(AppError::new(
+                "stale_dataset",
+                "Reload the current game archive.",
+            ));
+        }
+        let version = analysis_version(descriptor);
+        let statistics = self
+            .store
+            .tactical_statistics(dataset, &descriptor.id, &version)?;
+        let page =
+            self.store
+                .tactical_observations(dataset, &descriptor.id, &version, before, 30)?;
+        let mut observations = Vec::new();
+        for stored in page.observations {
+            let details: TacticalDetails = serde_json::from_str(&stored.observation.details_json)
+                .map_err(|e| domain("invalid_tactical_history", e))?;
+            observations.push(json!({
+                "id": stored.id, "source": stored.source, "game_id": stored.game_id,
+                "learner": stored.learner, "ply": stored.observation.ply,
+                "outcome": details.assessment.outcome,
+                "details": details, "puzzle": stored.observation.train,
+                "request_id": stored.request_id, "fulfilled": stored.fulfilled,
+                "analysis_version": stored.analysis_version,
+            }));
+        }
+        Ok(
+            json!({"statistics": statistics, "observations": observations,
+            "next_before": page.next_before, "analysis_version": version}),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -103,12 +103,23 @@ pub fn backfill_personal_tactics(path: &Path, apply: bool) -> LocalResult<()> {
 }
 
 pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
+    let mut registry = DetectorRegistry::default();
+    match crate::tactical_engine::StockfishEvaluator::discover(database) {
+        Ok(evaluator) => registry.register(tempo_chess::HangingMaterialDetector::new(
+            evaluator,
+            tempo_chess::HangingMaterialConfig::default(),
+        )?)?,
+        Err(error) => eprintln!("Tempo tactical analysis unavailable: {}", error.message),
+    }
     serve_with_detectors(
         database,
         ui,
         port,
-        DetectorRegistry::default(),
-        AnalysisOptions::default(),
+        registry,
+        AnalysisOptions {
+            deadline: std::time::Duration::from_secs(120),
+            ..AnalysisOptions::default()
+        },
     )
 }
 
