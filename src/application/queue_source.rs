@@ -5,15 +5,16 @@
 //! The retained block is copied into this adapter and accepted by Tempo only
 //! after the issuance transaction succeeds.
 use crate::{AppError, app_error::domain};
-use std::collections::BTreeSet;
-use tempo_chess::ChessDefinition;
+use std::collections::{BTreeMap, BTreeSet};
+use tempo_chess::{Catalog, ChessDefinition};
+use tempo_learning::LearningState;
 use tempo_queue::{Candidate, Group, Line, QueueInput, QueueOrderContext, QueuePolicy};
-use tempo_store::Snapshot;
 use tempo_study::{Availability, Exercise, QuestionSource};
 use tempo_types::{StudyDay, TargetId};
 
 pub(super) struct QueueSource<'a> {
-    pub(super) snapshot: &'a Snapshot,
+    pub(super) catalog: &'a Catalog,
+    pub(super) learning: &'a BTreeMap<TargetId, LearningState>,
     pub(super) queue: &'a dyn QueuePolicy,
     pub(super) today: StudyDay,
     pub(super) context: QueueOrderContext,
@@ -24,12 +25,11 @@ impl QuestionSource for QueueSource<'_> {
     type Error = AppError;
     fn next(&mut self) -> Result<Availability<Exercise<ChessDefinition>>, AppError> {
         let candidates = self
-            .snapshot
             .catalog
             .items
             .values()
             .map(|item| {
-                let learning = &self.snapshot.learning[&item.target];
+                let learning = &self.learning[&item.target];
                 Candidate {
                     target: item.target.clone(),
                     active: item.active(),
@@ -41,7 +41,6 @@ impl QuestionSource for QueueSource<'_> {
             })
             .collect();
         let lines = self
-            .snapshot
             .catalog
             .lines
             .iter()
@@ -67,7 +66,6 @@ impl QuestionSource for QueueSource<'_> {
             // Assign overlapping line occurrences to their first eligible block once.
             let mut assigned = BTreeSet::new();
             let groups: Vec<_> = self
-                .snapshot
                 .catalog
                 .lines
                 .iter()
@@ -102,7 +100,7 @@ impl QuestionSource for QueueSource<'_> {
             }
         };
         let item =
-            self.snapshot.catalog.items.get(&target).ok_or_else(|| {
+            self.catalog.items.get(&target).ok_or_else(|| {
                 AppError::new("queue_error", "selection referenced unknown content")
             })?;
         Ok(Availability::Ready(item.exercise()))

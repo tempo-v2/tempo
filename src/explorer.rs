@@ -40,6 +40,22 @@ struct Counts {
     black: u64,
 }
 
+impl Counts {
+    fn buckets(&self) -> [u64; 3] {
+        [self.white, self.draws, self.black]
+    }
+
+    fn validate_total(&self) -> Result<(), &'static str> {
+        const MAX_SAFE_COUNT: u64 = (1 << 53) - 1;
+        self.buckets()
+            .into_iter()
+            .try_fold(0u64, u64::checked_add)
+            .filter(|total| *total <= MAX_SAFE_COUNT)
+            .map(|_| ())
+            .ok_or("invalid_reply")
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct MoveCounts {
     uci: String,
@@ -205,6 +221,18 @@ fn parse_reply(output: &[u8], legal: &[String]) -> Result<Statistics, &'static s
     stats
         .moves
         .retain(|item| legal.contains(&item.uci) && seen.insert(item.uci.clone()));
+    stats.counts.validate_total()?;
+    let population = stats.counts.buckets();
+    let mut returned = [0u64; 3];
+    for item in &stats.moves {
+        item.counts.validate_total()?;
+        for (index, count) in item.counts.buckets().into_iter().enumerate() {
+            returned[index] = returned[index]
+                .checked_add(count)
+                .filter(|sum| *sum <= population[index])
+                .ok_or("invalid_reply")?;
+        }
+    }
     stats.moves.truncate(12);
     Ok(stats)
 }
@@ -212,6 +240,38 @@ fn parse_reply(output: &[u8], legal: &[String]) -> Result<Statistics, &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_rejects_inconsistent_populations_before_truncating() {
+        use serde_json::json;
+        let legal: Vec<_> = (0..13).map(|index| format!("move-{index}")).collect();
+        let mut rows: Vec<_> = legal
+            .iter()
+            .map(|uci| json!({"uci":uci,"white":1,"draws":0,"black":0}))
+            .collect();
+        let parse = |white: u64, draws: u64, black: u64, rows| {
+            let body = json!({"white":white,"draws":draws,"black":black,"moves":rows});
+            parse_reply(format!("{body}\n200").as_bytes(), &legal)
+        };
+        const SAFE: u64 = (1 << 53) - 1;
+        assert_eq!(parse(12, 0, 0, rows.clone()).err(), Some("invalid_reply"));
+        assert_eq!(parse(0, 0, 0, rows.clone()).err(), Some("invalid_reply"));
+        assert_eq!(parse(SAFE, 1, 0, vec![]).err(), Some("invalid_reply"));
+        assert_eq!(parse(u64::MAX, 1, 0, vec![]).err(), Some("invalid_reply"));
+        rows[0]["white"] = json!(SAFE);
+        rows[0]["draws"] = json!(1);
+        assert_eq!(parse(SAFE, 0, 0, rows).err(), Some("invalid_reply"));
+        assert!(parse(0, 0, 0, vec![]).unwrap().moves.is_empty());
+        let valid = parse(
+            100,
+            0,
+            0,
+            vec![json!({"uci":legal[0],"white":5,"draws":0,"black":0})],
+        )
+        .unwrap();
+        assert_eq!(valid.moves[0].counts.white, 5);
+        assert_eq!(valid.counts.white, 100);
+    }
 
     #[test]
     fn validates_explorer_counts_and_only_returns_legal_distinct_candidates() {

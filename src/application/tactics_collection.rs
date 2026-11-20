@@ -90,11 +90,9 @@ impl Tempo {
                         "The dataset changed. Reopen the tactics list.",
                     ));
                 }
-                let item = state
-                    .catalog
-                    .items
-                    .get(&target)
-                    .filter(|item| !item.definition.is_repertoire())
+                let (item, _) = state
+                    .target(&target)?
+                    .filter(|(item, _)| !item.definition.is_repertoire())
                     .ok_or_else(|| {
                         AppError::new("unknown_tactic", "This tactic is unavailable.")
                     })?;

@@ -9,10 +9,11 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-use tempo::{
+use crate::{
     AppError, Tempo,
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_evidence::{GameImport, GameJobs, GameRefresh},
+    game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
     game_model::{GameModel, GapRequest, ModelRequest},
     gap_analysis::{GapAnalysis, GapAnalysisRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
@@ -29,19 +30,21 @@ pub(super) fn serve(
     database: &Path,
     ui: &Path,
     port: u16,
+    detection: GameDetection,
 ) -> LocalResult<()> {
     let public = build_files(ui)?;
     let server = Server::http((Ipv4Addr::LOCALHOST, port))?;
     let address = server.server_addr().to_string();
     let origin = format!("http://{address}");
     println!("Tempo study at {origin}");
-    let explorer = std::sync::Arc::new(tempo::explorer::ExplorerClient::new(database));
+    let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
     let mut games = Games {
         refresh: GameJobs::start()?,
+        detection,
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
         gap_analysis: GapAnalysis::new(database),
-        position_evidence: tempo::position_evidence::PositionEvidence::new(
+        position_evidence: crate::position_evidence::PositionEvidence::new(
             database,
             explorer.clone(),
         ),
@@ -65,6 +68,7 @@ pub(super) fn serve(
             next_model_check = Instant::now() + Duration::from_millis(250);
         }
         games.refresh.poll(app);
+        games.detection.poll(app);
         if !games.refresh.active() {
             games.backfill.poll(app);
         }
@@ -87,11 +91,12 @@ pub(super) fn serve(
 
 struct Games {
     refresh: GameJobs,
+    detection: GameDetection,
     backfill: BackfillCoordinator,
     model: GameModel,
     gap_analysis: GapAnalysis,
     gap_explorer: GapExplorer,
-    position_evidence: tempo::position_evidence::PositionEvidence,
+    position_evidence: crate::position_evidence::PositionEvidence,
 }
 
 #[derive(serde::Deserialize)]
@@ -189,6 +194,33 @@ fn respond(
         request.respond(Response::empty(StatusCode(403)))?;
     } else if matches!(
         request.url(),
+        "/api/games/detectors" | "/api/games/detection" | "/api/games/detection-result"
+    ) {
+        let reply = match (request.method(), request.url()) {
+            (&Method::Get, "/api/games/detectors") => Ok(games.detection.discovery()),
+            (&Method::Post, "/api/games/detection") => {
+                command::<DetectionRequest>(&mut request, MAX_COMMAND_BYTES)
+                    .map(|intent| games.detection.start(app, intent))
+            }
+            (&Method::Post, "/api/games/detection-result") => {
+                command::<DetectionRead>(&mut request, MAX_COMMAND_BYTES)
+                    .map(|intent| games.detection.read(app, intent))
+            }
+            _ => Ok(DetectionReply {
+                status: 405,
+                body: serde_json::json!({"schema_version": 1, "status": "error", "code": "method_not_allowed"}),
+            }),
+        }.unwrap_or_else(|error| DetectionReply {
+            status: 400,
+            body: serde_json::json!({"schema_version": 1, "status": "error", "code": error.code}),
+        });
+        request.respond(
+            body("application/json; charset=utf-8", serde_json::to_vec(&reply.body)?)
+                .with_status_code(StatusCode(reply.status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
+    } else if matches!(
+        request.url(),
         "/api/games"
             | "/api/analysis/evidence"
             | "/api/analysis/result"
@@ -211,7 +243,7 @@ fn respond(
         let (status, reply) = match (request.method(), request.url()) {
             (&Method::Post, "/api/analysis/evidence") => (
                 202,
-                command::<tempo::position_evidence::EvidenceRequest>(
+                command::<crate::position_evidence::EvidenceRequest>(
                     &mut request,
                     MAX_COMMAND_BYTES,
                 )
@@ -219,7 +251,7 @@ fn respond(
             ),
             (&Method::Post, "/api/analysis/result") => (
                 200,
-                command::<tempo::position_evidence::EvidenceRead>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::position_evidence::EvidenceRead>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|r| games.position_evidence.read(r)),
             ),
             (&Method::Get, "/api/games") => (200, app.game_history()),
@@ -295,7 +327,7 @@ fn respond(
             ),
             (&Method::Post, "/api/games/choose") => (
                 200,
-                command::<tempo::game_evidence::ChooseGameCorrection>(
+                command::<crate::game_evidence::ChooseGameCorrection>(
                     &mut request,
                     MAX_COMMAND_BYTES,
                 )
@@ -304,15 +336,15 @@ fn respond(
             ),
             (&Method::Post, "/api/games/reprocess") => (
                 200,
-                command::<tempo::game_evidence::ReprocessGames>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::game_evidence::ReprocessGames>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|intent| app.reprocess_games(intent))
                     .map(|report| serde_json::json!(report)),
             ),
             (&Method::Post, "/api/games/refresh") => (
                 202,
-                command::<GameRefresh>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
-                    games.refresh.refresh(app, intent, !games.backfill.active())
-                }),
+                command::<GameRefresh>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.refresh.refresh(app, intent, !games.backfill.active()))
+                    .map(|reply| serde_json::json!(reply)),
             ),
             _ => (
                 405,
@@ -346,7 +378,7 @@ fn respond(
             serde_json::to_vec(&reply)?,
         ))?;
     } else if request.method() == &Method::Post && request.url() == "/api/tactics-collection" {
-        let reply = command::<tempo::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
+        let reply = command::<crate::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| app.read_tactics(intent))
             .map(|content| serde_json::json!(content))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
@@ -355,7 +387,7 @@ fn respond(
             serde_json::to_vec(&reply)?,
         ))?;
     } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
-        let reply = command::<Option<tempo::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
+        let reply = command::<Option<crate::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
             .and_then(|known| app.study_progress(known.as_ref()))
             .map(|progress| serde_json::json!(progress))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));

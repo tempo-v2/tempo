@@ -36,7 +36,8 @@ impl BookPositions {
         }
         let mut catalog = BTreeMap::<_, Vec<_>>::new();
         let mut names = BTreeMap::new();
-        let (snapshot, revision) = store.content_state()?;
+        let snapshot = store.content_state()?;
+        let revision = snapshot.content_revision;
         if snapshot.dataset != marker.0 || revision != marker.1 {
             return Err(AppError::new(
                 "stale_repertoire",
