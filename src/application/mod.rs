@@ -32,6 +32,8 @@ mod study_game_context;
 
 mod restore;
 mod resume;
+mod saved_reviews;
+pub use saved_reviews::{SaveStudyReview, SavedStudyReviewCommand};
 mod study_progress;
 mod submit;
 pub use study_progress::{ProgressStamp, StudyProgress};

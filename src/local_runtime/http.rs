@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use crate::{
-    AppError, Tempo,
+    AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
@@ -210,6 +210,7 @@ impl PhoneStudy {
                     | "/api/study-progress"
                     | "/api/study/relevance"
                     | "/api/study/game-context"
+                    | "/api/study/review-mark"
             ),
             _ => false,
         }
@@ -518,6 +519,20 @@ fn respond(
             .and_then(|intent| app.read_tactics(intent))
             .map(|content| serde_json::json!(content))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
+        request.respond(body(
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&reply)?,
+        ))?;
+    } else if request.method() == &Method::Post
+        && matches!(request.url(), "/api/study/review-mark" | "/api/study/saved-reviews")
+    {
+        let reply = match request.url() {
+            "/api/study/review-mark" => command::<SaveStudyReview>(&mut request, MAX_COMMAND_BYTES)
+                .and_then(|intent| app.save_study_review(intent)),
+            _ => command::<SavedStudyReviewCommand>(&mut request, MAX_COMMAND_BYTES)
+                .and_then(|intent| app.saved_study_reviews(intent)),
+        }
+        .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
         request.respond(body(
             "application/json; charset=utf-8",
             serde_json::to_vec(&reply)?,

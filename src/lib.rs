@@ -24,6 +24,7 @@ pub mod wire;
 
 pub use adapters::{CounterIds, FixedClock, FixtureGames, JsonSnapshotCodec, UnavailableGames};
 pub use app_error::AppError;
+pub use application::{SaveStudyReview, SavedStudyReviewCommand};
 pub use application::{
     GameLibraryRead, GameReviewLine, GameReviewRead, IntroductionLimits, ProgressStamp,
     StudyAnalysisLine, StudyProgress, TacticThemes, TacticsRead, TacticsReadReply, Tempo, tactic_themes,

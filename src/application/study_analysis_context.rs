@@ -34,6 +34,27 @@ impl Tempo {
             .state
             .decision_index
             .min(issued.definition.decisions.len().saturating_sub(1));
+        self.project_study_analysis(&record, &issued, index)
+    }
+
+    pub(super) fn project_saved_study_analysis(
+        &self,
+        record: &StoredAttempt,
+        index: usize,
+    ) -> Result<Value, AppError> {
+        let issued = self.analysis_issued_item(record)?;
+        self.project_study_analysis(record, &issued, index)
+    }
+
+    fn project_study_analysis(
+        &self,
+        record: &StoredAttempt,
+        issued: &ContentItem,
+        index: usize,
+    ) -> Result<Value, AppError> {
+        let attempt = &record.attempt;
+        let dataset = &attempt.dataset;
+        let attempt_id = &attempt.id;
         let decision = issued
             .definition
             .decisions
@@ -61,7 +82,7 @@ impl Tempo {
             "fen": decision.fen, "color": issued.definition.learner_color().map_err(|e| domain("invalid_content", e))?,
             "datasetId": dataset, "repertoireId": repertoire, "name": record.exercise_name,
             "prescribedUci": decision.expected.uci, "playedUci": played,
-            "attemptId": attempt_id, "revision": revision, "contentVersion": version,
+            "attemptId": attempt_id, "revision": attempt.revision, "contentVersion": attempt.content_version,
         }))
     }
 
@@ -146,29 +167,39 @@ impl Tempo {
                 "The issued exercise changed.",
             ));
         }
-        if record.mode == ActivityMode::Test
-            && !(attempt.status == AttemptStatus::Complete
-                || (attempt.status == AttemptStatus::Abandoned
-                    && attempt.terminal == Some(Grade::Again)))
-        {
-            return Err(AppError::new(
-                "analysis_requires_concession",
-                "End this review before opening analysis.",
-            ));
-        }
-        if record.mode == ActivityMode::Practice
-            && attempt.status == AttemptStatus::Active
-            && attempt.terminal.is_none()
-        {
-            return Err(AppError::new(
-                "analysis_requires_reveal",
-                "Reveal this practice move before opening analysis.",
-            ));
-        }
-        let issued = self
-            .store
-            .issued_item(dataset, &attempt.target, version)?
-            .ok_or_else(|| AppError::new("stale_content", "The issued content is unavailable."))?;
+        analysis_disclosure(&record)?;
+        let issued = self.analysis_issued_item(&record)?;
         Ok((record, issued))
     }
+
+    fn analysis_issued_item(&self, record: &StoredAttempt) -> Result<ContentItem, AppError> {
+        let attempt = &record.attempt;
+        self.store
+            .issued_item(&attempt.dataset, &attempt.target, attempt.content_version)?
+            .ok_or_else(|| AppError::new("stale_content", "The issued content is unavailable."))
+    }
+}
+
+pub(super) fn analysis_disclosure(record: &StoredAttempt) -> Result<(), AppError> {
+    let attempt = &record.attempt;
+    if record.mode == ActivityMode::Test
+        && !(attempt.status == AttemptStatus::Complete
+            || (attempt.status == AttemptStatus::Abandoned
+                && attempt.terminal == Some(Grade::Again)))
+    {
+        return Err(AppError::new(
+            "analysis_requires_concession",
+            "End this review before opening analysis.",
+        ));
+    }
+    if record.mode == ActivityMode::Practice
+        && attempt.status == AttemptStatus::Active
+        && attempt.terminal.is_none()
+    {
+        return Err(AppError::new(
+            "analysis_requires_reveal",
+            "Reveal this practice move before opening analysis.",
+        ));
+    }
+    Ok(())
 }

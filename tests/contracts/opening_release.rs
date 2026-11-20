@@ -2812,3 +2812,74 @@ fn marked_preview_returns_a_signed_save_for_a_large_document() {
     assert_eq!(content(&mut app, save)["status"], "repertoires");
     assert_eq!(app.snapshot().unwrap().revision.0, revision.0 + 1);
 }
+
+#[test]
+fn a_saved_opening_uses_the_issued_definition_until_history_is_reset() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("saved-review.sqlite");
+    let today = Arc::new(AtomicI32::new(20_000));
+    let mut app = open(&db, today, IntroductionLimits::default(), 0);
+    let (_, book) = preview_and_save(&mut app, "1. e4 *", "Before edit", None);
+    let book_id = book["repertoires"][0]["id"].as_str().unwrap();
+    let lesson = study(&mut app, json!({"command": "next"}));
+    assert_eq!(lesson["activity"], "teach");
+    let before = app.snapshot().unwrap();
+    let save = json!({
+        "dataset_id": lesson["dataset_id"],
+        "attempt_id": lesson["attempt_id"],
+        "content_version": lesson["content_version"],
+        "position": {"kind": "decision", "index": 0},
+        "submission_id": "saved-opening",
+    });
+    let saved = app
+        .save_study_review(serde_json::from_value(save.clone()).unwrap())
+        .unwrap();
+    assert_eq!(app.snapshot().unwrap(), before);
+    let mut acknowledgement = activity_command("acknowledge", &lesson, "teach-opening");
+    acknowledgement["answer"] = json!({"uci": "e2e4"});
+    assert_eq!(study(&mut app, acknowledgement)["status"], "complete");
+    let renamed = content(
+        &mut app,
+        json!({
+            "command": "rename", "dataset_id": lesson["dataset_id"],
+            "repertoire_id": book_id, "name": "After edit",
+        }),
+    );
+    assert_eq!(renamed["status"], "repertoires", "{renamed}");
+    preview_and_save(&mut app, "1. d4 *", "After edit", Some(book_id));
+    let open_mark = json!({
+        "command": "open", "dataset_id": lesson["dataset_id"], "id": saved["id"],
+    });
+    let context = app
+        .saved_study_reviews(serde_json::from_value(open_mark.clone()).unwrap())
+        .unwrap();
+    assert_eq!(context["origin"]["fen"], lesson["prompt"]["fen"]);
+    assert_eq!(context["origin"]["name"], "Before edit");
+    assert_eq!(context["origin"]["prescribedUci"], "e2e4");
+    let reset = content(
+        &mut app,
+        json!({
+            "command": "reset_progress", "dataset_id": lesson["dataset_id"],
+            "repertoire_id": book_id, "command_id": "reset-after-mark",
+        }),
+    );
+    assert_eq!(reset["status"], "progress_reset", "{reset}");
+    let gone = app
+        .saved_study_reviews(serde_json::from_value(open_mark).unwrap())
+        .unwrap_err();
+    assert_eq!(gone.code, "unknown_review");
+    assert_eq!(
+        app.save_study_review(serde_json::from_value(save).unwrap())
+            .unwrap(),
+        saved
+    );
+    let page = app
+        .saved_study_reviews(
+            serde_json::from_value(json!({
+                "command": "list", "dataset_id": lesson["dataset_id"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(page["rows"], json!([]));
+}
