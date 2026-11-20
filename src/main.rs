@@ -15,12 +15,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         [mode, database] if mode == "init" || mode == "init-practice" => {
             local_runtime::init(Path::new(database))
         }
-        [mode, database, repertoire, tactics] if mode == "configure" => {
-            local_runtime::configure(Path::new(database), repertoire.parse()?, tactics.parse()?, None)
-        }
-        [mode, database, repertoire, tactics, more] if mode == "configure" => {
-            local_runtime::configure(Path::new(database), repertoire.parse()?, tactics.parse()?, Some(more.parse()?))
-        }
+        [mode, ..] if mode == "configure" => Err("Open Settings in desktop Tempo to change Study limits.".into()),
         [mode, database, normalized] if mode == "import-tactics" => {
             local_runtime::import(Path::new(database), Path::new(normalized))
         }
@@ -34,7 +29,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             local_runtime::serve(Path::new(database), Path::new(ui), port.parse()?)
         }
         _ => Err(
-            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-personal-tactics DATABASE [--apply] | serve DATABASE UI_DIST PORT"
+            "Usage: tempo stdio | init DATABASE | import-tactics DATABASE NORMALIZED.json | backfill-personal-tactics DATABASE [--apply] | serve DATABASE UI_DIST PORT"
                 .into(),
         ),
     }

@@ -101,6 +101,7 @@ test("phone Study retains its shared commands and denies desktop routes after in
     ["/api/games/detection-result", "POST"], ["/api/games/library", "POST"],
     ["/api/games/review", "POST"], ["/api/games/import", "POST"],
     ["/api/repertoires", "POST"], ["/api/study/analysis-context", "POST"],
+    ["/api/settings/study", "POST"],
     ["/api/study", "PUT"], ["/api/study", "GET"],
   ]) assert.equal((await send(host, route, { method, headers: phoneHeaders, payload: {} })).status, 404, route);
   for (const changes of [

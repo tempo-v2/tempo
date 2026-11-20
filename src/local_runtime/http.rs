@@ -1,5 +1,5 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
-use super::{LocalResult, tactic_settings};
+use super::{LocalResult, study_settings};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
@@ -506,14 +506,15 @@ fn respond(
             .with_status_code(StatusCode(status))
             .with_header(field("Cache-Control", "no-store")),
         )?;
-    } else if request.method() == &Method::Post && request.url() == "/api/tactic-settings" {
+    } else if request.method() == &Method::Post && request.url() == "/api/settings/study" {
         let reply = command(&mut request, MAX_COMMAND_BYTES)
-            .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
-            .unwrap_or_else(|error| serde_json::json!(ErrorView::for_content(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+            .and_then(|intent| study_settings::handle(app, profile_store, intent));
+        let payload = match reply {
+            Ok(settings) => serde_json::to_vec(&settings)?,
+            Err(error) => serde_json::to_vec(&ErrorView::for_content(error))?,
+        };
+        request.respond(body("application/json; charset=utf-8", payload)
+            .with_header(field("Cache-Control", "no-store")))?;
     } else if request.method() == &Method::Post && request.url() == "/api/tactics-collection" {
         let reply = command::<crate::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| app.read_tactics(intent))

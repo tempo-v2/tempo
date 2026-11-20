@@ -212,8 +212,9 @@ mod tests {
         let database = directory.join(name);
         super::super::init(&database).unwrap();
         let mut app = super::super::open(&database).unwrap();
-        app.set_local_tactic_preferences(
-            10,
+        app.set_local_study_preferences(
+            crate::IntroductionLimits { tactics: 10, ..Default::default() },
+            super::super::default_more_tactics(),
             Some(crate::TacticThemes::Selected {
                 theme_ids: ["fork".to_owned()].into(),
             }),
