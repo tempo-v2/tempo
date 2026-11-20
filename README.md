@@ -13,8 +13,40 @@ component pins in the Planning release ledger. Normal `tempo serve` composes
 `DailyComponents` with SQLite, the Study clock and the built Tempo UI. The
 browser consumes Study wire 5 and signed content wire 4.
 
-The detector registry starts empty. For a disposable external-detector
-consumer, build `game_detection_contract_host` and pass the temporary database,
+Normal serving registers the hanging-material detector when Stockfish and the
+Python chess environment are available. Background analysis resumes retained
+games and follows new imports. Games displays the saved comparisons; every
+confirmed missed good capture creates or reuses a single-answer puzzle and a
+durable request for the next Study slot, after any active attempt.
+
+The runtime looks for Python at the database-adjacent `maia/venv/bin/python`
+and Stockfish at the existing Homebrew or system locations. Override them for
+an isolated instance with `TEMPO_TACTICAL_PYTHON` and `TEMPO_STOCKFISH`.
+Qualification uses `chess==1.11.2` and Stockfish 17.1. Missing dependencies are
+reported as unavailable; Study still runs. The engine adapter keeps one owned
+process group, uses two million nodes per position, and requires complete exact
+root scores at depth 12 or greater. The game host has a 120-second deadline.
+Incomplete evidence is recorded as uncertain and does not create a puzzle.
+
+The detector considers legal captures of opposing nonking pieces, including
+pawns, that permit no immediate legal recapture of the capturing piece.
+Stockfish compares every legal move; a 30-centipawn tolerance admits equivalent
+choices. Inferior captures are retained for comparison. When several captures
+qualify, the strongest is the puzzle's one answer, with a deterministic tie
+break. The actual game history and the standalone puzzle are evaluated
+separately before a miss is accepted.
+
+The implementation reuses the existing detector host, exact puzzle compiler,
+Study grader and scheduler. New captures bypass ordinary introduction limits.
+A new game miss involving an already tested puzzle receives immediate
+Practice without another scheduled grade that day. Replay or revised analysis
+does not duplicate an occurrence's request. An explicit Skip defers that target
+for the session; a distinct new miss restores its priority. Analysis and request
+state survive database restart; portable content/learning export keeps its
+existing scope and does not include game-analysis delivery state.
+
+For a disposable external-detector consumer, build
+`game_detection_contract_host` and pass the temporary database,
 built UI path, loopback port and scenario. The example calls the same
 [public host entry](src/local_runtime.rs) as production. The
 [HTTP proof](tests/game_detection_http.mjs) checks the addressed game, distinct
@@ -33,6 +65,7 @@ outcomes and stable durable state. The companion browser proof lives in Tempo UI
 | Report a standard-profile external miss | `AgainCommand` → `Tempo::again` | [again_command.rs](src/commands/again_command.rs) rejects analysis against the wrong definition; [again.rs](src/application/again.rs) updates learning without fabricating a human attempt. |
 | Update production repertoire or tactics content | Signed Preview and Save or the validated tactic transfer | [repertoires.rs](src/application/repertoires.rs) and [tactic_capture.rs](src/application/tactic_capture.rs) preserve content and Learning fences. |
 | Read a detector's observations for a stored game | Games detection discovery, start and result routes | [game_detection.rs](src/game_detection.rs) owns bounded ephemeral delivery. Chess checks legal occurrences and reports. |
+| Analyze retained games and prioritize missed captures | Normal runtime's `TacticalJobs`, then `POST /api/games/tactics` for a bounded read | [tactical_jobs.rs](src/tactical_jobs.rs) reuses the detector worker; [tactical_analysis.rs](src/application/tactical_analysis.rs) accepts observation, puzzle and request atomically. |
 | Process fixture-profile games | `Tempo::ingest_games` | [ingest_games.rs](src/application/ingest_games.rs) demonstrates replay-aware ingestion. The count includes processed deviations that were already committed. |
 | Transfer content and learning to an empty dataset | `Tempo::export`, `Tempo::restore` | [export.rs](src/application/export.rs) shows a read-only export; [restore.rs](src/application/restore.rs) restores under a new dataset identity. |
 | Dispatch one decoded UI intent | `wire::StudyCommand` → `Tempo::handle` | [study_command.rs](src/commands/study_command.rs) decodes the versioned envelope; [handle.rs](src/application/handle.rs) returns typed replies even on application failure. |

@@ -70,13 +70,13 @@ impl DetectorRegistry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DetectionRequest {
-    schema_version: u8,
-    request_id: String,
+    pub(crate) schema_version: u8,
+    pub(crate) request_id: String,
     pub(crate) dataset_id: DatasetId,
     pub(crate) source: String,
     pub(crate) game_id: String,
     pub(crate) learner: String,
-    detector_id: String,
+    pub(crate) detector_id: String,
 }
 
 #[derive(Deserialize)]
@@ -87,9 +87,9 @@ pub(crate) struct DetectionRead {
     dataset_id: DatasetId,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum DetectionStatus {
+pub(crate) enum DetectionStatus {
     Running,
     Complete {
         learner_color: LearnerColor,
@@ -106,16 +106,25 @@ enum DetectionStatus {
     SourceUnavailable,
 }
 
-#[derive(Serialize)]
-struct DetectionFinding {
+#[derive(Clone, Serialize)]
+pub(crate) struct DetectionFinding {
     finding_id: String,
     #[serde(flatten)]
-    moment: ValidatedMoment,
+    pub(crate) moment: ValidatedMoment,
 }
 
 pub(crate) struct DetectionReply {
     pub(crate) status: u16,
     pub(crate) body: Value,
+}
+
+/// A typed, source-validated completion for an explicitly composed application
+/// consumer. Reading or previewing a detector result still has no side effects.
+pub(crate) struct DetectionCompletion {
+    pub(crate) request: DetectionRequest,
+    pub(crate) source: AcceptedDetectionSource,
+    pub(crate) descriptor: DetectorDescriptor,
+    pub(crate) status: DetectionStatus,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -166,7 +175,17 @@ impl Entry {
             "game_id": self.request.game_id,
             "detector": descriptor_json(&self.descriptor),
         });
-        let status = serde_json::to_value(&self.status).expect("serializable detection status");
+        let mut status = serde_json::to_value(&self.status).expect("serializable detection status");
+        // Wire 1 is a display-only preview, consumed by older strict clients.
+        // Typed training evidence is accepted through the application command
+        // and exposed by its separate versioned history read.
+        if let Some(findings) = status.get_mut("findings").and_then(Value::as_array_mut) {
+            for finding in findings {
+                if let Some(fields) = finding.as_object_mut() {
+                    fields.remove("tactical");
+                }
+            }
+        }
         body.as_object_mut()
             .unwrap()
             .extend(status.as_object().unwrap().clone());
@@ -203,6 +222,32 @@ pub(crate) struct GameDetection {
 }
 
 impl GameDetection {
+    pub(crate) fn descriptor(&self, id: &str) -> Option<DetectorDescriptor> {
+        self.registry
+            .0
+            .get(id)
+            .map(|entry| entry.descriptor.clone())
+    }
+
+    pub(crate) fn idle(&self) -> bool {
+        self.active.is_none()
+    }
+
+    pub(crate) fn completion(&mut self, app: &Tempo, id: &str) -> Option<DetectionCompletion> {
+        self.poll(app);
+        self.revalidate_retained(app, id);
+        let entry = self.lookup(id)?;
+        if matches!(entry.status, DetectionStatus::Running) {
+            return None;
+        }
+        Some(DetectionCompletion {
+            request: entry.request.clone(),
+            source: (*entry.source).clone(),
+            descriptor: entry.descriptor.clone(),
+            status: entry.status.clone(),
+        })
+    }
+
     pub(crate) fn new(
         registry: DetectorRegistry,
         options: AnalysisOptions,

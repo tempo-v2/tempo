@@ -62,6 +62,7 @@ impl GameDetector for Fixture {
                         subjects: Vec::new(),
                         candidate_move: board.next_move().map(|answer| answer.uci.clone()),
                         explanation: "Occurrence of the initial position.".into(),
+                        tactical: None,
                     })
                     .collect(),
             );
@@ -91,6 +92,7 @@ impl GameDetector for Fixture {
                     subjects: Vec::new(),
                     candidate_move: board.next_move().map(|answer| answer.uci.clone()),
                     explanation: "First played move by the selected learner.".into(),
+                    tactical: None,
                 }])
             }
         }

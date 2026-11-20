@@ -1,5 +1,15 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
 use super::{LocalResult, tactic_settings};
+use crate::{
+    AppError, Tempo,
+    game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
+    game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
+    game_evidence::{GameImport, GameJobs, GameRefresh},
+    game_model::{GameModel, GapRequest, ModelRequest},
+    gap_analysis::{GapAnalysis, GapAnalysisRequest},
+    gap_explorer::{GapExplorer, GapExplorerRequest},
+    wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
@@ -8,16 +18,6 @@ use std::{
     net::Ipv4Addr,
     path::Path,
     time::{Duration, Instant},
-};
-use crate::{
-    AppError, Tempo,
-    game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
-    game_evidence::{GameImport, GameJobs, GameRefresh},
-    game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
-    game_model::{GameModel, GapRequest, ModelRequest},
-    gap_analysis::{GapAnalysis, GapAnalysisRequest},
-    gap_explorer::{GapExplorer, GapExplorerRequest},
-    wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use tempo_store::SqliteStore;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -38,9 +38,11 @@ pub(super) fn serve(
     let origin = format!("http://{address}");
     println!("Tempo study at {origin}");
     let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
+    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection);
     let mut games = Games {
         refresh: GameJobs::start()?,
         detection,
+        tactics,
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
         gap_analysis: GapAnalysis::new(database),
@@ -69,6 +71,7 @@ pub(super) fn serve(
         }
         games.refresh.poll(app);
         games.detection.poll(app);
+        games.tactics.poll(app, &mut games.detection);
         if !games.refresh.active() {
             games.backfill.poll(app);
         }
@@ -92,6 +95,7 @@ pub(super) fn serve(
 struct Games {
     refresh: GameJobs,
     detection: GameDetection,
+    tactics: crate::tactical_jobs::TacticalJobs,
     backfill: BackfillCoordinator,
     model: GameModel,
     gap_analysis: GapAnalysis,
@@ -192,6 +196,31 @@ fn respond(
         || header(&request, "Origin").is_some_and(|value| value != origin)
     {
         request.respond(Response::empty(StatusCode(403)))?;
+    } else if request.url() == "/api/games/tactics" {
+        let (status, value) = if request.method() == &Method::Post {
+            match command::<crate::tactical_jobs::TacticalRead>(&mut request, MAX_COMMAND_BYTES)
+                .and_then(|read| games.tactics.read(app, read))
+            {
+                Ok(value) => (200, value),
+                Err(error) => (
+                    400,
+                    serde_json::json!({"schema_version":1,"status":"error","code":error.code,"message":error.message}),
+                ),
+            }
+        } else {
+            (
+                405,
+                serde_json::json!({"schema_version":1,"status":"error","code":"method_not_allowed"}),
+            )
+        };
+        request.respond(
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&value)?,
+            )
+            .with_status_code(StatusCode(status))
+            .with_header(field("Cache-Control", "no-store")),
+        )?;
     } else if matches!(
         request.url(),
         "/api/games/detectors" | "/api/games/detection" | "/api/games/detection-result"
@@ -215,9 +244,12 @@ fn respond(
             body: serde_json::json!({"schema_version": 1, "status": "error", "code": error.code}),
         });
         request.respond(
-            body("application/json; charset=utf-8", serde_json::to_vec(&reply.body)?)
-                .with_status_code(StatusCode(reply.status))
-                .with_header(field("Cache-Control", "no-store")),
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply.body)?,
+            )
+            .with_status_code(StatusCode(reply.status))
+            .with_header(field("Cache-Control", "no-store")),
         )?;
     } else if matches!(
         request.url(),
@@ -317,7 +349,12 @@ fn respond(
             (&Method::Post, "/api/study/analysis-context") => (
                 200,
                 command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
-                    app.study_analysis_context(&intent.dataset_id, &intent.attempt_id, intent.revision, intent.content_version)
+                    app.study_analysis_context(
+                        &intent.dataset_id,
+                        &intent.attempt_id,
+                        intent.revision,
+                        intent.content_version,
+                    )
                 }),
             ),
             (&Method::Post, "/api/study/game-context") => (

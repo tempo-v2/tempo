@@ -13,14 +13,14 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tempo_chess::ContentItem;
-use tempo_learning::DailyAction;
+use tempo_learning::{DailyAction, ImmediateRecallMode};
 use tempo_queue::{
     DailyActivity, DailyAdmissions, DailyCandidate, DailyChoice, DailyContext, DailyEvidence,
-    DailyKind, DailySelection, DailySelectionInput, DailySession, Line, RelevanceReason,
-    TargetRelevance,
+    DailyKind, DailySelection, DailySelectionInput, DailySession, ImmediateRecall, Line,
+    RelevanceReason, TargetRelevance,
 };
 use tempo_store::{
-    ActivityMode, AnswerResult, Store, StoredAttempt, StudyScope, StudyState, Write,
+    ActivityMode, AnswerResult, Commit, Store, StoredAttempt, StudyScope, StudyState, Write,
 };
 use tempo_study::{Exercise, start_selected_exercise};
 use tempo_types::{DatasetId, StudyTime};
@@ -99,6 +99,27 @@ impl Tempo {
                 .collect(),
             ..DailyEvidence::default()
         };
+        for request in self.store.pending_tactical_requests(&snapshot.dataset)? {
+            let Some(item) = catalog
+                .items
+                .get(&request.target)
+                .filter(|item| item.active() && item.version == request.version)
+            else {
+                continue;
+            };
+            let Some(state) = learning.get(&request.target) else {
+                continue;
+            };
+            let activity = match state.immediate_recall_mode(item.version, at.day) {
+                ImmediateRecallMode::Test => DailyActivity::Test,
+                ImmediateRecallMode::Practice => DailyActivity::Practice,
+            };
+            evidence.immediate_recalls.push(ImmediateRecall {
+                request_id: request.id,
+                target: request.target,
+                activity,
+            });
+        }
 
         let mut capture_priority = BTreeMap::new();
         let candidates = catalog
@@ -173,6 +194,22 @@ impl Tempo {
             daily.tactic_themes.as_ref(),
             daily.starter_themes,
         );
+        let required_activity = match snapshot
+            .active_attempt
+            .as_ref()
+            .and_then(|id| snapshot.attempts.get(id))
+        {
+            Some(record)
+                if record.mode != ActivityMode::Practice
+                    || self.store.has_pending_tactical_request_for_attempt(
+                        &snapshot.dataset,
+                        &record.attempt.id,
+                    )? =>
+            {
+                Some(&record.attempt.target)
+            }
+            _ => None,
+        };
         Ok(daily.queue.select_daily(DailySelectionInput {
             context: DailyContext {
                 seed,
@@ -183,12 +220,7 @@ impl Tempo {
             candidates: &candidates,
             routes: &routes,
             admissions,
-            required_activity: snapshot
-                .active_attempt
-                .as_ref()
-                .and_then(|id| snapshot.attempts.get(id))
-                .filter(|record| record.mode != ActivityMode::Practice)
-                .map(|record| &record.attempt.target),
+            required_activity,
             new_tactic_order: order.as_ref(),
             capture_priority: &capture_priority,
             evidence: &evidence,
@@ -294,14 +326,23 @@ impl Tempo {
             target: Some(&item.target),
             ..StudyScope::default()
         };
-        self.commit_study(
-            snapshot,
-            vec![
-                Write::Issue(record),
-                Write::Active(Some(attempt.id.clone())),
-            ],
-            scope,
-        )?;
+        let writes = vec![
+            Write::Issue(record),
+            Write::Active(Some(attempt.id.clone())),
+        ];
+        if let Some(request_id) = choice.immediate_request {
+            self.store.commit_immediate_recall(
+                Commit {
+                    expected_revision: snapshot.revision,
+                    expected_dataset: snapshot.dataset.clone(),
+                    writes,
+                },
+                scope,
+                request_id,
+            )?;
+        } else {
+            self.commit_study(snapshot, writes, scope)?;
+        }
         self.daily
             .as_mut()
             .expect("daily release")
