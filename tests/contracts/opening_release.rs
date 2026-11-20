@@ -2775,6 +2775,14 @@ fn a_saved_opening_uses_the_issued_definition_until_history_is_reset() {
     let mut acknowledgement = activity_command("acknowledge", &lesson, "teach-opening");
     acknowledgement["answer"] = json!({"uci": "e2e4"});
     assert_eq!(study(&mut app, acknowledgement)["status"], "complete");
+    let renamed = content(
+        &mut app,
+        json!({
+            "command": "rename", "dataset_id": lesson["dataset_id"],
+            "repertoire_id": book_id, "name": "After edit",
+        }),
+    );
+    assert_eq!(renamed["status"], "repertoires", "{renamed}");
     preview_and_save(&mut app, "1. d4 *", "After edit", Some(book_id));
     let open_mark = json!({
         "command": "open", "dataset_id": lesson["dataset_id"], "id": saved["id"],
