@@ -5,7 +5,7 @@ use crate::{
     app_error::domain,
     explorer::{ExplorerClient, Ratings},
     game_evidence::check_id,
-    maia::{MODEL_KEY, Maia, PROFILE_LABEL},
+    maia::{MODEL_KEY, Maia, PROFILE_LABEL, checked_distribution},
     stockfish::stockfish,
 };
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use tempo_chess::{
     legal_model_moves,
 };
 use tempo_store::{SqliteStore, Store};
-use tempo_types::DatasetId;
+use tempo_types::{DatasetId, Revision};
 mod repertoires;
 use repertoires::BookPositions;
 
@@ -36,6 +36,13 @@ enum Source {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReviewVersion {
+    revision: Revision,
+    document_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceRequest {
     request_id: String,
     fen: String,
@@ -47,6 +54,8 @@ pub struct EvidenceRequest {
     ratings: Ratings,
     #[serde(default)]
     pins: Vec<String>,
+    candidate_count: Option<usize>,
+    review_version: Option<ReviewVersion>,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +140,25 @@ impl PositionEvidence {
                 "Choose up to sixteen legal candidate moves.",
             ));
         }
+        if request
+            .candidate_count
+            .is_some_and(|count| request.source != Source::Stockfish || !(1..=5).contains(&count))
+        {
+            return Err(AppError::new(
+                "invalid_candidate_count",
+                "Choose one to five Stockfish lines.",
+            ));
+        }
+        if request.review_version.is_some()
+            && (request.source != Source::Repertoire
+                || request.repertoire_id.is_none()
+                || request.dataset_id.is_none())
+        {
+            return Err(AppError::new(
+                "invalid_review_scope",
+                "Choose a game review and its repertoire.",
+            ));
+        }
         let id = request.request_id.clone();
         let source = request.source;
         let reply = json!({"status":"running","fen":request.fen,"request_id":id,"source":source});
@@ -209,7 +237,13 @@ impl Services {
         match r.source {
             Source::Stockfish => {
                 let pins = r.pins.iter().map(String::as_str).collect::<Vec<_>>();
-                let result = stockfish(&self.directory, &r.fen, &job.legal, &pins)?;
+                let result = stockfish(
+                    &self.directory,
+                    &r.fen,
+                    &job.legal,
+                    &pins,
+                    r.candidate_count.unwrap_or(3),
+                )?;
                 let complete = result.comparison.is_some() || pins.is_empty();
                 Ok(
                     json!({"engine":result.engine,"comparison_complete":complete,"candidates":result.comparison.unwrap_or(result.candidates)}),
@@ -227,24 +261,27 @@ impl Services {
             }
             Source::Maia => {
                 let store = SqliteStore::open(&self.database)?;
-                let distribution = if job.legal.is_empty() {
-                    BTreeMap::new()
-                } else if let Some(cached) = store.game_move_distribution(MODEL_KEY, &job.key.0)? {
-                    cached
-                } else {
-                    let mut worker = self.maia.lock().expect("interactive Maia");
-                    if worker.is_none() {
-                        *worker = Some(Maia::start(&self.directory)?);
-                    }
-                    match worker.as_mut().expect("initialized Maia").infer(&job.key) {
-                        Ok(distribution) => distribution,
-                        Err(error) => {
-                            *worker = None;
-                            return Err(error);
+                let distribution =
+                    if let Some(cached) = store.game_move_distribution(MODEL_KEY, &job.key.0)? {
+                        checked_distribution(&job.key, cached)?
+                    } else if job.legal.is_empty() {
+                        BTreeMap::new()
+                    } else {
+                        let mut worker = self.maia.lock().expect("interactive Maia");
+                        if worker.is_none() {
+                            *worker = Some(Maia::start(&self.directory)?);
                         }
-                    }
-                };
-                Ok(json!({"profile":PROFILE_LABEL,"probabilities":distribution}))
+                        match worker.as_mut().expect("initialized Maia").infer(&job.key) {
+                            Ok(distribution) => distribution,
+                            Err(error) => {
+                                *worker = None;
+                                return Err(error);
+                            }
+                        }
+                    };
+                Ok(
+                    json!({"profile":PROFILE_LABEL,"terminal":job.legal.is_empty(),"probabilities":distribution}),
+                )
             }
             Source::Repertoire => {
                 let store = SqliteStore::open(&self.database)?;
@@ -269,10 +306,11 @@ impl Services {
                         r.learner_color,
                     )?);
                 }
-                let data = books
-                    .as_ref()
-                    .expect("loaded book positions")
-                    .compare(&r.fen, &job.key)?;
+                let data = books.as_ref().expect("loaded book positions").compare(
+                    &r.fen,
+                    &job.key,
+                    r.review_version.as_ref(),
+                )?;
                 if store.model_content_marker()? != marker {
                     return Err(AppError::new(
                         "stale_repertoire",
@@ -282,5 +320,93 @@ impl Services {
                 Ok(data)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempo_chess::{Catalog, START_FEN};
+    use tempo_learning::{DailyLearning, LearningPolicy};
+
+    #[test]
+    fn cached_maia_on_the_shared_board_rejects_bad_mass_without_running_inference() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("evidence.sqlite");
+        let dataset = DatasetId::from("evidence-proof");
+        let mut store = SqliteStore::create(
+            &database,
+            dataset,
+            Catalog::default(),
+            DailyLearning::default().settings(),
+        )
+        .unwrap();
+        let make_job = |fen: &str| {
+            let key = StandardPositionCanonicalizer.canonicalize(fen).unwrap();
+            Job {
+                legal: legal_model_moves(&key).unwrap(),
+                key,
+                request: EvidenceRequest {
+                    request_id: "maia-fixture".into(),
+                    fen: fen.into(),
+                    source: Source::Maia,
+                    dataset_id: None,
+                    repertoire_id: None,
+                    learner_color: None,
+                    ratings: Ratings::default(),
+                    pins: vec![],
+                    candidate_count: None,
+                    review_version: None,
+                },
+            }
+        };
+        let initial = make_job(START_FEN);
+        let excess = initial
+            .legal
+            .iter()
+            .map(|mv| {
+                (
+                    mv.clone(),
+                    if ["e2e4", "d2d4"].contains(&mv.as_str()) {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                )
+            })
+            .collect();
+        let query = make_job("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+        let valid = query
+            .legal
+            .iter()
+            .map(|mv| (mv.clone(), if *mv == "e7e5" { 1.0 } else { 0.0 }))
+            .collect();
+        store
+            .save_game_move_distribution(MODEL_KEY, &initial.key.0, &excess)
+            .unwrap();
+        store
+            .save_game_move_distribution(MODEL_KEY, &query.key.0, &valid)
+            .unwrap();
+        let host = PositionEvidence::new(&database, Arc::new(ExplorerClient::new(&database)));
+        assert_eq!(
+            host.services.read(&initial).unwrap_err().code,
+            "invalid_maia_reply"
+        );
+        let response = host.services.read(&query).unwrap();
+        assert_eq!(response["probabilities"], json!(valid));
+        assert_eq!(response["terminal"], false);
+        let terminal = host
+            .services
+            .read(&make_job("7k/6Q1/6K1/8/8/8/8/8 b - - 0 50"))
+            .unwrap();
+        assert_eq!(terminal["terminal"], true);
+        assert_eq!(terminal["probabilities"], json!({}));
+        assert!(host.services.maia.lock().unwrap().is_none());
+        assert_eq!(
+            store
+                .game_move_distribution(MODEL_KEY, &initial.key.0)
+                .unwrap(),
+            Some(excess)
+        );
     }
 }

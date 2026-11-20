@@ -2,10 +2,12 @@
 //! The Tempo 1 converter writes a validated pack envelope. Capture Save marks
 //! an accepted personal capture. Other provenance entries are attribution.
 use serde::Deserialize;
+use std::collections::BTreeMap;
+use tempo_chess::Catalog;
 use tempo_chess::ContentItem;
 use tempo_learning::LearningState;
-use tempo_store::Snapshot;
-use tempo_types::{StudyDay, TargetId};
+use tempo_queue::{PackDifficulty, PackMembership, TacticPackCandidate};
+use tempo_types::TargetId;
 
 const PERSONAL_CAPTURE: &str = "tempo:capture-save";
 const LEGACY_PACK: &str = "tempo1:catalog-metadata:";
@@ -33,21 +35,6 @@ impl CaptureOrigin {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum PackDifficulty {
-    Easy,
-    Medium,
-    Hard,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PackMembership<'a> {
-    pub theme: &'a str,
-    pub difficulty: PackDifficulty,
-    pub ordinal: usize,
-    pub position: usize,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct LegacyPackMember<'a> {
@@ -59,7 +46,7 @@ struct LegacyPackMember<'a> {
 
 /// Keep the historical pack validation at ingress. Deck spelling has no role
 /// once the theme, difficulty, pack ordinal and position have been decoded.
-fn pack_memberships(provenance: &[String]) -> impl Iterator<Item = PackMembership<'_>> {
+pub(crate) fn pack_memberships(provenance: &[String]) -> impl Iterator<Item = PackMembership<'_>> {
     provenance.iter().filter_map(|entry| {
         let member: LegacyPackMember<'_> =
             serde_json::from_str(entry.strip_prefix(LEGACY_PACK)?).ok()?;
@@ -69,6 +56,9 @@ fn pack_memberships(provenance: &[String]) -> impl Iterator<Item = PackMembershi
             "hard" => PackDifficulty::Hard,
             _ => return None,
         };
+        if !super::tactic_preferences::known_tactic_theme(member.motif) {
+            return None;
+        }
         let (pack, ordinal) = member.deck_id.rsplit_once('-')?;
         let (theme, pack_difficulty) = pack.rsplit_once('-')?;
         let ordinal = ordinal.parse().ok()?;
@@ -85,36 +75,20 @@ fn pack_memberships(provenance: &[String]) -> impl Iterator<Item = PackMembershi
     })
 }
 
-pub(super) struct TacticPackCandidate<'a> {
-    pub target: &'a TargetId,
-    pub memberships: PackMemberships<'a>,
-    pub first_introduced: Option<StudyDay>,
-    pub guided_introduction: bool,
-}
-
-/// Delays reading legacy membership until the selection policy needs it.
-pub(super) struct PackMemberships<'a>(&'a [String]);
-
-impl PackMemberships<'_> {
-    pub(super) fn iter(&self) -> impl Iterator<Item = PackMembership<'_>> {
-        pack_memberships(self.0)
-    }
-}
-
 /// Adapt retained content and Learning to the inputs used by new-pack ordering.
-pub(super) fn tactic_pack_candidates(
-    snapshot: &Snapshot,
-) -> impl Iterator<Item = TacticPackCandidate<'_>> + Clone {
-    snapshot
-        .catalog
+pub(super) fn tactic_pack_candidates<'a>(
+    catalog: &'a Catalog,
+    learning: &'a BTreeMap<TargetId, LearningState>,
+) -> impl Iterator<Item = TacticPackCandidate<'a>> + Clone {
+    catalog
         .items
         .values()
         .filter(|item| item.active() && !item.definition.is_repertoire())
         .map(move |item| {
-            let state = &snapshot.learning[&item.target];
+            let state = &learning[&item.target];
             TacticPackCandidate {
                 target: &item.target,
-                memberships: PackMemberships(&item.provenance),
+                memberships: pack_memberships(&item.provenance).collect(),
                 first_introduced: state.first_introduced,
                 guided_introduction: state.taught_at.is_some(),
             }

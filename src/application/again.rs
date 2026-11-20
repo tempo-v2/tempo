@@ -4,7 +4,7 @@ use crate::{AgainCommand, AppError, app_error::domain};
 use tempo_chess::ContentKind;
 use tempo_learning::{AssessmentInput, AssessmentSource, Transition};
 use tempo_queue::OrderEvent;
-use tempo_store::{AssessmentKey, AssessmentRecord, Receipt, ReceiptResult, Write};
+use tempo_store::{AssessmentKey, AssessmentRecord, Receipt, ReceiptResult, StudyScope, Write};
 use tempo_types::Grade;
 
 impl Tempo {
@@ -13,11 +13,16 @@ impl Tempo {
     /// The event is tied to the compared content version. Only a newly committed
     /// event updates queue history; replay returns the saved learning transition.
     pub fn again(&mut self, command: AgainCommand) -> Result<Transition, AppError> {
-        let snapshot = self.store.snapshot()?;
         let fingerprint =
             serde_json::to_string(&("again", &command)).map_err(|e| domain("codec_error", e))?;
         let submission =
             Receipt::external_id(&command.dataset_id, &command.provider, &command.event_id);
+        let scope = StudyScope {
+            target: Some(&command.target),
+            submission: Some(&submission),
+            ..Default::default()
+        };
+        let snapshot = self.store.study_state(scope)?;
         if let Some(result) = replay(&snapshot, &submission, &fingerprint)? {
             return match result {
                 ReceiptResult::External { transition, .. } => Ok(transition),
@@ -36,10 +41,8 @@ impl Tempo {
                 "source and event identity are required",
             ));
         }
-        let item = snapshot
-            .catalog
-            .items
-            .get(&command.target)
+        let (item, learning) = snapshot
+            .target(&command.target)?
             .ok_or_else(|| AppError::new("unknown_target", "feedback target does not exist"))?;
         if item.version != command.expected_content_version {
             return Err(AppError::new(
@@ -76,9 +79,9 @@ impl Tempo {
         let transition = self
             .components
             .learning
-            .apply(&snapshot.learning[&command.target], &input)
+            .apply(learning, &input)
             .map_err(|e| domain("learning_error", e))?;
-        self.commit(
+        self.commit_study(
             &snapshot,
             vec![
                 Write::Learning {
@@ -97,7 +100,7 @@ impl Tempo {
                     transition: transition.clone(),
                 }),
                 Write::Receipt(Receipt {
-                    id: submission,
+                    id: submission.clone(),
                     command: fingerprint,
                     result: ReceiptResult::External {
                         target: command.target.clone(),
@@ -105,6 +108,7 @@ impl Tempo {
                     },
                 }),
             ],
+            scope,
         )?;
         self.order_history.push(OrderEvent::Missed {
             target: command.target,

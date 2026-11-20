@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicI32, Ordering},
     },
 };
-use tempo::{Clock, Components, CounterIds, IntroductionLimits, Tempo, wire::StudyCommand};
+use tempo::{Clock, DailyComponents, CounterIds, IntroductionLimits, Tempo, wire::StudyCommand};
 use tempo_chess::{Catalog, ImportRequest, LearnerColor, LegalSequenceGrader, compile_repertoire};
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::{SqliteStore, Store};
@@ -43,12 +43,12 @@ fn open(path: &Path, day: Day, limits: IntroductionLimits, generation: u8) -> Te
         )
         .unwrap()
     };
-    let components = Components {
+    let components = DailyComponents {
         clock: Box::new(TestClock(day)),
         grader: Box::new(LegalSequenceGrader),
         ids: Box::new(CounterIds(u64::from(generation) * 1_000)),
         learning: Box::new(learning),
-        ..Components::fixtures()
+        ..DailyComponents::fixtures()
     };
     Tempo::daily(Box::new(store), components, limits, [42; 32], 10).unwrap()
 }
@@ -582,14 +582,15 @@ fn mixed_study_independent_quotas_due_order_and_optional_actions() {
         },
     )
     .unwrap();
-    assert_eq!(scoped.catalog.items.len(), 1);
-    assert_eq!(scoped.learning.len(), 1);
-    assert_eq!(scoped.attempts.len(), 1);
-    assert!(
-        scoped.assessments.is_empty()
-            && scoped.receipts.is_empty()
-            && scoped.content_history.is_empty()
+    let target = &scoped.attempts[&current_id].attempt.target;
+    assert_eq!(
+        scoped.target_coverage(),
+        &tempo_store::TargetCoverage::Selected([target.clone()].into())
     );
+    assert!(scoped.target(target).unwrap().is_some());
+    assert!(scoped.complete_catalog().is_err());
+    assert_eq!(scoped.attempts.len(), 1);
+    assert!(scoped.assessments.is_empty() && scoped.receipts.is_empty());
     eprintln!(
         "Diagnostic: 558 targets and 60 scheduled outcomes; next issuance {issued_in:?}; current-command read returned one activity, target, and learning state."
     );

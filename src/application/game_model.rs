@@ -1,7 +1,7 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id};
 use crate::game_model::{GapRequest, model_input_stamp};
-use crate::maia::{MODEL_KEY, PROFILE_LABEL};
+use crate::maia::{MODEL_KEY, PROFILE_LABEL, checked_distribution};
 use crate::{
     AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
 };
@@ -12,7 +12,7 @@ use tempo_chess::{
     compile_repertoire, legal_move_labels,
 };
 use tempo_store::{ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets};
-use tempo_types::Revision;
+use tempo_types::{DatasetId, Revision};
 
 struct CheckedGap {
     authored: AuthoredRepertoire,
@@ -23,10 +23,11 @@ struct CheckedGap {
 }
 
 impl Tempo {
-    pub(crate) fn model_projection_status(&self) -> Result<Option<ProjectionStatus>, AppError> {
-        Ok(self
-            .store
-            .game_model_projection_status(&self.game_dataset()?)?)
+    pub(crate) fn model_projection_status(
+        &self,
+        dataset: &DatasetId,
+    ) -> Result<Option<ProjectionStatus>, AppError> {
+        Ok(self.store.game_model_projection_status(dataset)?)
     }
 
     /// Verify legacy source associations once against accepted content before cache reprojection.
@@ -37,7 +38,8 @@ impl Tempo {
             if pending.is_empty() {
                 return Ok(());
             }
-            let (snapshot, revision) = self.store.content_state()?;
+            let snapshot = self.store.content_state()?;
+            let revision = snapshot.content_revision;
             if snapshot.dataset != dataset {
                 continue;
             }
@@ -195,7 +197,8 @@ impl Tempo {
         let dataset = request.dataset_id.clone();
         let repertoire_id = request.repertoire_id.clone();
         let (draft, revision) = self.gap_position(request)?;
-        let (snapshot, current_revision) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
+        let current_revision = snapshot.content_revision;
         if snapshot.dataset != dataset || current_revision != revision {
             return Err(AppError::new(
                 "stale_repertoire",
@@ -262,9 +265,19 @@ impl Tempo {
             .map_err(|error| domain("invalid_gap_position", error))?;
         let after =
             legal_move_labels(&draft.fen).map_err(|error| domain("invalid_gap_position", error))?;
-        let distribution = self
+        let checked = self
             .store
-            .game_move_distribution(MODEL_KEY, &request.position.0)?;
+            .game_move_distribution(MODEL_KEY, &request.position.0)
+            .map_err(AppError::from)
+            .and_then(|cached| {
+                cached
+                    .map(|moves| checked_distribution(&request.position, moves))
+                    .transpose()
+            });
+        let (distribution, local_model_error) = match checked {
+            Ok(distribution) => (distribution, None),
+            Err(error) => (None, Some(error.code)),
+        };
         let coverage = distribution.as_ref().map(|moves| {
             authored.positions[&request.position]
                 .replies
@@ -298,6 +311,7 @@ impl Tempo {
             "opponent_move_labels": before,
             "response_move_labels": after,
             "profile": PROFILE_LABEL,
+            "local_model_error": local_model_error,
             "local_coverage": coverage,
             "actual_probability": actual_probability,
             "top_replies": top,

@@ -76,7 +76,10 @@ impl Tempo {
             return study_result(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
-        let definition = &snapshot.catalog.items[&old.attempt.target].definition;
+        let (item, prior) = snapshot
+            .target(&old.attempt.target)?
+            .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
+        let definition = &item.definition;
         if matches!(old.mode, ActivityMode::Teach | ActivityMode::Repair) {
             return Err(AppError::new(
                 "wrong_activity",
@@ -157,7 +160,6 @@ impl Tempo {
                     issued_miss_revision: old.issued_miss_revision,
                 },
             };
-            let prior = &snapshot.learning[&old.attempt.target];
             let policy = self.components.learning.as_ref();
             let transition = if self.daily.is_some() {
                 DailyLearning::assess_test(
@@ -192,7 +194,6 @@ impl Tempo {
                     && record.input.grade == Grade::Again
             })
         {
-            let prior = &snapshot.learning[&old.attempt.target];
             if record.transition.state.correction.is_some() {
                 let state = DailyLearning::repair(
                     prior,

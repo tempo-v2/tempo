@@ -70,13 +70,16 @@ impl Tempo {
         let results: Vec<_> = history
             .results
             .into_iter()
-            .map(|entry| GameResult {
-                comparison_id: Some(entry.comparison_id),
-                effect: entry
-                    .summary
-                    .correction_effect
-                    .unwrap_or(GameReviewEffect::RecordedOnly),
-                summary: entry.summary,
+            .map(|entry| {
+                let mut result = json!(GameResult {
+                    comparison_id: Some(entry.comparison_id),
+                    effect: entry.summary.correction_effect.unwrap_or(GameReviewEffect::RecordedOnly),
+                    summary: entry.summary,
+                });
+                result["players"] = json!({
+                    "white":entry.white, "black":entry.black, "played_date_ms":entry.played_date_ms
+                });
+                result
             })
             .collect();
         Ok(
@@ -352,7 +355,7 @@ impl Tempo {
     /// Upgrade only outstanding legacy obligations backed by stored evidence.
     /// Each game transaction can safely be replayed if startup was interrupted.
     pub fn reconcile_legacy_game_requests(&mut self) -> Result<(), AppError> {
-        let (snapshot, _) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
         let mut batches = BTreeMap::<_, BTreeSet<_>>::new();
         let mut reconciled = BTreeSet::new();
         for (target, state) in &snapshot.learning {
@@ -425,7 +428,7 @@ impl Tempo {
             )?;
         }
         if !reconciled.is_empty() {
-            let (current, _) = self.store.content_state()?;
+            let current = self.store.content_state()?;
             let writes = reconciled
                 .into_iter()
                 .filter_map(|target| {
@@ -439,7 +442,7 @@ impl Tempo {
                 })
                 .collect::<Vec<_>>();
             if !writes.is_empty() {
-                self.commit(&current, writes)?;
+                self.commit(&current.dataset, current.revision, writes)?;
             }
         }
         Ok(())
@@ -449,7 +452,8 @@ impl Tempo {
     pub fn reconcile_choice_encounters(&mut self) -> Result<EncounterRepairReport, AppError> {
         let mut report = EncounterRepairReport::default();
         let mut cursor = None;
-        let (mut snapshot, mut revision) = self.store.content_state()?;
+        let mut snapshot = self.store.content_state()?;
+        let mut revision = snapshot.content_revision;
         let mut books = self.comparison_books(&snapshot, revision)?;
         let mut retries = 0;
         loop {
@@ -505,7 +509,8 @@ impl Tempo {
                     retries = 0;
                 }
                 Err(StoreError::Conflict(_)) if retries < 3 => {
-                    let (current, new_revision) = self.store.content_state()?;
+                    let current = self.store.content_state()?;
+                    let new_revision = current.content_revision;
                     if current.dataset != snapshot.dataset {
                         return Err(invalid(
                             "The dataset changed during encounter reconciliation.",
@@ -537,7 +542,8 @@ impl Tempo {
         if learner.is_empty() || learner.len() > 100 {
             return Err(invalid("Choose the learner with their exact player name."));
         }
-        let (snapshot, revision) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
+        let revision = snapshot.content_revision;
         if expected_dataset != &snapshot.dataset {
             return Err(invalid("The dataset changed during refresh."));
         }
@@ -938,7 +944,8 @@ impl Tempo {
         {
             return Ok(Arc::clone(cached));
         }
-        let (snapshot, revision) = self.store.content_state()?;
+        let snapshot = self.store.content_state()?;
+        let revision = snapshot.content_revision;
         if &snapshot.dataset != dataset {
             return Err(invalid("The active dataset changed."));
         }
@@ -947,7 +954,7 @@ impl Tempo {
 
     fn comparison_books(
         &mut self,
-        snapshot: &tempo_store::Snapshot,
+        snapshot: &tempo_store::ContentState,
         revision: Revision,
     ) -> Result<Arc<GameBooks>, AppError> {
         if let Some(cached) = &self.game_books
@@ -1080,7 +1087,7 @@ fn encounter_projection(decisions: &[PlayedDecision], choices: &GameChoices) -> 
     encounters
 }
 
-fn learner_side(game: &GameRecord, learner: &str) -> Option<LearnerColor> {
+pub(super) fn learner_side(game: &GameRecord, learner: &str) -> Option<LearnerColor> {
     match (
         game.white.to_lowercase() == learner,
         game.black.to_lowercase() == learner,
@@ -1105,7 +1112,7 @@ fn parsed_game_date(game: &PlayedGame) -> Option<NaiveDate> {
         .find_map(|tag| NaiveDate::parse_from_str(game.tags.get(tag)?, "%Y.%m.%d").ok())
 }
 
-fn parse_stored_game(mut game: GameRecord) -> Result<(GameRecord, PlayedGame), String> {
+pub(super) fn parse_stored_game(mut game: GameRecord) -> Result<(GameRecord, PlayedGame), String> {
     let mut parsed = parse_played_games(&game.pgn).map_err(|error| error.to_string())?;
     if parsed.len() != 1 {
         return Err("Expected one stored completed game.".into());
@@ -1201,8 +1208,14 @@ fn uploaded_record(game: &PlayedGame, fetched_ms: u64) -> Result<GameRecord, Str
         .map_or_else(String::new, |date| {
             format!("[Date \"{}\"]\n", date.format("%Y.%m.%d"))
         });
+    // These validated PGN tag values retain their original escaping. Opening
+    // labels describe a game in the library and do not participate in identity.
+    let opening_tags = ["Opening", "Variation", "ECO", "ECOUrl"]
+        .into_iter()
+        .filter_map(|key| tag(key).map(|value| format!("[{key} \"{value}\"]\n")))
+        .collect::<String>();
     let pgn = format!(
-        "[White {}]\n[Black {}]\n[Result {}]\n{setup}{date_tag}\n{}\n",
+        "[White {}]\n[Black {}]\n[Result {}]\n{setup}{date_tag}{opening_tags}\n{}\n",
         json!(white),
         json!(black),
         json!(game.result),

@@ -33,9 +33,11 @@ impl Tempo {
             seed: snapshot.revision.0,
             history: self.order_history.clone(),
         };
+        let (catalog, learning) = snapshot.complete_catalog()?;
         let mut source = QueueSource {
-            snapshot: &snapshot,
-            queue: self.components.queue.as_ref(),
+            catalog,
+            learning,
+            queue: self.fixture.as_ref().expect("fixture app").queue.as_ref(),
             today: at.day,
             context,
             remaining: self.remaining_block.clone(),
@@ -52,12 +54,9 @@ impl Tempo {
         let Availability::Ready(started) = result else {
             return Ok(None);
         };
-        let state = snapshot
-            .learning
-            .get(&started.attempt.target)
-            .ok_or_else(|| {
-                AppError::new("invalid_learning", "selected target has no learning state")
-            })?;
+        let state = learning.get(&started.attempt.target).ok_or_else(|| {
+            AppError::new("invalid_learning", "selected target has no learning state")
+        })?;
         let row = StoredAttempt {
             attempt: started.attempt,
             issued_at: at,
@@ -72,12 +71,16 @@ impl Tempo {
             acceptance: None,
             revealed_decision: None,
         };
-        self.commit(
+        self.commit_study(
             &snapshot,
             vec![
                 Write::Issue(row.clone()),
                 Write::Active(Some(row.attempt.id.clone())),
             ],
+            StudyScope {
+                target: Some(&row.attempt.target),
+                ..Default::default()
+            },
         )?;
         self.remaining_block = remaining;
         Ok(Some(AnswerResult {

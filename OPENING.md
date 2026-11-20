@@ -161,12 +161,18 @@ sqlite3 -readonly .local/usable-release/study.sqlite ".backup '$recovery_dir/bac
 sqlite3 -readonly "$recovery_dir/backup.sqlite" 'PRAGMA integrity_check; PRAGMA foreign_key_check;'
 ```
 
-A valid check prints `ok` with no foreign-key rows. To recover or inspect that backup, copy it into a new file and serve it on a separate port with the matching schema-3 checkpoint.
+A valid check prints `ok` with no foreign-key rows. Inspect or rehearse recovery
+using a copy of the backup and the binary/UI pair verified for that backup's
+schema. Find the current pair in the managed registration and release ledger.
+For a schema-11 backup from the PGN-cap release, the matching checkpoint is
+`workspace-c21029b32dd79bcfc7e2`. Use a separate port and a free database
+path outside the UI directory. Keep the managed registration and installed
+database in place during rehearsal.
 
 ```sh
+checkpoint="$PWD/.local/usable-release/checkpoints/workspace-c21029b32dd79bcfc7e2"
 cp -n "$recovery_dir/backup.sqlite" "$recovery_dir/recovered.sqlite"
-.local/usable-release/checkpoints/04/tempo serve \
-  "$recovery_dir/recovered.sqlite" .local/usable-release/checkpoints/04/ui 41823
+"$checkpoint/tempo" serve "$recovery_dir/recovered.sqlite" "$checkpoint/ui" 41823
 ```
 
 Open [the recovered copy](http://127.0.0.1:41823). Confirm the expected study state before choosing a recovery file for routine use. Keep the original database and backup intact. An older backup contains only the learning present at the time it was made.
@@ -212,6 +218,8 @@ Opening a gap shows similar repertoire responses alongside a bounded
 Stockfish search. Nearby positions are ranked by pawn files, piece placement
 and castling rights. Tempo tries the most common reusable replies in the
 current repertoire first, then other saved repertoires for the same side.
+For replies backed by the same number of positions, a better comparable
+Stockfish evaluation wins the tie. Structural closeness breaks remaining ties.
 
 Tempo suggests the first reply within 50 centipawns of Stockfish's best.
 If the best comparable repertoire reply is 51–150 centipawns behind, the

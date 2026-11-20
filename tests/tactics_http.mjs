@@ -11,6 +11,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createStudyController } from '../../tempo-ui/study_controller.js';
+import { databaseRows } from './support/game_detection_readback.mjs';
 
 const binary = process.env.TEMPO_BINARY ?? fileURLToPath(new URL('../../target/debug/tempo', import.meta.url));
 const ui = fileURLToPath(new URL('../../tempo-ui/dist', import.meta.url));
@@ -100,12 +101,17 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     let serial = 0;
     let stored = null;
     let loseMove = false;
+    let interruptNext = false;
     let lostResult;
     const sent = [];
     function controller() {
         return createStudyController({
             transport: { async send(command) {
                 sent.push(structuredClone(command));
+                if (interruptNext && command.command === 'next') {
+                    interruptNext = false;
+                    throw new Error('Next interrupted before delivery');
+                }
                 const response = await fetch(host.url + '/api/study', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -212,11 +218,20 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     assert.equal(inspected.solution.moves.length, 3);
     assert.deepEqual(persisted(database), after);
 
-    client = controller();
-    const reloaded = await client.start();
+    interruptNext = true;
+    const continuation = sent.length;
+    await assert.rejects(client.next(), /Next interrupted before delivery/);
+    assert.equal(client.getState().retryingNext, true);
+    assert.equal(client.getState().view.status, 'complete');
+    assert.deepEqual(persisted(database), after);
+    const reloaded = await client.retry();
+    assert.deepEqual(sent.slice(continuation), [{ command: 'next' }, { command: 'next' }]);
     assert.equal(reloaded.status, 'empty');
     assert.equal(reloaded.done, true);
     assert.equal(reloaded.can_practice_tactics, true);
+    const schedulingRows = () => databaseRows(database).filter(([name]) =>
+        name === 'learning' || name === 'daily_tactics_allowances');
+    const beforePractice = schedulingRows();
     const practice = await client.practiceTactics();
     assert.equal(practice.activity, 'practice');
     assert.notEqual(practice.attempt_id, issued.attempt_id);
@@ -224,6 +239,7 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     await client.answer('a6c8');
     assert.equal((await client.answer('e1e8')).assessment, 'good');
     assert.deepEqual(persisted(database).grades, ['again']);
+    assert.deepEqual(schedulingRows(), beforePractice);
     assert.equal((await client.next()).status, 'empty');
 });
 
@@ -256,6 +272,13 @@ test('SQLite rolls back a teaching acknowledgement if its receipt cannot be stor
         attempt_id: card.attempt_id, expected_revision: card.revision, answer: { uci: 'e2e4' },
     };
     const before = persisted(database);
+    const wrongShown = await post('study', {
+        ...ack, submission_id: 'wrong-shown-move', answer: { uci: 'd2d4' },
+    });
+    assert.equal(wrongShown.status, 'error');
+    assert.equal(wrongShown.code, 'try_shown_move');
+    assert.deepEqual(persisted(database), before);
+    assert.deepEqual(await post('study', { command: 'next' }), card);
     const sql = new DatabaseSync(database);
     try {
         sql.exec(`CREATE TRIGGER fail_test_receipt BEFORE INSERT ON receipts

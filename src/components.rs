@@ -5,7 +5,7 @@ use tempo_learning::{FixedIntervalScheduler, LearningPolicy, StandardLearning};
 use tempo_queue::{QueuePolicy, StableQueue};
 use tempo_types::{StudyDay, StudyTime};
 
-/// Dependencies selected by the composition root and consumed by [`crate::Tempo`].
+/// Ports for the standalone fixture workflow assembled by [`crate::Tempo::new`].
 ///
 /// Start with [`Self::fixtures`] for a runnable demonstration, then replace a
 /// single field with another implementation of the same port. The store is a
@@ -44,6 +44,45 @@ impl Components {
             })),
             ids: Box::new(CounterIds::default()),
         }
+    }
+}
+
+/// Ports consumed by Daily Study and the signed content and game commands.
+pub struct DailyComponents {
+    pub learning: Box<dyn LearningPolicy>,
+    pub grader: Box<ChessGrader>,
+    pub clock: Box<dyn Clock>,
+    pub ids: Box<dyn AttemptIds>,
+}
+
+impl DailyComponents {
+    /// Deterministic baseline ports for disposable integration tests.
+    pub fn fixtures() -> Self {
+        Components::fixtures().split().0
+    }
+}
+
+pub(crate) struct FixtureOperations {
+    pub(crate) queue: Box<dyn QueuePolicy>,
+    pub(crate) parser: Box<dyn ContentParser>,
+    pub(crate) comparator: Box<dyn GameComparator>,
+}
+
+impl Components {
+    pub(crate) fn split(self) -> (DailyComponents, FixtureOperations) {
+        (
+            DailyComponents {
+                learning: self.learning,
+                grader: self.grader,
+                clock: self.clock,
+                ids: self.ids,
+            },
+            FixtureOperations {
+                queue: self.queue,
+                parser: self.parser,
+                comparator: self.comparator,
+            },
+        )
     }
 }
 

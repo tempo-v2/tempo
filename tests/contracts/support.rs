@@ -6,14 +6,33 @@ use std::{
 use tempo::{AgainCommand, Clock, Components, SubmitCommand, Tempo};
 use tempo_chess::{Catalog, ImportRequest, demo_catalog};
 use tempo_learning::LearningState;
-use tempo_store::{AnswerResult, Commit, MemoryStore, Snapshot, Store, StoreError, Write};
-use tempo_types::{Revision, StudyDay, StudyTime, TargetId};
+use tempo_store::{
+    AnswerResult, Commit, ContentState, MemoryStore, PortableGameEvidence, Snapshot, Store,
+    StoreError, StudyScope, StudyState, Write,
+};
+use tempo_types::{DatasetId, Revision, StudyDay, StudyTime, TargetId};
 
 #[derive(Clone)]
 struct SharedStore(Rc<RefCell<MemoryStore>>);
 impl Store for SharedStore {
     fn snapshot(&self) -> Result<Snapshot, StoreError> {
         self.0.borrow().snapshot()
+    }
+    fn study_state(&self, scope: StudyScope<'_>) -> Result<StudyState, StoreError> {
+        self.0.borrow().study_state(scope)
+    }
+    fn content_state(&self) -> Result<ContentState, StoreError> {
+        self.0.borrow().content_state()
+    }
+    fn repertoire_reset_at(
+        &self,
+        dataset: &DatasetId,
+        repertoire: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        self.0.borrow().repertoire_reset_at(dataset, repertoire)
+    }
+    fn portable_state(&self) -> Result<(Snapshot, PortableGameEvidence), StoreError> {
+        self.0.borrow().portable_state()
     }
     fn commit(&mut self, commit: Commit) -> Result<Revision, StoreError> {
         self.0.borrow_mut().commit(commit)

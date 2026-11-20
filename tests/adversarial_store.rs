@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use std::path::Path;
 use tempo::game_backfill::BackfillCoordinator;
-use tempo::{Components, FixedClock, IntroductionLimits, Tempo};
+use tempo::{DailyComponents, FixedClock, IntroductionLimits, Tempo};
 use tempo_chess::{Catalog, LegalSequenceGrader};
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::{SqliteStore, Store};
@@ -21,14 +21,14 @@ fn app(path: &Path) -> Tempo {
     .unwrap();
     Tempo::daily(
         Box::new(store),
-        Components {
+        DailyComponents {
             clock: Box::new(FixedClock(StudyTime {
                 day: StudyDay(20_004),
                 unix_ms: NOW,
             })),
             grader: Box::new(LegalSequenceGrader),
             learning: Box::new(learning),
-            ..Components::fixtures()
+            ..DailyComponents::fixtures()
         },
         IntroductionLimits::default(),
         [42; 32],

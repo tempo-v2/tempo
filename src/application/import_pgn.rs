@@ -3,7 +3,7 @@ use super::Tempo;
 use crate::{AppError, app_error::domain};
 use tempo_chess::{Catalog, ChangeKind, ContentPlan, ImportRequest};
 use tempo_learning::LearningState;
-use tempo_store::{Snapshot, Write};
+use tempo_store::{ContentState, Write};
 use tempo_types::DatasetId;
 
 impl Tempo {
@@ -17,15 +17,14 @@ impl Tempo {
         dataset: &DatasetId,
         request: &ImportRequest,
     ) -> Result<Vec<tempo_chess::ContentChange>, AppError> {
-        if self.daily.is_some() {
-            return Err(AppError::new(
+        let fixture = self.fixture.as_ref().ok_or_else(|| {
+            AppError::new(
                 "unsupported",
                 "Use Repertoires to preview and save repertoire PGN.",
-            ));
-        }
+            )
+        })?;
         let snapshot = self.import_snapshot(dataset)?;
-        let parsed = self
-            .components
+        let parsed = fixture
             .parser
             .parse(request)
             .map_err(|e| domain("content_parse_error", e))?;
@@ -49,7 +48,7 @@ impl Tempo {
     /// existing target. The transfer report records aliases to preexisting
     /// content without modifying its metadata.
     pub fn apply_tactic_transfer(&mut self, catalog: &Catalog) -> Result<ContentPlan, AppError> {
-        let snapshot = self.store.snapshot()?;
+        let snapshot = self.store.content_state()?;
         let mut plan = tempo_chess::plan_tactic_capture(&snapshot.catalog, catalog)
             .map_err(|error| domain("content_change_error", error))?
             .content;
@@ -64,8 +63,8 @@ impl Tempo {
         self.publish_import(&snapshot, plan)
     }
 
-    fn import_snapshot(&self, dataset: &DatasetId) -> Result<Snapshot, AppError> {
-        let snapshot = self.store.snapshot()?;
+    fn import_snapshot(&self, dataset: &DatasetId) -> Result<ContentState, AppError> {
+        let snapshot = self.store.content_state()?;
         if dataset != &snapshot.dataset {
             return Err(AppError::new(
                 "stale_dataset",
@@ -77,7 +76,7 @@ impl Tempo {
 
     fn apply_catalog_to(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &ContentState,
         catalog: &Catalog,
     ) -> Result<ContentPlan, AppError> {
         let plan = if self.daily.is_some() {
@@ -91,7 +90,7 @@ impl Tempo {
 
     fn publish_import(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &ContentState,
         plan: ContentPlan,
     ) -> Result<ContentPlan, AppError> {
         if plan.catalog == snapshot.catalog {
@@ -117,7 +116,7 @@ impl Tempo {
                 writes.push(Write::Active(None));
             }
         }
-        self.commit(snapshot, writes)?;
+        self.commit(&snapshot.dataset, snapshot.revision, writes)?;
         self.remaining_block.clear();
         Ok(plan)
     }
