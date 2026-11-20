@@ -5,6 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { setTimeout as delay } from "node:timers/promises";
 import { join, resolve } from "node:path";
 import { databaseRows } from "./support/game_detection_readback.mjs";
 
@@ -231,10 +232,11 @@ try {
     assert.equal(pending, immutableBytes);
     if (acceptedBeforeUpgrade) {
       // Let the independent cache projection settle before comparing complete database readbacks.
-      await page.waitForFunction(async () => {
-        const status = await (await fetch("/api/games/model")).json();
-        return status.projection?.complete_current === 1;
-      }, null, { polling: 100 });
+      const deadline = Date.now() + 6000;
+      while (count(databaseRows(database), "game_model_projection") === 0) {
+        assert.ok(Date.now() < deadline, "The prior release did not finish projecting the saved book.");
+        await delay(50);
+      }
     }
     const afterOld = databaseRows(database);
     assert.equal(count(afterOld, "content_receipts"), Number(acceptedBeforeUpgrade));
