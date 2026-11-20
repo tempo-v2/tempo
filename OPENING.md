@@ -109,7 +109,7 @@ tailscale serve status
 
 Use Serve in tailnet-only mode. Validate the private URL before sharing it
 with your devices. To take the phone URL offline, run
-`tailscale serve --https=8443 http://127.0.0.1:41822 off` before rolling back
+`tailscale serve --https=8443 off` before rolling back
 the managed Tempo release. If unrelated disposable Tempo sessions are running,
 set `TEMPO_KEEP_DEV_SERVERS=1` for this managed installation.
 
