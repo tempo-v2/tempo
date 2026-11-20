@@ -53,7 +53,11 @@ impl Tempo {
             .values()
             .filter(|item| item.active())
             .filter_map(|item| match &item.definition.kind {
-                ContentKind::Repertoire { repertoire, .. } => Some(repertoire),
+                ContentKind::Repertoire { repertoire, .. }
+                    if !snapshot.suspended_repertoires.contains(repertoire) =>
+                {
+                    Some(repertoire)
+                }
                 _ => None,
             })
             .collect();

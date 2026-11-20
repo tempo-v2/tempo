@@ -75,3 +75,57 @@ fn exact_legacy_move_and_empty_explorer_are_independent_of_learning_and_model_au
     assert_eq!(stale["code"], "stale_dataset");
     assert_eq!(store.snapshot().unwrap(), before);
 }
+
+#[test]
+fn unpinned_game_evidence_excludes_suspended_books_without_changing_library_evidence() {
+    use tempo_store::{RepertoireActivity, RepertoireActivityCommand};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("suspend-evidence.sqlite");
+    let mut books =
+        compile_repertoire("1. e4 *", "active", "Italian", LearnerColor::White, "pgn-a").unwrap();
+    let london =
+        compile_repertoire("1. d4 *", "paused", "London", LearnerColor::White, "pgn-b").unwrap();
+    books.items.extend(london.items);
+    books.lines.extend(london.lines);
+    let dataset = "dataset".into();
+    let mut store =
+        SqliteStore::create(&path, dataset, books, DailyLearning::default().settings()).unwrap();
+    let before = store.snapshot().unwrap();
+    store
+        .set_repertoire_activity(
+            &RepertoireActivityCommand {
+                dataset: &before.dataset,
+                repertoire: "paused",
+                command_id: "pause",
+                activity: RepertoireActivity::Suspended,
+            },
+            before.revision,
+            None,
+        )
+        .unwrap();
+    let service = PositionEvidence::new(&path, Arc::new(ExplorerClient::new(&path)));
+    let mut request = json!({
+        "request_id":"library","source":"repertoire","fen":START,"dataset_id":"dataset","repertoire_id":"active",
+        "repertoire_scope":"library",
+    });
+    assert_eq!(
+        query(&service, request.clone())["data"]["exact"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    request["request_id"] = json!("game-gap");
+    request["repertoire_scope"] = json!("game");
+    let game = query(&service, request.clone());
+    assert_eq!(
+        game["data"]["exact"],
+        json!([{"uci":"e2e4","repertoire_id":"active"}]),
+        "{game}"
+    );
+    assert!(game["data"]["repertoire_names"]["paused"].is_null());
+    request["request_id"] = json!("paused-target");
+    request["repertoire_id"] = json!("paused");
+    assert_eq!(query(&service, request)["code"], "stale_repertoire");
+}

@@ -32,6 +32,9 @@ impl Tempo {
         let (item, _) = snapshot
             .target(&record.attempt.target)?
             .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
+        if super::repertoires::is_suspended(item, &snapshot.suspended_repertoires) {
+            return Err(super::repertoires::suspended_repertoire());
+        }
         if !item.active() || item.version != record.attempt.content_version {
             return Err(AppError::new(
                 "stale_content",

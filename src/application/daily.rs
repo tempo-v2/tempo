@@ -122,6 +122,9 @@ impl Tempo {
                         DailyKind::Tactic => {}
                     }
                 }
+                if super::repertoires::is_suspended(item, &snapshot.suspended_repertoires) {
+                    return None;
+                }
                 if kind == DailyKind::Tactic
                     && item.active()
                     && let Some(introduced_at) = capture_review_priority(item, state)
@@ -160,6 +163,7 @@ impl Tempo {
         let routes = catalog
             .lines
             .iter()
+            .filter(|line| !snapshot.suspended_repertoires.contains(&line.repertoire))
             .map(|line| Line {
                 id: line.id.clone(),
                 targets: line.targets.clone(),

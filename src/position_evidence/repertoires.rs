@@ -1,5 +1,5 @@
 //! Revision-scoped authored moves and structural comparisons.
-use super::ReviewVersion;
+use super::{RepertoireEvidenceScope, ReviewVersion};
 use crate::{AppError, app_error::domain, gap_recommendation::SimilarMoves};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -7,12 +7,37 @@ use tempo_chess::{
     AuthoredRepertoire, ContentKind, LearnerColor, PositionKey, SavedRepertoireResponse,
     nearby_repertoire_positions,
 };
-use tempo_store::{SqliteStore, Store};
+use tempo_store::{GameComparisonBasis, SqliteStore, Store};
 use tempo_types::{DatasetId, Revision};
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct BookMarker {
+    pub(super) dataset: DatasetId,
+    content: Revision,
+    participation: Option<Revision>,
+}
+
+impl BookMarker {
+    pub(super) fn new(
+        dataset: DatasetId,
+        basis: GameComparisonBasis,
+        scope: RepertoireEvidenceScope,
+    ) -> Self {
+        Self {
+            dataset,
+            content: basis.content,
+            participation: (scope == RepertoireEvidenceScope::Game).then_some(basis.participation),
+        }
+    }
+}
+
 pub(super) struct BookPositions {
-    pub(super) marker: (DatasetId, Revision),
-    pub(super) scope: (Option<String>, Option<LearnerColor>),
+    pub(super) marker: BookMarker,
+    pub(super) scope: (
+        Option<String>,
+        Option<LearnerColor>,
+        RepertoireEvidenceScope,
+    ),
     catalog: BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>,
     names: BTreeMap<String, String>,
     document_id: Option<String>,
@@ -21,15 +46,26 @@ pub(super) struct BookPositions {
 impl BookPositions {
     pub(super) fn load(
         store: &SqliteStore,
-        marker: (DatasetId, Revision),
+        marker: BookMarker,
         repertoire_id: Option<&str>,
         learner_color: Option<LearnerColor>,
+        scope: RepertoireEvidenceScope,
     ) -> Result<Self, AppError> {
+        let participating_only = scope == RepertoireEvidenceScope::Game;
         let mut color = learner_color;
         let mut document_id = None;
         let mut selected_authored = None;
         if let Some(id) = repertoire_id {
             let document = store.repertoire_document(id)?;
+            if document.dataset != marker.dataset
+                || document.revision != marker.content
+                || (participating_only && document.suspended)
+            {
+                return Err(AppError::new(
+                    "stale_repertoire",
+                    "The repertoire changed. Reload the comparison.",
+                ));
+            }
             document_id = document.source_id;
             let item = document
                 .item
@@ -43,8 +79,8 @@ impl BookPositions {
         let mut catalog = BTreeMap::<_, Vec<_>>::new();
         let mut names = BTreeMap::new();
         let snapshot = store.content_state()?;
-        let revision = snapshot.content_revision;
-        if snapshot.dataset != marker.0 || revision != marker.1 {
+        let basis = snapshot.game_comparison_basis();
+        if BookMarker::new(snapshot.dataset, basis, scope) != marker {
             return Err(AppError::new(
                 "stale_repertoire",
                 "The repertoire changed. Refresh the position.",
@@ -64,7 +100,9 @@ impl BookPositions {
                 .definition
                 .learner_color()
                 .map_err(|e| domain("invalid_repertoire", e))?;
-            if color.is_some_and(|c| c != side) {
+            if color.is_some_and(|c| c != side)
+                || (participating_only && snapshot.suspended_repertoires.contains(repertoire))
+            {
                 continue;
             }
             catalog
@@ -102,7 +140,7 @@ impl BookPositions {
         }
         Ok(Self {
             marker,
-            scope: (repertoire_id.map(str::to_owned), learner_color),
+            scope: (repertoire_id.map(str::to_owned), learner_color, scope),
             catalog,
             names,
             document_id,
@@ -117,7 +155,7 @@ impl BookPositions {
     ) -> Result<Value, AppError> {
         let id = self.scope.0.as_deref().unwrap_or("");
         if let Some(expected) = expected {
-            if expected.revision != self.marker.1
+            if expected.revision != self.marker.content
                 || self.document_id.as_ref() != Some(&expected.document_id)
                 || self.selected_authored.is_none()
             {
@@ -137,9 +175,9 @@ impl BookPositions {
             .map(|entry| json!({"uci":entry.answer.uci,"repertoire_id":entry.repertoire_id}))
             .collect::<Vec<_>>();
         let mut data = json!({"exact":exact,"nearby":nearby,"similar_responses":SimilarMoves::rank(&nearby),
-            "repertoire_names":self.names,"content_revision":self.marker.1});
+            "repertoire_names":self.names,"content_revision":self.marker.content});
         if expected.is_some() {
-            data["dataset_id"] = json!(self.marker.0);
+            data["dataset_id"] = json!(self.marker.dataset);
             data["repertoire_id"] = json!(id);
             data["document_id"] = json!(self.document_id);
             // Game review compares the authored document at both learner and opponent positions.

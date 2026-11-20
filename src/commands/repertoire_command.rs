@@ -48,6 +48,12 @@ pub enum RepertoireCommand {
         repertoire_id: String,
         name: String,
     },
+    SetActivity {
+        dataset_id: DatasetId,
+        repertoire_id: String,
+        command_id: String,
+        activity: tempo_store::RepertoireActivity,
+    },
     ResetProgress {
         dataset_id: DatasetId,
         repertoire_id: String,

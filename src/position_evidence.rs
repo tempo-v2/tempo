@@ -22,7 +22,7 @@ use tempo_chess::{
 use tempo_store::{SqliteStore, Store};
 use tempo_types::{DatasetId, Revision};
 mod repertoires;
-use repertoires::BookPositions;
+use repertoires::{BookMarker, BookPositions};
 
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +32,13 @@ enum Source {
     Rated,
     Masters,
     Maia,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RepertoireEvidenceScope {
+    Library,
+    Game,
 }
 
 #[derive(Deserialize)]
@@ -55,7 +62,22 @@ pub struct EvidenceRequest {
     #[serde(default)]
     pins: Vec<String>,
     candidate_count: Option<usize>,
+    repertoire_scope: Option<RepertoireEvidenceScope>,
     review_version: Option<ReviewVersion>,
+}
+
+impl EvidenceRequest {
+    fn repertoire_scope(&self) -> RepertoireEvidenceScope {
+        self.repertoire_scope.unwrap_or_else(|| {
+            // Earlier mounted Game Review pages identify this read with their
+            // versioned Game Review address. New requests carry the scope explicitly.
+            if self.review_version.is_some() {
+                RepertoireEvidenceScope::Game
+            } else {
+                RepertoireEvidenceScope::Library
+            }
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -149,10 +171,12 @@ impl PositionEvidence {
                 "Choose one to five Stockfish lines.",
             ));
         }
-        if request.review_version.is_some()
-            && (request.source != Source::Repertoire
-                || request.repertoire_id.is_none()
-                || request.dataset_id.is_none())
+        if (request.review_version.is_some()
+            && request.repertoire_scope() != RepertoireEvidenceScope::Game)
+            || (request.repertoire_scope() == RepertoireEvidenceScope::Game
+                && (request.source != Source::Repertoire
+                    || request.repertoire_id.is_none()
+                    || request.dataset_id.is_none()))
         {
             return Err(AppError::new(
                 "invalid_review_scope",
@@ -285,10 +309,12 @@ impl Services {
             }
             Source::Repertoire => {
                 let store = SqliteStore::open(&self.database)?;
-                let marker = store.model_content_marker()?;
+                let scope = r.repertoire_scope();
+                let (dataset, basis) = store.game_comparison_marker()?;
+                let marker = BookMarker::new(dataset, basis, scope);
                 if r.dataset_id
                     .as_ref()
-                    .is_some_and(|dataset| dataset != &marker.0)
+                    .is_some_and(|dataset| dataset != &marker.dataset)
                 {
                     return Err(AppError::new(
                         "stale_dataset",
@@ -297,13 +323,15 @@ impl Services {
                 }
                 let mut books = self.books.lock().expect("position repertoire snapshot");
                 if books.as_ref().is_none_or(|b| {
-                    b.marker != marker || b.scope != (r.repertoire_id.clone(), r.learner_color)
+                    b.marker != marker
+                        || b.scope != (r.repertoire_id.clone(), r.learner_color, scope)
                 }) {
                     *books = Some(BookPositions::load(
                         &store,
                         marker.clone(),
                         r.repertoire_id.as_deref(),
                         r.learner_color,
+                        scope,
                     )?);
                 }
                 let data = books.as_ref().expect("loaded book positions").compare(
@@ -311,7 +339,8 @@ impl Services {
                     &job.key,
                     r.review_version.as_ref(),
                 )?;
-                if store.model_content_marker()? != marker {
+                let (dataset, current) = store.game_comparison_marker()?;
+                if BookMarker::new(dataset, current, scope) != marker {
                     return Err(AppError::new(
                         "stale_repertoire",
                         "The repertoire changed. Refresh the position.",
@@ -356,6 +385,7 @@ mod tests {
                     ratings: Ratings::default(),
                     pins: vec![],
                     candidate_count: None,
+                    repertoire_scope: None,
                     review_version: None,
                 },
             }

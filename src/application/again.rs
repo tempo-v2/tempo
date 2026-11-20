@@ -56,6 +56,9 @@ impl Tempo {
                 "feedback target is quarantined",
             ));
         }
+        if super::repertoires::is_suspended(item, &snapshot.suspended_repertoires) {
+            return Err(super::repertoires::suspended_repertoire());
+        }
         if let ContentKind::Repertoire { repertoire, .. } = &item.definition.kind
             && self
                 .store
