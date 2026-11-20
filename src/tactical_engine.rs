@@ -614,11 +614,17 @@ for raw in sys.stdin:
         let config = configuration(&pid_file);
         let script =
             "import os,sys,time\nopen(sys.argv[1], 'w').write(str(os.getpid()))\ntime.sleep(30)\n";
-        let result = Worker::start_script(
-            &config,
-            Some(&CancelAt(Instant::now() + Duration::from_millis(150))),
-            script,
-        );
+        struct CancelAfterStart<'a>(&'a Path);
+        impl DetectionControl for CancelAfterStart<'_> {
+            fn check(&self) -> Result<(), DetectionStop> {
+                if std::fs::read_to_string(self.0).is_ok_and(|pid| !pid.is_empty()) {
+                    Err(DetectionStop::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let result = Worker::start_script(&config, Some(&CancelAfterStart(&pid_file)), script);
         assert!(matches!(
             result,
             Err(EvaluationFailure::Stopped(DetectionStop::Cancelled))

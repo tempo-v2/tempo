@@ -28,6 +28,8 @@ pub(crate) struct TacticalDetails {
     pub(crate) assessment: TacticalAssessment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) opponent_lead_in: Option<tempo_chess::OpponentLeadIn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skipped_analyses: Vec<String>,
 }
 
 pub(crate) fn analysis_version(descriptor: &DetectorDescriptor) -> String {
@@ -230,6 +232,11 @@ impl Tempo {
                         side_to_move: moment.side_to_move,
                         assessment: assessment.clone(),
                         opponent_lead_in: moment.opponent_lead_in.clone(),
+                        skipped_analyses: if assessment.outcome == TacticalOutcome::WinningMate {
+                            vec![completion.descriptor.id.clone()]
+                        } else {
+                            Vec::new()
+                        },
                     };
                     observations.push(TacticalObservation {
                         ply: moment

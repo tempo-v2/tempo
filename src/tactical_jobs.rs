@@ -145,7 +145,7 @@ impl TacticalJobs {
                 self.ready = Some((task, result));
             }
         }
-        if let Some((task, result)) = &self.ready {
+        if run_allowed && let Some((task, result)) = &self.ready {
             match app.accept_tactical_analysis(&task.game, result) {
                 Ok(_) => self.last_error = None,
                 Err(error) if matches!(error.code.as_str(), "stale_source" | "stale_dataset") => {}
@@ -157,7 +157,7 @@ impl TacticalJobs {
             }
             self.ready = None;
         }
-        if !run_allowed || self.active.is_some() || !detection.idle() {
+        if !run_allowed || self.ready.is_some() || self.active.is_some() || !detection.idle() {
             return Ok(());
         }
         let descriptor = self.descriptor.as_ref().expect("configured detector");
@@ -202,12 +202,6 @@ impl TacticalJobs {
             self.next_check = Instant::now() + Duration::from_secs(2);
             return Ok(());
         };
-        let [detector_id] = task.analyses.as_slice() else {
-            return Err(AppError::new(
-                "invalid_analysis_set",
-                "The queued analyses are unavailable in this release.",
-            ));
-        };
         self.sequence += 1;
         let request_id = format!("position-{}-{}", self.run, self.sequence);
         let reply = detection.start_work(
@@ -219,9 +213,10 @@ impl TacticalJobs {
                 source: task.game.game.source.clone(),
                 game_id: task.game.game.id.clone(),
                 learner: task.game.learner.clone(),
-                detector_id: detector_id.clone(),
+                detector_id: descriptor.id.clone(),
             },
             Some(task.run),
+            &task.analyses,
         );
         if reply.status != 202 {
             return Err(AppError::new(

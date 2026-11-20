@@ -156,6 +156,7 @@ impl DetectionControl for Stop {
 }
 
 struct Work {
+    position_detectors: Vec<RegisteredDetector>,
     position: Option<tempo_store::TacticalPositionRun>,
     request: DetectionRequest,
     source: Arc<AcceptedDetectionSource>,
@@ -300,7 +301,7 @@ impl GameDetection {
     }
 
     pub(crate) fn start(&mut self, app: &Tempo, request: DetectionRequest) -> DetectionReply {
-        self.start_work(app, request, None)
+        self.start_work(app, request, None, &[])
     }
 
     pub(crate) fn cancel_background(&mut self) {
@@ -316,6 +317,7 @@ impl GameDetection {
         app: &Tempo,
         request: DetectionRequest,
         position: Option<tempo_store::TacticalPositionRun>,
+        analyses: &[String],
     ) -> DetectionReply {
         let error =
             |status, code| addressed_error(status, code, &request.request_id, &request.dataset_id);
@@ -350,6 +352,16 @@ impl GameDetection {
             };
             return error(404, code);
         };
+        let Some(position_detectors) = analyses
+            .iter()
+            .map(|id| self.registry.0.get(id).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return error(404, "unknown_position_detector");
+        };
+        if position.is_some() && position_detectors.is_empty() {
+            return error(400, "empty_analysis_set");
+        }
         if self.active.is_some() {
             return error(409, "busy");
         }
@@ -385,6 +397,7 @@ impl GameDetection {
             .work
             .try_send(Work {
                 position,
+                position_detectors,
                 request,
                 source,
                 detector,
@@ -549,7 +562,14 @@ fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus 
     }
     let detector = &task.detector.detector;
     let outcome = if let Some(run) = task.position {
-        detector.detect_position(input, run.ply as usize, task.stop.as_ref())
+        tempo_chess::scan_position(
+            input,
+            run.ply as usize,
+            task.position_detectors
+                .iter()
+                .map(|entry| entry.detector.as_ref()),
+            task.stop.as_ref(),
+        )
     } else {
         detector.detect(input, task.stop.as_ref())
     };
@@ -693,6 +713,75 @@ mod tests {
             learner: "Learner".into(),
             detector_id: "barrier".into(),
         }
+    }
+
+    #[test]
+    fn queued_detector_set_reuses_one_search_inside_the_real_host() {
+        use std::sync::atomic::AtomicUsize;
+        use tempo_chess::{EvaluationProvenance, EvaluationStatus, PositionPass};
+
+        struct Probe(&'static str, Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl GameDetector for Probe {
+            fn descriptor(&self) -> DetectorDescriptor {
+                DetectorDescriptor {
+                    id: self.0.into(),
+                    label: self.0.into(),
+                    revision: "1".into(),
+                    configuration_fingerprint: "fixture".into(),
+                }
+            }
+
+            fn detect(&self, _: &GameDetectionInput, _: &dyn DetectionControl) -> DetectionOutcome {
+                panic!("a position task called the whole-game detector")
+            }
+
+            fn detect_position(
+                &self,
+                position: &PositionPass<'_>,
+                _: &dyn DetectionControl,
+            ) -> DetectionOutcome {
+                assert_eq!(position.occurrence().next_move().unwrap().uci, "e2e4");
+                self.1.fetch_add(1, Ordering::SeqCst);
+                let profile = EvaluationProvenance {
+                    engine: "fixture".into(),
+                    engine_version: "1".into(),
+                    configuration_fingerprint: "shared".into(),
+                };
+                position
+                    .compare(&profile, || {
+                        self.2.fetch_add(1, Ordering::SeqCst);
+                        Ok(EvaluationStatus::Incomplete { evaluation: None })
+                    })
+                    .unwrap();
+                DetectionOutcome::Complete(vec![])
+            }
+        }
+
+        let (_directory, mut app) = disposable_app();
+        let request = seed_game(&mut app, "shared");
+        let probes = Arc::new(AtomicUsize::new(0));
+        let searches = Arc::new(AtomicUsize::new(0));
+        let mut registry = DetectorRegistry::default();
+        for id in ["barrier", "second"] {
+            registry
+                .register(Probe(id, probes.clone(), searches.clone()))
+                .unwrap();
+        }
+        let mut jobs = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+        let delivery = jobs.start_work(
+            &app,
+            request.clone(),
+            Some(tempo_store::TacticalPositionRun {
+                id: 1,
+                ply: 0,
+                deeper: false,
+            }),
+            &["barrier".into(), "second".into()],
+        );
+        assert_eq!(delivery.status, 202);
+        assert_eq!(report(&app, &request, &mut jobs)["status"], "complete");
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!(searches.load(Ordering::SeqCst), 1);
     }
 
     fn barrier_detector() -> (

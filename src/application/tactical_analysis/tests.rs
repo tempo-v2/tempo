@@ -416,11 +416,18 @@ fn failed_and_timed_out_scans_do_not_block_other_games_or_create_false_misses() 
         }
         fn detect_position(
             &self,
-            input: &GameDetectionInput,
-            _ply: usize,
+            position: &tempo_chess::PositionPass<'_>,
             control: &dyn DetectionControl,
         ) -> DetectionOutcome {
-            self.detect(input, control)
+            if self.pending.swap(false, Ordering::SeqCst) {
+                if self.timed_out {
+                    DetectionOutcome::Stopped(DetectionStop::Deadline)
+                } else {
+                    DetectionOutcome::Failed("fixture engine failure".into())
+                }
+            } else {
+                self.inner.detect_position(position, control)
+            }
         }
     }
     for timed_out in [false, true] {
@@ -504,4 +511,37 @@ fn deterministic_acceptance_failure_is_recorded_without_blocking_the_archive() {
     assert_eq!(app.snapshot().unwrap().catalog, catalog);
     assert_eq!(app.snapshot().unwrap().learning, retained_learning);
     assert!(app.next_exercise().unwrap().is_none());
+}
+
+#[test]
+fn adjacent_positions_commit_separately_and_replay_the_exact_predecessor() {
+    let (directory, mut app) = disposable();
+    let regular = seed_due(&mut app, "Due review");
+    let (mut detection, mut jobs) = host("1", "miss");
+    import(&mut app, "Two decisions", "1. Kg2 Kg7 2. Kg1 Kh8");
+    let report = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    assert_eq!(report["statistics"]["decisions_scanned"], 2);
+    assert_eq!(report["statistics"]["pending_requests"], 2);
+    assert_eq!(report["observations"][0]["ply"], 2);
+    assert_eq!(report["observations"][1]["ply"], 0);
+    let first = app.next_exercise().unwrap().unwrap();
+    let issued = app
+        .store
+        .stored_attempt(&first.attempt.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(issued.opponent_lead_in.unwrap().uci, "h8g7");
+    answer(&mut app, &first, "a1a7", "first-miss");
+    drop(app);
+    let mut app = local_runtime::open(&directory.path().join("tactics.sqlite")).unwrap();
+    let review = app.next_exercise().unwrap().unwrap();
+    assert_eq!(review.attempt.target, regular);
+    answer(&mut app, &review, "e2e4", "due-review");
+    let second = app.next_exercise().unwrap().unwrap();
+    let issued = app
+        .store
+        .stored_attempt(&second.attempt.id)
+        .unwrap()
+        .unwrap();
+    assert!(issued.opponent_lead_in.is_none());
 }
