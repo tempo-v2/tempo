@@ -11,6 +11,7 @@ impl Tempo {
     /// `None` means no exercise is eligible now, not that the study service is
     /// permanently finished. Issuance and the active pointer are committed together.
     pub fn next_exercise(&mut self) -> Result<Option<AnswerResult>, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.next_exercise.next_exercise");
         let scope = StudyScope {
             catalog: true,
             ..StudyScope::default()
@@ -43,12 +44,14 @@ impl Tempo {
             remaining: self.remaining_block.clone(),
         };
         let id = self.components.ids.next_id();
-        let result = tempo_study::next_available_exercise_if_any(
-            &mut source,
-            self.components.grader.as_ref(),
-            snapshot.dataset.clone(),
-            id,
-        )
+        let result = crate::diagnostics::measure("study.next_available_exercise_if_any", || {
+            tempo_study::next_available_exercise_if_any(
+                &mut source,
+                self.components.grader.as_ref(),
+                snapshot.dataset.clone(),
+                id,
+            )
+        })
         .map_err(|e| domain("source_or_grader_error", e))?;
         let remaining = source.remaining;
         let Availability::Ready(started) = result else {

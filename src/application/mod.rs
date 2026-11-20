@@ -91,6 +91,7 @@ impl Tempo {
         components: DailyComponents,
         fixture: Option<FixtureOperations>,
     ) -> Result<Self, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.mod.assemble");
         let snapshot = store.study_state(StudyScope {
             catalog: true,
             ..StudyScope::default()

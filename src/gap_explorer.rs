@@ -37,6 +37,7 @@ impl GapExplorer {
         self.reply.lock().expect("Explorer reply").clone()
     }
     pub fn start(&self, app: &Tempo, request: GapExplorerRequest) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("gap_explorer.dispatch");
         check_id(&request.request_id)?;
         if self.status()["status"] == "running" {
             return Err(AppError::new(
@@ -59,26 +60,30 @@ impl GapExplorer {
         let reply = Arc::clone(&self.reply);
         let token_path = self.client.token_path.clone();
         let explorer = self.client.clone();
+        let context = crate::diagnostics::capture_context();
         if std::thread::Builder::new()
             .name("tempo-gap-explorer".into())
             .spawn(move || {
-                match explorer.position(&draft.fen, &draft.legal_moves, Some(request.ratings)) {
-                    Ok(stats) => {
-                        result["status"] = json!("complete");
-                        result["statistics"] = json!(stats);
-                    }
-                    Err(code) => {
-                        result["status"] = json!("unavailable");
-                        result["code"] = json!(code);
-                        match code {
-                            "token_missing" | "token_invalid" | "token_rejected" => {
-                                result["token_path"] = json!(token_path.to_string_lossy());
+                crate::diagnostics::with_context(context, || {
+                    let _worker = crate::diagnostics::Span::new("gap_explorer.worker");
+                    match explorer.position(&draft.fen, &draft.legal_moves, Some(request.ratings)) {
+                        Ok(stats) => {
+                            result["status"] = json!("complete");
+                            result["statistics"] = json!(stats);
+                        }
+                        Err(code) => {
+                            result["status"] = json!("unavailable");
+                            result["code"] = json!(code);
+                            match code {
+                                "token_missing" | "token_invalid" | "token_rejected" => {
+                                    result["token_path"] = json!(token_path.to_string_lossy());
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
-                }
-                *reply.lock().expect("Explorer reply") = result;
+                    *reply.lock().expect("Explorer reply") = result;
+                })
             })
             .is_err()
         {

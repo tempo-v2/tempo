@@ -72,6 +72,8 @@ impl TacticThemes {
 
 impl Tempo {
     pub fn set_local_tactic_preferences(&mut self, limit: usize, themes: Option<TacticThemes>) {
+        let _diagnostic =
+            crate::diagnostics::Span::new("app.tactic_preferences.set_local_tactic_preferences");
         if let Some(daily) = &mut self.daily {
             daily.limits.tactics = limit;
             daily.tactic_themes = themes;
@@ -82,6 +84,8 @@ impl Tempo {
     pub fn local_tactic_themes(
         &self,
     ) -> Result<(tempo_types::DatasetId, TacticThemes), crate::AppError> {
+        let _diagnostic =
+            crate::diagnostics::Span::new("app.tactic_preferences.local_tactic_themes");
         let snapshot = self.store.study_state(StudyScope {
             catalog: true,
             ..StudyScope::default()

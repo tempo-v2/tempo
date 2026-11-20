@@ -13,6 +13,13 @@ component pins in the Planning release ledger. Normal `tempo serve` composes
 `DailyComponents` with SQLite, the Study clock and the built Tempo UI. The
 browser consumes Study wire 5 and signed content wire 4.
 
+For slow or timed-out requests, start with [Diagnosing Tempo waits](DIAGNOSTICS.md).
+The application records bounded local JSONL timings, request IDs, active-operation
+watchdog observations and resource samples. The UI exports its delivery timeline;
+`tools/diagnose.py` optionally adds a bounded host-process snapshot without
+contacting Tempo or reading its database. Logging does not determine whether a
+command was accepted.
+
 The detector registry starts empty. For a disposable external-detector
 consumer, build `game_detection_contract_host` and pass the temporary database,
 built UI path, loopback port and scenario. The example calls the same

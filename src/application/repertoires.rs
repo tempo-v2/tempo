@@ -39,6 +39,7 @@ struct Summary {
 impl Tempo {
     /// Handle local content operations against the same durable learning dataset.
     pub fn handle_repertoire(&mut self, command: RepertoireCommand) -> Value {
+        let _diagnostic = crate::diagnostics::Span::new("app.repertoires.handle_repertoire");
         self.repertoire(command)
             .unwrap_or_else(|error| json!(ErrorView::for_content(error)))
     }
@@ -289,7 +290,11 @@ impl Tempo {
                         let state = match change.kind {
                             ChangeKind::Added => LearningState::default(),
                             ChangeKind::Semantic => {
-                                DailyLearning::changed_answer(&snapshot.learning[&change.target])
+                                crate::diagnostics::measure("learning.changed_answer", || {
+                                    DailyLearning::changed_answer(
+                                        &snapshot.learning[&change.target],
+                                    )
+                                })
                             }
                             _ => return None,
                         };
@@ -342,7 +347,11 @@ impl Tempo {
                 let abandoned = active
                     .as_deref()
                     .filter(|_| activity == RepertoireActivity::Suspended)
-                    .map(|attempt| tempo_study::abandon(attempt, attempt.revision))
+                    .map(|attempt| {
+                        crate::diagnostics::measure("study.abandon", || {
+                            tempo_study::abandon(attempt, attempt.revision)
+                        })
+                    })
                     .transpose()
                     .map_err(study_input)?;
                 self.store
@@ -481,8 +490,10 @@ fn prepare(
         }
     }
     let source = source_id(&input.pgn);
-    let incoming = compile_repertoire(&input.pgn, id, name, input.learner_color, &source)
-        .map_err(|e| domain("invalid_pgn", e))?;
+    let incoming = crate::diagnostics::measure("chess.compile_repertoire", || {
+        compile_repertoire(&input.pgn, id, name, input.learner_color, &source)
+    })
+    .map_err(|e| domain("invalid_pgn", e))?;
     let plan = plan_repertoire_replacement(&snapshot.catalog, &incoming, id)
         .map_err(|e| domain("content_change_error", e))?;
     Ok((source, incoming, plan))

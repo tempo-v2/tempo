@@ -101,6 +101,8 @@ impl PublicGames {
         account: &str,
         range: &GameRange,
     ) -> Result<FetchedGames, AppError> {
+        let mut trace = crate::diagnostics::Span::new("provider.fetch");
+        trace.field("provider", provider.label());
         let account = account.trim();
         if !valid_account(account) {
             return Err(AppError::new(
@@ -120,10 +122,12 @@ impl PublicGames {
             ));
         }
         let account = account.to_ascii_lowercase();
-        match provider {
+        let result = match provider {
             Provider::Lichess => self.lichess(&account, range),
             Provider::ChessCom => self.chess_com(&account, range),
-        }
+        };
+        trace.set_outcome(if result.is_ok() { "returned" } else { "error" });
+        result
     }
 
     fn lichess(&mut self, account: &str, range: &GameRange) -> Result<FetchedGames, AppError> {
@@ -144,6 +148,7 @@ impl PublicGames {
     }
 
     fn read(&mut self, provider: Provider, url: &str, accept: &str) -> Result<Vec<u8>, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("provider.read");
         if self
             .retry_after
             .get(&provider)
@@ -296,6 +301,16 @@ fn curl(
     accept: &str,
     cached: Option<&Cached>,
 ) -> Result<Vec<u8>, AppError> {
+    let mut trace = crate::diagnostics::Span::new("provider.network");
+    trace.field("provider", provider.label());
+    trace.field(
+        "timeout_ms",
+        if provider == Provider::Lichess {
+            30_000
+        } else {
+            12_000
+        },
+    );
     let mut command = Command::new("/usr/bin/curl");
     command.args([
         "--disable",
@@ -335,6 +350,7 @@ fn curl(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| provider_error("The system HTTPS client could not start."))?;
+    trace.field("child_pid", child.id());
     let mut output = Vec::new();
     let read = child
         .stdout
@@ -349,12 +365,18 @@ fn curl(
         .wait()
         .map_err(|_| provider_error("The system HTTPS client did not complete."))?;
     if output.len() > MAX_RESPONSE || status.code() == Some(63) {
+        trace.set_outcome("response_limit");
         return Err(AppError::new(
             "provider_response_limit",
             "Provider response was too large. Use a shorter date range.",
         ));
     }
     if read.is_err() || !status.success() {
+        trace.set_outcome(if status.code() == Some(28) {
+            "timed_out"
+        } else {
+            "network_error"
+        });
         let reason = match status.code() {
             Some(6) => "The provider hostname could not be resolved.",
             Some(28) => "The provider request timed out.",
@@ -362,6 +384,8 @@ fn curl(
         };
         return Err(provider_error(reason));
     }
+    trace.field("bytes", output.len());
+    trace.set_outcome("received");
     Ok(output)
 }
 

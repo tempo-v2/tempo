@@ -59,6 +59,7 @@ impl Tempo {
         preview_key: [u8; 32],
         more_tactics: usize,
     ) -> Result<Self, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.daily.daily");
         let mut app = Self::assemble(store, components, None)?;
         app.daily = Some(DailyStudy {
             limits,
@@ -77,6 +78,7 @@ impl Tempo {
         at: StudyTime,
         extra_tactics: usize,
     ) -> Result<DailySelection, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.daily.daily_selection");
         let daily = self.daily.as_ref().expect("daily release");
         let (catalog, learning) = snapshot.complete_catalog()?;
         let mut admissions = DailyAdmissions::default();
@@ -177,25 +179,27 @@ impl Tempo {
             daily.tactic_themes.as_ref(),
             daily.starter_themes,
         );
-        Ok(daily.queue.select_daily(DailySelectionInput {
-            context: DailyContext {
-                seed,
-                today: at.day,
-                repertoire_limit: daily.limits.repertoire,
-                tactics_limit: daily.limits.tactics.saturating_add(extra_tactics),
-            },
-            candidates: &candidates,
-            routes: &routes,
-            admissions,
-            required_activity: snapshot
-                .active_attempt
-                .as_ref()
-                .and_then(|id| snapshot.attempts.get(id))
-                .filter(|record| record.mode != ActivityMode::Practice)
-                .map(|record| &record.attempt.target),
-            new_tactic_order: order.as_ref(),
-            capture_priority: &capture_priority,
-            evidence: &evidence,
+        Ok(crate::diagnostics::measure("queue.select_daily", || {
+            daily.queue.select_daily(DailySelectionInput {
+                context: DailyContext {
+                    seed,
+                    today: at.day,
+                    repertoire_limit: daily.limits.repertoire,
+                    tactics_limit: daily.limits.tactics.saturating_add(extra_tactics),
+                },
+                candidates: &candidates,
+                routes: &routes,
+                admissions,
+                required_activity: snapshot
+                    .active_attempt
+                    .as_ref()
+                    .and_then(|id| snapshot.attempts.get(id))
+                    .filter(|record| record.mode != ActivityMode::Practice)
+                    .map(|record| &record.attempt.target),
+                new_tactic_order: order.as_ref(),
+                capture_priority: &capture_priority,
+                evidence: &evidence,
+            })
         }))
     }
 
@@ -217,6 +221,7 @@ impl Tempo {
         dataset_id: DatasetId,
         selection: DailySelection,
     ) -> StudyView {
+        let _diagnostic = crate::diagnostics::Span::new("app.daily.daily_summary");
         let more = self.daily.as_ref().expect("daily release").more_tactics;
         let done = selection.outstanding == 0;
         StudyView::Empty(EmptyView {
@@ -241,6 +246,7 @@ impl Tempo {
         at: StudyTime,
         choice: DailyChoice,
     ) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.daily.issue_daily");
         let (item, learning) = snapshot
             .target(&choice.target)?
             .ok_or_else(|| AppError::new("stale_content", "selected target is unavailable"))?;
@@ -255,12 +261,14 @@ impl Tempo {
             version: item.version,
             definition: item.definition.clone(),
         };
-        let attempt = start_selected_exercise(
-            &exercise,
-            self.components.grader.as_ref(),
-            snapshot.dataset.clone(),
-            || self.components.ids.next_id(),
-        )
+        let attempt = crate::diagnostics::measure("study.start_selected_exercise", || {
+            start_selected_exercise(
+                &exercise,
+                self.components.grader.as_ref(),
+                snapshot.dataset.clone(),
+                || self.components.ids.next_id(),
+            )
+        })
         .map_err(|error| domain("invalid_content", error))?;
         let record = StoredAttempt {
             attempt: attempt.clone(),

@@ -12,6 +12,7 @@ impl Tempo {
         snapshot: &StudyState,
         id: &AttemptId,
     ) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.resume.resume_from");
         let record = self.current(snapshot, &snapshot.dataset, id)?;
         Ok(AnswerResult {
             attempt: record.attempt.clone(),
@@ -22,6 +23,7 @@ impl Tempo {
     }
     /// Read an existing attempt against the current catalog, without a write.
     pub fn resume(&self, id: &AttemptId) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.resume.resume");
         self.resume_from(
             &self.store.study_state(StudyScope {
                 attempt: Some(id),

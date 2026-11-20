@@ -14,6 +14,8 @@ impl Tempo {
         dataset: &DatasetId,
         attempt_id: &AttemptId,
     ) -> Result<Value, AppError> {
+        let _diagnostic =
+            crate::diagnostics::Span::new("app.study_game_context.study_game_context");
         let state = self.store.study_state(StudyScope::default())?;
         let unavailable = || Ok(json!({"context": null}));
         if &state.dataset != dataset || state.active_attempt.as_ref() != Some(attempt_id) {

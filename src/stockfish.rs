@@ -32,6 +32,7 @@ pub(crate) fn stockfish(
     shortlist: &[&str],
     candidate_count: usize,
 ) -> Result<EngineResult, AppError> {
+    let _diagnostic = crate::diagnostics::Span::new("engine.evaluate");
     let binary = [
         "/opt/homebrew/bin/stockfish",
         "/usr/local/bin/stockfish",
@@ -122,21 +123,42 @@ pub(crate) fn stockfish(
 }
 
 fn start_engine_wrapper(command: &mut Command) -> Result<Child, AppError> {
+    let _diagnostic = crate::diagnostics::Span::new("engine.spawn");
     // Stockfish and the Python UCI wrapper share the owned process group.
     #[cfg(unix)]
     command.process_group(0);
-    command
+    let result = command
         .spawn()
-        .map_err(|error| domain("engine_unavailable", error))
+        .map_err(|error| domain("engine_unavailable", error));
+    if let Ok(process) = &result {
+        crate::diagnostics::emit(
+            "process.spawned",
+            serde_json::json!({
+                "operation":"engine.spawn", "child_pid":process.id()
+            }),
+        );
+    }
+    result
 }
 
 fn wait_for_engine(process: &mut Child, timeout: Duration) -> Result<(), AppError> {
+    let mut trace = crate::diagnostics::Span::new("engine.wait");
+    trace.field("timeout_ms", timeout.as_millis());
+    trace.field("child_pid", process.id());
     let deadline = Instant::now() + timeout;
     loop {
         match process.try_wait() {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(_)) => {
+                trace.set_outcome("child_exited");
+                return Ok(());
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
             outcome => {
+                trace.set_outcome(if outcome.is_err() {
+                    "io_error"
+                } else {
+                    "timed_out"
+                });
                 #[cfg(unix)]
                 let _ = Command::new("/bin/kill")
                     .args(["-s", "KILL", "--", &format!("-{}", process.id())])

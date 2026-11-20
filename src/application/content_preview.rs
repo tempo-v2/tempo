@@ -15,6 +15,7 @@ impl Tempo {
         source: Option<ContentSource<'_>>,
         receipt: Option<ContentReceipt<'_>>,
     ) -> Result<(), AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.content_preview.commit_catalog");
         let catalog_changed = catalog != &snapshot.catalog;
         if catalog_changed && let Some(active) = &snapshot.active_attempt {
             let record = &snapshot.attempts[active];
@@ -24,7 +25,10 @@ impl Tempo {
                 .get(&old.target)
                 .is_none_or(|item| !item.active() || item.version != old.content_version)
             {
-                let attempt = tempo_study::abandon(old, old.revision).map_err(study_input)?;
+                let attempt = crate::diagnostics::measure("study.abandon", || {
+                    tempo_study::abandon(old, old.revision)
+                })
+                .map_err(study_input)?;
                 writes.push(Write::Progress(StoredAttempt {
                     attempt,
                     ..record.clone()

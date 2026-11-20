@@ -50,6 +50,7 @@ impl GapAnalysis {
     }
 
     pub fn start(&self, app: &Tempo, request: GapAnalysisRequest) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("gap_analysis.dispatch");
         check_id(&request.request_id)?;
         if self.status()["status"] == "running" {
             return Err(AppError::new(
@@ -63,13 +64,17 @@ impl GapAnalysis {
         let id = request.request_id;
         let directory = self.directory.clone();
         *reply.lock().expect("gap analysis reply") = queued.clone();
+        let context = crate::diagnostics::capture_context();
         if let Err(error) = std::thread::Builder::new()
             .name("tempo-gap-analysis".into())
             .spawn(move || {
-                let result = analyze(id, input, &directory, |progress| {
-                    *reply.lock().expect("gap analysis reply") = progress;
-                });
-                *reply.lock().expect("gap analysis reply") = result;
+                crate::diagnostics::with_context(context, || {
+                    let _worker = crate::diagnostics::Span::new("gap_analysis.worker");
+                    let result = analyze(id, input, &directory, |progress| {
+                        *reply.lock().expect("gap analysis reply") = progress;
+                    });
+                    *reply.lock().expect("gap analysis reply") = result;
+                })
             })
         {
             *self.reply.lock().expect("gap analysis reply") = json!({"status":"idle"});
@@ -88,6 +93,7 @@ fn analyze(
     directory: &Path,
     publish: impl FnOnce(Value),
 ) -> Value {
+    let _diagnostic = crate::diagnostics::Span::new("gap_analysis.execute");
     let nearby = nearby_repertoire_positions(
         &input.draft.fen,
         &input.repertoire_id,

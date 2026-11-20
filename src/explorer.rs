@@ -97,12 +97,18 @@ impl ExplorerClient {
         legal: &[String],
         ratings: Option<Ratings>,
     ) -> Result<Statistics, &'static str> {
+        let mut trace = crate::diagnostics::Span::new("explorer.position");
         // Rated, Masters, and Fix Response share one outbound connection budget.
-        let _connection = self.connection.lock().expect("Explorer connection");
+        let _connection = {
+            let _wait = crate::diagnostics::Span::new("explorer.lock_wait");
+            self.connection.lock().expect("Explorer connection")
+        };
         if self.limited() {
+            trace.set_outcome("rate_limited");
             return Err("rate_limited");
         }
         let result = lookup(&self.token_path, fen, legal, ratings);
+        trace.set_outcome(result.as_ref().err().copied().unwrap_or("complete"));
         if matches!(result, Err("rate_limited")) {
             *self.retry_after.lock().expect("Explorer retry deadline") =
                 Some(Instant::now() + Duration::from_secs(60));
@@ -138,6 +144,8 @@ fn lookup(
     legal: &[String],
     ratings: Option<Ratings>,
 ) -> Result<Statistics, &'static str> {
+    let mut trace = crate::diagnostics::Span::new("explorer.lookup");
+    trace.field("timeout_ms", 8_000);
     let token = token(path)?;
     let mut command = Command::new("/usr/bin/curl");
     command.args([
@@ -187,6 +195,7 @@ fn lookup(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| "offline")?;
+    trace.field("child_pid", child.id());
     // Pass the credential through stdin so it never appears in a process argument.
     let wrote = writeln!(
         child.stdin.take().expect("piped curl stdin"),
@@ -195,13 +204,20 @@ fn lookup(
     let output = child.wait_with_output().map_err(|_| "offline")?;
     wrote.map_err(|_| "offline")?;
     if !output.status.success() {
+        trace.set_outcome(if output.status.code() == Some(28) {
+            "timed_out"
+        } else {
+            "offline"
+        });
         return Err(if output.status.code() == Some(28) {
             "timeout"
         } else {
             "offline"
         });
     }
-    parse_reply(&output.stdout, legal)
+    let result = parse_reply(&output.stdout, legal);
+    trace.set_outcome(result.as_ref().err().copied().unwrap_or("complete"));
+    result
 }
 
 fn parse_reply(output: &[u8], legal: &[String]) -> Result<Statistics, &'static str> {

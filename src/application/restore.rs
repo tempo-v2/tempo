@@ -17,6 +17,7 @@ impl Tempo {
         data: &str,
         codec: &dyn SnapshotCodec,
     ) -> Result<(), AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.restore.restore");
         let snapshot = self.store.snapshot()?;
         if !snapshot.catalog.items.is_empty() {
             return Err(AppError::new(
@@ -65,8 +66,10 @@ impl Tempo {
                         "Legacy game obligations require a Daily Study repertoire target.",
                     ));
                 }
-                DailyLearning::restore_portable(state, item.version)
-                    .map_err(|e| domain("invalid_learning", e))?;
+                crate::diagnostics::measure("learning.restore_portable", || {
+                    DailyLearning::restore_portable(state, item.version)
+                })
+                .map_err(|e| domain("invalid_learning", e))?;
             }
             self.components
                 .learning

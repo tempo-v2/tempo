@@ -17,6 +17,7 @@ impl Tempo {
         dataset: &DatasetId,
         request: &ImportRequest,
     ) -> Result<Vec<tempo_chess::ContentChange>, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.import_pgn.import_pgn");
         let fixture = self.fixture.as_ref().ok_or_else(|| {
             AppError::new(
                 "unsupported",
@@ -39,6 +40,7 @@ impl Tempo {
         dataset: &DatasetId,
         catalog: &Catalog,
     ) -> Result<ContentPlan, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.import_pgn.apply_catalog");
         let snapshot = self.import_snapshot(dataset)?;
         self.apply_catalog_to(&snapshot, catalog)
     }
@@ -48,6 +50,7 @@ impl Tempo {
     /// existing target. The transfer report records aliases to preexisting
     /// content without modifying its metadata.
     pub fn apply_tactic_transfer(&mut self, catalog: &Catalog) -> Result<ContentPlan, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.import_pgn.apply_tactic_transfer");
         let snapshot = self.store.content_state()?;
         let mut plan = tempo_chess::plan_tactic_capture(&snapshot.catalog, catalog)
             .map_err(|error| domain("content_change_error", error))?

@@ -15,6 +15,7 @@ pub mod app_error;
 mod application;
 pub mod commands;
 pub mod components;
+mod diagnostics;
 pub mod game;
 pub mod game_range;
 pub mod portable_snapshot;
@@ -24,11 +25,12 @@ pub mod wire;
 
 pub use adapters::{CounterIds, FixedClock, FixtureGames, JsonSnapshotCodec, UnavailableGames};
 pub use app_error::AppError;
-pub use application::{SaveStudyReview, SavedStudyReviewCommand};
 pub use application::{
     GameLibraryRead, GameReviewLine, GameReviewRead, IntroductionLimits, ProgressStamp,
-    StudyAnalysisLine, StudyProgress, TacticThemes, TacticsRead, TacticsReadReply, Tempo, tactic_themes,
+    StudyAnalysisLine, StudyProgress, TacticThemes, TacticsRead, TacticsReadReply, Tempo,
+    tactic_themes,
 };
+pub use application::{SaveStudyReview, SavedStudyReviewCommand};
 pub use commands::{AbandonCommand, AgainCommand, SubmitCommand};
 pub use components::{Components, DailyComponents};
 pub use game::Game;
@@ -41,13 +43,13 @@ pub mod game_evidence;
 pub mod game_backfill;
 pub mod game_model;
 
-pub mod gap_analysis;
-pub mod position_evidence;
 pub mod explorer;
-mod maia;
-mod stockfish;
-mod gap_recommendation;
+pub mod gap_analysis;
 pub mod gap_explorer;
+mod gap_recommendation;
+mod maia;
+pub mod position_evidence;
+mod stockfish;
 
 pub mod game_detection;
 pub mod local_runtime;

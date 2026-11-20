@@ -11,6 +11,7 @@ use tempo_types::{DatasetId, SubmissionId};
 
 impl Tempo {
     pub(super) fn practice_tactics(&mut self) -> Result<StudyView, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.optional_tactics.practice_tactics");
         let snapshot = self.store.study_state(StudyScope {
             catalog: true,
             ..StudyScope::default()
@@ -38,6 +39,7 @@ impl Tempo {
         dataset: DatasetId,
         submission: SubmissionId,
     ) -> Result<StudyView, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.optional_tactics.learn_more_tactics");
         let scope = StudyScope {
             submission: Some(&submission),
             ..StudyScope::default()
