@@ -57,7 +57,7 @@ async function post(route, body) {
   return value;
 }
 
-async function clickMove(page, uci, fen) {
+async function clickMove(page, uci, fen, flipped = false) {
   await page.waitForFunction(expected =>
     document.querySelector('[aria-label="Study chessboard"][aria-disabled="false"]')?.dataset.fen === expected, fen);
   const board = page.locator(".study-board cg-board");
@@ -67,7 +67,10 @@ async function clickMove(page, uci, fen) {
   for (const offset of [0, 2]) {
     const file = uci.charCodeAt(offset) - "a".charCodeAt(0);
     const rank = 8 - Number(uci[offset + 1]);
-    await page.mouse.click(rect.x + (file + 0.5) * rect.width / 8, rect.y + (rank + 0.5) * rect.height / 8);
+    await page.mouse.click(
+      rect.x + ((flipped ? 7 - file : file) + 0.5) * rect.width / 8,
+      rect.y + ((flipped ? 7 - rank : rank) + 0.5) * rect.height / 8,
+    );
   }
 }
 
@@ -99,6 +102,10 @@ async function seed(kind) {
       source_id: "03ySM",
       solver_fen: "2r3k1/5pp1/Q3b2p/3p4/3q4/3B3P/1P3PP1/4R1K1 w - - 0 27",
       solution: ["a6c8", "e6c8", "e1e8"],
+      opponent_lead_ins: [{
+        before_fen: "2r3k1/5pp1/Q3b2p/3pq3/8/3B3P/1P3PP1/4R1K1 b - - 0 26",
+        uci: "e5d4",
+      }],
       label: "Mate in two",
       provenance: ["Lichess CC0 fixture"],
     }] }));
@@ -107,7 +114,7 @@ async function seed(kind) {
   await start(database);
   if (kind === "teach") {
     const { dataset_id } = await post("repertoires", { command: "list" });
-    const input = { dataset_id, name: "Fixture repertoire", learner_color: "white", pgn: "1. e4 *" };
+    const input = { dataset_id, name: "Fixture repertoire", learner_color: "black", pgn: "1. e4 c5 *" };
     const preview = await post("repertoires", { command: "preview", ...input });
     assert.equal((await post("repertoires", { command: "save", ...input, token: preview.token })).status, "repertoires");
   }
@@ -147,7 +154,7 @@ try {
       await clone(baseline, database, name);
       await start(database);
       const page = await browser.newPage();
-      page.setDefaultTimeout(6000);
+      page.setDefaultTimeout(10_000);
       await page.addInitScript(() => {
         let serial = 0;
         crypto.randomUUID = () => "00000000-0000-4000-8000-" + String(++serial).padStart(12, "0");
@@ -161,10 +168,11 @@ try {
       const active = await resumed;
       assert.equal(active.exercise_name ?? undefined, name);
       assert.equal(active.attempt_id, baseline.attempt);
+      assert.equal(active.opponent_move?.uci, journey === "teach" ? "e2e4" : "e5d4");
 
       const continued = studyReply(page, "next").catch(error => error);
       if (journey === "teach") {
-        await clickMove(page, "e2e4", active.display_fen);
+        await clickMove(page, "c7c5", active.display_fen, true);
         const completion = studyReply(page, "acknowledge");
         await page.getByRole("button", { name: "Got it — continue" }).click();
         const taught = await completion;

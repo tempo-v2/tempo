@@ -24,10 +24,12 @@ struct SourcePuzzle {
     solution: Vec<String>,
     label: String,
     provenance: Vec<String>,
+    #[serde(default)]
+    opponent_lead_ins: Vec<tempo_chess::OpponentLeadIn>,
 }
 
 pub(super) struct Batch {
-    catalog: Catalog,
+    pub(super) catalog: Catalog,
     identities: Vec<SourceIdentity>,
 }
 
@@ -37,19 +39,38 @@ impl Batch {
         if pack.schema_version != 1 {
             return Err("unsupported tactic transfer schema version".into());
         }
-        let records = pack
+        let (records, context): (Vec<_>, Vec<_>) = pack
             .puzzles
             .into_iter()
-            .map(|row| TacticRecord {
-                namespace: row.namespace,
-                source_id: row.source_id,
-                solver_fen: row.solver_fen,
-                solution: row.solution,
-                label: row.label,
-                provenance: row.provenance,
+            .map(|row| {
+                (
+                    TacticRecord {
+                        namespace: row.namespace,
+                        source_id: row.source_id,
+                        solver_fen: row.solver_fen,
+                        solution: row.solution,
+                        label: row.label,
+                        provenance: row.provenance,
+                    },
+                    row.opponent_lead_ins,
+                )
             })
-            .collect::<Vec<_>>();
-        let catalog = compile_tactics(&records)?;
+            .unzip();
+        let mut catalog = compile_tactics(&records)?;
+        for (record, lead_ins) in records.iter().zip(context) {
+            let item = catalog
+                .items
+                .get_mut(&record.target_id())
+                .expect("compiled target");
+            for lead_in in lead_ins {
+                let verified = tempo_chess::OpponentLeadIn::verified(
+                    &lead_in.before_fen,
+                    &lead_in.uci,
+                    &record.solver_fen,
+                );
+                item.opponent_lead_in.reconcile(&verified.into());
+            }
+        }
         let mut identities = records
             .into_iter()
             .map(|row| SourceIdentity {
@@ -126,7 +147,7 @@ fn apply(app: &mut Tempo, batch: Batch) -> LocalResult<Report> {
         .zip(&plan.changes)
         .map(|(source, change)| {
             let item = &plan.catalog.items[&change.target];
-            if change.kind == ChangeKind::Unchanged
+            if matches!(change.kind, ChangeKind::Unchanged | ChangeKind::Metadata)
                 && let Some(incoming) = batch.catalog.items.get(&source.source_token)
             {
                 let retained: Vec<_> = pack_memberships(&item.provenance).collect();
@@ -258,5 +279,64 @@ mod tests {
             assert_eq!(retained.snapshot().unwrap(), before);
             assert!(retained.next_exercise().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn matching_transfers_reconcile_setup_without_replacing_issued_facts() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("transfer.sqlite");
+        super::super::init(&database).unwrap();
+        let mut app = super::super::open(&database).unwrap();
+        let transfer = directory.path().join("transfer.json");
+        let load = |id, fen, uci| {
+            std::fs::write(
+                &transfer,
+                json!({"schema_version":1,"puzzles":[{
+                    "namespace":"catalog-test","source_id":id,
+                    "solver_fen":"4k3/8/5n2/8/8/8/4P3/4K3 w - - 0 1","solution":["e2e4"],
+                    "label":"Example","provenance":[],
+                    "opponent_lead_ins":[{"before_fen":fen,"uci":uci}],
+                }]})
+                .to_string(),
+            )
+            .unwrap();
+            Batch::open(&transfer).unwrap()
+        };
+        let first = apply(
+            &mut app,
+            load("a", "4k1n1/8/8/8/8/8/4P3/4K3 b - - 0 1", "g8f6"),
+        )
+        .unwrap();
+        let target = &first.sources[0].target;
+        let issued = app.next_exercise().unwrap().unwrap().attempt;
+        let before = app.snapshot().unwrap();
+        assert_eq!(
+            before.attempts[&issued.id]
+                .opponent_lead_in
+                .as_ref()
+                .unwrap()
+                .uci,
+            "g8f6"
+        );
+
+        let revision = apply(
+            &mut app,
+            load("b", "4k3/8/8/7n/8/8/4P3/4K3 b - - 0 1", "h5f6"),
+        )
+        .unwrap();
+        assert_eq!(revision.changes[0].kind, ChangeKind::Metadata);
+        let after = app.snapshot().unwrap();
+        assert_eq!(
+            after.catalog.items[target].opponent_lead_in,
+            tempo_chess::LeadInEvidence::Conflicting
+        );
+        assert_eq!(
+            after.catalog.items[target].provenance,
+            before.catalog.items[target].provenance
+        );
+        assert_eq!(after.content_history, before.content_history);
+        assert_eq!(after.learning, before.learning);
+        assert_eq!(after.active_attempt, before.active_attempt);
+        assert_eq!(after.attempts, before.attempts);
     }
 }

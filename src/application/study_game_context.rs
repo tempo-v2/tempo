@@ -3,8 +3,8 @@
 use super::Tempo;
 use crate::AppError;
 use serde_json::{Value, json};
-use tempo_chess::ContentKind;
-use tempo_store::{ActivityMode, CorrectionGameLookup, StudyScope};
+use tempo_chess::{ContentItem, ContentKind, OpponentLeadIn};
+use tempo_store::{ActivityMode, CorrectionGame, CorrectionGameLookup, StoredAttempt, StudyScope};
 use tempo_study::AttemptStatus;
 use tempo_types::{AttemptId, DatasetId};
 
@@ -34,26 +34,10 @@ impl Tempo {
         else {
             return unavailable();
         };
-        let ContentKind::Repertoire {
-            repertoire,
-            position,
-        } = &item.definition.kind
-        else {
+        let ContentKind::Repertoire { position, .. } = &item.definition.kind else {
             return unavailable();
         };
-        let Some(decision) = item.definition.decisions.first() else {
-            return unavailable();
-        };
-        let Some(evidence) = self.store.correction_game(CorrectionGameLookup {
-            dataset,
-            target: &record.attempt.target,
-            version: record.attempt.content_version,
-            miss_revision: record.issued_miss_revision,
-            issued_at_ms: record.issued_at.unix_ms,
-            reset_at_ms: self.store.repertoire_reset_at(dataset, repertoire)?,
-            prescribed: &decision.expected.uci,
-        })?
-        else {
+        let Some(evidence) = self.issued_repair_game(record, &item)? else {
             return unavailable();
         };
         let Ok(Some((played_san, line))) = tempo_chess::played_deviation(
@@ -73,5 +57,49 @@ impl Tempo {
         Ok(
             json!({"context": {"played_san": played_san, "played_uci": evidence.played, "line": line, "url": url}}),
         )
+    }
+
+    pub(super) fn repair_lead_in(
+        &self,
+        record: &StoredAttempt,
+        item: &ContentItem,
+    ) -> Option<OpponentLeadIn> {
+        let ContentKind::Repertoire { position, .. } = &item.definition.kind else {
+            return None;
+        };
+        let evidence = self.issued_repair_game(record, item).ok()??;
+        tempo_chess::played_deviation_lead_in(
+            &evidence.game.pgn,
+            evidence.ply,
+            position,
+            &evidence.played,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn issued_repair_game(
+        &self,
+        record: &StoredAttempt,
+        item: &ContentItem,
+    ) -> Result<Option<CorrectionGame>, AppError> {
+        let ContentKind::Repertoire { repertoire, .. } = &item.definition.kind else {
+            return Ok(None);
+        };
+        let Some(decision) = item.definition.decisions.first() else {
+            return Ok(None);
+        };
+        let attempt = &record.attempt;
+        Ok(self.store.correction_game(CorrectionGameLookup {
+            dataset: &attempt.dataset,
+            target: &attempt.target,
+            version: attempt.content_version,
+            miss_revision: record.issued_miss_revision,
+            issued_at_ms: record.issued_at.unix_ms,
+            reset_at_ms: self
+                .store
+                .repertoire_reset_at(&attempt.dataset, repertoire)?,
+            prescribed: &decision.expected.uci,
+        })?)
     }
 }

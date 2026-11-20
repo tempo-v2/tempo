@@ -43,10 +43,9 @@ impl Tempo {
         self.apply_catalog_to(&snapshot, catalog)
     }
 
-    /// Add validated tactics while retaining existing targets byte for byte.
-    /// The changes are in incoming target order, including matches to an
-    /// existing target. The transfer report records aliases to preexisting
-    /// content without modifying its metadata.
+    /// Add validated tactics while retaining existing target definitions and
+    /// source attribution. Matching transfers can add or disambiguate the
+    /// evidence for the preceding opponent move. Changes follow input order.
     pub fn apply_tactic_transfer(&mut self, catalog: &Catalog) -> Result<ContentPlan, AppError> {
         let snapshot = self.store.content_state()?;
         let mut plan = tempo_chess::plan_tactic_capture(&snapshot.catalog, catalog)
@@ -54,10 +53,19 @@ impl Tempo {
             .content;
         for change in &mut plan.changes {
             if let Some(existing) = snapshot.catalog.items.get(&change.target) {
-                plan.catalog
+                let retained = plan
+                    .catalog
                     .items
-                    .insert(change.target.clone(), existing.clone());
-                change.kind = ChangeKind::Unchanged;
+                    .get_mut(&change.target)
+                    .expect("planned target");
+                let lead_in = std::mem::take(&mut retained.opponent_lead_in);
+                retained.clone_from(existing);
+                change.kind = if lead_in == retained.opponent_lead_in {
+                    ChangeKind::Unchanged
+                } else {
+                    retained.opponent_lead_in = lead_in;
+                    ChangeKind::Metadata
+                };
             }
         }
         self.publish_import(&snapshot, plan)

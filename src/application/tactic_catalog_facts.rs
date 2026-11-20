@@ -103,3 +103,11 @@ pub(super) fn capture_review_priority(item: &ContentItem, state: &LearningState)
         && CaptureOrigin::read(&item.provenance) == CaptureOrigin::PersonalCapture)
         .then_some(introduced.unix_ms)
 }
+
+/// Tactic Capture stores the immutable PGN archive under this digest and
+/// attaches that exact key to the imported target as source provenance.
+pub(crate) fn saved_pgn_source(source: &str) -> bool {
+    source
+        .strip_prefix("pgn:")
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|c| c.is_ascii_hexdigit()))
+}

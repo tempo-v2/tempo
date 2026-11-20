@@ -30,11 +30,21 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         [mode, database, apply] if mode == "backfill-personal-tactics" && apply == "--apply" => {
             local_runtime::backfill_personal_tactics(Path::new(database), true)
         }
+        [mode, database, args @ ..] if mode == "backfill-study-lead-ins" => {
+            let (transfer, apply) = match args {
+                [] => (None, false),
+                [apply] if apply == "--apply" => (None, true),
+                [path] => (Some(Path::new(path)), false),
+                [path, apply] if apply == "--apply" => (Some(Path::new(path)), true),
+                _ => return Err("Usage: tempo backfill-study-lead-ins DATABASE [TRANSFER.json] [--apply]".into()),
+            };
+            local_runtime::backfill_study_lead_ins(Path::new(database), transfer, apply)
+        }
         [mode, database, ui, port] if mode == "serve" => {
             local_runtime::serve(Path::new(database), Path::new(ui), port.parse()?)
         }
         _ => Err(
-            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-personal-tactics DATABASE [--apply] | serve DATABASE UI_DIST PORT"
+            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-personal-tactics DATABASE [--apply] | backfill-study-lead-ins DATABASE [TRANSFER.json] [--apply] | serve DATABASE UI_DIST PORT"
                 .into(),
         ),
     }
@@ -49,7 +59,10 @@ fn stdio() -> Result<(), Box<dyn Error + Send + Sync>> {
             continue;
         }
         let view = match serde_json::from_str::<StudyCommand>(&line) {
-            Ok(command) => app.handle(command).without_move_details(),
+            Ok(command) => app
+                .handle(command)
+                .without_move_details()
+                .without_opponent_context(),
             Err(error) => StudyView::from(AppError::new("invalid_command", error.to_string())),
         };
         serde_json::to_writer(&mut output, &view)?;
