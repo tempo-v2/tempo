@@ -87,6 +87,32 @@ launchctl bootstrap "gui/$(id -u)" "$PWD/.local/usable-release/com.tempo-v2.usab
 launchctl kickstart "gui/$(id -u)/com.tempo-v2.usable-release"
 ```
 
+## Phone Study over Tailscale
+
+Tempo Study opens the regular Study queue and uses the same saved progress as
+desktop Tempo. Open the private HTTPS address in iPhone Safari, then use
+**Share → Add to Home Screen** to keep it handy. The Mac must be awake and
+reachable through Tailscale to start a session or submit a move.
+
+On the Mac, install the paired Tempo and UI build with the Serve HTTPS origin
+and your exact Tailscale login. The managed registration saves both values for
+future restarts. Read the hostname and login from the running Mac's Tailscale
+account. This example uses port 8443 on the tailnet and the existing managed
+Tempo port on loopback.
+
+```sh
+TEMPO_PHONE_ORIGIN=https://your-mac.your-tailnet.ts.net:8443 \
+TEMPO_PHONE_TAILSCALE_LOGIN=you@example.com make start
+tailscale serve --bg --https=8443 http://127.0.0.1:41822
+tailscale serve status
+```
+
+Use Serve in tailnet-only mode. Validate the private URL before sharing it
+with your devices. To take the phone URL offline, run
+`tailscale serve --https=8443 off` before rolling back
+the managed Tempo release. If unrelated disposable Tempo sessions are running,
+set `TEMPO_KEEP_DEV_SERVERS=1` for this managed installation.
+
 ## Scheduling and settings
 
 The runtime uses the upstream Rust FSRS crate pinned at `6.6.2` with its default parameter vector and 0.90 desired retention. The versioned policy and calendar settings are in SQLite. Actual reviews use the elapsed study days since the last accepted review. The scheduler rounds its returned intervals to whole study days, bounded from 1 to 36,500 days. A teaching acknowledgement schedules tomorrow's first blind review without creating FSRS memory.

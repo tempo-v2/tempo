@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,7 @@ from stop_local_server import listeners, lsof, server_stamp, stop_server
 
 DOMAIN = f"gui/{os.getuid()}"
 SERVICE = f"{DOMAIN}/{LABEL}"
+PHONE_VARIABLES = ("TEMPO_PHONE_ORIGIN", "TEMPO_PHONE_TAILSCALE_LOGIN")
 
 
 def launch(*args):
@@ -64,10 +66,39 @@ def study_status(port, dataset, ui):
             raise ValueError("Tempo did not serve the expected UI")
 
 
-def rehearse(binary, ui, database, dataset, scratch):
+def phone_environment(job):
+    registered = job.get("EnvironmentVariables", {})
+    overriding = any(key in os.environ for key in PHONE_VARIABLES)
+    environment = os.environ if overriding else registered
+    phone = {key: environment[key] for key in PHONE_VARIABLES if key in environment}
+    if phone and (len(phone) != len(PHONE_VARIABLES) or not all(phone.values())):
+        raise ValueError("Set both TEMPO_PHONE_ORIGIN and TEMPO_PHONE_TAILSCALE_LOGIN")
+    if overriding:
+        job["EnvironmentVariables"] = {**registered, **phone}
+    return phone
+
+
+def phone_status(port, dataset, ui, phone):
+    origin, login = (phone[key] for key in PHONE_VARIABLES)
+    host = origin.removeprefix("https://")
+    headers = {"Host": host, "X-Forwarded-Host": host, "X-Forwarded-Proto": "https",
+               "Tailscale-User-Login": login, "Origin": origin, "Content-Type": "application/json"}
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1", port, timeout=2)) as connection:
+        connection.request("GET", "/", headers=headers)
+        response = connection.getresponse()
+        if response.status != 200 or response.read() != (ui / "phone/index.html").read_bytes():
+            raise ValueError("Tempo did not serve the expected phone UI")
+        connection.request("POST", "/api/study", b'{"command":"study_status"}', headers=headers)
+        response = connection.getresponse()
+        if response.status != 200 or json.load(response).get("dataset_id") != dataset:
+            raise ValueError("Tempo phone Study did not report the registered dataset")
+
+
+def rehearse(binary, ui, database, dataset, scratch, phone):
     copy = scratch / "rehearsal.sqlite"
     backup(database, copy)
-    with subprocess.Popen([binary, "serve", copy, ui, "0"], stdout=subprocess.PIPE) as server:
+    with subprocess.Popen([binary, "serve", copy, ui, "0"], stdout=subprocess.PIPE,
+                          env={**os.environ, **phone}) as server:
         try:
             with selectors.DefaultSelector() as ready:
                 ready.register(server.stdout, selectors.EVENT_READ)
@@ -77,7 +108,10 @@ def rehearse(binary, ui, database, dataset, scratch):
             prefix = "Tempo study at http://127.0.0.1:"
             if not banner.startswith(prefix):
                 raise ValueError("The candidate did not start on the disposable database")
-            study_status(int(banner[len(prefix):]), dataset, ui)
+            port = int(banner[len(prefix):])
+            study_status(port, dataset, ui)
+            if phone:
+                phone_status(port, dataset, ui, phone)
         finally:
             if server.poll() is None:
                 server.terminate()
@@ -144,14 +178,19 @@ def stop_managed(port):
 def start_managed(config, port, dataset):
     resources = plist_resources(config)
     (_, _, ui, _), _ = resources
+    job = plistlib.loads(config.read_bytes())
+    registered = job.get("EnvironmentVariables", {})
+    phone = {key: registered[key] for key in PHONE_VARIABLES if key in registered}
     launch("bootstrap", DOMAIN, str(config))
-    if not plistlib.loads(config.read_bytes()).get("RunAtLoad"):
+    if not job.get("RunAtLoad"):
         launch("kickstart", SERVICE)
     for _ in range(50):
         pid = managed_pid()
         if pid and listeners(port) == {pid}:
             try:
                 study_status(port, dataset, ui)
+                if phone:
+                    phone_status(port, dataset, ui, phone)
                 if registration(config, resources):
                     return
             except (ConnectionError, TimeoutError, URLError):
@@ -171,11 +210,15 @@ def write_plist(config, contents):
             path.unlink(missing_ok=True)
 
 
-def restart(config):
+def restart(config, keep_development=False):
     release = config.parent
     if not config.is_file():
         raise ValueError("No managed Tempo registration. Use make start-dev for a separate workspace.")
     original = config.read_bytes()
+    job = plistlib.loads(original)
+    initial_environment = job.get("EnvironmentVariables", {})
+    phone = phone_environment(job)
+    environment_changed = initial_environment != job.get("EnvironmentVariables", {})
     resources = plist_resources(config)
     (old_binary, database, old_ui, port), _ = resources
     dataset, schema = database_status(database)
@@ -185,7 +228,8 @@ def restart(config):
     check_ui(installation, UI)
     target = Path(os.environ.get("CARGO_TARGET_DIR") or "target").resolve()
     installation.check_cargo_output(target)
-    other_servers(port, installation)
+    if not keep_development:
+        other_servers(port, installation)
     build_backend(target, "release")
     build_ui()
 
@@ -197,16 +241,15 @@ def restart(config):
         shutil.copytree(UI / "dist", stage / "ui")
         checksum = artifact_hash(stage / "tempo", stage / "ui")
         changed = checksum != artifact_hash(old_binary, old_ui)
-        replacement = original
+        if changed or environment_changed:
+            rehearse(stage / "tempo", stage / "ui", database, dataset, scratch, phone)
         if changed:
-            rehearse(stage / "tempo", stage / "ui", database, dataset, scratch)
             checkpoint = release / "checkpoints" / f"workspace-{checksum[:20]}"
             if checkpoint.exists():
                 if checksum != artifact_hash(checkpoint / "tempo", checkpoint / "ui"):
                     raise ValueError(f"Existing Tempo checkpoint differs from the build: {checkpoint}")
             else:
                 stage.rename(checkpoint)
-            job = plistlib.loads(original)
             job["ProgramArguments"] = [str(checkpoint / "tempo"), "serve", str(database),
                                        str(checkpoint / "ui"), str(port)]
             if "Program" in job:
@@ -214,23 +257,23 @@ def restart(config):
             job["RunAtLoad"] = True
             for key, suffix in (("StandardOutPath", "log"), ("StandardErrorPath", "err")):
                 job[key] = str(release / f"server-{checkpoint.name}.{suffix}")
-            replacement = plistlib.dumps(job)
 
         running = registration(config, resources)
         check_port_owner(port)
-        for other_port, stamp in other_servers(port, installation).items():
-            stop_server(other_port, installation, stamp)
+        if not keep_development:
+            for other_port, stamp in other_servers(port, installation).items():
+                stop_server(other_port, installation, stamp)
         try:
             if running:
                 stop_managed(port)
             if listeners(port):
                 raise ValueError(f"Another application is using the registered Tempo port {port}")
-            if changed:
+            if changed or environment_changed:
                 recovery = Path(tempfile.mkdtemp(prefix="recovery-start-", dir=release))
                 (recovery / config.name).write_bytes(original)
                 backup(database, recovery / "study.sqlite")
                 print(f"Saved Tempo backup in {recovery}", flush=True)
-                write_plist(config, replacement)
+                write_plist(config, plistlib.dumps(job))
             start_managed(config, port, dataset)
         except (OSError, ValueError, subprocess.CalledProcessError, sqlite3.Error, KeyboardInterrupt):
             # The live database may already have accepted writes. Never restore a backup here.
@@ -243,9 +286,10 @@ def restart(config):
             except (OSError, ValueError, subprocess.CalledProcessError, sqlite3.Error) as recovery_error:
                 print(f"Could not restart the previous Tempo service: {recovery_error}", file=sys.stderr)
             raise
-        remaining = other_servers(port, Installation(WORKSPACE))
-        if remaining:
-            raise ValueError(f"Another Tempo session started during restart on ports {sorted(remaining)}")
+        if not keep_development:
+            remaining = other_servers(port, Installation(WORKSPACE))
+            if remaining:
+                raise ValueError(f"Another Tempo session started during restart on ports {sorted(remaining)}")
     print(f"Tempo is running at http://127.0.0.1:{port}", flush=True)
 
 
@@ -260,7 +304,7 @@ def main():
         raise ValueError("No managed Tempo registration. Use make start-dev for a separate workspace.")
     with (release / "start.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        restart(config)
+        restart(config, keep_development=os.environ.get("TEMPO_KEEP_DEV_SERVERS") == "1")
 
 
 if __name__ == "__main__":

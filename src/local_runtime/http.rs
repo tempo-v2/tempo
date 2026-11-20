@@ -30,11 +30,15 @@ pub(super) fn serve(
     ui: &Path,
     port: u16,
 ) -> LocalResult<()> {
-    let public = build_files(ui)?;
     let server = Server::http((Ipv4Addr::LOCALHOST, port))?;
     let address = server.server_addr().to_string();
-    let origin = format!("http://{address}");
-    println!("Tempo study at {origin}");
+    let surfaces = HttpSurfaces {
+        origin: format!("http://{address}"),
+        address,
+        desktop: build_files(ui)?,
+        phone: PhoneStudy::load(ui)?,
+    };
+    println!("Tempo study at {}", surfaces.origin);
     let explorer = std::sync::Arc::new(tempo::explorer::ExplorerClient::new(database));
     let mut games = Games {
         refresh: GameJobs::start()?,
@@ -71,15 +75,7 @@ pub(super) fn serve(
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
-        if let Err(error) = respond(
-            app,
-            profile_store,
-            &mut games,
-            request,
-            &public,
-            &address,
-            &origin,
-        ) {
+        if let Err(error) = respond(app, profile_store, &mut games, request, &surfaces) {
             eprintln!("Tempo HTTP: {error}");
         }
     }
@@ -114,6 +110,122 @@ struct StudyAnalysisRead {
     attempt_id: tempo_types::AttemptId,
     revision: tempo_types::Revision,
     content_version: tempo_types::ContentVersion,
+}
+
+struct HttpSurfaces {
+    address: String,
+    origin: String,
+    desktop: BTreeMap<String, Asset>,
+    phone: Option<PhoneStudy>,
+}
+
+impl HttpSurfaces {
+    fn assets_for(&self, request: &Request) -> Result<&BTreeMap<String, Asset>, StatusCode> {
+        // Tailscale Serve rewrites the forwarding headers and always marks proxied
+        // requests. Classify those before checking the caller-controlled Host,
+        // including when phone access is disabled.
+        if header(request, "X-Forwarded-Host").is_some()
+            || header(request, "X-Forwarded-Proto").is_some()
+        {
+            let phone = self
+                .phone
+                .as_ref()
+                .filter(|phone| phone.authorizes(request))
+                .ok_or(StatusCode(403))?;
+            if !phone.exposes(request) {
+                return Err(StatusCode(404));
+            }
+            return Ok(&phone.assets);
+        }
+        if header(request, "Host") != Some(self.address.as_str())
+            || header(request, "Origin").is_some_and(|origin| origin != self.origin)
+        {
+            return Err(StatusCode(403));
+        }
+        Ok(&self.desktop)
+    }
+}
+
+struct PhoneStudy {
+    origin: String,
+    authority: String,
+    login: String,
+    assets: BTreeMap<String, Asset>,
+}
+
+impl PhoneStudy {
+    fn load(ui: &Path) -> LocalResult<Option<Self>> {
+        use std::env::VarError::NotPresent;
+
+        let (origin, login) = match (
+            std::env::var("TEMPO_PHONE_ORIGIN"),
+            std::env::var("TEMPO_PHONE_TAILSCALE_LOGIN"),
+        ) {
+            (Err(NotPresent), Err(NotPresent)) => return Ok(None),
+            (Ok(origin), Ok(login)) if !login.trim().is_empty() => (origin, login),
+            _ => return Err("set both Tempo phone origin and Tailscale login".into()),
+        };
+        let authority = origin
+            .strip_prefix("https://")
+            .filter(|authority| valid_phone_authority(authority))
+            .ok_or("expected a Tempo phone HTTPS origin with a .ts.net host and explicit port")?
+            .to_owned();
+        Ok(Some(Self {
+            origin,
+            authority,
+            login,
+            assets: build_files(&ui.join("phone"))?,
+        }))
+    }
+
+    fn authorizes(&self, request: &Request) -> bool {
+        let matches = |name, expected: &str| {
+            let mut values = request
+                .headers()
+                .iter()
+                .filter(|field| field.field.equiv(name))
+                .map(|field| field.value.as_str());
+            values.next() == Some(expected) && values.next().is_none()
+        };
+        matches("Host", &self.authority)
+            && matches("X-Forwarded-Host", &self.authority)
+            && matches("X-Forwarded-Proto", "https")
+            && matches("Tailscale-User-Login", &self.login)
+            && header(request, "Tailscale-Funnel-Request").is_none()
+            && (matches("Origin", &self.origin)
+                || (request.method() == &Method::Get && header(request, "Origin").is_none()))
+    }
+
+    fn exposes(&self, request: &Request) -> bool {
+        match request.method() {
+            Method::Get => self.assets.contains_key(asset_path(request)),
+            Method::Post => matches!(
+                request.url(),
+                "/api/study"
+                    | "/api/study-progress"
+                    | "/api/study/relevance"
+                    | "/api/study/game-context"
+            ),
+            _ => false,
+        }
+    }
+}
+
+fn valid_phone_authority(authority: &str) -> bool {
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    host.ends_with(".ts.net")
+        && host.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
+        && port
+            .parse::<u16>()
+            .is_ok_and(|port| port > 0 && port != 443)
+}
+
+fn asset_path(request: &Request) -> &str {
+    request.url().split('?').next().unwrap_or_default()
 }
 
 struct Asset {
@@ -156,6 +268,7 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
             "css" => "text/css; charset=utf-8",
             "svg" => "image/svg+xml",
             "png" => "image/png",
+            "webmanifest" => "application/manifest+json",
             "mp3" => "audio/mpeg",
             "woff2" => "font/woff2",
             _ => continue,
@@ -176,18 +289,16 @@ fn respond(
     profile_store: &SqliteStore,
     games: &mut Games,
     mut request: Request,
-    public: &BTreeMap<String, Asset>,
-    address: &str,
-    origin: &str,
+    surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
+    let public = match surfaces.assets_for(&request) {
+        Ok(assets) => assets,
+        Err(status) => return Ok(request.respond(Response::empty(status))?),
+    };
     // Older open tabs have strict v5 reply validators. The opt-in changes
     // display only, independent of submission identity and saved receipts.
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
-    if header(&request, "Host") != Some(address)
-        || header(&request, "Origin").is_some_and(|value| value != origin)
-    {
-        request.respond(Response::empty(StatusCode(403)))?;
-    } else if matches!(
+    if matches!(
         request.url(),
         "/api/games"
             | "/api/analysis/evidence"
@@ -274,7 +385,12 @@ fn respond(
             (&Method::Post, "/api/study/analysis-context") => (
                 200,
                 command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
-                    app.study_analysis_context(&intent.dataset_id, &intent.attempt_id, intent.revision, intent.content_version)
+                    app.study_analysis_context(
+                        &intent.dataset_id,
+                        &intent.attempt_id,
+                        intent.revision,
+                        intent.content_version,
+                    )
                 }),
             ),
             (&Method::Post, "/api/study/analysis-line") => (
@@ -401,8 +517,7 @@ fn respond(
             serde_json::to_vec(&reply)?,
         ))?;
     } else if request.method() == &Method::Get {
-        let url = request.url().split('?').next().unwrap_or_default();
-        if let Some(asset) = public.get(url) {
+        if let Some(asset) = public.get(asset_path(&request)) {
             request.respond(body(asset.mime, asset.bytes.clone()).with_header(
                 field("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'"),
             ))?;
