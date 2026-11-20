@@ -234,15 +234,11 @@ impl Tempo {
                         side_to_move: moment.side_to_move,
                         assessment: assessment.clone(),
                         opponent_lead_in: moment.opponent_lead_in.clone(),
-                        skipped_analyses: if assessment.outcome == TacticalOutcome::WinningMate {
-                            completion
-                                .analyses
-                                .iter()
-                                .map(|member| member.id.clone())
-                                .collect()
-                        } else {
-                            Vec::new()
-                        },
+                        skipped_analyses: finding
+                            .skipped
+                            .iter()
+                            .map(|member| member.id.clone())
+                            .collect(),
                     };
                     observations.push(TacticalObservation {
                         producer: Some(finding.producer.clone()),

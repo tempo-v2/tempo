@@ -687,4 +687,140 @@ fn admitted_detector_set_persists_each_producer_through_the_durable_worker() {
             .into_iter()
             .collect()
     );
+    drop(app);
+    let path = directory.path().join("tactics.sqlite");
+    let app = local_runtime::open(&path).unwrap();
+    let store = tempo_store::SqliteStore::open(&path).unwrap();
+    let reversed = TacticalJobs::new(&detection, &["test-second-analysis", "hanging-material"]);
+    let replay = read(&app, &reversed, &store);
+    assert_eq!(replay["analysis_version"], report["analysis_version"]);
+    assert_eq!(replay["observations"], report["observations"]);
+    assert_eq!(replay["statistics"]["pending_games"], 0);
+}
+
+#[test]
+fn independent_mate_finding_needs_no_hanging_capture_and_skips_only_later_members() {
+    use tempo_chess::{
+        ChessAnswer, DetectedMoment, DetectionOutcome, GameDetectionInput, GameDetector,
+        PositionPass, TacticalAssessment, TacticalKind, TacticalOutcome,
+    };
+    struct MateEngine;
+    impl TacticalEvaluator for MateEngine {
+        fn descriptor(&self) -> EvaluationProvenance {
+            EvaluationProvenance {
+                engine: "Mate fixture".into(),
+                engine_version: "1".into(),
+                configuration_fingerprint: "fixture".into(),
+            }
+        }
+        fn evaluate(
+            &self,
+            request: &TacticalEvaluationRequest,
+            _: &dyn DetectionControl,
+        ) -> Result<RootEvaluation, EvaluationFailure> {
+            Ok(RootEvaluation {
+                provenance: self.descriptor(),
+                depth: 12,
+                nodes: 10_000,
+                roots: request
+                    .legal_moves
+                    .iter()
+                    .map(|uci| RootScore {
+                        uci: uci.clone(),
+                        bound: ScoreBound::Exact,
+                        score: if uci == "f7f8" {
+                            EvaluationScore::Mate(1)
+                        } else {
+                            EvaluationScore::Centipawns(0)
+                        },
+                    })
+                    .collect(),
+            })
+        }
+    }
+    struct MateCheck(&'static str);
+    impl GameDetector for MateCheck {
+        fn descriptor(&self) -> DetectorDescriptor {
+            DetectorDescriptor {
+                id: self.0.into(),
+                revision: "1".into(),
+                label: "Mate test".into(),
+                configuration_fingerprint: "fixture".into(),
+            }
+        }
+        fn produces_tactical_assessments(&self) -> bool {
+            true
+        }
+        fn detect(&self, _: &GameDetectionInput, _: &dyn DetectionControl) -> DetectionOutcome {
+            DetectionOutcome::Unsupported
+        }
+        fn detect_position(
+            &self,
+            position: &PositionPass<'_>,
+            control: &dyn DetectionControl,
+        ) -> DetectionOutcome {
+            assert_eq!(
+                self.0, "mate-analysis",
+                "a later detector ran after the mate"
+            );
+            assert!(position.move_is_mate("f7f8"));
+            let assessment = TacticalAssessment {
+                kind: TacticalKind::WinningMate,
+                candidates: vec![],
+                played: position.occurrence().next_move().unwrap().clone(),
+                outcome: TacticalOutcome::WinningMate,
+                analysis: position.compare(&MateEngine, control).unwrap(),
+                standalone_analysis: None,
+                accepted_moves: vec![ChessAnswer::from("f7f8")],
+                puzzle: None,
+                equivalence_cp: 0,
+            };
+            DetectionOutcome::Complete(vec![DetectedMoment {
+                occurrence: position.occurrence().offset(),
+                code: "winning_mate".into(),
+                subjects: vec![],
+                candidate_move: Some("f7f8".into()),
+                explanation: "Winning mate.".into(),
+                tactical: Some(assessment),
+            }])
+        }
+    }
+    let (directory, mut app) = disposable();
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(
+            HangingMaterialDetector::new(
+                Evaluator {
+                    revision: "1",
+                    outcome: "capture",
+                },
+                HangingMaterialConfig::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    registry.register(MateCheck("mate-analysis")).unwrap();
+    registry.register(MateCheck("z-unvisited")).unwrap();
+    let mut detection = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+    let mut jobs = TacticalJobs::new(
+        &detection,
+        &["z-unvisited", "mate-analysis", "hanging-material"],
+    );
+    let fen = "7k/5Q2/6K1/8/8/8/8/8 w - - 0 1";
+    assert!(tempo_chess::hanging_captures(fen).unwrap().is_empty());
+    let dataset_id = app.game_dataset().unwrap();
+    app.import_game_pgn(GameImport {
+        dataset_id, command_id: "mate-without-capture".into(), learner: "Learner".into(), repertoire_id: None,
+        pgn: format!("[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n\n1. Qf8# 1-0\n"),
+    }).unwrap();
+    let result = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    assert_eq!(result["statistics"]["observations"], 1);
+    let finding = &result["observations"][0];
+    assert_eq!(finding["producer"]["id"], "mate-analysis");
+    assert_eq!(finding["outcome"], "winning_mate");
+    assert_eq!(
+        finding["details"]["skipped_analyses"],
+        serde_json::json!(["z-unvisited"])
+    );
+    assert!(finding["puzzle"].is_null());
 }

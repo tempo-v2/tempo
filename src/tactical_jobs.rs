@@ -62,11 +62,12 @@ pub(crate) struct TacticalJobs {
 
 impl TacticalJobs {
     pub(crate) fn new(detection: &GameDetection, selected: &[&str]) -> Self {
-        let configured = selected
+        let mut configured = selected
             .iter()
             .map(|id| detection.tactical_descriptor(id))
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default();
+        configured.sort_by(|left, right| left.id.cmp(&right.id));
         let descriptor = configured.first().cloned();
         let analyses: Vec<_> = configured
             .iter()

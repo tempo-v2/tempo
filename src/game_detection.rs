@@ -111,6 +111,8 @@ pub(crate) enum DetectionStatus {
 pub(crate) struct DetectionFinding {
     #[serde(skip)]
     pub(crate) producer: DetectorIdentity,
+    #[serde(skip)]
+    pub(crate) skipped: Vec<DetectorIdentity>,
     finding_id: String,
     #[serde(flatten)]
     pub(crate) moment: ValidatedMoment,
@@ -608,6 +610,7 @@ fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus 
                     .map(|moment| PositionFinding {
                         producer: task.detector.descriptor.identity(),
                         moment,
+                        skipped: vec![],
                     })
                     .collect(),
             ),
@@ -651,6 +654,7 @@ fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus 
         ]))
     };
     let mut by_producer = BTreeMap::<DetectorIdentity, Vec<_>>::new();
+    let mut skipped = vec![];
     for finding in claims {
         if task
             .position
@@ -658,6 +662,7 @@ fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus 
         {
             return DetectionStatus::InvalidResult;
         }
+        skipped.extend(finding.skipped);
         by_producer
             .entry(finding.producer)
             .or_default()
@@ -677,6 +682,7 @@ fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus 
             findings.push(DetectionFinding {
                 finding_id: digest(&key),
                 producer: producer.clone(),
+                skipped: skipped.clone(),
                 moment,
             });
         }

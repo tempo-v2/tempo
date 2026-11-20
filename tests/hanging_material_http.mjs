@@ -204,7 +204,7 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
       missed_good_capture: 1, took_good_capture: 1, winning_mate: 3,
     });
     for (const row of history.observations.filter(row => row.outcome === "winning_mate")) {
-      assert.deepEqual(row.details.skipped_analyses, ["hanging-material"]);
+      assert.deepEqual(row.details.skipped_analyses ?? [], []);
       assert.deepEqual(row.details.assessment.candidates, []);
       assert.equal(row.details.assessment.standalone_analysis, null);
     }
