@@ -1019,6 +1019,13 @@ fn personal_findings_flow_through_games_and_study_and_reuse_the_previous_request
             outcome: "good",
         })))
         .unwrap();
+    let duplicate = registry
+        .register(tempo_chess::PersonalTacticsDetector(Evaluator {
+            revision: "competing",
+            outcome: "good",
+        }))
+        .unwrap_err();
+    assert_eq!(duplicate.code, "duplicate_complete_decision_detector");
     let mut detector = GameDetection::new(
         registry,
         AnalysisOptions {

@@ -58,11 +58,23 @@ impl DetectorRegistry {
                 "Duplicate detector ID.",
             ));
         }
+        let tactical_format = detector.tactical_evidence_format();
+        if tactical_format == Some(tempo_chess::TacticalEvidenceFormat::CompleteDecision)
+            && self
+                .0
+                .values()
+                .any(|entry| entry.tactical_format == tactical_format)
+        {
+            return Err(AppError::new(
+                "duplicate_complete_decision_detector",
+                "Only one detector may own the complete game-decision evidence.",
+            ));
+        }
         self.0.insert(
             descriptor.id.clone(),
             RegisteredDetector {
                 descriptor,
-                tactical_format: detector.tactical_evidence_format(),
+                tactical_format,
                 detector: Arc::new(detector),
             },
         );
