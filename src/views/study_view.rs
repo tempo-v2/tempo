@@ -1,5 +1,5 @@
 //! The three reply shapes a presentation client must handle.
-use super::attempt_view::AttemptFeedback;
+use super::attempt_view::{AttemptFeedback, OpponentMoveView};
 use crate::views::{AttemptView, EmptyView, ErrorView, LessonView};
 use crate::{AppError, wire::STUDY_WIRE_VERSION};
 use serde::{Deserialize, Serialize};
@@ -38,9 +38,9 @@ impl StudyView {
     }
 
     /// Older strict Study clients did not request this presentation field.
-    pub fn without_opponent_lead_in(mut self) -> Self {
+    pub fn without_opponent_context(mut self) -> Self {
         if let Self::Attempt(view) = &mut self {
-            view.opponent_lead_in = None;
+            view.opponent_move = None;
         }
         self
     }
@@ -72,13 +72,21 @@ impl StudyView {
             },
             corrective_repair: (record.mode == tempo_store::ActivityMode::Repair).then_some(true),
             lesson,
-            opponent_lead_in: if attempt.status == AttemptStatus::Active
-                && attempt.state.decision_index == 0
-                && attempt.revision.0 == 0
-            {
-                record.opponent_lead_in.clone()
+            opponent_move: if attempt.state.decision_index == 0 {
+                record
+                    .opponent_lead_in
+                    .as_ref()
+                    .map(|lead_in| OpponentMoveView {
+                        uci: lead_in.uci.clone(),
+                        before_fen: (attempt.status == AttemptStatus::Active
+                            && attempt.revision.0 == 0)
+                            .then(|| lead_in.before_fen.clone()),
+                    })
             } else {
-                None
+                board.last_opponent_move.map(|uci| OpponentMoveView {
+                    uci,
+                    before_fen: None,
+                })
             },
             exercise_name: record.exercise_name.clone(),
             history,

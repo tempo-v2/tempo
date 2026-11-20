@@ -19,9 +19,9 @@ pub struct AttemptView {
     pub corrective_repair: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lesson: Option<LessonView>,
-    /// Display-only context for a ready, unplayed first decision.
+    /// The opponent move into this board, when the issued line establishes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opponent_lead_in: Option<tempo_chess::OpponentLeadIn>,
+    pub opponent_move: Option<OpponentMoveView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional public display text. Consumers may render or omit it.
     pub exercise_name: Option<String>,
@@ -52,6 +52,15 @@ pub struct AttemptView {
     pub feedback: Option<AttemptFeedback>,
     /// The attempt's lifetime grade, including an earlier miss during correction.
     pub assessment: Option<Grade>,
+}
+
+/// Display-only context projected for the current board, including on resume.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpponentMoveView {
+    pub uci: String,
+    /// Supplied only on an unplayed first decision to authorize the opening hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_fen: Option<String>,
 }
 
 /// Guided reproduction data. Blind tests never include a lesson.

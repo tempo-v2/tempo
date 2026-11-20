@@ -3,7 +3,7 @@ use super::{LocalResult, import::Batch};
 use crate::application::tactic_catalog_facts::saved_pgn_source;
 use serde_json::json;
 use std::{collections::BTreeMap, path::Path};
-use tempo_chess::{Catalog, ContentItem, ContentKind, OpponentLeadIn, archived_tactic_lead_ins};
+use tempo_chess::{Catalog, ContentItem, ContentKind, LeadInEvidence, archived_tactic_lead_in};
 use tempo_store::{SqliteStore, Store};
 
 /// Preview verified context coverage, or apply the same metadata-only operation.
@@ -29,7 +29,7 @@ pub fn backfill_study_lead_ins(
         .catalog
         .items
         .values()
-        .filter(|item| item.active() && item.opponent_lead_in.is_none())
+        .filter(|item| item.active() && item.opponent_lead_in.is_unavailable())
     {
         let lead_in = match &item.definition.kind {
             ContentKind::Repertoire {
@@ -46,7 +46,7 @@ pub fn backfill_study_lead_ins(
                         Some(pgn) => tempo_chess::compile_repertoire(
                             &pgn,
                             book,
-                            &item.label,
+                            "Saved repertoire",
                             item.definition.learner_color()?,
                             "",
                         )
@@ -55,39 +55,40 @@ pub fn backfill_study_lead_ins(
                     };
                     books.insert(book.clone(), catalog);
                 }
-                matching_context(&books[book], &item.target.0, item).cloned()
+                matching_context(&books[book], &item.target.0, item)
+                    .cloned()
+                    .unwrap_or_default()
             }
             ContentKind::Tactic { .. } => {
-                let mut candidates = Vec::new();
+                let mut evidence = LeadInEvidence::Unavailable;
                 for source in &item.provenance {
                     if let Some(lead_in) = legacy
                         .as_ref()
                         .and_then(|catalog| matching_context(catalog, source, item))
                     {
-                        candidates.push(lead_in.clone());
+                        evidence.reconcile(lead_in);
                     }
                     if saved_pgn_source(source) {
                         if !archives.contains_key(source) {
                             archives.insert(source.clone(), store.archived_content_pgn(source)?);
                         }
                         if let Some(pgn) = &archives[source] {
-                            candidates.extend(
-                                archived_tactic_lead_ins(pgn, &item.definition).unwrap_or_default(),
+                            evidence.reconcile(
+                                &archived_tactic_lead_in(pgn, &item.definition).unwrap_or_default(),
                             );
                         }
                     }
                 }
-                unique_context(candidates, &mut conflicts)
+                evidence
             }
         };
-        if let Some(lead_in) = lead_in {
-            if item.definition.is_repertoire() {
-                repertoire += 1;
-            } else {
-                tactics += 1;
-            }
-            context.insert(item.target.clone(), lead_in);
+        match lead_in {
+            LeadInEvidence::Unavailable => continue,
+            LeadInEvidence::Verified(_) if item.definition.is_repertoire() => repertoire += 1,
+            LeadInEvidence::Verified(_) => tactics += 1,
+            LeadInEvidence::Conflicting => conflicts += 1,
         }
+        context.insert(item.target.clone(), lead_in);
     }
 
     if apply && !context.is_empty() {
@@ -104,7 +105,8 @@ pub fn backfill_study_lead_ins(
             "repertoire": repertoire,
             "tactics": tactics,
             "conflicts": conflicts,
-            "already_available": snapshot.catalog.items.values().filter(|item| item.active() && item.opponent_lead_in.is_some()).count(),
+            "already_available": snapshot.catalog.items.values().filter(|item| item.active() && item.opponent_lead_in.verified_move().is_some()).count(),
+            "already_conflicting": snapshot.catalog.items.values().filter(|item| item.active() && item.opponent_lead_in == LeadInEvidence::Conflicting).count(),
         })
     );
     Ok(())
@@ -114,22 +116,7 @@ fn matching_context<'a>(
     catalog: &'a Catalog,
     source: &str,
     item: &ContentItem,
-) -> Option<&'a OpponentLeadIn> {
+) -> Option<&'a LeadInEvidence> {
     let candidate = catalog.items.get(&tempo_types::TargetId::from(source))?;
-    (candidate.definition == item.definition)
-        .then_some(candidate.opponent_lead_in.as_ref())
-        .flatten()
-}
-
-fn unique_context(
-    candidates: Vec<OpponentLeadIn>,
-    conflicts: &mut usize,
-) -> Option<OpponentLeadIn> {
-    let mut candidates = candidates.into_iter();
-    let first = candidates.next()?;
-    if candidates.any(|other| other != first) {
-        *conflicts += 1;
-        return None;
-    }
-    Some(first)
+    (candidate.definition == item.definition).then_some(&candidate.opponent_lead_in)
 }

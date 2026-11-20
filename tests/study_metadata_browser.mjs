@@ -102,10 +102,10 @@ async function seed(kind) {
       source_id: "03ySM",
       solver_fen: "2r3k1/5pp1/Q3b2p/3p4/3q4/3B3P/1P3PP1/4R1K1 w - - 0 27",
       solution: ["a6c8", "e6c8", "e1e8"],
-      opponent_lead_in: {
+      opponent_lead_ins: [{
         before_fen: "2r3k1/5pp1/Q3b2p/3pq3/8/3B3P/1P3PP1/4R1K1 b - - 0 26",
         uci: "e5d4",
-      },
+      }],
       label: "Mate in two",
       provenance: ["Lichess CC0 fixture"],
     }] }));
@@ -168,7 +168,7 @@ try {
       const active = await resumed;
       assert.equal(active.exercise_name ?? undefined, name);
       assert.equal(active.attempt_id, baseline.attempt);
-      assert.equal(active.opponent_lead_in?.uci, journey === "teach" ? "e2e4" : "e5d4");
+      assert.equal(active.opponent_move?.uci, journey === "teach" ? "e2e4" : "e5d4");
 
       const continued = studyReply(page, "next").catch(error => error);
       if (journey === "teach") {

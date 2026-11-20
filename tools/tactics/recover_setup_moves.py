@@ -53,11 +53,10 @@ def enrich(bundle):
                     and isinstance(moves, list) and moves and isinstance(moves[0], str)
                     and moves[1:] == row["solution"]):
                 setups.add((source["FEN"], moves[0]))
-        if len(setups) == 1:
-            before, uci = setups.pop()
-            row["opponent_lead_in"] = {"before_fen": before, "uci": uci}
-        elif setups:
-            row.pop("opponent_lead_in", None)
+        if setups:
+            row["opponent_lead_ins"] = [
+                {"before_fen": before, "uci": uci} for before, uci in sorted(setups)
+            ]
     return transfer
 
 
