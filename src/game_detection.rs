@@ -43,6 +43,7 @@ pub struct DetectorRegistry(BTreeMap<String, RegisteredDetector>);
 struct RegisteredDetector {
     descriptor: DetectorDescriptor,
     detector: Arc<dyn GameDetector>,
+    tactical_format: Option<tempo_chess::TacticalEvidenceFormat>,
 }
 
 impl DetectorRegistry {
@@ -61,6 +62,7 @@ impl DetectorRegistry {
             descriptor.id.clone(),
             RegisteredDetector {
                 descriptor,
+                tactical_format: detector.tactical_evidence_format(),
                 detector: Arc::new(detector),
             },
         );
@@ -244,12 +246,19 @@ impl GameDetection {
             .map(|entry| entry.descriptor.clone())
     }
 
-    pub(crate) fn tactical_descriptor(&self, id: &str) -> Option<DetectorDescriptor> {
-        self.registry
-            .0
-            .get(id)
-            .filter(|entry| entry.detector.produces_tactical_assessments())
-            .map(|entry| entry.descriptor.clone())
+    pub(crate) fn tactical_registration(
+        &self,
+        id: &str,
+    ) -> Option<(DetectorDescriptor, tempo_chess::TacticalEvidenceFormat)> {
+        let entry = self.registry.0.get(id)?;
+        Some((entry.descriptor.clone(), entry.tactical_format?))
+    }
+
+    pub(crate) fn complete_decision_detector(&self) -> Option<&str> {
+        self.registry.0.iter().find_map(|(id, entry)| {
+            (entry.tactical_format == Some(tempo_chess::TacticalEvidenceFormat::CompleteDecision))
+                .then_some(id.as_str())
+        })
     }
 
     pub(crate) fn idle(&self) -> bool {
@@ -654,6 +663,24 @@ fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus 
     let mut by_producer = BTreeMap::<DetectorIdentity, Vec<_>>::new();
     let mut skipped = vec![];
     for finding in claims {
+        let producer = if task.position.is_some() {
+            task.position_detectors
+                .iter()
+                .find(|entry| entry.descriptor.identity() == finding.producer)
+        } else {
+            Some(&task.detector)
+        };
+        if finding.moment.tactical.as_ref().is_some_and(|assessment| {
+            let required = match assessment.kind {
+                tempo_chess::TacticalKind::PersonalTactics => {
+                    tempo_chess::TacticalEvidenceFormat::CompleteDecision
+                }
+                _ => tempo_chess::TacticalEvidenceFormat::LegacyFindings,
+            };
+            producer.and_then(|entry| entry.tactical_format) != Some(required)
+        }) {
+            return DetectionStatus::InvalidResult;
+        }
         if task
             .position
             .is_some_and(|run| finding.moment.occurrence != run.ply as usize)

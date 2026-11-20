@@ -281,11 +281,7 @@ impl Tempo {
                     observations.push(TacticalObservation {
                         producer: Some(finding.producer.clone()),
                         ply,
-                        motif: serde_json::to_value(assessment.kind)
-                            .expect("typed motif")
-                            .as_str()
-                            .expect("enum string")
-                            .into(),
+                        motif: assessment.kind.code().into(),
                         outcome: serde_json::to_value(assessment.outcome)
                             .expect("typed outcome")
                             .as_str()

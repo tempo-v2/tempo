@@ -209,7 +209,7 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     const position = async id => (await api("games/tactics/position", {dataset_id:dataset,id})).detail;
     const missedDetail = await position(missed.id);
     assert.equal(missedDetail.details.assessment.personal.puzzle.line[0].uci, "d4e5");
-    assert.ok(missedDetail.request_id && !missedDetail.fulfilled);
+    assert.equal(missedDetail.training.status, "queued");
     assert.ok(personal.games.some(row => row.motifs.includes("mate_in_one")));
     assert.ok(personal.games.some(row => row.motifs.includes("mate_in_two")));
     const resumed = await api("study", { command: "next" });
@@ -320,7 +320,7 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
       await page.close();
     } else assert.equal((await client.answer("d4e5")).status, "complete");
     await completed(5, 0);
-    assert.equal((await position(missed.id)).fulfilled, true);
+    assert.equal((await position(missed.id)).training.status, "reviewed");
     assert.equal((await client.next()).status, "empty");
 
     // A subsequent game while idle must become the first card, even though the
@@ -331,7 +331,7 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     await completed(6, 1);
     const idleHistory = await api("games/tactics/report", {dataset_id:dataset});
     const blackMiss = idleHistory.games.find(row => row.outcome === "missed_tactic" && row.game.result === "loss" && row.id !== missed.id);
-    assert.ok(blackMiss && (await position(blackMiss.id)).request_id);
+    assert.equal((await position(blackMiss.id)).training.status, "queued");
     const first = await client.next();
     blind(first);
     assert.equal(first.learner_color, "black");

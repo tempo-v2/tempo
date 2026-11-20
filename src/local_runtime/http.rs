@@ -43,11 +43,9 @@ pub(super) fn serve(
     };
     println!("Tempo study at {}", surfaces.origin);
     let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
-    let detector = if detection.tactical_descriptor("personal-tactics").is_some() {
-        "personal-tactics"
-    } else {
-        "hanging-material"
-    };
+    let detector = detection
+        .complete_decision_detector()
+        .unwrap_or("hanging-material");
     let tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
     let mut games = Games {
         tactics_report: TacticalReportWorker::start(database)?,

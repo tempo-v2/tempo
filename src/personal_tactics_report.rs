@@ -79,13 +79,13 @@ fn position(
     dataset: &DatasetId,
     id: u64,
 ) -> Result<Value, AppError> {
-    let (encoded, request, fulfilled) = store
+    let stored = store
         .tactical_details(dataset, id, version)?
         .ok_or_else(|| AppError::new("unknown_position", "This finding has changed."))?;
-    let details: TacticalDetails = serde_json::from_str(&encoded)
+    let details: TacticalDetails = serde_json::from_str(&stored.evidence_json)
         .map_err(|e| crate::app_error::domain("invalid_tactical_history", e))?;
     Ok(json!({"id":id,"best_moves":details.assessment.best_moves(),
-        "details":details,"request_id":request,"fulfilled":fulfilled}))
+        "details":details,"training":stored.training}))
 }
 
 #[derive(Clone, Serialize)]
@@ -214,7 +214,7 @@ pub(crate) fn read(
     request: ReportRequest,
 ) -> Result<Value, AppError> {
     let dataset = &request.dataset_id;
-    let rows = store.tactical_archive(dataset, version)?;
+    let rows = store.tactical_archive(dataset, GAME_TACTICS_REPORT, version)?;
     let mut ends = rows
         .iter()
         .filter_map(|game| game.end_ms)
@@ -304,30 +304,7 @@ pub(crate) fn read(
         } else {
             [0, 5, 10, 20]
         };
-        let mut report = bounds.map(|min| LoadBand {
-            min,
-            ..LoadBand::default()
-        });
-        for g in &selected {
-            let amount = if daily { g.prior_today } else { g.prior_hour };
-            let Some(amount) = amount else { continue };
-            let entry = &mut report[bounds.partition_point(|&min| min <= amount) - 1];
-            entry.results.add(g.result);
-            if let Some(day) = g.local_day {
-                entry.days.insert(day);
-            }
-            if g.fully_analyzed {
-                let rows = per_game
-                    .get(&(g.source.as_str(), g.id.as_str()))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                let evidence = chances(rows, request.filters.motif);
-                if !evidence.unclear {
-                    entry.opportunities += evidence.offered;
-                    entry.misses += evidence.missed;
-                }
-            }
-        }
+        let report = playing_load(&selected, &per_game, request.filters.motif, daily, bounds);
         let possible_break = find_break(&selected, daily, bounds);
         json!({"bands":report.iter().map(|band| json!({"min":band.min,"results":band.results,"opportunities":band.opportunities,"misses":band.misses,"days":band.days.len()})).collect::<Vec<_>>(),"possible_break":possible_break})
     };
@@ -397,6 +374,38 @@ struct LoadBand {
     opportunities: usize,
     misses: usize,
     days: BTreeSet<NaiveDate>,
+}
+
+fn playing_load(
+    games: &[&Game],
+    per_game: &BTreeMap<(&str, &str), Vec<&TacticalDecisionRow>>,
+    motif: Option<Motif>,
+    daily: bool,
+    bounds: [usize; 4],
+) -> [LoadBand; 4] {
+    let mut report = bounds.map(|min| LoadBand {
+        min,
+        ..LoadBand::default()
+    });
+    for g in games {
+        let amount = if daily { g.prior_today } else { g.prior_hour };
+        let Some(amount) = amount else { continue };
+        let entry = &mut report[bounds.partition_point(|&min| min <= amount) - 1];
+        entry.results.add(g.result);
+        if let Some(day) = g.local_day {
+            entry.days.insert(day);
+        }
+        if g.fully_analyzed {
+            let rows = per_game
+                .get(&(g.source.as_str(), g.id.as_str()))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let evidence = chances(rows, motif);
+            entry.opportunities += evidence.offered;
+            entry.misses += evidence.missed;
+        }
+    }
+    report
 }
 
 type Stratum<'a> = (&'a str, GameTimeControl, i64);
@@ -536,6 +545,40 @@ mod tests {
             prior_hour: Some(prior),
             fully_analyzed: true,
         }
+    }
+
+    #[test]
+    fn ambiguous_turn_preserves_the_same_games_clear_motif_chance() {
+        let game = sample(1, LearnerGameResult::Loss, 12, 60);
+        let row = |id, outcome| TacticalDecisionRow {
+            id,
+            learner: game.learner.clone(),
+            source: game.source.clone(),
+            game_id: game.id.clone(),
+            ply: id as u32,
+            position: String::new(),
+            outcome,
+            candidates: vec![(Motif::Fork, "e5c6".into())],
+            accepted: vec!["e5c6".into()],
+        };
+        let clear = row(1, TacticalOutcome::MissedTactic);
+        let ambiguous = row(2, TacticalOutcome::UnclearMiss);
+        let per_game = BTreeMap::from([(
+            (game.source.as_str(), game.id.as_str()),
+            vec![&clear, &ambiguous],
+        )]);
+        let bands = playing_load(
+            &[&game],
+            &per_game,
+            Some(Motif::Fork),
+            true,
+            [0, 10, 20, 40],
+        );
+        assert_eq!((bands[1].opportunities, bands[1].misses), (1, 1));
+        let all = playing_load(&[&game], &per_game, None, true, [0, 10, 20, 40]);
+        assert_eq!((all[1].opportunities, all[1].misses), (2, 2));
+        let games = loss_comparison(&[&game], &per_game, Some(Motif::Fork));
+        assert_eq!(games["with_miss"]["losses"], 1);
     }
 
     #[test]

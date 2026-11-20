@@ -60,6 +60,7 @@ pub(crate) enum TacticalCommand {
 pub(crate) struct TacticalJobs {
     descriptor: Option<DetectorDescriptor>,
     analyses: Vec<DetectorIdentity>,
+    has_complete_decisions: bool,
     version: String,
     active: Option<(TacticalPositionTask, String)>,
     ready: Option<(TacticalPositionTask, DetectionCompletion)>,
@@ -77,14 +78,17 @@ impl TacticalJobs {
     pub(crate) fn new(detection: &GameDetection, selected: &[&str]) -> Self {
         let mut configured = selected
             .iter()
-            .map(|id| detection.tactical_descriptor(id))
+            .map(|id| detection.tactical_registration(id))
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default();
-        configured.sort_by(|left, right| left.id.cmp(&right.id));
-        let descriptor = configured.first().cloned();
+        configured.sort_by(|(left, _), (right, _)| left.id.cmp(&right.id));
+        let descriptor = configured.first().map(|(descriptor, _)| descriptor.clone());
+        let has_complete_decisions = configured
+            .iter()
+            .any(|(_, format)| *format == tempo_chess::TacticalEvidenceFormat::CompleteDecision);
         let analyses: Vec<_> = configured
             .iter()
-            .map(DetectorDescriptor::identity)
+            .map(|(descriptor, _)| descriptor.identity())
             .collect();
         let version = analysis_version(&analyses);
         let on_wall_power = Arc::new(AtomicBool::new(false));
@@ -103,6 +107,7 @@ impl TacticalJobs {
         Self {
             descriptor,
             analyses,
+            has_complete_decisions,
             version,
             active: None,
             ready: None,
@@ -213,7 +218,7 @@ impl TacticalJobs {
             return Ok(());
         }
         let descriptor = self.descriptor.as_ref().expect("configured detector");
-        if descriptor.id == "personal-tactics" && self.enrolled_archive.as_ref() != Some(&dataset) {
+        if self.has_personal_report() && self.enrolled_archive.as_ref() != Some(&dataset) {
             store.enroll_verified_archive(&dataset)?;
             self.enrolled_archive = Some(dataset.clone());
         }
@@ -286,9 +291,7 @@ impl TacticalJobs {
     }
 
     pub(crate) fn has_personal_report(&self) -> bool {
-        self.descriptor
-            .as_ref()
-            .is_some_and(|member| member.id == "personal-tactics")
+        self.has_complete_decisions
     }
 
     pub(crate) fn report_version(&self) -> &str {
