@@ -15,7 +15,19 @@ use tempo_chess::{DetectorDescriptor, DetectorIdentity, parse_played_games};
 use tempo_store::{SqliteStore, TacticalPositionTask};
 use tempo_types::DatasetId;
 
-const IDLE: Duration = Duration::from_secs(30);
+mod study_presence;
+
+pub(crate) use study_presence::PresenceReport;
+use study_presence::{StudyPresence, StudyWait};
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AnalysisWait {
+    WallPower,
+    StudyInFront,
+    StudyQuietPeriod,
+    ForegroundEngine,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,8 +64,8 @@ pub(crate) struct TacticalJobs {
     active: Option<(TacticalPositionTask, String)>,
     ready: Option<(TacticalPositionTask, DetectionCompletion)>,
     next_check: Instant,
-    last_study: Option<Instant>,
-    idle_on_ac: Arc<AtomicBool>,
+    study: StudyPresence,
+    on_wall_power: Arc<AtomicBool>,
     run: u128,
     sequence: u64,
     last_error: Option<String>,
@@ -74,12 +86,12 @@ impl TacticalJobs {
             .map(DetectorDescriptor::identity)
             .collect();
         let version = analysis_version(&analyses);
-        let idle_on_ac = Arc::new(AtomicBool::new(false));
+        let on_wall_power = Arc::new(AtomicBool::new(false));
         if descriptor.is_some() {
-            let sensor = Arc::downgrade(&idle_on_ac);
+            let sensor = Arc::downgrade(&on_wall_power);
             std::thread::spawn(move || {
                 loop {
-                    let ready = machine_idle_on_ac();
+                    let ready = machine_on_wall_power();
                     let Some(state) = sensor.upgrade() else { break };
                     state.store(ready, Ordering::Relaxed);
                     drop(state);
@@ -94,8 +106,8 @@ impl TacticalJobs {
             active: None,
             ready: None,
             next_check: Instant::now(),
-            last_study: None,
-            idle_on_ac,
+            study: StudyPresence::new(Instant::now()),
+            on_wall_power,
             run: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -107,19 +119,41 @@ impl TacticalJobs {
     }
 
     pub(crate) fn study_activity(&mut self, detection: &mut GameDetection) {
-        self.last_study = Some(Instant::now());
+        self.study.command(Instant::now());
         detection.cancel_background();
+    }
+
+    pub(crate) fn study_presence(
+        &mut self,
+        report: PresenceReport,
+        detection: &mut GameDetection,
+    ) -> Result<(), AppError> {
+        if self
+            .study
+            .report(report, Instant::now())
+            .map_err(|message| AppError::new("invalid_presence", message))?
+        {
+            detection.cancel_background();
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn force_idle_for_test(&mut self) {
-        self.idle_on_ac = Arc::new(AtomicBool::new(true));
+        self.on_wall_power = Arc::new(AtomicBool::new(true));
+        self.study.finish_startup_wait(Instant::now());
     }
 
-    fn idle(&self) -> bool {
-        self.idle_on_ac.load(Ordering::Relaxed)
-            && self.last_study.is_none_or(|event| event.elapsed() >= IDLE)
-            && !crate::stockfish::foreground_waiting()
+    fn waiting(&self) -> Option<AnalysisWait> {
+        if !self.on_wall_power.load(Ordering::Relaxed) {
+            return Some(AnalysisWait::WallPower);
+        }
+        match self.study.waiting(Instant::now()) {
+            Some(StudyWait::Active) => Some(AnalysisWait::StudyInFront),
+            Some(StudyWait::QuietPeriod) => Some(AnalysisWait::StudyQuietPeriod),
+            None if crate::stockfish::foreground_waiting() => Some(AnalysisWait::ForegroundEngine),
+            None => None,
+        }
     }
 
     pub(crate) fn poll(
@@ -145,7 +179,7 @@ impl TacticalJobs {
         detection: &mut GameDetection,
     ) -> Result<(), AppError> {
         let dataset = app.game_dataset()?;
-        let run_allowed = self.idle() && !store.analysis_paused(&dataset)?;
+        let run_allowed = self.waiting().is_none() && !store.analysis_paused(&dataset)?;
         if !run_allowed {
             detection.cancel_background();
         }
@@ -278,6 +312,7 @@ impl TacticalJobs {
         app: &Tempo,
         store: &SqliteStore,
         read: TacticalRead,
+        include_wait_reason: bool,
     ) -> Result<Value, AppError> {
         if app.game_dataset()? != read.dataset_id {
             return Err(AppError::new(
@@ -301,7 +336,11 @@ impl TacticalJobs {
         });
         reply["games"] = json!(store.recent_analysis_games(&read.dataset_id, &self.version)?);
         reply["paused"] = json!(store.analysis_paused(&read.dataset_id)?);
-        reply["waiting_for_idle"] = json!(!self.idle());
+        let waiting = self.waiting();
+        reply["waiting_for_idle"] = json!(waiting.is_some());
+        if include_wait_reason {
+            reply["wait_reason"] = json!(waiting);
+        }
         reply["detector"] = json!(descriptor);
         reply["analysis_version"] = json!(self.version);
         reply["last_error"] = json!(self.last_error);
@@ -313,28 +352,8 @@ impl TacticalJobs {
 }
 
 #[cfg(target_os = "macos")]
-fn machine_idle_on_ac() -> bool {
+fn machine_on_wall_power() -> bool {
     use std::process::Command;
-    let idle = Command::new("/usr/sbin/ioreg")
-        .args(["-r", "-c", "IOHIDSystem", "-d", "1"])
-        .output();
-    let idle = idle
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .find_map(|line| {
-                    line.trim()
-                        .strip_prefix("\"HIDIdleTime\" = ")?
-                        .trim()
-                        .parse::<u64>()
-                        .ok()
-                })
-        });
-    if idle.is_none_or(|ns| Duration::from_nanos(ns) < IDLE) {
-        return false;
-    }
     Command::new("/usr/bin/pmset")
         .args(["-g", "batt"])
         .output()
@@ -346,6 +365,6 @@ fn machine_idle_on_ac() -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn machine_idle_on_ac() -> bool {
+fn machine_on_wall_power() -> bool {
     false
 }
