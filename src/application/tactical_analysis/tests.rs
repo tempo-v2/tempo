@@ -545,3 +545,80 @@ fn adjacent_positions_commit_separately_and_replay_the_exact_predecessor() {
         .unwrap();
     assert!(issued.opponent_lead_in.is_none());
 }
+
+#[test]
+#[ignore = "requires TEMPO_TACTICAL_PYTHON and TEMPO_STOCKFISH"]
+fn real_stockfish_position_reaches_study_with_source_move() {
+    let (directory, mut app) = disposable();
+    let path = directory.path().join("tactics.sqlite");
+    let store = tempo_store::SqliteStore::open(&path).unwrap();
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(
+            HangingMaterialDetector::new(
+                crate::tactical_engine::StockfishEvaluator::discover(&path).unwrap(),
+                HangingMaterialConfig::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut detection = GameDetection::new(
+        registry,
+        AnalysisOptions {
+            deadline: Duration::from_secs(90),
+            ..AnalysisOptions::default()
+        },
+    )
+    .unwrap();
+    let mut jobs = TacticalJobs::new(&detection);
+    jobs.force_idle_for_test();
+    let dataset = app.game_dataset().unwrap();
+    app.import_game_pgn(GameImport {
+        dataset_id: dataset,
+        command_id: "from-real-stockfish".into(),
+        learner: "Learner".into(),
+        repertoire_id: None,
+        pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"r5k1/pp2qppp/8/8/3P4/8/PP3PPP/R2Q2K1 b - - 0 1\"]\n\n1... Qe5 2. h3 0-1\n".into(),
+    }).unwrap();
+    let started = Instant::now();
+    let mut study_read = Duration::ZERO;
+    let mut task_poll = Duration::ZERO;
+    let result = loop {
+        detection.poll(&app);
+        let tick = Instant::now();
+        jobs.poll(&mut app, &store, &mut detection);
+        task_poll = task_poll.max(tick.elapsed());
+        let tick = Instant::now();
+        app.study_progress(None).unwrap();
+        study_read = study_read.max(tick.elapsed());
+        let result = read(&app, &jobs, &store);
+        if result["statistics"]["pending_games"] == 0 {
+            break result;
+        }
+        assert!(started.elapsed() < Duration::from_secs(85), "{result}");
+        std::thread::sleep(Duration::from_millis(15));
+    };
+    assert_eq!(result["statistics"]["decisions_scanned"], 1);
+    assert_eq!(result["statistics"]["outcomes"]["missed_good_capture"], 1);
+    assert_eq!(
+        result["observations"][0]["details"]["assessment"]["puzzle"]["answer"]["uci"],
+        "d4e5"
+    );
+    if let Some(destination) = std::env::var_os("TEMPO_TEST_POSITION_DATABASE") {
+        std::fs::copy(&path, destination).unwrap();
+    }
+    let issued = app.next_exercise().unwrap().unwrap();
+    let record = app
+        .store
+        .stored_attempt(&issued.attempt.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.opponent_lead_in.unwrap().uci, "e7e5");
+    answer(&mut app, &issued, "d4e5", "completed-real-puzzle");
+    println!(
+        "Elapsed {:?}, slowest task tick {:?}, slowest Study progress read {:?}",
+        started.elapsed(),
+        task_poll,
+        study_read
+    );
+}
