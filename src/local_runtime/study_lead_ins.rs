@@ -29,9 +29,9 @@ pub fn backfill_study_lead_ins(
         .catalog
         .items
         .values()
-        .filter(|item| item.active() && item.opponent_lead_in.is_unavailable())
+        .filter(|item| item.active() && item.opponent_lead_in != LeadInEvidence::Conflicting)
     {
-        let lead_in = match &item.definition.kind {
+        let source_evidence = match &item.definition.kind {
             ContentKind::Repertoire {
                 repertoire: book, ..
             } => {
@@ -82,6 +82,11 @@ pub fn backfill_study_lead_ins(
                 evidence
             }
         };
+        let mut lead_in = item.opponent_lead_in.clone();
+        lead_in.reconcile(&source_evidence);
+        if lead_in == item.opponent_lead_in {
+            continue;
+        }
         match lead_in {
             LeadInEvidence::Unavailable => continue,
             LeadInEvidence::Verified(_) if item.definition.is_repertoire() => repertoire += 1,
@@ -119,4 +124,57 @@ fn matching_context<'a>(
 ) -> Option<&'a LeadInEvidence> {
     let candidate = catalog.items.get(&tempo_types::TargetId::from(source))?;
     (candidate.definition == item.definition).then_some(&candidate.opponent_lead_in)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backfill_reconciles_a_verified_move_with_newly_available_source_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("study.sqlite");
+        let transfer = directory.path().join("transfer.json");
+        super::super::init(&database).unwrap();
+        let write_transfer = |before, uci| {
+            std::fs::write(
+                &transfer,
+                json!({"schema_version":1,"puzzles":[{
+                    "namespace":"fixture", "source_id":"same",
+                    "solver_fen":"4k3/8/5n2/8/8/8/4P3/4K3 w - - 0 1",
+                    "solution":["e2e4"], "label":"Fixture", "provenance":[],
+                    "opponent_lead_ins":[{"before_fen":before,"uci":uci}],
+                }]})
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_transfer("4k1n1/8/8/8/8/8/4P3/4K3 b - - 0 1", "g8f6");
+        super::super::import(&database, &transfer).unwrap();
+        let mut app = super::super::open(&database).unwrap();
+        let attempt = app.next_exercise().unwrap().unwrap().attempt;
+        let before = app.snapshot().unwrap();
+        assert!(matches!(
+            before.catalog.items[&attempt.target].opponent_lead_in,
+            LeadInEvidence::Verified(_)
+        ));
+        drop(app);
+
+        write_transfer("4k3/8/8/7n/8/8/4P3/4K3 b - - 0 1", "h5f6");
+        let read = SqliteStore::open_read_only(&database).unwrap();
+        backfill_study_lead_ins(&database, Some(&transfer), false).unwrap();
+        assert_eq!(read.snapshot().unwrap(), before);
+        backfill_study_lead_ins(&database, Some(&transfer), true).unwrap();
+        let after = read.snapshot().unwrap();
+        assert_eq!(
+            after.catalog.items[&attempt.target].opponent_lead_in,
+            LeadInEvidence::Conflicting
+        );
+        assert_eq!(after.learning, before.learning);
+        assert_eq!(after.content_history, before.content_history);
+        assert_eq!(after.attempts, before.attempts);
+        assert_eq!(after.active_attempt, before.active_attempt);
+        backfill_study_lead_ins(&database, Some(&transfer), true).unwrap();
+        assert_eq!(read.snapshot().unwrap(), after);
+    }
 }
