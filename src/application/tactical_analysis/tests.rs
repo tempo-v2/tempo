@@ -94,17 +94,23 @@ fn disposable() -> (tempfile::TempDir, Tempo) {
 }
 
 fn seed_due(app: &mut Tempo, label: &str) -> tempo_types::TargetId {
+    seed_due_with_answer(app, label, "e2e4")
+}
+
+fn seed_due_with_answer(app: &mut Tempo, label: &str, answer: &str) -> tempo_types::TargetId {
     let snapshot = app.store.content_state().unwrap();
-    let catalog = compile_tactics(&[TacticRecord {
+    let fresh = compile_tactics(&[TacticRecord {
         namespace: "fixture".into(),
-        source_id: "ordinary".into(),
+        source_id: answer.into(),
         solver_fen: tempo_chess::START_FEN.into(),
-        solution: vec!["e2e4".into()],
+        solution: vec![answer.into()],
         label: label.into(),
         provenance: vec![],
     }])
     .unwrap();
-    let target = catalog.items.keys().next().unwrap().clone();
+    let target = fresh.items.keys().next().unwrap().clone();
+    let mut catalog = snapshot.catalog;
+    catalog.items.extend(fresh.items);
     let state =
         DailyLearning::introduce_capture(&Default::default(), app.components.clock.now()).unwrap();
     app.store
@@ -517,9 +523,12 @@ fn deterministic_acceptance_failure_is_recorded_without_blocking_the_archive() {
 }
 
 #[test]
-fn adjacent_positions_commit_separately_and_replay_the_exact_predecessor() {
+fn adjacent_requests_alternate_with_due_work_and_preserve_issuance_on_restart() {
     let (directory, mut app) = disposable();
+    let path = directory.path().join("tactics.sqlite");
     let regular = seed_due(&mut app, "Due review");
+    let other_regular = seed_due_with_answer(&mut app, "Other due review", "d2d4");
+    assert_ne!(regular, other_regular);
     let (mut detection, mut jobs) = host("1", "miss");
     import(&mut app, "Two decisions", "1. Kg2 Kg7 2. Kg1 Kh8");
     let report = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
@@ -527,26 +536,76 @@ fn adjacent_positions_commit_separately_and_replay_the_exact_predecessor() {
     assert_eq!(report["statistics"]["pending_requests"], 2);
     assert_eq!(report["observations"][0]["ply"], 2);
     assert_eq!(report["observations"][1]["ply"], 0);
+
+    let dataset = app.game_dataset().unwrap();
+    let requested = app.store.pending_tactical_requests(&dataset).unwrap();
     let first = app.next_exercise().unwrap().unwrap();
-    let issued = app
-        .store
-        .stored_attempt(&first.attempt.id)
-        .unwrap()
-        .unwrap();
+    assert_eq!(first.attempt.target, requested[0].target);
+    let issued = app.store.stored_attempt(&first.attempt.id).unwrap().unwrap();
     assert_eq!(issued.opponent_lead_in.unwrap().uci, "h8g7");
-    answer(&mut app, &first, "a1a7", "first-miss");
+    let after_first = app.snapshot().unwrap();
     drop(app);
-    let mut app = local_runtime::open(&directory.path().join("tactics.sqlite")).unwrap();
+    let mut app = local_runtime::open(&path).unwrap();
+    assert_eq!(app.next_exercise().unwrap().unwrap().attempt, first.attempt);
+    assert_eq!(app.snapshot().unwrap(), after_first);
+    assert_eq!(
+        app.store.pending_tactical_requests(&dataset).unwrap(),
+        vec![requested[1].clone()]
+    );
+    assert!(
+        app.store
+            .has_pending_tactical_request_for_attempt(&dataset, &first.attempt.id)
+            .unwrap()
+    );
+    assert!(app.store.regular_review_owed(&dataset).unwrap());
+    let first_answer = answer(&mut app, &first, "a1a7", "first-miss");
+
     let review = app.next_exercise().unwrap().unwrap();
-    assert_eq!(review.attempt.target, regular);
-    answer(&mut app, &review, "e2e4", "due-review");
+    let review_answer = if review.attempt.target == regular {
+        "e2e4"
+    } else {
+        assert_eq!(review.attempt.target, other_regular);
+        "d2d4"
+    };
+    let after_review = app.snapshot().unwrap();
+    drop(app);
+    let mut app = local_runtime::open(&path).unwrap();
+    assert_eq!(app.next_exercise().unwrap().unwrap().attempt, review.attempt);
+    assert_eq!(app.snapshot().unwrap(), after_review);
+    assert!(!app.store.regular_review_owed(&dataset).unwrap());
+    assert_eq!(
+        app.store.pending_tactical_requests(&dataset).unwrap(),
+        vec![requested[1].clone()]
+    );
+    assert!(
+        !app.store
+            .has_pending_tactical_request_for_attempt(&dataset, &first.attempt.id)
+            .unwrap()
+    );
+    assert!(app.submit(first_answer).unwrap().assessment.is_some());
+    assert_eq!(app.snapshot().unwrap(), after_review);
+    answer(&mut app, &review, review_answer, "due-review");
+
+    // Another ordinary due review is still available. The second request wins
+    // because Queue's first regular issuance cleared the persisted turn.
     let second = app.next_exercise().unwrap().unwrap();
-    let issued = app
-        .store
-        .stored_attempt(&second.attempt.id)
-        .unwrap()
-        .unwrap();
+    assert_eq!(second.attempt.target, requested[1].target);
+    let issued = app.store.stored_attempt(&second.attempt.id).unwrap().unwrap();
     assert!(issued.opponent_lead_in.is_none());
+    assert!(
+        app.store
+            .has_pending_tactical_request_for_attempt(&dataset, &second.attempt.id)
+            .unwrap()
+    );
+    assert!(app.store.pending_tactical_requests(&dataset).unwrap().is_empty());
+    answer(&mut app, &second, "a1a7", "second-miss");
+    let spare = app.next_exercise().unwrap().unwrap();
+    let spare_target = if review_answer == "e2e4" {
+        other_regular
+    } else {
+        regular
+    };
+    assert_eq!(spare.attempt.target, spare_target);
 }
 
 #[test]
