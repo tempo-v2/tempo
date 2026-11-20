@@ -226,7 +226,10 @@ try {
       }
       await route.abort("failed");
     });
+    const failedSave = page.waitForEvent("requestfailed", request =>
+      request.url().endsWith("/api/repertoires") && request.postDataJSON().command === "save");
     await page.getByRole("button", { name: "Create repertoire", exact: true }).click();
+    await failedSave;
     await page.getByRole("button", { name: "Retry save", exact: true }).waitFor();
     const pending = await page.evaluate(key => sessionStorage.getItem(key), repertoireRecoveryKey);
     assert.equal(pending, immutableBytes);
