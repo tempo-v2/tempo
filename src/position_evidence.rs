@@ -296,14 +296,17 @@ impl Services {
                     ));
                 }
                 let mut books = self.books.lock().expect("position repertoire snapshot");
+                let game_review = r.review_version.is_some();
                 if books.as_ref().is_none_or(|b| {
-                    b.marker != marker || b.scope != (r.repertoire_id.clone(), r.learner_color)
+                    b.marker != marker
+                        || b.scope != (r.repertoire_id.clone(), r.learner_color, game_review)
                 }) {
                     *books = Some(BookPositions::load(
                         &store,
                         marker.clone(),
                         r.repertoire_id.as_deref(),
                         r.learner_color,
+                        game_review,
                     )?);
                 }
                 let data = books.as_ref().expect("loaded book positions").compare(

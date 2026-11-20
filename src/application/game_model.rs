@@ -155,6 +155,9 @@ impl Tempo {
                 "The repertoire changed. Refresh game evidence before editing.",
             ));
         }
+        if doc.suspended {
+            return Err(super::repertoires::suspended_repertoire());
+        }
         let color = item
             .definition
             .learner_color()
@@ -213,6 +216,9 @@ impl Tempo {
                 repertoire,
             } = &item.definition.kind
             {
+                if snapshot.suspended_repertoires.contains(repertoire) {
+                    continue;
+                }
                 repertoire_names
                     .entry(repertoire.clone())
                     .or_insert_with(|| item.label.clone());

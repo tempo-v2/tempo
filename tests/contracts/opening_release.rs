@@ -2883,3 +2883,204 @@ fn a_saved_opening_uses_the_issued_definition_until_history_is_reset() {
         .unwrap();
     assert_eq!(page["rows"], json!([]));
 }
+
+fn activity_change(repertoire: &str, command_id: &str, activity: &str) -> Value {
+    json!({
+        "command":"set_activity", "dataset_id":"opening-proof",
+        "repertoire_id":repertoire, "command_id":command_id, "activity":activity,
+    })
+}
+
+#[test]
+fn repertoire_suspension_fences_study_and_preserves_learning_and_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("suspend-study.sqlite");
+    let day = Arc::new(AtomicI32::new(20_000));
+    let limits = IntroductionLimits {
+        repertoire: 1,
+        ..IntroductionLimits::default()
+    };
+    let mut app = open(&db, day.clone(), limits, 0);
+    let pgn = "1. d4 d5 2. Bf4 Nf6 3. e3 *";
+    let (_, list) = preview_and_save(&mut app, pgn, "London", None);
+    let id = list["repertoires"][0]["id"].as_str().unwrap();
+    let lesson = study(&mut app, json!({"command":"next"}));
+    let mut ack = activity_command("acknowledge", &lesson, "teach-london");
+    ack["answer"] = json!({"uci":"d2d4"});
+    let taught = study(&mut app, ack.clone());
+    assert_eq!(taught["status"], "complete", "{taught}");
+
+    day.store(20_001, Ordering::Relaxed);
+    let test = study(&mut app, json!({"command":"next"}));
+    assert_eq!(test["activity"], "test", "{test}");
+    let mut answer = activity_command("answer", &test, "review-london");
+    answer["answer"] = json!({"uci":"d2d4"});
+    let passed = study(&mut app, answer.clone());
+    assert_eq!(passed["assessment"], "good", "{passed}");
+    let lesson = study(&mut app, json!({"command":"next"}));
+    assert_eq!(lesson["activity"], "teach", "{lesson}");
+    let mut late_ack = activity_command("acknowledge", &lesson, "unaccepted-london");
+    late_ack["answer"] = json!({"uci":"c1f4"});
+
+    let before = app.snapshot().unwrap();
+    let suspend = activity_change(id, "suspend-london", "suspended");
+    let applied = content(&mut app, suspend.clone());
+    assert_eq!(applied["status"], "activity_set", "{applied}");
+    let suspended = app.snapshot().unwrap();
+    assert_eq!(suspended.active_attempt, None);
+    assert_eq!(
+        suspended.attempts[before.active_attempt.as_ref().unwrap()]
+            .attempt
+            .status,
+        tempo_study::AttemptStatus::Abandoned
+    );
+    assert_eq!(suspended.assessments, before.assessments);
+    assert_eq!(suspended.learning, before.learning);
+    assert_eq!(suspended.receipts, before.receipts);
+    assert_eq!(suspended.catalog, before.catalog);
+
+    drop(app);
+    day.store(20_100, Ordering::Relaxed);
+    let mut app = open(&db, day, limits, 1);
+    assert_eq!(study(&mut app, late_ack)["code"], "suspended_repertoire");
+    assert_eq!(study(&mut app, ack), taught);
+    assert_eq!(study(&mut app, answer), passed);
+    let empty = study(&mut app, json!({"command":"next"}));
+    assert_eq!(empty["done"], true, "{empty}");
+    assert_eq!(empty["outstanding"], 0);
+
+    let renamed = content(
+        &mut app,
+        json!({
+            "command":"rename", "dataset_id":"opening-proof", "repertoire_id":id, "name":"White d4",
+        }),
+    );
+    assert_eq!(renamed["repertoires"][0]["activity"], "suspended");
+    let (_, replaced) = preview_and_save(
+        &mut app,
+        "1. d4 d5 2. Bf4 Nf6 3. e3 e6 4. Nf3 *",
+        "White d4",
+        Some(id),
+    );
+    assert_eq!(replaced["repertoires"][0]["activity"], "suspended");
+    preview_and_save(&mut app, SHORT, "Italian", None);
+    let italian = study(&mut app, json!({"command":"next"}));
+    assert_eq!(italian["exercise_name"], "Italian", "{italian}");
+
+    let resume = activity_change(id, "resume-london", "active");
+    assert_eq!(content(&mut app, resume)["activity"], "active");
+    assert_eq!(content(&mut app, suspend), applied);
+    assert_eq!(study(&mut app, json!({"command":"next"})), italian);
+    let leave = activity_command("abandon", &italian, "leave-italian");
+    assert_eq!(study(&mut app, leave)["status"], "abandoned");
+    let test = study(&mut app, json!({"command":"next"}));
+    assert_eq!(test["exercise_name"], "White d4", "{test}");
+    assert_eq!(test["activity"], "test");
+    assert_eq!(app.snapshot().unwrap().assessments, before.assessments);
+}
+
+#[test]
+fn repertoire_suspension_excludes_game_checks_and_retains_prior_gap_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("suspend-games.sqlite");
+    let day = Arc::new(AtomicI32::new(20_000));
+    let mut app = open(&db, day, IntroductionLimits::default(), 0);
+    let (_, list) = preview_and_save(&mut app, "1. d4 d5 2. Bf4 *", "London", None);
+    let london = list["repertoires"][0]["id"].as_str().unwrap();
+    let moves = "1. d4 Nf6 2. Bf4";
+    let checked = date_only_import(&mut app, "before-suspension", "2024.10.01", moves);
+    assert_eq!(
+        checked["results"][0]["repertoires"][0]["repertoire_id"], london,
+        "{checked}"
+    );
+    assert_eq!(
+        app.opponent_gaps(0).unwrap()["gaps"][0]["repertoire_id"],
+        london
+    );
+    let before = app.snapshot().unwrap();
+
+    let suspended = content(
+        &mut app,
+        activity_change(london, "suspend-games", "suspended"),
+    );
+    assert_eq!(suspended["status"], "activity_set");
+    assert_eq!(app.opponent_gaps(0).unwrap()["gaps"], json!([]));
+    let raw = date_only_import(
+        &mut app,
+        "suspended-new-game",
+        "2024.10.02",
+        "1. d4 d5 2. Nf3",
+    );
+    assert_eq!(raw["new_games"], 1, "{raw}");
+    assert!(raw["results"][0]["repertoires"].is_null(), "{raw}");
+    assert_eq!(raw["results"][0]["coverage_gaps"], 0);
+    assert_eq!(raw["results"][0]["matches"], 0);
+    assert_eq!(raw["results"][0]["deviations"], 0);
+
+    let review = json!({
+        "dataset_id":"opening-proof","source":raw["results"][0]["source"],
+        "game_id":raw["results"][0]["game_id"],"learner":"learner","repertoire_id":london,
+    });
+    assert_eq!(
+        app.game_review(serde_json::from_value(review.clone()).unwrap())
+            .unwrap_err()
+            .code,
+        "suspended_repertoire"
+    );
+    let mut timeline = review;
+    timeline["repertoire_id"] = Value::Null;
+    assert!(
+        app.game_review(serde_json::from_value(timeline).unwrap())
+            .is_ok()
+    );
+    date_only_import(&mut app, "suspended-old-game", "2024.10.01", moves);
+    assert_eq!(app.snapshot().unwrap().learning, before.learning);
+    assert_eq!(app.snapshot().unwrap().assessments, before.assessments);
+
+    let (_, list) = preview_and_save(&mut app, SHORT, "Italian", None);
+    let italian = list["repertoires"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "Italian")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let store = SqliteStore::open(&db).unwrap();
+    let books = store
+        .projection_books(
+            &"opening-proof".into(),
+            tempo_store::ProjectionScope::AllVerified,
+        )
+        .unwrap();
+    assert_eq!(
+        books
+            .iter()
+            .map(|book| book.repertoire_id.as_str())
+            .collect::<Vec<_>>(),
+        [italian]
+    );
+    let current = date_only_import(&mut app, "italian-only", "2024.10.03", "1. d4 d5 2. Bf4");
+    assert_eq!(
+        current["results"][0]["repertoires"][0]["repertoire_id"],
+        italian
+    );
+    assert_eq!(
+        current["results"][0]["repertoires"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(current["results"][0]["deviations"], 1, "{current}");
+    assert_eq!(current["results"][0]["matches"], 0);
+
+    assert_eq!(
+        content(&mut app, activity_change(london, "resume-games", "active"))["activity"],
+        "active"
+    );
+    assert_eq!(
+        app.opponent_gaps(0).unwrap()["gaps"][0]["repertoire_id"],
+        london
+    );
+}

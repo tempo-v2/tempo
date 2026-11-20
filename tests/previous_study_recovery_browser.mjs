@@ -18,6 +18,8 @@ const previous = join(directory, "previous-tempo");
 const previousUi = join(directory, "previous-ui");
 const recoveryKey = "tempo-study-recovery-v4";
 const studyApi = "**/api/study";
+const repertoireApi = "**/api/repertoires";
+const repertoireRecoveryKey = "tempo-repertoire-recovery-v4";
 const fixture = {
   schema_version: 1,
   puzzles: [{
@@ -63,6 +65,15 @@ async function stop() {
 
 function count(snapshot, table) {
   return snapshot.find(([name]) => name === table)[1].length;
+}
+
+function assertReplayPreservedRows(after, before) {
+  const oldTables = new Set(before.map(([name]) => name));
+  for (const [name, rows] of after.filter(([name]) => !oldTables.has(name))) {
+    assert.equal(name, "repertoire_suspensions");
+    assert.deepEqual(rows, []);
+  }
+  assert.deepEqual(after.filter(([name]) => oldTables.has(name)), before);
 }
 
 async function missTactic(page) {
@@ -171,7 +182,7 @@ try {
         assert.equal(count(after, "assessments"), count(prior, "assessments"));
         assert.equal(count(after, "daily_tactics_allowances"), count(prior, "daily_tactics_allowances") + 1);
       }
-      if (acceptedBeforeUpgrade) assert.deepEqual(after, afterOld);
+      if (acceptedBeforeUpgrade) assertReplayPreservedRows(after, afterOld);
       if (kind === "learn_more_tactics") {
         const next = page.waitForResponse(response =>
           response.url().endsWith("/api/study") && response.request().postDataJSON().command === "next");
@@ -184,6 +195,74 @@ try {
       await stop();
       console.log(`Replayed prior installed ${kind} (${acceptedBeforeUpgrade ? "accepted, reply lost" : "unaccepted"}) exactly once.`);
     }
+  }
+
+  for (const acceptedBeforeUpgrade of [true, false]) {
+    const database = join(directory, "repertoire-save-" + acceptedBeforeUpgrade + ".sqlite");
+    execFileSync(previous, ["init-practice", database]);
+    const origin = await start(previous, database, previousUi);
+    const page = await browser.newPage();
+    page.setDefaultTimeout(6000);
+    await page.goto(origin);
+    await page.getByRole("button", { name: "Repertoires", exact: true }).click();
+    await page.getByLabel("Repertoire name").fill("Previous release PGN");
+    await page.getByLabel("Learner color").selectOption("white");
+    await page.getByLabel("Or paste PGN").fill("1. e4 *");
+    await page.getByRole("button", { name: "Preview PGN", exact: true }).click();
+    let immutableBytes;
+    let priorReply;
+    await page.route(repertoireApi, async route => {
+      const request = route.request();
+      if (request.postDataJSON().command !== "save") return route.continue();
+      immutableBytes = request.postData();
+      if (acceptedBeforeUpgrade) {
+        const accepted = await route.fetch();
+        assert.equal(accepted.status(), 200);
+        priorReply = await accepted.text();
+        const reply = JSON.parse(priorReply);
+        assert.equal(reply.status, "repertoires");
+        assert.ok(!Object.hasOwn(reply.repertoires[0], "activity"));
+      }
+      await route.abort("failed");
+    });
+    await page.getByRole("button", { name: "Create repertoire", exact: true }).click();
+    await page.getByRole("button", { name: "Retry save", exact: true }).waitFor();
+    const pending = await page.evaluate(key => sessionStorage.getItem(key), repertoireRecoveryKey);
+    assert.equal(pending, immutableBytes);
+    if (acceptedBeforeUpgrade) {
+      // Let the independent cache projection settle before comparing complete database readbacks.
+      await page.waitForFunction(async () => {
+        const status = await (await fetch("/api/games/model")).json();
+        return status.projection?.complete_current === 1;
+      }, null, { polling: 100 });
+    }
+    const afterOld = databaseRows(database);
+    assert.equal(count(afterOld, "content_receipts"), Number(acceptedBeforeUpgrade));
+
+    await page.unroute(repertoireApi);
+    await stop();
+    assert.equal(await start(binary, database, ui, new URL(origin).port), origin);
+    const candidate = page.waitForResponse(response =>
+      response.url().endsWith("/api/repertoires") && response.request().postDataJSON().command === "save");
+    await page.reload();
+    const response = await candidate;
+    assert.equal(response.status(), 200);
+    assert.equal(response.request().postData(), immutableBytes);
+    const reply = await response.text();
+    if (priorReply) assert.equal(reply, priorReply);
+    const result = JSON.parse(reply);
+    assert.equal(result.status, "repertoires");
+    if (!acceptedBeforeUpgrade) assert.equal(result.repertoires[0].activity, "active");
+    await page.getByRole("button", {name: "Edit Previous release PGN", exact: true}).waitFor();
+    assert.equal(await page.evaluate(key => sessionStorage.getItem(key), repertoireRecoveryKey), null);
+
+    const after = databaseRows(database);
+    assert.equal(count(after, "content_receipts"), 1);
+    assert.equal(count(after, "repertoire_documents"), 1);
+    if (acceptedBeforeUpgrade) assertReplayPreservedRows(after, afterOld);
+    await page.close();
+    await stop();
+    console.log(`Replayed prior installed repertoire save (${acceptedBeforeUpgrade ? "accepted, reply lost" : "unaccepted"}) exactly once.`);
   }
 } finally {
   await browser?.close();

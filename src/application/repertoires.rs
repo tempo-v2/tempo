@@ -15,14 +15,15 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tempo_chess::{
     AuthoredRepertoire, Catalog, ChangeKind, ContentItem, ContentKind, ContentPlan, LearnerColor,
     compile_repertoire, plan_repertoire_replacement,
 };
 use tempo_learning::{DailyLearning, LearningState};
 use tempo_store::{
-    ContentReceipt, ContentSource, ContentState, RepertoireReset, Write, model_targets,
+    ContentReceipt, ContentSource, ContentState, RepertoireActivity, RepertoireActivityResult,
+    RepertoireReset, Write, model_targets,
 };
 use tempo_types::{DatasetId, Revision};
 
@@ -32,6 +33,7 @@ struct Summary {
     name: String,
     learner_color: LearnerColor,
     positions: usize,
+    activity: RepertoireActivity,
 }
 
 impl Tempo {
@@ -113,13 +115,25 @@ impl Tempo {
         {
             return self.reset_repertoire(dataset_id, repertoire_id, command_id);
         }
+        if let RepertoireCommand::SetActivity {
+            dataset_id,
+            repertoire_id,
+            command_id,
+            activity,
+        } = &command
+        {
+            return self.set_repertoire_activity(dataset_id, repertoire_id, command_id, *activity);
+        }
         let snapshot = self.store.content_state()?;
         let revision = snapshot.content_revision;
+        let suspended = &snapshot.suspended_repertoires;
         match command {
-            RepertoireCommand::ReadDocument { .. } | RepertoireCommand::ResetProgress { .. } => {
+            RepertoireCommand::ReadDocument { .. }
+            | RepertoireCommand::ResetProgress { .. }
+            | RepertoireCommand::SetActivity { .. } => {
                 unreachable!("handled without reading the catalog")
             }
-            RepertoireCommand::List => list(&snapshot.dataset, &snapshot.catalog),
+            RepertoireCommand::List => list(&snapshot.dataset, &snapshot.catalog, suspended),
             RepertoireCommand::Rename {
                 dataset_id,
                 repertoire_id,
@@ -141,7 +155,7 @@ impl Tempo {
                 if catalog != snapshot.catalog {
                     self.commit_catalog(&snapshot, &catalog, vec![], None, None)?;
                 }
-                list(&snapshot.dataset, &catalog)
+                list(&snapshot.dataset, &catalog, suspended)
             }
             RepertoireCommand::MarkedPreview {
                 dataset_id,
@@ -262,7 +276,7 @@ impl Tempo {
                     input.learner_color,
                     model_targets(&plan.catalog, id),
                 );
-                let reply = list(&snapshot.dataset, &plan.catalog)?;
+                let reply = list(&snapshot.dataset, &plan.catalog, suspended)?;
                 let encoded = reply.to_string();
                 let receipt = ContentReceipt {
                     request: &token,
@@ -301,6 +315,41 @@ impl Tempo {
                 Ok(reply)
             }
         }
+    }
+
+    fn set_repertoire_activity(
+        &mut self,
+        dataset: &DatasetId,
+        repertoire: &str,
+        command_id: &str,
+        activity: RepertoireActivity,
+    ) -> Result<Value, AppError> {
+        if command_id.trim().is_empty() || command_id.len() > 120 {
+            return Err(AppError::new(
+                "invalid_command_id",
+                "A repertoire activity command identity is required.",
+            ));
+        }
+        match self
+            .store
+            .set_repertoire_activity(dataset, repertoire, command_id, activity)?
+        {
+            RepertoireActivityResult::Applied => {}
+            RepertoireActivityResult::StaleDataset => {
+                return Err(super::content_preview::stale_dataset());
+            }
+            RepertoireActivityResult::UnknownRepertoire => return Err(unknown_repertoire()),
+            RepertoireActivityResult::CommandConflict => {
+                return Err(AppError::new(
+                    "command_conflict",
+                    "This command was already used for a different repertoire activity change.",
+                ));
+            }
+        }
+        Ok(json!({
+            "schema_version": CONTENT_WIRE_VERSION, "status": "activity_set",
+            "dataset_id": dataset, "repertoire_id": repertoire, "activity": activity,
+        }))
     }
 
     fn reset_repertoire(
@@ -367,6 +416,18 @@ fn stale_draft() -> AppError {
     )
 }
 
+pub(super) fn suspended_repertoire() -> AppError {
+    AppError::new(
+        "suspended_repertoire",
+        "Resume this repertoire to study it or compare games with it.",
+    )
+}
+
+pub(super) fn is_suspended(item: &ContentItem, suspended: &BTreeSet<String>) -> bool {
+    matches!(&item.definition.kind, ContentKind::Repertoire { repertoire, .. }
+        if suspended.contains(repertoire))
+}
+
 fn unknown_repertoire() -> AppError {
     AppError::new("unknown_repertoire", "Choose an existing repertoire.")
 }
@@ -390,7 +451,7 @@ fn prepare(
     check_dataset(snapshot, &input.dataset_id)?;
     let name = validate_name(&input.name)?;
     if let Some(replacement) = &input.repertoire_id {
-        let metadata = summaries(&snapshot.catalog)?
+        let metadata = summaries(&snapshot.catalog, &snapshot.suspended_repertoires)?
             .remove(replacement)
             .ok_or_else(unknown_repertoire)?;
         if id != replacement
@@ -411,7 +472,10 @@ fn prepare(
     Ok((source, incoming, plan))
 }
 
-fn summaries(catalog: &Catalog) -> Result<BTreeMap<String, Summary>, AppError> {
+fn summaries(
+    catalog: &Catalog,
+    suspended: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Summary>, AppError> {
     use std::collections::btree_map::Entry;
 
     let mut summaries = BTreeMap::new();
@@ -429,6 +493,11 @@ fn summaries(catalog: &Catalog) -> Result<BTreeMap<String, Summary>, AppError> {
                     .learner_color()
                     .map_err(|error| domain("invalid_content", error))?,
                 positions: 0,
+                activity: if suspended.contains(repertoire) {
+                    RepertoireActivity::Suspended
+                } else {
+                    RepertoireActivity::Active
+                },
             }),
         };
         summary.positions += usize::from(item.active());
@@ -436,10 +505,14 @@ fn summaries(catalog: &Catalog) -> Result<BTreeMap<String, Summary>, AppError> {
     Ok(summaries)
 }
 
-fn list(dataset: &DatasetId, catalog: &Catalog) -> Result<Value, AppError> {
+fn list(
+    dataset: &DatasetId,
+    catalog: &Catalog,
+    suspended: &BTreeSet<String>,
+) -> Result<Value, AppError> {
     Ok(json!({
         "schema_version": CONTENT_WIRE_VERSION, "status": "repertoires", "dataset_id": dataset,
-        "repertoires": summaries(catalog)?.into_values().collect::<Vec<_>>(),
+        "repertoires": summaries(catalog, suspended)?.into_values().collect::<Vec<_>>(),
     }))
 }
 

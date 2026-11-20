@@ -11,8 +11,8 @@ use std::{
     sync::Arc,
 };
 use tempo_chess::{
-    AuthoredRepertoire, ContentKind, DecisionAdherence, LearnerColor, PlayedDecision, PlayedGame,
-    RepertoireAdherence, compare_authored_repertoires, parse_played_games,
+    AuthoredRepertoire, Catalog, ContentKind, DecisionAdherence, LearnerColor, PlayedDecision,
+    PlayedGame, RepertoireAdherence, compare_authored_repertoires, parse_played_games,
 };
 use tempo_learning::{
     AssessmentInput, AssessmentSource, DailyLearning, GameReviewEffect, LearningState,
@@ -28,6 +28,7 @@ use tempo_types::{DatasetId, Grade, Revision, TargetId};
 pub(super) struct GameBooks {
     dataset: DatasetId,
     revision: Revision,
+    catalog: Catalog,
     colors: BTreeMap<String, LearnerColor>,
     white: BTreeMap<String, AuthoredRepertoire>,
     black: BTreeMap<String, AuthoredRepertoire>,
@@ -363,6 +364,9 @@ impl Tempo {
                 continue;
             }
             let item = &snapshot.catalog.items[target];
+            if super::repertoires::is_suspended(item, &snapshot.suspended_repertoires) {
+                continue;
+            }
             let misses = self
                 .store
                 .legacy_game_misses(&snapshot.dataset, target, item.version)?;
@@ -489,7 +493,7 @@ impl Tempo {
                     unresolved += 1;
                 }
                 let decisions =
-                    compare_authored_repertoires(&played, &snapshot.catalog, side, documents);
+                    compare_authored_repertoires(&played, &books.catalog, side, documents);
                 let encounters = encounter_projection(&decisions, &choices);
                 repairs.push(EncounterRepair {
                     key: key.clone(),
@@ -590,8 +594,11 @@ impl Tempo {
                 LearnerColor::White => &books.white,
                 LearnerColor::Black => &books.black,
             };
-            let decisions =
-                compare_authored_repertoires(&played, &snapshot.catalog, side, documents);
+            let decisions = if books.colors.values().any(|color| *color == side) {
+                compare_authored_repertoires(&played, &books.catalog, side, documents)
+            } else {
+                Vec::new()
+            };
             let prior_choices =
                 self.store
                     .game_choices(&snapshot.dataset, &game.source, &game.id)?;
@@ -966,6 +973,7 @@ impl Tempo {
         let mut books = GameBooks {
             dataset: snapshot.dataset.clone(),
             revision,
+            catalog: Catalog::default(),
             colors: BTreeMap::new(),
             white: BTreeMap::new(),
             black: BTreeMap::new(),
@@ -975,6 +983,13 @@ impl Tempo {
             let ContentKind::Repertoire { repertoire, .. } = &item.definition.kind else {
                 continue;
             };
+            if snapshot.suspended_repertoires.contains(repertoire) {
+                continue;
+            }
+            books
+                .catalog
+                .items
+                .insert(item.target.clone(), item.clone());
             if books.colors.contains_key(repertoire) {
                 continue;
             }

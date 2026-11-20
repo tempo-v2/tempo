@@ -12,7 +12,7 @@ use tempo_types::{DatasetId, Revision};
 
 pub(super) struct BookPositions {
     pub(super) marker: (DatasetId, Revision),
-    pub(super) scope: (Option<String>, Option<LearnerColor>),
+    pub(super) scope: (Option<String>, Option<LearnerColor>, bool),
     catalog: BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>,
     names: BTreeMap<String, String>,
     document_id: Option<String>,
@@ -24,12 +24,19 @@ impl BookPositions {
         marker: (DatasetId, Revision),
         repertoire_id: Option<&str>,
         learner_color: Option<LearnerColor>,
+        game_review: bool,
     ) -> Result<Self, AppError> {
         let mut color = learner_color;
         let mut document_id = None;
         let mut selected_authored = None;
         if let Some(id) = repertoire_id {
             let document = store.repertoire_document(id)?;
+            if game_review && document.suspended {
+                return Err(AppError::new(
+                    "stale_repertoire",
+                    "This repertoire is suspended. Reload the game comparison.",
+                ));
+            }
             document_id = document.source_id;
             let item = document
                 .item
@@ -64,7 +71,9 @@ impl BookPositions {
                 .definition
                 .learner_color()
                 .map_err(|e| domain("invalid_repertoire", e))?;
-            if color.is_some_and(|c| c != side) {
+            if color.is_some_and(|c| c != side)
+                || (game_review && snapshot.suspended_repertoires.contains(repertoire))
+            {
                 continue;
             }
             catalog
@@ -102,7 +111,7 @@ impl BookPositions {
         }
         Ok(Self {
             marker,
-            scope: (repertoire_id.map(str::to_owned), learner_color),
+            scope: (repertoire_id.map(str::to_owned), learner_color, game_review),
             catalog,
             names,
             document_id,
