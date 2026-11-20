@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn game_history_on_study_fixture_reports_a_nonretryable_capability_error() {
-        let app = crate::Tempo::demo().unwrap();
+        let mut app = crate::Tempo::demo().unwrap();
         let before = app.snapshot().unwrap();
         let error = app.game_history().unwrap_err();
         assert_eq!(error.code, "unsupported_capability");

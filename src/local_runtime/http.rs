@@ -59,7 +59,7 @@ pub(super) fn serve(
     loop {
         if Instant::now() >= next_model_check {
             let scheduled = (|| -> LocalResult<()> {
-                let marker = profile_store.model_content_marker()?;
+                let marker = profile_store.game_comparison_marker()?;
                 if model_marker.as_ref() != Some(&marker) {
                     games.model.project_cached(marker.0.clone())?;
                     model_marker = Some(marker);

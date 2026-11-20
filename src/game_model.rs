@@ -489,7 +489,7 @@ fn run(
         .iter()
         .flat_map(|book| book.jobs.iter().cloned())
         .collect();
-    let total = jobs.len();
+    let mut total = jobs.len();
     let mut cache = BTreeMap::new();
     let mut missing = Vec::new();
     let mut invalid_cache = BTreeSet::new();
@@ -513,6 +513,14 @@ fn run(
         let result = (|| {
             let mut maia = Maia::start(directory)?;
             for position in missing {
+                let suspended = store.suspended_repertoires(dataset)?;
+                if !books.iter().any(|book| {
+                    book.jobs.contains(&position) && !suspended.contains(&book.repertoire_id)
+                }) {
+                    total -= 1;
+                    progress(cache.len(), total);
+                    continue;
+                }
                 let distribution = maia.infer(&position)?;
                 store.save_game_move_distribution(MODEL_KEY, &position.0, &distribution)?;
                 cache.insert(position, distribution);

@@ -106,6 +106,9 @@ impl Tempo {
                     "The selected dataset changed.",
                 ));
             }
+            if doc.suspended {
+                return Err(super::repertoires::suspended_repertoire());
+            }
             let item = doc.item.ok_or_else(|| {
                 AppError::new("unknown_repertoire", "Select a current repertoire.")
             })?;
