@@ -21,6 +21,7 @@ pub(crate) struct Maia {
 
 impl Maia {
     pub(crate) fn start(directory: &Path) -> Result<Self, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("maia.start");
         let mut child = Command::new(directory.join("venv/bin/python"))
             .args(["-I", "-u", "-c", include_str!("../tools/maia/infer.py")])
             .arg(directory.join("weights"))
@@ -30,6 +31,12 @@ impl Maia {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|error| domain("maia_runtime_unavailable", error))?;
+        crate::diagnostics::emit(
+            "process.spawned",
+            json!({
+                "operation":"maia.spawn", "child_pid":child.id()
+            }),
+        );
         let input = child.stdin.take().expect("piped model input");
         let stdout = child.stdout.take().expect("piped model output");
         let (send, output) = sync_channel(1);
@@ -56,14 +63,28 @@ impl Maia {
     }
 
     fn read<T: serde::de::DeserializeOwned>(&self, timeout: Duration) -> Result<T, AppError> {
-        let reply = self
-            .output
-            .recv_timeout(timeout)
-            .map_err(|error| domain("maia_timeout", error))?;
-        serde_json::from_str(&reply).map_err(|error| domain("invalid_maia_reply", error))
+        let mut trace = crate::diagnostics::Span::new("maia.wait");
+        trace.field("child_pid", self.child.id());
+        trace.field("timeout_ms", timeout.as_millis());
+        let reply = self.output.recv_timeout(timeout).map_err(|error| {
+            trace.set_outcome(match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => "timed_out",
+                std::sync::mpsc::RecvTimeoutError::Disconnected => "disconnected",
+            });
+            domain("maia_timeout", error)
+        })?;
+        let result =
+            serde_json::from_str(&reply).map_err(|error| domain("invalid_maia_reply", error));
+        trace.set_outcome(if result.is_ok() {
+            "received"
+        } else {
+            "invalid_reply"
+        });
+        result
     }
 
     pub(crate) fn infer(&mut self, position: &PositionKey) -> Result<Distribution, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("maia.infer");
         let fen = json!(format!("{} 0 1", position.0));
         writeln!(self.input, "{fen}").map_err(|error| domain("maia_request", error))?;
         checked_distribution(position, self.read(Duration::from_secs(10))?)

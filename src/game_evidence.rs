@@ -150,6 +150,7 @@ pub struct GameJobs {
 
 impl GameJobs {
     pub fn start() -> std::io::Result<Self> {
+        let _diagnostic = crate::diagnostics::Span::new("refresh.initialize");
         let (commands, requests) = sync_channel::<GameRefresh>(1);
         let (replies, results) = sync_channel(1);
         std::thread::Builder::new()
@@ -157,11 +158,13 @@ impl GameJobs {
             .spawn(move || {
                 let mut providers = PublicGames::default();
                 while let Ok(refresh) = requests.recv() {
+                    let mut trace = crate::diagnostics::Span::new("refresh.fetch");
                     let range = GameRange {
                         from_ms: refresh.from_ms,
                         to_ms: refresh.to_ms,
                     };
                     let fetched = providers.fetch(refresh.source, &refresh.account, &range);
+                    trace.set_outcome(if fetched.is_ok() { "returned" } else { "error" });
                     if replies.send((refresh, fetched)).is_err() {
                         break;
                     }
@@ -186,6 +189,7 @@ impl GameJobs {
         request: GameRefresh,
         allow_fetch: bool,
     ) -> Result<RefreshAcknowledgement, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("refresh.dispatch");
         check_id(&request.command_id)?;
         if app.game_dataset()? != request.dataset_id {
             return Err(AppError::new(
@@ -242,6 +246,7 @@ impl GameJobs {
 
     /// Apply fetched records on the single application owner, after network I/O.
     pub fn poll(&mut self, app: &mut Tempo) -> Value {
+        let _diagnostic = crate::diagnostics::Span::new("refresh.apply");
         if let Some(pending) = &self.pending {
             self.status = match self.results.try_recv() {
                 Ok((request, fetched)) => match fetched.and_then(|fetched| {

@@ -177,6 +177,7 @@ impl DetectionControl for Stop {
 struct Work {
     position_detectors: Vec<RegisteredDetector>,
     position: Option<tempo_store::TacticalPositionRun>,
+    diagnostic_context: Option<String>,
     request: DetectionRequest,
     source: Arc<AcceptedDetectionSource>,
     detector: RegisteredDetector,
@@ -236,6 +237,7 @@ impl Entry {
 }
 
 struct Active {
+    diagnostic_context: Option<String>,
     entry: Entry,
     stop: Arc<Stop>,
     reply: Receiver<DetectionStatus>,
@@ -297,17 +299,22 @@ impl GameDetection {
         registry: DetectorRegistry,
         options: AnalysisOptions,
     ) -> std::io::Result<Self> {
+        let _diagnostic = crate::diagnostics::Span::new("detection.initialize");
         let (work, incoming) = mpsc::sync_channel::<Work>(1);
         std::thread::Builder::new()
             .name("tempo-game-detection".into())
             .spawn(move || {
                 let mut cached = None;
                 while let Ok(task) = incoming.recv() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        detect(&task, &mut cached)
-                    }))
-                    .unwrap_or(DetectionStatus::Failed);
-                    let _ = task.reply.send(result);
+                    crate::diagnostics::with_context(task.diagnostic_context.clone(), || {
+                        let mut trace = crate::diagnostics::Span::new("detection.worker");
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            detect(&task, &mut cached)
+                        }))
+                        .unwrap_or(DetectionStatus::Failed);
+                        trace.set_outcome(diagnostic_status(&result));
+                        let _ = task.reply.send(result);
+                    });
                 }
             })?;
         Ok(Self {
@@ -355,6 +362,7 @@ impl GameDetection {
         position: Option<tempo_store::TacticalPositionRun>,
         analyses: &[DetectorIdentity],
     ) -> DetectionReply {
+        let _diagnostic = crate::diagnostics::Span::new("detection.start");
         let error =
             |status, code| addressed_error(status, code, &request.request_id, &request.dataset_id);
         if request.schema_version != VERSION
@@ -413,6 +421,10 @@ impl GameDetection {
             return error(400, "empty_analysis_set");
         }
         if self.active.is_some() {
+            crate::diagnostics::emit(
+                "detection.busy",
+                json!({"operation":"detection.start","outcome":"busy"}),
+            );
             return error(409, "busy");
         }
         let source = match app.accepted_detection_source(&request) {
@@ -444,11 +456,13 @@ impl GameDetection {
             descriptor: detector.descriptor.clone(),
             status: DetectionStatus::Running,
         };
+        let diagnostic_context = crate::diagnostics::capture_context();
         if self
             .work
             .try_send(Work {
                 position,
                 position_detectors,
+                diagnostic_context: diagnostic_context.clone(),
                 request,
                 source,
                 detector,
@@ -466,14 +480,20 @@ impl GameDetection {
         }
         let delivery = entry.reply();
         self.active = Some(Active {
+            diagnostic_context,
             entry,
             stop,
             reply: result,
         });
+        crate::diagnostics::emit(
+            "detection.queued",
+            json!({"operation":"detection.start","outcome":"queued"}),
+        );
         delivery
     }
 
     pub(crate) fn read(&mut self, app: &Tempo, request: DetectionRead) -> DetectionReply {
+        let _diagnostic = crate::diagnostics::Span::new("detection.read");
         let error =
             |status, code| addressed_error(status, code, &request.request_id, &request.dataset_id);
         if request.schema_version != VERSION
@@ -501,6 +521,7 @@ impl GameDetection {
     }
 
     pub(crate) fn poll(&mut self, app: &Tempo) {
+        let _diagnostic = crate::diagnostics::Span::new("detection.poll");
         let Some(active) = &mut self.active else {
             return;
         };
@@ -515,12 +536,30 @@ impl GameDetection {
                     && let Err(stop) = active.stop.check()
                 {
                     active.entry.status = stopped(stop);
+                    crate::diagnostics::with_context(active.diagnostic_context.clone(), || {
+                        crate::diagnostics::emit(
+                            "detection.deadline",
+                            json!({
+                                "operation":"detection.poll", "outcome": diagnostic_status(&active.entry.status)
+                            }),
+                        );
+                    });
                 }
                 return;
             }
             Err(TryRecvError::Disconnected) => DetectionStatus::Failed,
         };
-        let mut finished = self.active.take().unwrap().entry;
+        let active = self.active.take().unwrap();
+        crate::diagnostics::with_context(active.diagnostic_context, || {
+            crate::diagnostics::emit(
+                "detection.acknowledged",
+                json!({
+                    "operation":"detection.poll",
+                    "outcome": if matches!(active.entry.status, DetectionStatus::Running) { "accepted_result" } else { "late_result_discarded" }
+                }),
+            );
+        });
+        let mut finished = active.entry;
         if matches!(finished.status, DetectionStatus::Running) {
             finished.status = result;
         }
@@ -577,6 +616,19 @@ fn descriptor_json(descriptor: &DetectorDescriptor) -> Value {
     })
 }
 
+fn diagnostic_status(status: &DetectionStatus) -> &'static str {
+    match status {
+        DetectionStatus::Running => "running",
+        DetectionStatus::Complete { .. } => "complete",
+        DetectionStatus::Cancelled => "cancelled",
+        DetectionStatus::TimedOut => "timed_out",
+        DetectionStatus::Unsupported => "unsupported",
+        DetectionStatus::InvalidResult => "invalid_result",
+        DetectionStatus::Failed => "failed",
+        DetectionStatus::SourceUnavailable => "source_unavailable",
+    }
+}
+
 fn stopped(stop: DetectionStop) -> DetectionStatus {
     match stop {
         DetectionStop::Cancelled => DetectionStatus::Cancelled,
@@ -587,6 +639,7 @@ fn stopped(stop: DetectionStop) -> DetectionStatus {
 type CachedDetection = (Arc<AcceptedDetectionSource>, GameDetectionInput, String);
 
 fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus {
+    let _diagnostic = crate::diagnostics::Span::new("detection.execute");
     if let Err(stop) = task.stop.check() {
         return stopped(stop);
     }

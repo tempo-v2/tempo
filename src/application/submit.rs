@@ -29,6 +29,7 @@ impl Tempo {
     /// The grader decides correctness. A new terminal assessment is interpreted
     /// by Learning and saved in the same commit as the attempt and receipt.
     pub fn submit(&mut self, command: SubmitCommand) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.submit.submit");
         let fingerprint =
             serde_json::to_string(&("answer", &command)).map_err(|e| domain("codec_error", e))?;
         let address = AbandonCommand {
@@ -41,6 +42,7 @@ impl Tempo {
     }
 
     pub(super) fn give_up(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.submit.give_up");
         // Installed releases used a blank-answer payload for the reveal fingerprint.
         let legacy = SubmitCommand {
             dataset_id: command.dataset_id.clone(),
@@ -55,6 +57,7 @@ impl Tempo {
     }
 
     pub(super) fn concede(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.submit.concede");
         let fingerprint =
             serde_json::to_string(&("concede", &command)).map_err(|e| domain("codec_error", e))?;
         self.advance(command, Response::Concede, fingerprint)
@@ -66,6 +69,7 @@ impl Tempo {
         response: Response,
         fingerprint: String,
     ) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.submit.advance");
         let scope = StudyScope {
             attempt: Some(&command.attempt_id),
             submission: Some(&command.submission_id),
@@ -98,19 +102,21 @@ impl Tempo {
             autoplay: vec![],
         };
         let progress = match &response {
-            Response::Concede => {
+            Response::Concede => crate::diagnostics::measure("study.concede", || {
                 tempo_study::concede(&old.attempt, command.expected_revision, reveal())
-            }
-            Response::Reveal => {
+            }),
+            Response::Reveal => crate::diagnostics::measure("study.give_up", || {
                 tempo_study::give_up(&old.attempt, command.expected_revision, reveal())
-            }
-            Response::Move(answer) => tempo_study::submit(
-                self.components.grader.as_ref(),
-                definition,
-                &old.attempt,
-                command.expected_revision,
-                answer,
-            ),
+            }),
+            Response::Move(answer) => crate::diagnostics::measure("study.submit", || {
+                tempo_study::submit(
+                    self.components.grader.as_ref(),
+                    definition,
+                    &old.attempt,
+                    command.expected_revision,
+                    answer,
+                )
+            }),
         }
         .map_err(study_input)?;
         let accepted_at = progress.assessment.map(|_| self.components.clock.now());
@@ -162,13 +168,15 @@ impl Tempo {
             };
             let policy = self.components.learning.as_ref();
             let transition = if self.daily.is_some() {
-                DailyLearning::assess_test(
-                    policy,
-                    prior,
-                    &input,
-                    old.attempt.content_version,
-                    old.issued_at,
-                )
+                crate::diagnostics::measure("learning.assess_test", || {
+                    DailyLearning::assess_test(
+                        policy,
+                        prior,
+                        &input,
+                        old.attempt.content_version,
+                        old.issued_at,
+                    )
+                })
             } else {
                 policy.apply(prior, &input)
             }
@@ -195,12 +203,14 @@ impl Tempo {
             })
         {
             if record.transition.state.correction.is_some() {
-                let state = DailyLearning::repair(
-                    prior,
-                    old.attempt.content_version,
-                    record.transition.state.miss_revision,
-                    self.components.clock.now(),
-                )
+                let state = crate::diagnostics::measure("learning.repair", || {
+                    DailyLearning::repair(
+                        prior,
+                        old.attempt.content_version,
+                        record.transition.state.miss_revision,
+                        self.components.clock.now(),
+                    )
+                })
                 .map_err(|error| domain("learning_error", error))?;
                 if state != *prior {
                     writes.push(Write::Learning {

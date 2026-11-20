@@ -15,10 +15,12 @@ impl Tempo {
     /// Abandonment clears its active pointer and saves a receipt atomically. An
     /// assessment already emitted by an earlier miss remains part of the attempt.
     pub fn abandon(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.abandon.abandon");
         self.leave(command, false)
     }
 
     pub(super) fn skip(&mut self, command: AbandonCommand) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.abandon.skip");
         self.leave(command, true)
     }
 
@@ -36,8 +38,10 @@ impl Tempo {
             return study_result(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
-        let attempt =
-            tempo_study::abandon(&old.attempt, command.expected_revision).map_err(study_input)?;
+        let attempt = crate::diagnostics::measure("study.abandon", || {
+            tempo_study::abandon(&old.attempt, command.expected_revision)
+        })
+        .map_err(study_input)?;
         let result = AnswerResult {
             attempt: attempt.clone(),
             feedback: None,

@@ -27,6 +27,8 @@ impl Tempo {
         revision: Revision,
         version: ContentVersion,
     ) -> Result<Value, AppError> {
+        let _diagnostic =
+            crate::diagnostics::Span::new("app.study_analysis_context.study_analysis_context");
         let (record, issued) = self.authorized_analysis(dataset, attempt_id, revision, version)?;
         let attempt = &record.attempt;
         // On a completed exercise the cursor is one past the last decision.
@@ -42,6 +44,9 @@ impl Tempo {
         record: &StoredAttempt,
         index: usize,
     ) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new(
+            "app.study_analysis_context.project_saved_study_analysis",
+        );
         let issued = self.analysis_issued_item(record)?;
         self.project_study_analysis(record, &issued, index)
     }
@@ -95,6 +100,8 @@ impl Tempo {
         revision: Revision,
         version: ContentVersion,
     ) -> Result<StudyAnalysisLine, AppError> {
+        let _diagnostic =
+            crate::diagnostics::Span::new("app.study_analysis_context.study_analysis_line");
         let (record, issued) = self.authorized_analysis(dataset, attempt_id, revision, version)?;
         let definition = &issued.definition;
         match &definition.kind {

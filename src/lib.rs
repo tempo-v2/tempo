@@ -15,6 +15,7 @@ pub mod app_error;
 mod application;
 pub mod commands;
 pub mod components;
+mod diagnostics;
 pub mod game;
 pub mod game_range;
 pub mod portable_snapshot;

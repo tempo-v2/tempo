@@ -11,6 +11,7 @@ impl Tempo {
     /// earlier events from this batch.
     /// Accept already-fetched games. Provider I/O happens outside this application object.
     pub fn ingest_games(&mut self, games: &[Game]) -> Result<usize, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.ingest_games.ingest_games");
         if self.fixture.is_none() {
             return Err(AppError::new(
                 "unsupported_capability",

@@ -51,6 +51,7 @@ impl Tempo {
     /// Read one bounded page or an addressed tactic. Inspection writes nothing.
     /// Active study takes precedence over a request to disclose the same target.
     pub fn read_tactics(&self, command: TacticsRead) -> Result<TacticsReadReply, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.tactics_collection.read_tactics");
         match command {
             TacticsRead::List {
                 search,

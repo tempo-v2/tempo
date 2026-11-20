@@ -17,6 +17,7 @@ use tempo_store::{ContentReceipt, ContentSource, Write};
 
 impl Tempo {
     pub fn handle_tactic_capture(&mut self, command: TacticCaptureCommand) -> Value {
+        let _diagnostic = crate::diagnostics::Span::new("app.tactic_capture.handle_tactic_capture");
         self.tactic_capture(command)
             .unwrap_or_else(|error| json!(ErrorView::for_content(error)))
     }
@@ -87,7 +88,10 @@ impl Tempo {
                         .expect("planned target");
                     let prior = snapshot.learning.get(&target).cloned().unwrap_or_default();
                     if item.active() && !prior.introduced {
-                        let state = DailyLearning::introduce_capture(&prior, at)
+                        let state =
+                            crate::diagnostics::measure("learning.introduce_capture", || {
+                                DailyLearning::introduce_capture(&prior, at)
+                            })
                             .map_err(|error| domain("learning_error", error))?;
                         CaptureOrigin::record_personal_capture(&mut item.provenance);
                         writes.push(Write::Learning { target, state });

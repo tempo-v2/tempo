@@ -14,6 +14,7 @@ use tempo_study::AttemptStatus;
 impl Tempo {
     /// Handle one decoded transport intent, returning an attempt, empty, or error view.
     pub fn handle(&mut self, command: StudyCommand) -> StudyView {
+        let _diagnostic = crate::diagnostics::Span::new("app.handle.handle");
         let result: Result<StudyView, AppError> = match command {
             StudyCommand::Next => self.next_view(),
             StudyCommand::StudyStatus => self.study_status(),
@@ -52,6 +53,7 @@ impl Tempo {
     }
 
     fn study_status(&self) -> Result<StudyView, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.handle.study_status");
         if self.daily.is_none() {
             return Err(AppError::new("unsupported", "Use the local study release."));
         }
@@ -66,6 +68,7 @@ impl Tempo {
     }
 
     fn next_view(&mut self) -> Result<StudyView, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.handle.next_view");
         let active = self.store.study_state(StudyScope::default())?;
         if let Some(id) = &active.active_attempt {
             return self.project(self.resume_from(&active, id)?);
@@ -106,6 +109,7 @@ impl Tempo {
     }
 
     pub(super) fn project(&self, result: AnswerResult) -> Result<StudyView, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.handle.project");
         let attempt = &result.attempt;
         let record = self
             .store

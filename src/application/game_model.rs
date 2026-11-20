@@ -32,6 +32,7 @@ impl Tempo {
 
     /// Verify legacy source associations once against accepted content before cache reprojection.
     pub fn bootstrap_model_inputs(&mut self) -> Result<(), AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_model.bootstrap_model_inputs");
         for _ in 0..4 {
             let dataset = self.game_dataset()?;
             let pending = self.store.model_bootstrap_repertoires(&dataset)?;
@@ -60,7 +61,10 @@ impl Tempo {
                     .and_then(|(pgn, item)| {
                         let color = item.definition.learner_color().ok()?;
                         let compiled =
-                            compile_repertoire(pgn, &id, &item.label, color, &source_id).ok()?;
+                            crate::diagnostics::measure("chess.compile_repertoire", || {
+                                compile_repertoire(pgn, &id, &item.label, color, &source_id)
+                            })
+                            .ok()?;
                         let targets = model_targets(&snapshot.catalog, &id);
                         let compiled_targets = model_targets(&compiled, &id);
                         if model_lines(&compiled, &id) != model_lines(&snapshot.catalog, &id)
@@ -94,6 +98,7 @@ impl Tempo {
     }
 
     pub fn opponent_gaps(&mut self, offset: usize) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_model.opponent_gaps");
         let dataset = self.game_dataset()?;
         let candidates = self.store.opponent_gaps(&dataset)?;
         if candidates.is_empty() {
@@ -244,6 +249,7 @@ impl Tempo {
     }
 
     pub fn game_gap_draft(&self, request: GapRequest) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_model.game_gap_draft");
         let CheckedGap {
             authored,
             draft,

@@ -1,7 +1,7 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
 use super::{LocalResult, tactic_settings};
 use crate::{
-    AppError, Tempo,
+    AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
     game_evidence::{GameImport, GameJobs, GameRefresh},
@@ -10,7 +10,6 @@ use crate::{
     gap_explorer::{GapExplorer, GapExplorerRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
-use crate::{SaveStudyReview, SavedStudyReviewCommand};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
@@ -42,6 +41,12 @@ pub(super) fn serve(
         phone: PhoneStudy::load(ui)?,
     };
     println!("Tempo study at {}", surfaces.origin);
+    crate::diagnostics::emit(
+        "runtime.listening",
+        serde_json::json!({
+            "listen_port": surfaces.address.rsplit(':').next().and_then(|port| port.parse::<u16>().ok())
+        }),
+    );
     let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
     let detector = detection
         .complete_decision_detector()
@@ -71,6 +76,7 @@ pub(super) fn serve(
             continue;
         }
         if Instant::now() >= next_model_check {
+            let mut trace = crate::diagnostics::Span::new("loop.model_schedule");
             let scheduled = (|| -> LocalResult<()> {
                 let marker = profile_store.game_comparison_marker()?;
                 if model_marker.as_ref() != Some(&marker) {
@@ -81,13 +87,30 @@ pub(super) fn serve(
             })();
             if let Err(error) = scheduled {
                 eprintln!("Tempo model scheduling: {error}");
+                trace.set_outcome("error");
+                crate::diagnostics::emit(
+                    "runtime.error",
+                    serde_json::json!({
+                        "operation": "loop.model_schedule", "error_code": "model_scheduling_failed"
+                    }),
+                );
             }
             next_model_check = Instant::now() + Duration::from_millis(250);
         }
-        games.refresh.poll(app);
-        games.detection.poll(app);
-        games.tactics.poll(app, profile_store, &mut games.detection);
+        {
+            let _trace = crate::diagnostics::Span::new("loop.refresh_apply");
+            games.refresh.poll(app);
+        }
+        {
+            let _trace = crate::diagnostics::Span::new("loop.detection_apply");
+            games.detection.poll(app);
+        }
+        {
+            let _trace = crate::diagnostics::Span::new("loop.tactics_apply");
+            games.tactics.poll(app, profile_store, &mut games.detection);
+        }
         if !games.refresh.active() {
+            let _trace = crate::diagnostics::Span::new("loop.backfill_apply");
             games.backfill.poll(app);
         }
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
@@ -95,6 +118,12 @@ pub(super) fn serve(
         };
         if let Err(error) = respond(app, profile_store, &mut games, request, &surfaces) {
             eprintln!("Tempo HTTP: {error}");
+            crate::diagnostics::emit(
+                "runtime.error",
+                serde_json::json!({
+                    "operation": "http.request", "error_code": "http_io_error"
+                }),
+            );
         }
     }
 }
@@ -386,12 +415,45 @@ fn respond(
     app: &mut Tempo,
     profile_store: &SqliteStore,
     games: &mut Games,
+    request: Request,
+    surfaces: &HttpSurfaces,
+) -> LocalResult<()> {
+    let context = crate::diagnostics::RequestContext::new(header(&request, "X-Tempo-Request-Id"));
+    let mut trace = crate::diagnostics::Span::new("http.request");
+    trace.field("request_id", context.id());
+    trace.field(
+        "method",
+        match request.method() {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Head => "HEAD",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
+            Method::Options => "OPTIONS",
+            Method::Patch => "PATCH",
+            _ => "OTHER",
+        },
+    );
+    trace.field("route", diagnostic_route(request.url()));
+    let result = respond_inner(app, profile_store, games, request, surfaces);
+    trace.set_outcome(if result.is_ok() {
+        "returned"
+    } else {
+        "io_error"
+    });
+    result
+}
+
+fn respond_inner(
+    app: &mut Tempo,
+    profile_store: &SqliteStore,
+    games: &mut Games,
     mut request: Request,
     surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
     let public = match surfaces.assets_for(&request) {
         Ok(assets) => assets,
-        Err(status) => return Ok(request.respond(Response::empty(status))?),
+        Err(status) => return Ok(respond_traced(request, Response::empty(status))?),
     };
     // Older open tabs have strict v5 reply validators. The opt-in changes
     // display only, independent of submission identity and saved receipts.
@@ -515,7 +577,8 @@ fn respond(
             status: 400,
             body: serde_json::json!({"schema_version": 1, "status": "error", "code": error.code}),
         });
-        request.respond(
+        respond_traced(
+            request,
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&reply.body)?,
@@ -695,7 +758,8 @@ fn respond(
                 serde_json::json!(ErrorView::for_content(error)),
             ),
         };
-        request.respond(
+        respond_traced(
+            request,
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&reply)?,
@@ -707,19 +771,25 @@ fn respond(
         let reply = command(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
             .unwrap_or_else(|error| serde_json::json!(ErrorView::for_content(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post && request.url() == "/api/tactics-collection" {
         let reply = command::<crate::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| app.read_tactics(intent))
             .map(|content| serde_json::json!(content))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post
         && matches!(
             request.url(),
@@ -733,19 +803,25 @@ fn respond(
                 .and_then(|intent| app.saved_study_reviews(intent)),
         }
         .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
         let reply = command::<Option<crate::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
             .and_then(|known| app.study_progress(known.as_ref()))
             .map(|progress| serde_json::json!(progress))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post && request.url() == "/api/study" {
         let reply = command::<StudyCommand>(&mut request, MAX_COMMAND_BYTES)
             .map(|intent| {
@@ -765,10 +841,13 @@ fn respond(
         } else {
             reply.without_opponent_context()
         };
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post
         && matches!(request.url(), "/api/repertoires" | "/api/tactics")
     {
@@ -781,20 +860,23 @@ fn respond(
                 app.handle_tactic_capture(intent)
             })?
         };
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Get {
         if let Some(asset) = public.get(asset_path(&request)) {
-            request.respond(body(asset.mime, asset.bytes.clone()).with_header(
+            respond_traced(request, body(asset.mime, asset.bytes.clone()).with_header(
                 field("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'"),
             ))?;
         } else {
-            request.respond(Response::empty(StatusCode(404)))?;
+            respond_traced(request, Response::empty(StatusCode(404)))?;
         }
     } else {
-        request.respond(Response::empty(StatusCode(405)))?;
+        respond_traced(request, Response::empty(StatusCode(405)))?;
     }
     Ok(())
 }
@@ -822,30 +904,40 @@ fn json_command<T: DeserializeOwned>(
     if mime != Some("application/json") {
         return Err(invalid("Use an application/json command."));
     }
+    let mut body_trace = crate::diagnostics::Span::new("http.read_body");
     let size = request.body_length();
     let mut bytes = Vec::new();
     if let Some(max_bytes) = max_bytes {
         let Some(size) = size.filter(|size| *size <= max_bytes) else {
+            body_trace.set_outcome("invalid_size");
             return Err(AppError::new(
                 "invalid_command",
                 format!("Send a command body of at most {} KiB.", max_bytes / 1024),
             ));
         };
         bytes.resize(size, 0);
-        request
-            .as_reader()
-            .read_exact(&mut bytes)
-            .map_err(|_| invalid("Could not read the command."))?;
+        request.as_reader().read_exact(&mut bytes).map_err(|_| {
+            body_trace.set_outcome("io_error");
+            invalid("Could not read the command.")
+        })?;
     } else {
-        request
-            .as_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|_| invalid("Could not read the command."))?;
+        request.as_reader().read_to_end(&mut bytes).map_err(|_| {
+            body_trace.set_outcome("io_error");
+            invalid("Could not read the command.")
+        })?;
         if size.is_some_and(|size| bytes.len() != size) {
+            body_trace.set_outcome("invalid_size");
             return Err(invalid("Could not read the command."));
         }
     }
-    serde_json::from_slice(&bytes).map_err(|_| invalid("The command is invalid."))
+    body_trace.field("bytes", bytes.len());
+    drop(body_trace);
+    let mut decode_trace = crate::diagnostics::Span::new("http.decode_body");
+    let result = serde_json::from_slice(&bytes).map_err(|_| invalid("The command is invalid."));
+    if result.is_err() {
+        decode_trace.set_outcome("invalid_json");
+    }
+    result
 }
 
 fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
@@ -865,4 +957,91 @@ fn body(mime: &str, bytes: Vec<u8>) -> Response<std::io::Cursor<Vec<u8>>> {
         .with_header(field("Content-Type", mime))
         .with_header(field("Cache-Control", "no-store"))
         .with_header(field("X-Content-Type-Options", "nosniff"))
+}
+
+/// Diagnostics only use known route templates; URLs and query strings are never recorded.
+fn diagnostic_route(url: &str) -> &'static str {
+    match url.split('?').next().unwrap_or_default() {
+        "/api/study" => "study",
+        "/api/study-progress" => "study_progress",
+        "/api/study/relevance" => "study_relevance",
+        "/api/study/game-context" => "study_game_context",
+        "/api/study/analysis-context" => "study_analysis_context",
+        "/api/study/analysis-line" => "study_analysis_line",
+        "/api/study/review-mark" => "study_review_mark",
+        "/api/study/saved-reviews" => "study_saved_reviews",
+        "/api/repertoires" => "repertoires",
+        "/api/tactics" => "tactics",
+        "/api/tactics-collection" => "tactics_collection",
+        "/api/tactic-settings" => "tactic_settings",
+        "/api/games" => "games",
+        "/api/games/library" => "game_library",
+        "/api/games/job" => "game_refresh_status",
+        "/api/games/import" => "game_import",
+        "/api/games/refresh" => "game_refresh",
+        "/api/games/choose" => "game_choose",
+        "/api/games/reprocess" => "game_reprocess",
+        "/api/games/backfill" => "game_backfill",
+        "/api/games/backfill/retry" => "game_backfill_retry",
+        "/api/games/model" => "game_model",
+        "/api/games/gaps" => "game_gaps",
+        "/api/games/gap-draft" => "game_gap_draft",
+        "/api/games/review" => "game_review",
+        "/api/games/gap-analysis" => "game_gap_analysis",
+        "/api/games/gap-explorer" => "game_gap_explorer",
+        "/api/games/detectors" => "game_detectors",
+        "/api/games/detection" => "game_detection",
+        "/api/games/detection-result" => "game_detection_result",
+        "/api/analysis/evidence" => "analysis_evidence",
+        "/api/analysis/result" => "analysis_result",
+        "/" | "/index.html" => "ui_index",
+        path if path.starts_with("/assets/") => "ui_asset",
+        _ => "other",
+    }
+}
+
+/// A completed write records transport delivery only, never command acceptance.
+fn respond_traced<R: std::io::Read>(
+    request: Request,
+    mut response: Response<R>,
+) -> std::io::Result<()> {
+    let mut trace = crate::diagnostics::Span::new("http.write_response");
+    let status = response.status_code().0;
+    trace.field("status_code", status);
+    if let Some(id) = crate::diagnostics::current_request_id() {
+        response.add_header(field("X-Tempo-Request-Id", &id));
+    }
+    if let Some(id) = crate::diagnostics::run_id() {
+        response.add_header(field("X-Tempo-Run-Id", &id));
+    }
+    let result = request.respond(response);
+    let outcome = if result.is_ok() {
+        "written"
+    } else {
+        "io_error"
+    };
+    trace.set_outcome(outcome);
+    crate::diagnostics::emit(
+        "http.response",
+        serde_json::json!({
+            "operation":"http.write_response", "status_code":status, "outcome":outcome
+        }),
+    );
+    result
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::diagnostic_route;
+
+    #[test]
+    fn routes_never_include_payloads_or_query_values() {
+        assert_eq!(diagnostic_route("/api/study?token=secret"), "study");
+        assert_eq!(diagnostic_route("/api/private-player-name"), "other");
+        assert_eq!(
+            diagnostic_route("/assets/private-build-name.js"),
+            "ui_asset"
+        );
+        assert_eq!(diagnostic_route("https://example.com/api/study"), "other");
+    }
 }

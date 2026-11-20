@@ -76,6 +76,7 @@ fn other_route<'a>(
 
 impl Tempo {
     pub fn game_review(&self, request: GameReviewRead) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_review.game_review");
         if self.game_dataset()? != request.dataset_id {
             return Err(AppError::new(
                 "stale_dataset",

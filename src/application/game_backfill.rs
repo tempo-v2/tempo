@@ -16,6 +16,7 @@ impl Tempo {
         dataset: &DatasetId,
         id: Option<&str>,
     ) -> Result<Option<BackfillJob>, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_backfill.read_backfill");
         self.store
             .game_backfill_state(dataset, id)?
             .as_deref()

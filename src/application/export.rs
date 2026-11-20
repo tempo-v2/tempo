@@ -8,6 +8,7 @@ impl Tempo {
     /// Attempts and receipts are intentionally absent from this portable format;
     /// callers pass the encoded payload to a fresh destination's `restore` method.
     pub fn export(&self, codec: &dyn SnapshotCodec) -> Result<String, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.export.export");
         let (snapshot, game_evidence) = self.store.portable_state()?;
         codec.encode(&PortableSnapshot {
             schema_version: if self.daily.is_some() { 5 } else { 1 },
