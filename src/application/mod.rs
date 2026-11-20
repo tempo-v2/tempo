@@ -27,6 +27,7 @@ mod queue_source;
 mod receipts;
 mod repertoires;
 mod study_analysis_context;
+pub use study_analysis_context::StudyAnalysisLine;
 mod study_game_context;
 
 mod restore;

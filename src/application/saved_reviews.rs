@@ -182,7 +182,7 @@ impl Tempo {
         {
             return Ok(json!({"status": "study_required", "id": id}));
         }
-        let origin = self.project_study_analysis(source, context.decision_index)?;
+        let origin = self.project_saved_study_analysis(source, context.decision_index)?;
         Ok(json!({"status": "review_context", "id": id, "origin": origin}))
     }
 }

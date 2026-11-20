@@ -1,11 +1,23 @@
-//! Disclose one issued decision to the separate analysis page, after any required concession.
+//! Authorize reads of an issued decision and, on request, its complete line.
 use super::Tempo;
 use crate::{AppError, app_error::domain};
+use serde::Serialize;
 use serde_json::{Value, json};
-use tempo_chess::ContentKind;
+use tempo_chess::{
+    ContentItem, ContentKind, RevealedLine, first_matching_repertoire_line, revealed_line,
+};
 use tempo_store::{AcceptanceKind, ActivityMode, StoredAttempt, StudyScope};
 use tempo_study::AttemptStatus;
 use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision};
+
+/// A read-only export for an authorized Study visit. Missing authored context
+/// can still provide the issued move. Lookup failures return an application error.
+#[derive(Debug, Serialize)]
+#[serde(tag = "scope", content = "line", rename_all = "snake_case")]
+pub enum StudyAnalysisLine {
+    FullLine(RevealedLine),
+    IssuedMove(RevealedLine),
+}
 
 impl Tempo {
     pub fn study_analysis_context(
@@ -15,50 +27,34 @@ impl Tempo {
         revision: Revision,
         version: ContentVersion,
     ) -> Result<Value, AppError> {
-        let state = self.store.study_state(StudyScope {
-            attempt: Some(attempt_id),
-            ..StudyScope::default()
-        })?;
-        let record = state.attempts.get(attempt_id).ok_or_else(|| {
-            AppError::new("unknown_attempt", "The issued exercise is unavailable.")
-        })?;
+        let (record, issued) = self.authorized_analysis(dataset, attempt_id, revision, version)?;
         let attempt = &record.attempt;
-        if &state.dataset != dataset || &attempt.dataset != dataset {
-            return Err(AppError::new("stale_dataset", "The Study dataset changed."));
-        }
-        if attempt.revision != revision
-            || attempt.content_version != version
-            || (attempt.status == AttemptStatus::Active
-                && state.active_attempt.as_ref() != Some(attempt_id))
-        {
-            return Err(AppError::new(
-                "stale_revision",
-                "The issued exercise changed.",
-            ));
-        }
-        analysis_disclosure(record)?;
-        // A completed exercise's cursor is one past its last decision.
-        let index = if attempt.status == AttemptStatus::Complete {
-            attempt.state.decision_index.saturating_sub(1)
-        } else {
-            attempt.state.decision_index
-        };
-        self.project_study_analysis(record, index)
+        // On a completed exercise the cursor is one past the last decision.
+        let index = attempt
+            .state
+            .decision_index
+            .min(issued.definition.decisions.len().saturating_sub(1));
+        self.project_study_analysis(&record, &issued, index)
     }
 
-    pub(super) fn project_study_analysis(
+    pub(super) fn project_saved_study_analysis(
         &self,
         record: &StoredAttempt,
+        index: usize,
+    ) -> Result<Value, AppError> {
+        let issued = self.analysis_issued_item(record)?;
+        self.project_study_analysis(record, &issued, index)
+    }
+
+    fn project_study_analysis(
+        &self,
+        record: &StoredAttempt,
+        issued: &ContentItem,
         index: usize,
     ) -> Result<Value, AppError> {
         let attempt = &record.attempt;
         let dataset = &attempt.dataset;
         let attempt_id = &attempt.id;
-        let version = attempt.content_version;
-        let issued = self
-            .store
-            .issued_item(dataset, &attempt.target, version)?
-            .ok_or_else(|| AppError::new("stale_content", "The issued content is unavailable."))?;
         let decision = issued
             .definition
             .decisions
@@ -86,8 +82,101 @@ impl Tempo {
             "fen": decision.fen, "color": issued.definition.learner_color().map_err(|e| domain("invalid_content", e))?,
             "datasetId": dataset, "repertoireId": repertoire, "name": record.exercise_name,
             "prescribedUci": decision.expected.uci, "playedUci": played,
-            "attemptId": attempt_id, "revision": attempt.revision, "contentVersion": version,
+            "attemptId": attempt_id, "revision": attempt.revision, "contentVersion": attempt.content_version,
         }))
+    }
+
+    /// Export only on explicit request. The ordinary board can open without
+    /// fetching the current document or interpreting its PGN.
+    pub fn study_analysis_line(
+        &self,
+        dataset: &DatasetId,
+        attempt_id: &AttemptId,
+        revision: Revision,
+        version: ContentVersion,
+    ) -> Result<StudyAnalysisLine, AppError> {
+        let (_, issued) = self.authorized_analysis(dataset, attempt_id, revision, version)?;
+        let definition = &issued.definition;
+        match &definition.kind {
+            ContentKind::Tactic { .. } => {
+                let line = revealed_line(definition, definition.decisions.len())
+                    .map_err(|error| domain("invalid_content", error))?;
+                Ok(StudyAnalysisLine::FullLine(line))
+            }
+            ContentKind::Repertoire {
+                repertoire,
+                position,
+            } => {
+                let document = self.store.repertoire_document(repertoire)?;
+                if &document.dataset != dataset {
+                    return Err(AppError::new("stale_dataset", "The Study dataset changed."));
+                }
+                let decision = definition.decisions.first().ok_or_else(|| {
+                    AppError::new("invalid_content", "The exercise has no decision.")
+                })?;
+                if let Some(pgn) = document.pgn {
+                    let matched =
+                        first_matching_repertoire_line(&pgn, position, &decision.expected.uci)
+                            .map_err(|_| {
+                                AppError::new(
+                                    "analysis_line_invalid",
+                                    "Tempo could not read the saved variation.",
+                                )
+                            })?;
+                    if let Some(line) = matched {
+                        return Ok(StudyAnalysisLine::FullLine(line));
+                    }
+                } else if document.source_id.is_some() {
+                    return Err(AppError::new(
+                        "analysis_line_unavailable",
+                        "The saved variation is unavailable.",
+                    ));
+                }
+                let line = revealed_line(definition, 1)
+                    .map_err(|error| domain("invalid_content", error))?;
+                Ok(StudyAnalysisLine::IssuedMove(line))
+            }
+        }
+    }
+
+    fn authorized_analysis(
+        &self,
+        dataset: &DatasetId,
+        attempt_id: &AttemptId,
+        revision: Revision,
+        version: ContentVersion,
+    ) -> Result<(StoredAttempt, ContentItem), AppError> {
+        let mut state = self.store.study_state(StudyScope {
+            attempt: Some(attempt_id),
+            ..StudyScope::default()
+        })?;
+        let record = state.attempts.remove(attempt_id).ok_or_else(|| {
+            AppError::new("unknown_attempt", "The issued exercise is unavailable.")
+        })?;
+        let attempt = &record.attempt;
+        if &state.dataset != dataset || &attempt.dataset != dataset {
+            return Err(AppError::new("stale_dataset", "The Study dataset changed."));
+        }
+        if attempt.revision != revision
+            || attempt.content_version != version
+            || (attempt.status == AttemptStatus::Active
+                && state.active_attempt.as_ref() != Some(attempt_id))
+        {
+            return Err(AppError::new(
+                "stale_revision",
+                "The issued exercise changed.",
+            ));
+        }
+        analysis_disclosure(&record)?;
+        let issued = self.analysis_issued_item(&record)?;
+        Ok((record, issued))
+    }
+
+    fn analysis_issued_item(&self, record: &StoredAttempt) -> Result<ContentItem, AppError> {
+        let attempt = &record.attempt;
+        self.store
+            .issued_item(&attempt.dataset, &attempt.target, attempt.content_version)?
+            .ok_or_else(|| AppError::new("stale_content", "The issued content is unavailable."))
     }
 }
 
