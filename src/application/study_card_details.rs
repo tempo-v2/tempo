@@ -287,7 +287,9 @@ mod tests {
                 ],
             })
             .unwrap();
-        let pgn = "[Event \"Same puzzle\"]\n[TempoSetupPlies \"0\"]\n\n1. e4 e5 2. Nf3 *";
+        let pgn = format!(
+            "[Event \"Same puzzle\"]\n[SetUp \"1\"]\n[FEN \"{START_FEN}\"]\n[TempoSetupPlies \"0\"]\n\n1. e4 e5 2. Nf3 *"
+        );
         let preview = app.handle_tactic_capture(
             serde_json::from_value(json!({
                 "command": "preview", "dataset_id": dataset, "pgn": pgn,
