@@ -40,6 +40,14 @@ pub enum SavedStudyReviewCommand {
         dataset_id: DatasetId,
         id: i64,
     },
+    Check {
+        dataset_id: DatasetId,
+        id: i64,
+    },
+    CardDetails {
+        dataset_id: DatasetId,
+        id: i64,
+    },
     Remove {
         dataset_id: DatasetId,
         id: i64,
@@ -50,6 +58,12 @@ pub enum SavedStudyReviewCommand {
         id: i64,
         submission_id: String,
     },
+}
+
+enum SavedReviewRead {
+    Analysis,
+    Authorization,
+    CardDetails,
 }
 
 impl Tempo {
@@ -138,7 +152,13 @@ impl Tempo {
                 Ok(json!({"status": "saved_reviews", "rows": rows, "next": next}))
             }
             SavedStudyReviewCommand::Open { dataset_id, id } => {
-                self.open_study_review(dataset_id, *id)
+                self.read_study_review(dataset_id, *id, SavedReviewRead::Analysis)
+            }
+            SavedStudyReviewCommand::Check { dataset_id, id } => {
+                self.read_study_review(dataset_id, *id, SavedReviewRead::Authorization)
+            }
+            SavedStudyReviewCommand::CardDetails { dataset_id, id } => {
+                self.read_study_review(dataset_id, *id, SavedReviewRead::CardDetails)
             }
             SavedStudyReviewCommand::Remove {
                 dataset_id,
@@ -184,7 +204,12 @@ impl Tempo {
         }
     }
 
-    fn open_study_review(&self, dataset: &DatasetId, id: i64) -> Result<Value, AppError> {
+    fn read_study_review(
+        &self,
+        dataset: &DatasetId,
+        id: i64,
+        view: SavedReviewRead,
+    ) -> Result<Value, AppError> {
         let context = self
             .store
             .saved_review_context(dataset, id)?
@@ -223,8 +248,17 @@ impl Tempo {
         {
             return Ok(json!({"status": "study_required", "id": id}));
         }
-        let origin = self.project_saved_study_analysis(source, context.decision_index)?;
-        Ok(json!({"status": "review_context", "id": id, "origin": origin}))
+        match view {
+            SavedReviewRead::Authorization => Ok(json!({"status": "review_available", "id": id})),
+            SavedReviewRead::Analysis => {
+                let origin = self.project_saved_study_analysis(source, context.decision_index)?;
+                Ok(json!({"status": "review_context", "id": id, "origin": origin}))
+            }
+            SavedReviewRead::CardDetails => {
+                let details = self.project_saved_card_details(source)?;
+                Ok(json!({"status": "card_details", "id": id, "details": details}))
+            }
+        }
     }
 }
 

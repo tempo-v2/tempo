@@ -866,7 +866,8 @@ fn respond_inner(
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&reply)?,
-            ),
+            )
+            .with_header(field("Cache-Control", "no-store")),
         )?;
     } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
         let reply = command::<Option<crate::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)

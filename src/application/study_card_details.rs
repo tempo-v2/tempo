@@ -15,7 +15,7 @@ use tempo_store::{
 use tempo_study::AttemptStatus;
 use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision};
 
-pub(super) enum CardDisclosure {
+enum CardDisclosure {
     SourceOnly,
     Full,
 }
@@ -126,8 +126,25 @@ impl Tempo {
         }))
     }
 
-    /// Saved Analysis has already verified disclosure for this exact mark.
-    pub(super) fn project_card_details(
+    /// The saved-mark read has already checked the exact decision's disclosure.
+    pub(super) fn project_saved_card_details(
+        &self,
+        record: &StoredAttempt,
+    ) -> Result<CardDetails, AppError> {
+        let attempt = &record.attempt;
+        let issued = self
+            .store
+            .issued_item(&attempt.dataset, &attempt.target, attempt.content_version)?
+            .ok_or_else(|| AppError::new("stale_content", "The issued card is unavailable."))?;
+        let disclosure = if attempt.status == AttemptStatus::Active {
+            CardDisclosure::SourceOnly
+        } else {
+            CardDisclosure::Full
+        };
+        self.project_card_details(record, &issued, disclosure)
+    }
+
+    fn project_card_details(
         &self,
         record: &StoredAttempt,
         item: &ContentItem,
