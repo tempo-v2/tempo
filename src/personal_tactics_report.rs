@@ -4,15 +4,23 @@ use crate::application::tactical_analysis::{GAME_TACTICS_REPORT, TacticalDetails
 use chrono::{DateTime, Datelike, NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tempo_chess::{
-    GameTimeControl, LearnerColor, LearnerGameResult, Motif, PositionKey, TacticalOutcome,
-    game_report_facts, structural_neighbors,
+    GameTimeControl, LearnerColor, LearnerGameResult, Motif, PositionKey, PositionStructure,
+    TacticalOutcome, game_report_facts,
 };
-use tempo_store::{SqliteStore, TacticalDecisionRow};
+use tempo_store::{
+    SqliteStore, TacticalArchiveCoverage, TacticalArchiveMetadata, TacticalDecisionRow,
+    TacticalReportGeneration,
+};
 use tempo_types::DatasetId;
 
 const PAGE: usize = 30;
+// Keep one compact archive and evidence generation. The number of filters and
+// anchors retained is fixed. Each filter holds at most one index per finding,
+// and each anchor holds at most one page. Raw PGNs are never cached.
+const FILTER_CACHE: usize = 4;
+const ANCHOR_CACHE: usize = 4;
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,7 +39,7 @@ fn speed(clock: GameTimeControl) -> Speed {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 struct Filters {
     motif: Option<Motif>,
@@ -55,6 +63,7 @@ pub(crate) struct ReportRequest {
     filters: Filters,
     before: Option<u64>,
     anchor: Option<u64>,
+    report_generation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +71,22 @@ pub(crate) struct ReportRequest {
 pub(crate) struct PositionRequest {
     pub(crate) dataset_id: DatasetId,
     id: u64,
+    report_generation: Option<String>,
+}
+
+/// A report generation is scoped to both the dataset and accepted analysis policy.
+pub(crate) fn report_generation(version: &str, evidence: u64) -> String {
+    format!("{version}:{evidence}")
+}
+
+fn check_generation(expected: Option<&str>, actual: &str) -> Result<(), AppError> {
+    if expected.is_some_and(|expected| expected != actual) {
+        return Err(AppError::new(
+            "report_changed",
+            "This report snapshot has changed. Refresh the report to continue.",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn read_position(
@@ -69,8 +94,12 @@ pub(crate) fn read_position(
     version: &str,
     request: PositionRequest,
 ) -> Result<Value, AppError> {
-    let details = position(store, version, &request.dataset_id, request.id)?;
-    Ok(json!({"schema_version":2,"dataset_id":request.dataset_id,"detail":details}))
+    store.with_tactical_report_snapshot(&request.dataset_id, |read, generation| {
+        let stamp = report_generation(version, generation.evidence);
+        check_generation(request.report_generation.as_deref(), &stamp)?;
+        let details = position(read, version, &request.dataset_id, request.id)?;
+        Ok(json!({"schema_version":2,"dataset_id":request.dataset_id,"report_generation":stamp,"detail":details}))
+    })
 }
 
 fn position(
@@ -161,43 +190,35 @@ struct Chances {
     unclear: bool,
 }
 
-fn chances(rows: &[&TacticalDecisionRow], motif: Option<Motif>) -> Chances {
-    let mut counts = Chances::default();
-    for row in rows {
-        let relevant = |(kind, uci): &(Motif, String)| {
-            motif.is_none_or(|wanted| wanted == *kind) && row.accepted.contains(uci)
-        };
-        if !row.candidates.iter().any(relevant) {
-            continue;
+impl Chances {
+    fn observe(&mut self, row: &Decision, motif: Option<Motif>) {
+        if !row
+            .accepted_motifs
+            .iter()
+            .any(|&kind| motif.is_none_or(|wanted| wanted == kind))
+        {
+            return;
         }
         if motif.is_some() && row.outcome == TacticalOutcome::UnclearMiss {
-            counts.unclear = true;
-            continue;
+            self.unclear = true;
+            return;
         }
-        counts.offered += 1;
-        counts.missed += usize::from(matches!(
+        self.offered += 1;
+        self.missed += usize::from(matches!(
             row.outcome,
             TacticalOutcome::MissedTactic | TacticalOutcome::UnclearMiss
         ));
     }
-    counts
 }
 
-fn loss_comparison(
-    games: &[&Game],
-    per_game: &BTreeMap<(&str, &str), Vec<&TacticalDecisionRow>>,
-    motif: Option<Motif>,
-) -> Value {
+type SelectedGame<'a> = (&'a Game, Chances);
+
+fn loss_comparison(games: &[SelectedGame<'_>]) -> Value {
     let mut groups = [Results::default(); 2];
     let mut coverage = 0;
     let mut opportunity_counts = [[Results::default(); 2]; 3];
-    for game in games.iter().filter(|g| g.fully_analyzed) {
+    for &(game, evidence) in games.iter().filter(|(game, _)| game.fully_analyzed) {
         coverage += 1;
-        let rows = per_game
-            .get(&(game.source.as_str(), game.id.as_str()))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let evidence = chances(rows, motif);
         if evidence.offered == 0 || evidence.unclear && evidence.missed == 0 {
             continue;
         }
@@ -208,163 +229,475 @@ fn loss_comparison(
     json!({"with_miss":groups[1],"without_miss":groups[0],"analyzed":coverage,"opportunity_counts":opportunity_counts})
 }
 
+/// The existing single report worker owns this cache. Reads drive reconstruction
+/// after startup or a changed generation. Normal status polling never enters it.
+#[derive(Default)]
+pub(crate) struct ReportCache {
+    archive: Option<Archive>,
+    evidence: Option<Evidence>,
+    queries: VecDeque<Query>,
+    #[cfg(test)]
+    pub(crate) work: WorkCounts,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+pub(crate) struct WorkCounts {
+    pub(crate) pgns: usize,
+    pub(crate) decisions: usize,
+    pub(crate) aggregates: usize,
+    pub(crate) similarity: usize,
+    pub(crate) page_rows: usize,
+}
+
+struct Captured {
+    generation: TacticalReportGeneration,
+    metadata: Option<Vec<TacticalArchiveMetadata>>,
+    evidence: Option<(Vec<TacticalArchiveCoverage>, Vec<TacticalDecisionRow>)>,
+}
+
+impl ReportCache {
+    fn capture(
+        &self,
+        store: &SqliteStore,
+        version: &str,
+        request: &ReportRequest,
+    ) -> Result<Captured, AppError> {
+        let dataset = &request.dataset_id;
+        store.with_tactical_report_snapshot(dataset, |read, generation| {
+            check_generation(
+                request.report_generation.as_deref(),
+                &report_generation(version, generation.evidence),
+            )?;
+            let metadata = self
+                .archive
+                .as_ref()
+                .is_none_or(|archive| {
+                    &archive.dataset != dataset || archive.generation != generation.archive
+                })
+                .then(|| read.tactical_archive_metadata(dataset))
+                .transpose()?;
+            let evidence = if metadata.is_some()
+                || self.evidence.as_ref().is_none_or(|cached| {
+                    cached.generation != generation.evidence || cached.version != version
+                }) {
+                Some((
+                    read.tactical_archive_coverage(dataset, GAME_TACTICS_REPORT, version)?,
+                    read.tactical_decisions(dataset, GAME_TACTICS_REPORT, version)?,
+                ))
+            } else {
+                None
+            };
+            Ok(Captured {
+                generation,
+                metadata,
+                evidence,
+            })
+        })
+    }
+
+    pub(crate) fn read(
+        &mut self,
+        store: &SqliteStore,
+        version: &str,
+        request: ReportRequest,
+    ) -> Result<Value, AppError> {
+        let Captured {
+            generation,
+            metadata,
+            evidence,
+        } = self.capture(store, version, &request)?;
+        let dataset = &request.dataset_id;
+        if let Some(rows) = metadata {
+            #[cfg(test)]
+            {
+                self.work.pgns += rows.len();
+            }
+            self.archive = Some(Archive::build(dataset.clone(), generation.archive, rows));
+        }
+        let archive = self.archive.as_mut().expect("captured archive");
+        if let Some((coverage, rows)) = evidence {
+            #[cfg(test)]
+            {
+                self.work.decisions += rows.len();
+            }
+            self.evidence = Some(Evidence::build(
+                archive,
+                generation.evidence,
+                version,
+                coverage,
+                rows,
+            ));
+            self.queries.clear();
+        }
+        let evidence = self.evidence.as_ref().expect("captured report evidence");
+        let cached = self
+            .queries
+            .iter()
+            .position(|query| query.filters == request.filters);
+        let query = if let Some(index) = cached {
+            self.queries.remove(index).expect("cached query")
+        } else {
+            #[cfg(test)]
+            {
+                self.work.aggregates += 1;
+            }
+            Query::build(archive, evidence, request.filters)
+        };
+        self.queries.push_back(query);
+        if self.queries.len() > FILTER_CACHE {
+            self.queries.pop_front();
+        }
+        let query = self.queries.back_mut().expect("current query");
+        let (page, next_before) = if let Some(anchor) = request.anchor {
+            #[cfg(test)]
+            if !query.similarities.iter().any(|(id, _)| *id == anchor) {
+                self.work.similarity += 1;
+            }
+            (query.similar(anchor, evidence)?, None)
+        } else {
+            query.page(request.before, evidence)
+        };
+        #[cfg(test)]
+        {
+            self.work.page_rows += page.len();
+        }
+        let stamp = report_generation(version, generation.evidence);
+        // Cache building runs outside SQLite. A short second read both checks
+        // the facts still match and loads only the selected detail and its
+        // current training link. A changed generation cannot give a mixed page.
+        let detail = store.with_tactical_report_snapshot(dataset, |read, current| {
+            check_generation(Some(&stamp), &report_generation(version, current.evidence))?;
+            page.first()
+                .map(|&index| position(read, version, dataset, evidence.rows[index].id))
+                .transpose()
+        })?;
+        let entries: Vec<_> = page.iter().map(|&index| {
+            let row = &evidence.rows[index];
+            json!({"id":row.id,"ply":row.ply,"outcome":row.outcome,"motifs":row.motifs,"game":archive.games[row.game]})
+        }).collect();
+        let aggregate = &query.aggregate;
+        Ok(
+            json!({"schema_version":2,"dataset_id":dataset,"report_generation":stamp,"games":entries,
+            "detail":detail,"next_before":next_before,"loss_comparison":aggregate.comparison,
+            "prior_today":aggregate.prior_today,"prior_hour":aggregate.prior_hour,
+            "filtered_games":aggregate.selected,"archive_games":archive.games.len(),"clocks":archive.clocks,
+            "learner_bands":archive.learner_bands,"opponent_bands":archive.opponent_bands,"sources":archive.sources}),
+        )
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn read(
     store: &SqliteStore,
     version: &str,
     request: ReportRequest,
 ) -> Result<Value, AppError> {
-    let dataset = &request.dataset_id;
-    let rows = store.tactical_archive(dataset, GAME_TACTICS_REPORT, version)?;
-    let mut ends = rows
-        .iter()
-        .filter_map(|game| game.end_ms)
-        .collect::<Vec<_>>();
-    ends.sort_unstable();
-    let zone = chrono_tz::America::New_York;
-    let mut games = BTreeMap::new();
-    for game in rows {
-        let local = game
-            .start_ms
-            .and_then(DateTime::from_timestamp_millis)
-            .map(|start| start.with_timezone(&zone));
-        let prior = game
-            .start_ms
-            .map(|start| ends.partition_point(|end| *end < start));
-        let midnight = local
-            .as_ref()
-            .and_then(|start| start.date_naive().and_hms_opt(0, 0, 0))
-            .and_then(|time| time.and_local_timezone(zone).single())
-            .map(|start| start.timestamp_millis());
-        let result = game_report_facts(
-            &game.pgn,
-            if game.white.to_lowercase() == game.learner {
-                LearnerColor::White
-            } else {
-                LearnerColor::Black
-            },
-        );
-        let summary = Game {
-            source: game.source,
-            id: game.id,
-            learner: game.learner,
-            result: result.result,
-            clock: result.time_control,
-            learner_rating: result.learner_rating,
-            opponent_rating: result.opponent_rating,
-            local_day: local.as_ref().map(|d| d.date_naive()),
-            weekday: local.as_ref().map(|d| d.weekday().num_days_from_monday()),
-            hour: local.as_ref().map(|d| d.hour()),
-            prior_today: prior
-                .zip(midnight)
-                .map(|(before, midnight)| before - ends.partition_point(|end| *end < midnight)),
-            prior_hour: prior.zip(game.start_ms).map(|(before, start)| {
-                before - ends.partition_point(|end| *end < start.saturating_sub(3_600_000))
-            }),
-            fully_analyzed: game.fully_analyzed,
-        };
-        games.insert((summary.source.clone(), summary.id.clone()), summary);
-    }
-    let mut decisions = store.tactical_decisions(dataset, GAME_TACTICS_REPORT, version)?;
-    // The report runs off the write owner. A game import can change the selected
-    // learner between the reads, so bind each finding to the captured perspective.
-    decisions.retain(|row| {
-        games
-            .get(&(row.source.clone(), row.game_id.clone()))
-            .is_some_and(|game| game.learner == row.learner)
-    });
-    let mut per_game: BTreeMap<(&str, &str), Vec<_>> = BTreeMap::new();
-    for row in &decisions {
-        per_game
-            .entry((&row.source, &row.game_id))
-            .or_default()
-            .push(row);
-    }
-    let selected: Vec<_> = games
-        .values()
-        .filter(|g| request.filters.includes(g))
-        .collect();
-    let selected_keys: BTreeSet<_> = selected
-        .iter()
-        .map(|g| (g.source.as_str(), g.id.as_str()))
-        .collect();
-    let findings: Vec<_> = decisions
-        .iter()
-        .filter(|row| {
-            selected_keys.contains(&(row.source.as_str(), row.game_id.as_str()))
-                && request
-                    .filters
-                    .motif
-                    .is_none_or(|motif| row.candidates.iter().any(|(kind, _)| *kind == motif))
-        })
-        .collect();
-    let comparison = loss_comparison(&selected, &per_game, request.filters.motif);
-    let pattern = |daily| {
-        let bounds = if daily {
-            [0, 10, 20, 40]
-        } else {
-            [0, 5, 10, 20]
-        };
-        let report = playing_load(&selected, &per_game, request.filters.motif, daily, bounds);
-        let possible_break = find_break(&selected, daily, bounds);
-        json!({"bands":report.iter().map(|band| json!({"min":band.min,"results":band.results,"opportunities":band.opportunities,"misses":band.misses,"days":band.days.len()})).collect::<Vec<_>>(),"possible_break":possible_break})
-    };
-    let peers = if let Some(anchor) = request.anchor {
-        let reference = decisions
+    ReportCache::default().read(store, version, request)
+}
+
+struct Archive {
+    dataset: DatasetId,
+    generation: u64,
+    games: Vec<Game>,
+    game_index: BTreeMap<(String, String), usize>,
+    clocks: BTreeSet<GameTimeControl>,
+    learner_bands: BTreeSet<u32>,
+    opponent_bands: BTreeSet<u32>,
+    sources: BTreeSet<String>,
+}
+
+impl Archive {
+    fn build(dataset: DatasetId, generation: u64, mut rows: Vec<TacticalArchiveMetadata>) -> Self {
+        rows.sort_unstable_by(|left, right| {
+            (&left.source, &left.id).cmp(&(&right.source, &right.id))
+        });
+        let mut ends = rows
             .iter()
-            .find(|row| row.id == anchor)
-            .ok_or_else(|| {
+            .filter_map(|game| game.end_ms)
+            .collect::<Vec<_>>();
+        ends.sort_unstable();
+        let zone = chrono_tz::America::New_York;
+        let games: Vec<_> = rows
+            .into_iter()
+            .map(|game| {
+                let local = game
+                    .start_ms
+                    .and_then(DateTime::from_timestamp_millis)
+                    .map(|start| start.with_timezone(&zone));
+                let prior = game
+                    .start_ms
+                    .map(|start| ends.partition_point(|end| *end < start));
+                let midnight = local
+                    .as_ref()
+                    .and_then(|start| start.date_naive().and_hms_opt(0, 0, 0))
+                    .and_then(|time| time.and_local_timezone(zone).single())
+                    .map(|start| start.timestamp_millis());
+                let result = game_report_facts(
+                    &game.pgn,
+                    if game.white.to_lowercase() == game.learner {
+                        LearnerColor::White
+                    } else {
+                        LearnerColor::Black
+                    },
+                );
+                Game {
+                    source: game.source,
+                    id: game.id,
+                    learner: game.learner,
+                    result: result.result,
+                    clock: result.time_control,
+                    learner_rating: result.learner_rating,
+                    opponent_rating: result.opponent_rating,
+                    local_day: local.as_ref().map(|d| d.date_naive()),
+                    weekday: local.as_ref().map(|d| d.weekday().num_days_from_monday()),
+                    hour: local.as_ref().map(|d| d.hour()),
+                    prior_today: prior.zip(midnight).map(|(before, midnight)| {
+                        before - ends.partition_point(|end| *end < midnight)
+                    }),
+                    prior_hour: prior.zip(game.start_ms).map(|(before, start)| {
+                        before - ends.partition_point(|end| *end < start.saturating_sub(3_600_000))
+                    }),
+                    fully_analyzed: false,
+                }
+            })
+            .collect();
+        Self {
+            dataset,
+            generation,
+            clocks: games.iter().filter_map(|g| g.clock).collect(),
+            learner_bands: games
+                .iter()
+                .filter_map(|g| g.learner_rating.map(rating_band))
+                .collect(),
+            opponent_bands: games
+                .iter()
+                .filter_map(|g| g.opponent_rating.map(rating_band))
+                .collect(),
+            sources: games.iter().map(|g| g.source.clone()).collect(),
+            game_index: games
+                .iter()
+                .enumerate()
+                .map(|(index, g)| ((g.source.clone(), g.id.clone()), index))
+                .collect(),
+            games,
+        }
+    }
+}
+
+struct Descriptor {
+    key: PositionKey,
+    structure: Result<PositionStructure, tempo_chess::ChessError>,
+}
+
+impl Descriptor {
+    fn structure(&self) -> Result<&PositionStructure, AppError> {
+        self.structure
+            .as_ref()
+            .map_err(|error| crate::app_error::domain("invalid_position", error))
+    }
+}
+
+struct Decision {
+    id: u64,
+    ply: u32,
+    outcome: TacticalOutcome,
+    position: usize,
+    game: usize,
+    motifs: BTreeSet<Motif>,
+    accepted_motifs: BTreeSet<Motif>,
+}
+
+struct Evidence {
+    generation: u64,
+    version: String,
+    /// Descending finding ID is the report's stable keyset order.
+    rows: Vec<Decision>,
+    positions: Vec<Descriptor>,
+}
+
+impl Evidence {
+    fn build(
+        archive: &mut Archive,
+        generation: u64,
+        version: &str,
+        coverage: Vec<TacticalArchiveCoverage>,
+        rows: Vec<TacticalDecisionRow>,
+    ) -> Self {
+        for game in &mut archive.games {
+            game.fully_analyzed = false;
+        }
+        for row in coverage {
+            if let Some(&index) = archive.game_index.get(&(row.source, row.id)) {
+                let game = &mut archive.games[index];
+                if game.learner == row.learner {
+                    game.fully_analyzed = row.fully_analyzed;
+                }
+            }
+        }
+        let mut descriptors = Vec::new();
+        let mut positions = BTreeMap::new();
+        let rows = rows
+            .into_iter()
+            .filter_map(|row| {
+                let &game = archive.game_index.get(&(row.source, row.game_id))?;
+                if archive.games[game].learner != row.learner {
+                    return None;
+                }
+                let key = PositionKey(row.position);
+                let position = *positions.entry(key.clone()).or_insert_with(|| {
+                    let index = descriptors.len();
+                    descriptors.push(Descriptor {
+                        structure: PositionStructure::from_key(&key),
+                        key,
+                    });
+                    index
+                });
+                let motifs = row.candidates.iter().map(|&(kind, _)| kind).collect();
+                let accepted_motifs = row
+                    .candidates
+                    .into_iter()
+                    .filter_map(|(kind, uci)| row.accepted.contains(&uci).then_some(kind))
+                    .collect();
+                Some(Decision {
+                    id: row.id,
+                    ply: row.ply,
+                    outcome: row.outcome,
+                    position,
+                    game,
+                    motifs,
+                    accepted_motifs,
+                })
+            })
+            .collect();
+        Self {
+            generation,
+            version: version.to_owned(),
+            rows,
+            positions: descriptors,
+        }
+    }
+}
+
+struct Aggregate {
+    selected: usize,
+    comparison: Value,
+    prior_today: Value,
+    prior_hour: Value,
+}
+
+struct Query {
+    filters: Filters,
+    findings: Vec<usize>,
+    aggregate: Aggregate,
+    similarities: VecDeque<(u64, Vec<usize>)>,
+}
+
+impl Query {
+    fn build(archive: &Archive, evidence: &Evidence, filters: Filters) -> Self {
+        let selected: Vec<_> = archive.games.iter().map(|g| filters.includes(g)).collect();
+        let mut chances = vec![Chances::default(); archive.games.len()];
+        let mut findings = Vec::new();
+        for (index, row) in evidence
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| selected[row.game])
+        {
+            chances[row.game].observe(row, filters.motif);
+            if filters
+                .motif
+                .is_none_or(|motif| row.motifs.contains(&motif))
+            {
+                findings.push(index);
+            }
+        }
+        let games: Vec<_> = archive
+            .games
+            .iter()
+            .zip(chances)
+            .zip(selected)
+            .filter_map(|(row, selected)| selected.then_some(row))
+            .collect();
+        let selected_games: Vec<_> = games.iter().map(|(game, _)| *game).collect();
+        let pattern = |daily| {
+            let bounds = if daily {
+                [0, 10, 20, 40]
+            } else {
+                [0, 5, 10, 20]
+            };
+            let report = playing_load(&games, daily, bounds);
+            let possible_break = find_break(&selected_games, daily, bounds);
+            json!({"bands":report.iter().map(|band| json!({"min":band.min,"results":band.results,
+                "opportunities":band.opportunities,"misses":band.misses,"days":band.days.len()}))
+                .collect::<Vec<_>>(),"possible_break":possible_break})
+        };
+        let aggregate = Aggregate {
+            selected: games.len(),
+            comparison: loss_comparison(&games),
+            prior_today: pattern(true),
+            prior_hour: pattern(false),
+        };
+        Self {
+            filters,
+            findings,
+            aggregate,
+            similarities: VecDeque::new(),
+        }
+    }
+
+    fn page(&self, before: Option<u64>, evidence: &Evidence) -> (&[usize], Option<u64>) {
+        let start = before.map_or(0, |before| {
+            self.findings
+                .partition_point(|&index| evidence.rows[index].id >= before)
+        });
+        let end = (start + PAGE).min(self.findings.len());
+        let next = (end < self.findings.len()).then(|| evidence.rows[self.findings[end - 1]].id);
+        (&self.findings[start..end], next)
+    }
+
+    fn similar(&mut self, anchor: u64, evidence: &Evidence) -> Result<&[usize], AppError> {
+        let cached = self.similarities.iter().position(|(id, _)| *id == anchor);
+        let ranked = if let Some(index) = cached {
+            self.similarities
+                .remove(index)
+                .expect("cached similarity")
+                .1
+        } else {
+            self.rank(anchor, evidence)?
+        };
+        self.similarities.push_back((anchor, ranked));
+        if self.similarities.len() > ANCHOR_CACHE {
+            self.similarities.pop_front();
+        }
+        Ok(&self.similarities.back().expect("current similarity").1)
+    }
+
+    fn rank(&self, anchor: u64, evidence: &Evidence) -> Result<Vec<usize>, AppError> {
+        let anchor = evidence
+            .rows
+            .binary_search_by(|row| anchor.cmp(&row.id))
+            .map_err(|_| {
                 AppError::new("unknown_position", "The selected position is unavailable.")
             })?;
-        let mut positions = BTreeMap::new();
-        for row in &findings {
-            positions
-                .entry(PositionKey(row.position.clone()))
-                .or_insert(*row);
+        let reference = evidence.positions[evidence.rows[anchor].position].structure()?;
+        let mut seen = vec![false; evidence.positions.len()];
+        let mut nearest = BTreeMap::new();
+        for &index in &self.findings {
+            let position = evidence.rows[index].position;
+            if std::mem::replace(&mut seen[position], true) {
+                continue;
+            }
+            let candidate = &evidence.positions[position];
+            if let Some(rank) = reference.rank(&candidate.key, candidate.structure()?) {
+                nearest.insert(rank, index);
+                if nearest.len() > PAGE {
+                    nearest.pop_last();
+                }
+            }
         }
-        let ranked = structural_neighbors(
-            &format!("{} 0 1", reference.position),
-            positions.keys(),
-            PAGE,
-        )
-        .map_err(|e| crate::app_error::domain("invalid_position", e))?;
-        Some(ranked.iter().map(|key| positions[key]).collect::<Vec<_>>())
-    } else {
-        None
-    };
-    let mut page: Vec<_> = match peers {
-        Some(peers) => peers,
-        None => findings
-            .iter()
-            .copied()
-            .filter(|row| request.before.is_none_or(|before| row.id < before))
-            .take(PAGE + 1)
-            .collect(),
-    };
-    let next_before = (page.len() > PAGE).then(|| page[PAGE - 1].id);
-    page.truncate(PAGE);
-    let detail = page
-        .first()
-        .map(|row| position(store, version, dataset, row.id))
-        .transpose()?;
-    let entries: Vec<_> = page.into_iter().map(|row| {
-        let motifs: BTreeSet<_> = row.candidates.iter().map(|(kind,_)| *kind).collect();
-        json!({"id":row.id,"ply":row.ply,"outcome":row.outcome,"motifs":motifs,"game":games[&(row.source.clone(),row.game_id.clone())]})
-    }).collect();
-    let clocks: BTreeSet<_> = games.values().filter_map(|g| g.clock).collect();
-    let learner_bands: BTreeSet<_> = games
-        .values()
-        .filter_map(|g| g.learner_rating.map(rating_band))
-        .collect();
-    let opponent_bands: BTreeSet<_> = games
-        .values()
-        .filter_map(|g| g.opponent_rating.map(rating_band))
-        .collect();
-    let sources: BTreeSet<_> = games.values().map(|g| &g.source).collect();
-    Ok(
-        json!({"schema_version":2,"dataset_id":dataset,"games":entries,"detail":detail,"next_before":next_before,
-        "loss_comparison":comparison,"prior_today":pattern(true),"prior_hour":pattern(false),"filtered_games":selected.len(),
-        "archive_games":games.len(),"clocks":clocks,"learner_bands":learner_bands,"opponent_bands":opponent_bands,"sources":sources}),
-    )
+        Ok(nearest.into_values().collect())
+    }
 }
 
 #[derive(Default)]
@@ -376,18 +709,12 @@ struct LoadBand {
     days: BTreeSet<NaiveDate>,
 }
 
-fn playing_load(
-    games: &[&Game],
-    per_game: &BTreeMap<(&str, &str), Vec<&TacticalDecisionRow>>,
-    motif: Option<Motif>,
-    daily: bool,
-    bounds: [usize; 4],
-) -> [LoadBand; 4] {
+fn playing_load(games: &[SelectedGame<'_>], daily: bool, bounds: [usize; 4]) -> [LoadBand; 4] {
     let mut report = bounds.map(|min| LoadBand {
         min,
         ..LoadBand::default()
     });
-    for g in games {
+    for &(g, evidence) in games {
         let amount = if daily { g.prior_today } else { g.prior_hour };
         let Some(amount) = amount else { continue };
         let entry = &mut report[bounds.partition_point(|&min| min <= amount) - 1];
@@ -396,11 +723,6 @@ fn playing_load(
             entry.days.insert(day);
         }
         if g.fully_analyzed {
-            let rows = per_game
-                .get(&(g.source.as_str(), g.id.as_str()))
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let evidence = chances(rows, motif);
             entry.opportunities += evidence.offered;
             entry.misses += evidence.missed;
         }
@@ -550,34 +872,29 @@ mod tests {
     #[test]
     fn ambiguous_turn_preserves_the_same_games_clear_motif_chance() {
         let game = sample(1, LearnerGameResult::Loss, 12, 60);
-        let row = |id, outcome| TacticalDecisionRow {
+        let row = |id, outcome| Decision {
             id,
-            learner: game.learner.clone(),
-            source: game.source.clone(),
-            game_id: game.id.clone(),
             ply: id as u32,
-            position: String::new(),
             outcome,
-            candidates: vec![(Motif::Fork, "e5c6".into())],
-            accepted: vec!["e5c6".into()],
+            game: 0,
+            position: 0,
+            motifs: BTreeSet::from([Motif::Fork]),
+            accepted_motifs: BTreeSet::from([Motif::Fork]),
         };
         let clear = row(1, TacticalOutcome::MissedTactic);
         let ambiguous = row(2, TacticalOutcome::UnclearMiss);
-        let per_game = BTreeMap::from([(
-            (game.source.as_str(), game.id.as_str()),
-            vec![&clear, &ambiguous],
-        )]);
-        let bands = playing_load(
-            &[&game],
-            &per_game,
-            Some(Motif::Fork),
-            true,
-            [0, 10, 20, 40],
-        );
+        let counts = |motif| {
+            let mut counts = Chances::default();
+            counts.observe(&clear, motif);
+            counts.observe(&ambiguous, motif);
+            counts
+        };
+        let fork = [(&game, counts(Some(Motif::Fork)))];
+        let bands = playing_load(&fork, true, [0, 10, 20, 40]);
         assert_eq!((bands[1].opportunities, bands[1].misses), (1, 1));
-        let all = playing_load(&[&game], &per_game, None, true, [0, 10, 20, 40]);
+        let all = playing_load(&[(&game, counts(None))], true, [0, 10, 20, 40]);
         assert_eq!((all[1].opportunities, all[1].misses), (2, 2));
-        let games = loss_comparison(&[&game], &per_game, Some(Motif::Fork));
+        let games = loss_comparison(&fork);
         assert_eq!(games["with_miss"]["losses"], 1);
     }
 
