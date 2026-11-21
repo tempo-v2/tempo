@@ -330,6 +330,11 @@ impl Tempo {
             route: choice.route.clone(),
             first_introduction: choice.new_kind.is_some(),
             exercise_name: exercise_name(item),
+            tactic_attribution: self.issued_tactic_attribution(
+                &snapshot.dataset,
+                item,
+                choice.immediate_request,
+            )?,
             relevance_reason: choice.relevance.map(relevance_reason),
             lesson: match mode {
                 ActivityMode::Teach => item.lesson.clone(),

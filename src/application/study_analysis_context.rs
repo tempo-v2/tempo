@@ -1,5 +1,5 @@
 //! Authorize reads of an issued decision and, on request, its complete line.
-use super::Tempo;
+use super::{Tempo, study_card_details::CardDisclosure};
 use crate::{AppError, app_error::domain};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -49,11 +49,12 @@ impl Tempo {
         );
         let issued = self.analysis_issued_item(record)?;
         let mut origin = self.project_study_analysis(record, &issued, index)?;
-        origin["cardDetails"] = json!(self.project_card_details(
-            record,
-            &issued,
-            record.attempt.status != AttemptStatus::Active,
-        )?);
+        let disclosure = if record.attempt.status == AttemptStatus::Active {
+            CardDisclosure::SourceOnly
+        } else {
+            CardDisclosure::Full
+        };
+        origin["cardDetails"] = json!(self.project_card_details(record, &issued, disclosure)?);
         Ok(origin)
     }
 

@@ -258,11 +258,11 @@ fn study_removal_keeps_game_origin_and_blocks_the_retained_request_after_rescan(
         "dataset_id": dataset, "attempt_id": issued.id, "content_version": issued.content_version,
         "position": { "kind": "decision", "index": 0 }, "submission_id": "mark-game-card",
     })).unwrap()).unwrap();
-    let read = |app: &Tempo, revision| {
+    let read_details = |app: &Tempo, revision| {
         app.study_card_details(dataset, &issued.id, revision, issued.content_version)
     };
     assert_eq!(
-        read(&app, issued.revision).unwrap_err().code,
+        read_details(&app, issued.revision).unwrap_err().code,
         "card_details_unavailable"
     );
     let missed = app
@@ -276,7 +276,7 @@ fn study_removal_keeps_game_origin_and_blocks_the_retained_request_after_rescan(
         .unwrap()
         .attempt;
     assert_eq!(
-        read(&app, missed.revision).unwrap()["details"],
+        read_details(&app, missed.revision).unwrap()["details"],
         json!({
             "kind": "tactic", "sources": ["Game finding"],
         })
@@ -292,12 +292,17 @@ fn study_removal_keeps_game_origin_and_blocks_the_retained_request_after_rescan(
     };
     assert_eq!(exclude(&mut app)["status"], "excluded");
     let after = app.snapshot().unwrap();
+    let reporting_store =
+        tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
+    let report = read(&app, &jobs, &reporting_store);
+    assert_eq!(report["statistics"]["pending_requests"], 0);
+    assert!(report["observations"][0]["request_id"].is_null());
     assert_eq!(after.learning, before.learning);
     assert_eq!(after.assessments, before.assessments);
     assert_eq!(after.catalog, before.catalog);
     assert!(after.active_attempt.is_none());
     let abandoned = &after.attempts[&issued.id].attempt;
-    let details = read(&app, abandoned.revision).unwrap();
+    let details = read_details(&app, abandoned.revision).unwrap();
     assert_eq!(
         details["details"]["explanation"]["game"]["black"],
         "Source opponent"
@@ -342,7 +347,7 @@ fn study_removal_keeps_game_origin_and_blocks_the_retained_request_after_rescan(
             writes: vec![Write::Catalog(revised_catalog)],
         })
         .unwrap();
-    assert_eq!(read(&app, abandoned.revision).unwrap(), details);
+    assert_eq!(read_details(&app, abandoned.revision).unwrap(), details);
     assert!(app.next_exercise().unwrap().is_none());
 }
 
@@ -370,7 +375,23 @@ fn later_occurrence_survives_old_completion_reuses_learning_and_replays_after_re
         ActivityMode::Practice
     );
     let practice = answer(&mut app, &second, "a1a7", "second-puzzle-answer");
-    assert_eq!(app.submit(practice).unwrap().assessment, None);
+    let second_saved = app.submit(practice).unwrap();
+    assert_eq!(second_saved.assessment, None);
+    for (saved, opponent) in [
+        (&first_saved, "First opponent"),
+        (&second_saved, "Second opponent"),
+    ] {
+        let attempt = &saved.attempt;
+        let details = app
+            .study_card_details(
+                &attempt.dataset,
+                &attempt.id,
+                attempt.revision,
+                attempt.content_version,
+            )
+            .unwrap();
+        assert_eq!(details["details"]["explanation"]["game"]["black"], opponent);
+    }
     assert_eq!(
         app.snapshot().unwrap().learning[&first.attempt.target],
         learned
