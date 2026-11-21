@@ -1,6 +1,6 @@
 //! The current attempt as presentation data, with private grading state removed.
 use serde::{Deserialize, Serialize};
-use tempo_chess::{ChessFeedback, ChessPrompt, LearnerColor};
+use tempo_chess::{ChessFeedback, ChessPrompt, LearnerColor, TacticExplanation};
 use tempo_store::ActivityMode;
 use tempo_types::{AttemptId, ContentVersion, DatasetId, Grade, Revision, TargetId};
 
@@ -91,6 +91,15 @@ pub struct AttemptFeedback {
     pub correction_uci: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correction_san: Option<String>,
+    /// Verified board relationships for an already revealed move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tactic_explanation: Option<TacticExplanation>,
+}
+
+pub(crate) struct CorrectionView {
+    pub uci: String,
+    pub san: String,
+    pub tactic_explanation: Option<TacticExplanation>,
 }
 
 #[cfg(test)]

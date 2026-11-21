@@ -34,6 +34,7 @@ class Candidate:
     card_id: str | None = None
     checked: dict | None = None
     membership_issues: list = field(default_factory=list)
+    legacy_game_captures: list = field(default_factory=list)
 
     def manifest(self):
         return {
@@ -55,6 +56,8 @@ class Candidate:
             "solution": self.checked["solution"],
             "label": self.label,
             "provenance": self.provenance,
+            **({"legacy_game_captures": self.legacy_game_captures}
+               if self.legacy_game_captures else {}),
             **({"opponent_lead_ins": [{"before_fen": self.fen, "uci": self.setup}]}
                if self.setup is not None else {}),
         }
@@ -250,6 +253,33 @@ def by_id(rows, key):
     return result
 
 
+def captured_game_request(capture):
+    """Read the game claim, board and line from one authoritative capture."""
+    if capture.get("source_kind") != "game":
+        return None
+    request = capture.get("request_json")
+    if isinstance(request, str):
+        request = read_move_json(request)
+    if (not isinstance(request, dict)
+            or request.get("capture_id") != capture["id"]
+            or request.get("source_kind") != "game"
+            or not isinstance(request.get("starting_fen"), str)
+            or not isinstance(request.get("moves"), list)
+            or not all(isinstance(move, str) for move in request["moves"])):
+        return None
+    position = request["starting_fen"].split()
+    # Tempo 1 persisted clockless position keys on capture requests.
+    if len(position) == 4:
+        position.extend(["0", "1"])
+    if len(position) != 6:
+        return None
+    return {
+        "capture_id": capture["id"],
+        "solver_fen": " ".join(position),
+        "solution": request["moves"],
+    }
+
+
 def card_candidates(rows):
     cards = by_id(rows["cards"], "id")
     deletions = by_id(rows["deleted_cards"], "card_id")
@@ -260,6 +290,7 @@ def card_candidates(rows):
     for origin in rows["queue_attempt_origins"]:
         retained_boards[origin["card_id"]].add((origin["start_fen"], origin["moves_json"]))
     links = defaultdict(list)
+    game_captures = defaultdict(list)
     progress = {}
     captured_ids = {capture["card_id"] for capture in rows["tactic_captures"]}
     for capture in rows["tactic_captures"]:
@@ -270,6 +301,9 @@ def card_candidates(rows):
                 attribution.append(f"tempo1:{key}:{capture[key]}")
         if capture.get("source_url"):
             attribution.append(capture["source_url"])
+        proof = captured_game_request(capture)
+        if proof is not None:
+            game_captures[capture["card_id"]].append(proof)
     for row in rows["tactic_progress"]:
         progress[row["puzzle_id"]] = row["card_id"]
         if row["card_id"]:
@@ -279,7 +313,8 @@ def card_candidates(rows):
         card = cards.get(card_id)
         candidate = Candidate(CARD_NAMESPACE, card_id, [f"raw-personal.json#/rows/candidate_card_ids/{candidate_offsets[card_id]}"],
                               label="Captured tactic" if card_id in captured_ids else "Studied tactic",
-                              provenance=[f"tempo1:card:{card_id}", *sorted(links[card_id])])
+                              provenance=[f"tempo1:card:{card_id}", *sorted(links[card_id])],
+                              legacy_game_captures=sorted(game_captures[card_id], key=lambda row: row["capture_id"]))
         if card_id in deletions:
             candidate.locations.append(f"raw-personal.json#/rows/deleted_cards/{deletion_offsets[card_id]}")
         if card is None:

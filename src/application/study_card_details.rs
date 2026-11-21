@@ -73,6 +73,7 @@ impl Tempo {
             title: item.label.clone(),
             provenance: item.provenance.clone(),
             game,
+            game_capture: item.game_capture.clone(),
         }))
     }
 

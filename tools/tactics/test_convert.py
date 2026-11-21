@@ -6,10 +6,20 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from convert import CARD_NAMESPACE, PACK_NAMESPACE, Candidate, MEMBERSHIP_PREFIX, parse_content, read_catalog, reconcile
+from convert import CARD_NAMESPACE, PACK_NAMESPACE, Candidate, MEMBERSHIP_PREFIX, captured_game_request, parse_content, read_catalog, reconcile
 
 
 class ConvertTests(unittest.TestCase):
+    def test_game_capture_requires_the_paired_request_and_supports_clockless_positions(self):
+        fen = "4k3/8/2n5/8/8/8/4B3/6K1 w - -"
+        request = {"capture_id": "game", "source_kind": "game", "starting_fen": fen, "moves": ["e2b5"]}
+        row = {"id": "game", "source_kind": "game", "request_json": json.dumps(request)}
+        self.assertEqual(captured_game_request(row), {
+            "capture_id": "game", "solver_fen": fen + " 0 1", "solution": ["e2b5"],
+        })
+        self.assertIsNone(captured_game_request({**row, "id": "unrelated"}))
+        self.assertIsNone(captured_game_request({**row, "source_kind": "manual"}))
+
     def test_source_convention_is_explicit(self):
         pack = Candidate(PACK_NAMESPACE, "sample", [])
         card = Candidate(CARD_NAMESPACE, "sample", [])

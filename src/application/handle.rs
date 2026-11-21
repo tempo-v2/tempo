@@ -4,12 +4,19 @@ use crate::{
     AppError,
     app_error::domain,
     commands::StudyCommand,
+    views::attempt_view::CorrectionView,
     views::{EmptyView, LessonView, StudyView},
     wire::STUDY_WIRE_VERSION,
 };
-use tempo_chess::{move_san, project_position};
-use tempo_store::{ActivityMode, AnswerResult, StudyScope};
+use tempo_chess::{ContentItem, explain_tactic_move, move_san, project_position};
+use tempo_store::{ActivityMode, AnswerResult, StoredAttempt, StudyScope, TacticGameLookup};
 use tempo_study::AttemptStatus;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FeedbackSource {
+    SubmittedMove,
+    Other,
+}
 
 impl Tempo {
     /// Handle one decoded transport intent, returning an attempt, empty, or error view.
@@ -42,9 +49,9 @@ impl Tempo {
             StudyCommand::Resume { attempt_id } => self
                 .resume(&attempt_id)
                 .and_then(|value| self.project(value)),
-            StudyCommand::Answer(command) => {
-                self.submit(command).and_then(|value| self.project(value))
-            }
+            StudyCommand::Answer(command) => self
+                .submit(command)
+                .and_then(|value| self.project_result(value, FeedbackSource::SubmittedMove)),
             StudyCommand::Acknowledge(command) => self
                 .acknowledge(command)
                 .and_then(|value| self.project(value)),
@@ -120,6 +127,14 @@ impl Tempo {
     }
 
     pub(super) fn project(&self, result: AnswerResult) -> Result<StudyView, AppError> {
+        self.project_result(result, FeedbackSource::Other)
+    }
+
+    fn project_result(
+        &self,
+        result: AnswerResult,
+        source: FeedbackSource,
+    ) -> Result<StudyView, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.handle.project");
         let attempt = &result.attempt;
         let record = self
@@ -150,7 +165,22 @@ impl Tempo {
             let uci = &decision.expected.uci;
             let san =
                 move_san(&decision.fen, uci).map_err(|error| domain("invalid_content", error))?;
-            Some((uci.clone(), san))
+            let tactic_explanation = if source == FeedbackSource::SubmittedMove
+                && attempt.status == AttemptStatus::Active
+                && matches!(record.mode, ActivityMode::Test | ActivityMode::Practice)
+                && self.issued_game_tactic(&record, &issued)
+            {
+                explain_tactic_move(&decision.fen, &decision.expected)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            Some(CorrectionView {
+                uci: uci.clone(),
+                san,
+                tactic_explanation,
+            })
         } else {
             None
         };
@@ -177,6 +207,27 @@ impl Tempo {
         Ok(StudyView::attempt(
             result, board, correction, &record, lesson, history,
         ))
+    }
+
+    fn issued_game_tactic(&self, record: &StoredAttempt, item: &ContentItem) -> bool {
+        if item.definition.is_repertoire() {
+            return false;
+        }
+        if let Some(origin) = &record.tactic_attribution {
+            return origin.game.is_some() || origin.game_capture.is_some();
+        }
+        // Pre-snapshot attempts may still have an exact retained game request.
+        let attempt = &record.attempt;
+        item.game_capture.is_some()
+            || self
+                .store
+                .tactic_game_origin(
+                    &attempt.dataset,
+                    &attempt.target,
+                    attempt.content_version,
+                    TacticGameLookup::LegacyAttempt(&attempt.id),
+                )
+                .is_ok_and(|origin| origin.is_some())
     }
 }
 

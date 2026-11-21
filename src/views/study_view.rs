@@ -1,5 +1,7 @@
 //! The three reply shapes a presentation client must handle.
-use super::attempt_view::{AttemptFeedback, OpponentMoveView, RepertoirePresentation};
+use super::attempt_view::{
+    AttemptFeedback, CorrectionView, OpponentMoveView, RepertoirePresentation,
+};
 use crate::views::{AttemptView, EmptyView, ErrorView, LessonView};
 use crate::{AppError, wire::STUDY_WIRE_VERSION};
 use serde::{Deserialize, Serialize};
@@ -52,10 +54,20 @@ impl StudyView {
         self
     }
 
+    /// Keep the strict v5 feedback shape for clients without this presentation capability.
+    pub fn without_tactic_explanation(mut self) -> Self {
+        if let Self::Attempt(view) = &mut self
+            && let Some(feedback) = &mut view.feedback
+        {
+            feedback.tactic_explanation = None;
+        }
+        self
+    }
+
     pub(crate) fn attempt(
         value: AnswerResult,
         board: PositionDisplay,
-        correction: Option<(String, String)>,
+        correction: Option<CorrectionView>,
         record: &StoredAttempt,
         lesson: Option<LessonView>,
         history: Option<tempo_chess::RevealedLine>,
@@ -66,8 +78,8 @@ impl StudyView {
             AttemptStatus::Complete => "complete",
             AttemptStatus::Abandoned => "abandoned",
         };
-        let (correction_uci, correction_san) = correction
-            .map(|(uci, san)| (Some(uci), Some(san)))
+        let (correction_uci, correction_san, tactic_explanation) = correction
+            .map(|value| (Some(value.uci), Some(value.san), value.tactic_explanation))
             .unwrap_or_default();
         Self::Attempt(Box::new(AttemptView {
             schema_version: STUDY_WIRE_VERSION,
@@ -114,6 +126,7 @@ impl StudyView {
                 result,
                 correction_uci,
                 correction_san,
+                tactic_explanation,
             }),
             assessment: attempt.terminal,
         }))
