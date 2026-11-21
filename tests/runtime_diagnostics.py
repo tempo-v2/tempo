@@ -315,6 +315,10 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertGreaterEqual(worker["queue_wait_ms"], 0)
             self.assertEqual(headers["X-Tempo-Request-Id"], report_id)
             self.assertEqual(headers["X-Tempo-Run-Id"], worker["run_id"])
+            self.assertEqual(operation(report_id, "tactics.report.capture")["outcome"], "archive")
+            self.assertEqual(operation(report_id, "tactics.report.archive_facts")["count"], 0)
+            self.assertEqual(operation(report_id, "tactics.report.decision_facts")["count"], 0)
+            self.assertEqual(operation(report_id, "tactics.report.aggregates")["outcome"], "rebuilt")
 
             status, _, payload, warm_id = post(
                 server, "/api/games/tactics/report", {**query, "report_generation": report["report_generation"]},
@@ -323,6 +327,9 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(json.loads(payload), report)
             self.assertNotEqual(warm_id, report_id)
             self.assertEqual(operation(warm_id, "tactics.report.worker")["outcome"], "ready")
+            self.assertEqual(operation(warm_id, "tactics.report.capture")["outcome"], "reused")
+            self.assertEqual(operation(warm_id, "tactics.report.aggregates")["outcome"], "reused")
+            self.assertEqual(operation(warm_id, "tactics.report.page")["count"], 0)
 
             status, headers, payload, detail_id = post(
                 server, "/api/games/tactics/position",
@@ -332,6 +339,7 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(json.loads(payload)["code"], "unknown_position")
             self.assertEqual(headers["X-Tempo-Request-Id"], detail_id)
             operation(detail_id, "tactics.report.detail")
+            operation(detail_id, "tactics.report.position")
 
             tab = str(uuid.uuid4())
             status, headers, _, presence_id = post(

@@ -1,6 +1,7 @@
 //! Learner-relative Games reports. No read operation issues or grades a card.
 use crate::AppError;
 use crate::application::tactical_analysis::{GAME_TACTICS_REPORT, TacticalDetails};
+use crate::diagnostics::Span;
 use chrono::{DateTime, Datelike, NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -108,6 +109,7 @@ fn position(
     dataset: &DatasetId,
     id: u64,
 ) -> Result<Value, AppError> {
+    let _trace = Span::new("tactics.report.position");
     let stored = store
         .tactical_details(dataset, id, version)?
         .ok_or_else(|| AppError::new("unknown_position", "This finding has changed."))?;
@@ -263,8 +265,9 @@ impl ReportCache {
         version: &str,
         request: &ReportRequest,
     ) -> Result<Captured, AppError> {
+        let mut trace = Span::new("tactics.report.capture");
         let dataset = &request.dataset_id;
-        store.with_tactical_report_snapshot(dataset, |read, generation| {
+        let captured = store.with_tactical_report_snapshot(dataset, |read, generation| {
             check_generation(
                 request.report_generation.as_deref(),
                 &report_generation(version, generation.evidence),
@@ -293,7 +296,14 @@ impl ReportCache {
                 metadata,
                 evidence,
             })
-        })
+        });
+        trace.set_outcome(match &captured {
+            Ok(input) if input.metadata.is_some() => "archive",
+            Ok(input) if input.evidence.is_some() => "evidence",
+            Ok(_) => "reused",
+            Err(_) => "error",
+        });
+        captured
     }
 
     pub(crate) fn read(
@@ -335,14 +345,19 @@ impl ReportCache {
             .queries
             .iter()
             .position(|query| query.filters == request.filters);
-        let query = if let Some(index) = cached {
-            self.queries.remove(index).expect("cached query")
-        } else {
-            #[cfg(test)]
-            {
-                self.work.aggregates += 1;
+        let query = {
+            let mut trace = Span::new("tactics.report.aggregates");
+            if let Some(index) = cached {
+                trace.set_outcome("reused");
+                self.queries.remove(index).expect("cached query")
+            } else {
+                trace.set_outcome("rebuilt");
+                #[cfg(test)]
+                {
+                    self.work.aggregates += 1;
+                }
+                Query::build(archive, evidence, request.filters)
             }
-            Query::build(archive, evidence, request.filters)
         };
         self.queries.push_back(query);
         if self.queries.len() > FILTER_CACHE {
@@ -372,10 +387,14 @@ impl ReportCache {
                 .map(|&index| position(read, version, dataset, evidence.rows[index].id))
                 .transpose()
         })?;
-        let entries: Vec<_> = page.iter().map(|&index| {
-            let row = &evidence.rows[index];
-            json!({"id":row.id,"ply":row.ply,"outcome":row.outcome,"motifs":row.motifs,"game":archive.games[row.game]})
-        }).collect();
+        let entries: Vec<_> = {
+            let mut trace = Span::new("tactics.report.page");
+            trace.field("count", page.len());
+            page.iter().map(|&index| {
+                let row = &evidence.rows[index];
+                json!({"id":row.id,"ply":row.ply,"outcome":row.outcome,"motifs":row.motifs,"game":archive.games[row.game]})
+            }).collect()
+        };
         let aggregate = &query.aggregate;
         Ok(
             json!({"schema_version":2,"dataset_id":dataset,"report_generation":stamp,"games":entries,
@@ -409,6 +428,8 @@ struct Archive {
 
 impl Archive {
     fn build(dataset: DatasetId, generation: u64, mut rows: Vec<TacticalArchiveMetadata>) -> Self {
+        let mut trace = Span::new("tactics.report.archive_facts");
+        trace.field("count", rows.len());
         rows.sort_unstable_by(|left, right| {
             (&left.source, &left.id).cmp(&(&right.source, &right.id))
         });
@@ -524,6 +545,8 @@ impl Evidence {
         coverage: Vec<TacticalArchiveCoverage>,
         rows: Vec<TacticalDecisionRow>,
     ) -> Self {
+        let mut trace = Span::new("tactics.report.decision_facts");
+        trace.field("count", rows.len());
         for game in &mut archive.games {
             game.fully_analyzed = false;
         }
@@ -657,14 +680,19 @@ impl Query {
     }
 
     fn similar(&mut self, anchor: u64, evidence: &Evidence) -> Result<&[usize], AppError> {
+        let mut trace = Span::new("tactics.report.similarity");
         let cached = self.similarities.iter().position(|(id, _)| *id == anchor);
         let ranked = if let Some(index) = cached {
+            trace.set_outcome("reused");
             self.similarities
                 .remove(index)
                 .expect("cached similarity")
                 .1
         } else {
-            self.rank(anchor, evidence)?
+            trace.field("count", self.findings.len());
+            let result = self.rank(anchor, evidence);
+            trace.set_outcome(if result.is_ok() { "rebuilt" } else { "error" });
+            result?
         };
         self.similarities.push_back((anchor, ranked));
         if self.similarities.len() > ANCHOR_CACHE {
