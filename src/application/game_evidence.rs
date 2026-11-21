@@ -75,6 +75,22 @@ impl GameBooks {
         recorded != current
     }
 
+    pub(super) fn document_for_forecast(
+        &self,
+        gap: &tempo_chess::OpponentGap,
+        stale: bool,
+    ) -> Option<&str> {
+        let id = &gap.repertoire_id;
+        if stale {
+            let color = *self.colors.get(id)?;
+            let book = self.white.get(id).or_else(|| self.black.get(id))?;
+            if !book.needs_response(&gap.position, &gap.actual_move, color) {
+                return None;
+            }
+        }
+        self.document_ids.get(id).map(String::as_str)
+    }
+
     pub(super) fn document_for_gap(&self, gap: &tempo_chess::OpponentGap) -> Option<&str> {
         let book = self
             .white

@@ -66,6 +66,7 @@ pub(super) fn serve(
             database,
             explorer.clone(),
         ),
+        coverage: crate::coverage_scan::CoverageScan::new(database, explorer.clone()),
         gap_explorer: GapExplorer::with_client(explorer),
     };
     let mut model_marker = None;
@@ -237,6 +238,7 @@ struct Games {
     tactics: crate::tactical_jobs::TacticalJobs,
     backfill: BackfillCoordinator,
     model: GameModel,
+    coverage: crate::coverage_scan::CoverageScan,
     gap_analysis: GapAnalysis,
     gap_explorer: GapExplorer,
     position_evidence: crate::position_evidence::PositionEvidence,
@@ -246,6 +248,7 @@ struct Games {
 #[serde(deny_unknown_fields)]
 struct GapPage {
     offset: usize,
+    forecast_repertoire: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -628,6 +631,8 @@ fn respond_inner(
             | "/api/games/backfill"
             | "/api/games/backfill/retry"
             | "/api/games/model"
+            | "/api/games/coverage"
+            | "/api/games/coverage/status"
             | "/api/games/gaps"
             | "/api/games/gap-draft"
             | "/api/games/review"
@@ -676,11 +681,22 @@ fn respond_inner(
                 command::<ModelRequest>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.model.start(app, intent)),
             ),
+            (&Method::Post, "/api/games/coverage") => (
+                202,
+                command::<crate::coverage_scan::StartCoverage>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.coverage.start(app, intent)),
+            ),
+            (&Method::Post, "/api/games/coverage/status") => (
+                200,
+                command::<crate::coverage_scan::ReadCoverage>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.coverage.read(app, intent)),
+            ),
             (&Method::Get, "/api/games/gaps") => (200, app.opponent_gaps(0)),
             (&Method::Post, "/api/games/gaps") => (
                 200,
-                command::<GapPage>(&mut request, MAX_COMMAND_BYTES)
-                    .and_then(|page| app.opponent_gaps(page.offset)),
+                command::<GapPage>(&mut request, MAX_COMMAND_BYTES).and_then(|page| {
+                    app.opponent_gap_page(page.offset, page.forecast_repertoire.as_deref())
+                }),
             ),
             (&Method::Get, "/api/games/gap-analysis") => (200, Ok(games.gap_analysis.status())),
             (&Method::Post, "/api/games/gap-analysis") => (
@@ -1013,6 +1029,8 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/backfill" => "game_backfill",
         "/api/games/backfill/retry" => "game_backfill_retry",
         "/api/games/model" => "game_model",
+        "/api/games/coverage" => "repertoire_coverage_start",
+        "/api/games/coverage/status" => "repertoire_coverage_status",
         "/api/games/gaps" => "game_gaps",
         "/api/games/gap-draft" => "game_gap_draft",
         "/api/games/review" => "game_review",
