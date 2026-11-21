@@ -399,6 +399,7 @@ fn valid_field(key: &str, value: &Value) -> bool {
         | "timeout_ms"
         | "status_code"
         | "scheduler_delay_ms"
+        | "queue_wait_ms"
         | "cpu_percent"
         | "rss_bytes"
         | "peak_rss_bytes"

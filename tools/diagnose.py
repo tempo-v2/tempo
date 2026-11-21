@@ -37,7 +37,7 @@ LOG_NUMBERS = frozenset({
     "schema_version", "timestamp_ms", "monotonic_ms", "elapsed_ms",
     "pid", "status", "status_code", "cpu_percent", "rss_bytes", "peak_rss_bytes", "load1",
     "load5", "load15", "cpu_count", "dropped_events", "active_spans",
-    "scheduler_delay_ms", "store_span_id",
+    "scheduler_delay_ms", "queue_wait_ms", "store_span_id",
     "bytes", "request_bytes", "response_bytes", "child_pid", "timeout_ms",
     "sqlite_code", "sqlite_extended_code", "error_code", "queue_depth", "count", "listen_port",
 })

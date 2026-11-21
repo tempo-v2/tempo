@@ -2,12 +2,14 @@
 use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
+    diagnostics::{Span, capture_context, with_context},
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{GameModel, GapRequest, ModelRequest},
     gap_analysis::{GapAnalysis, GapAnalysisRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
+    personal_tactics_report::{ReportCache, report_generation},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use serde::de::DeserializeOwned;
@@ -132,6 +134,8 @@ struct TacticalReportWork {
     request: Request,
     read: crate::personal_tactics_report::ReportRequest,
     version: String,
+    delivery: Option<String>,
+    enqueued: Instant,
 }
 
 /// Keep archive aggregation out of the serialized foreground Study owner.
@@ -144,39 +148,57 @@ impl TacticalReportWorker {
         std::thread::Builder::new()
             .name("tempo-tactics-report".into())
             .spawn(move || {
+                let mut cache = ReportCache::default();
                 while let Ok(task) = work.recv() {
-                    let result =
-                        crate::personal_tactics_report::read(&store, &task.version, task.read);
-                    if let Err(error) = report_response(task.request, result) {
-                        eprintln!("Tempo tactical report: {error}");
-                    }
+                    with_context(task.delivery, || {
+                        let mut trace = Span::new("tactics.report.worker");
+                        trace.field("queue_wait_ms", task.enqueued.elapsed().as_millis() as u64);
+                        let result = cache.read(&store, &task.version, task.read);
+                        trace.set_outcome(if result.is_ok() { "ready" } else { "error" });
+                        if let Err(error) = report_response(task.request, result) {
+                            trace.set_outcome("io_error");
+                            eprintln!("Tempo tactical report: {error}");
+                        }
+                    });
                 }
             })?;
         Ok(Self(sender))
     }
 
     fn submit(&self, mut request: Request, version: &str) -> LocalResult<()> {
+        let mut trace = Span::new("tactics.report.admission");
         let read = match command(&mut request, MAX_COMMAND_BYTES) {
             Ok(read) => read,
-            Err(error) => return report_response(request, Err(error)),
+            Err(error) => {
+                trace.set_outcome("invalid");
+                return report_response(request, Err(error));
+            }
         };
         let task = TacticalReportWork {
             request,
             read,
             version: version.to_owned(),
+            delivery: capture_context(),
+            enqueued: Instant::now(),
         };
         match self.0.try_send(task) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                trace.set_outcome("admitted");
+                Ok(())
+            }
             Err(
                 std::sync::mpsc::TrySendError::Full(task)
                 | std::sync::mpsc::TrySendError::Disconnected(task),
-            ) => report_response(
-                task.request,
-                Err(AppError::new(
-                    "report_busy",
-                    "The tactics report is busy. Try again.",
-                )),
-            ),
+            ) => {
+                trace.set_outcome("busy");
+                report_response(
+                    task.request,
+                    Err(AppError::new(
+                        "report_busy",
+                        "The tactics report is busy. Try again.",
+                    )),
+                )
+            }
         }
     }
 }
@@ -188,12 +210,17 @@ fn report_response(request: Request, result: Result<Value, AppError>) -> LocalRe
             503,
             serde_json::json!({"code":error.code,"message":error.message}),
         ),
+        Err(error) if error.code == "report_changed" => (
+            409,
+            serde_json::json!({"code":error.code,"message":error.message}),
+        ),
         Err(error) => (
             400,
             serde_json::json!({"code":error.code,"message":error.message}),
         ),
     };
-    request.respond(
+    respond_traced(
+        request,
         body(
             "application/json; charset=utf-8",
             serde_json::to_vec(&value)?,
@@ -460,11 +487,13 @@ fn respond_inner(
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     let opponent_context = header(&request, "X-Tempo-Study-Opponent-Moves") == Some("1");
     if request.method() == &Method::Post && request.url() == "/api/study/presence" {
+        let _trace = Span::new("study.presence");
         let result = command(&mut request, 1024)
             .and_then(|report| games.tactics.study_presence(report, &mut games.detection));
         let status = if result.is_ok() { 204 } else { 400 };
-        request.respond(Response::empty(StatusCode(status)))?;
+        respond_traced(request, Response::empty(StatusCode(status)))?;
     } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/command" {
+        let _trace = Span::new("tactics.command");
         let result =
             command::<crate::tactical_jobs::TacticalCommand>(&mut request, MAX_COMMAND_BYTES)
                 .and_then(|intent| {
@@ -479,7 +508,8 @@ fn respond_inner(
                 serde_json::json!({"code":error.code,"message":error.message}),
             ),
         };
-        request.respond(
+        respond_traced(
+            request,
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&value)?,
@@ -487,6 +517,7 @@ fn respond_inner(
             .with_status_code(StatusCode(status)),
         )?;
     } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/position" {
+        let _trace = Span::new("tactics.report.detail");
         let result = command::<crate::personal_tactics_report::PositionRequest>(
             &mut request,
             MAX_COMMAND_BYTES,
@@ -498,44 +529,36 @@ fn respond_inner(
                 read,
             )
         });
-        let (status, value) = match result {
-            Ok(value) => (200, value),
-            Err(error) => (
-                400,
-                serde_json::json!({"code":error.code,"message":error.message}),
-            ),
-        };
-        request.respond(
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&value)?,
-            )
-            .with_status_code(StatusCode(status)),
-        )?;
+        report_response(request, result)?;
     } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/report" {
         games
             .tactics_report
             .submit(request, games.tactics.report_version())?;
     } else if request.url() == "/api/games/tactics" {
+        let _trace = Span::new("tactics.status");
         let (status, value) = if request.method() == &Method::Post {
             let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
             let report_discovery = header(&request, "X-Tempo-Tactics-Report") == Some("2");
             match command::<crate::tactical_jobs::TacticalRead>(&mut request, MAX_COMMAND_BYTES)
-                .and_then(|read| games.tactics.read(app, profile_store, read, wait_reason))
-            {
-                Ok(mut value) => {
-                    if !report_discovery && games.tactics.has_personal_report() {
-                        value = serde_json::json!({"schema_version": 1, "dataset_id": value["dataset_id"],
-                            "status": "unavailable", "message": "Reload Tempo to view personal tactical analysis."});
+                .and_then(|read| {
+                    let dataset = read.dataset_id.clone();
+                    let mut value = games.tactics.read(app, profile_store, read, wait_reason)?;
+                    if games.tactics.has_personal_report() {
+                        if !report_discovery {
+                            return Ok(serde_json::json!({"schema_version": 1, "dataset_id": dataset,
+                                "status": "unavailable", "message": "Reload Tempo to view personal tactical analysis."}));
+                        }
+                        if value["status"] != "unavailable" {
+                            let generation = profile_store.tactical_report_generation(&dataset)?;
+                            value["report_schema"] = serde_json::json!(2);
+                            value["report_generation"] = serde_json::json!(report_generation(
+                                games.tactics.report_version(), generation.evidence,
+                            ));
+                        }
                     }
-                    if report_discovery
-                        && games.tactics.has_personal_report()
-                        && value["status"] != "unavailable"
-                    {
-                        value["report_schema"] = serde_json::json!(2);
-                    }
-                    (200, value)
-                }
+                    Ok(value)
+                }) {
+                Ok(value) => (200, value),
                 Err(error) => (
                     400,
                     serde_json::json!({"schema_version":1,"status":"error","code":error.code,"message":error.message}),
@@ -547,7 +570,8 @@ fn respond_inner(
                 serde_json::json!({"schema_version":1,"status":"error","code":"method_not_allowed"}),
             )
         };
-        request.respond(
+        respond_traced(
+            request,
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&value)?,
@@ -970,6 +994,7 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/study/analysis-line" => "study_analysis_line",
         "/api/study/review-mark" => "study_review_mark",
         "/api/study/saved-reviews" => "study_saved_reviews",
+        "/api/study/presence" => "study_presence",
         "/api/repertoires" => "repertoires",
         "/api/tactics" => "tactics",
         "/api/tactics-collection" => "tactics_collection",
@@ -992,6 +1017,10 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/detectors" => "game_detectors",
         "/api/games/detection" => "game_detection",
         "/api/games/detection-result" => "game_detection_result",
+        "/api/games/tactics" => "tactics_status",
+        "/api/games/tactics/command" => "tactics_command",
+        "/api/games/tactics/position" => "tactics_position",
+        "/api/games/tactics/report" => "tactics_report",
         "/api/analysis/evidence" => "analysis_evidence",
         "/api/analysis/result" => "analysis_result",
         "/" | "/index.html" => "ui_index",
