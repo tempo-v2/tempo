@@ -6,8 +6,8 @@ use crate::{
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
     game_evidence::{GameImport, GameJobs, GameRefresh},
-    game_model::{GameModel, GapRequest, ModelRequest},
-    gap_analysis::{GapAnalysis, GapAnalysisRequest},
+    game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
+    gap_analysis::{GapAnalysis, GapAnalysisRead, GapAnalysisRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
     personal_tactics_report::{ReportCache, report_generation},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
@@ -279,7 +279,10 @@ struct HttpSurfaces {
 }
 
 impl HttpSurfaces {
-    fn assets_for(&self, request: &Request) -> Result<&BTreeMap<String, Asset>, StatusCode> {
+    fn admitted(
+        &self,
+        request: &Request,
+    ) -> Result<(&BTreeMap<String, Asset>, AuthoringSurface), StatusCode> {
         // Tailscale Serve rewrites the forwarding headers and always marks proxied
         // requests. Classify those before checking the caller-controlled Host,
         // including when phone access is disabled.
@@ -294,14 +297,14 @@ impl HttpSurfaces {
             if !phone.exposes(request) {
                 return Err(StatusCode(404));
             }
-            return Ok(&phone.assets);
+            return Ok((&phone.assets, AuthoringSurface::PhoneBuild));
         }
         if header(request, "Host") != Some(self.address.as_str())
             || header(request, "Origin").is_some_and(|origin| origin != self.origin)
         {
             return Err(StatusCode(403));
         }
-        Ok(&self.desktop)
+        Ok((&self.desktop, AuthoringSurface::Desktop))
     }
 }
 
@@ -367,6 +370,15 @@ impl PhoneStudy {
                     | "/api/study/game-context"
                     | "/api/study/review-mark"
                     | "/api/study/card-details"
+                    | "/api/repertoires"
+                    | "/api/games/coverage"
+                    | "/api/games/coverage/status"
+                    | "/api/games/gaps"
+                    | "/api/games/gap-draft"
+                    | "/api/games/gap-line"
+                    | "/api/games/gap-line/status"
+                    | "/api/games/gap-analysis"
+                    | "/api/games/gap-analysis/status"
             ),
             _ => false,
         }
@@ -486,8 +498,8 @@ fn respond_inner(
     mut request: Request,
     surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
-    let public = match surfaces.assets_for(&request) {
-        Ok(assets) => assets,
+    let (public, surface) = match surfaces.admitted(&request) {
+        Ok(admitted) => admitted,
         Err(status) => return Ok(respond_traced(request, Response::empty(status))?),
     };
     // Older open tabs have strict v5 reply validators. The opt-in changes
@@ -654,6 +666,7 @@ fn respond_inner(
             | "/api/games/gap-line/status"
             | "/api/games/review"
             | "/api/games/gap-analysis"
+            | "/api/games/gap-analysis/status"
             | "/api/games/gap-explorer"
             | "/api/study/relevance"
             | "/api/study/game-context"
@@ -713,6 +726,17 @@ fn respond_inner(
             (&Method::Post, "/api/games/gaps") => (
                 200,
                 command::<GapPage>(&mut request, MAX_COMMAND_BYTES).and_then(|page| {
+                    if surface == AuthoringSurface::PhoneBuild
+                        && page
+                            .forecast_repertoire
+                            .as_deref()
+                            .is_none_or(str::is_empty)
+                    {
+                        return Err(AppError::new(
+                            "phone_build_only",
+                            "Choose a repertoire to view its coverage gaps.",
+                        ));
+                    }
                     app.opponent_gap_page(page.offset, page.forecast_repertoire.as_deref())
                 }),
             ),
@@ -720,8 +744,17 @@ fn respond_inner(
             (&Method::Post, "/api/games/gap-analysis") => (
                 202,
                 command::<GapAnalysisRequest>(&mut request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.gap_analysis.start(app, intent)),
+                    .and_then(|intent| games.gap_analysis.start_on(app, intent, surface)),
             ),
+            (&Method::Post, "/api/games/gap-analysis/status")
+                if surface == AuthoringSurface::PhoneBuild =>
+            {
+                (
+                    200,
+                    command::<GapAnalysisRead>(&mut request, MAX_COMMAND_BYTES)
+                        .and_then(|intent| games.gap_analysis.phone_status(intent)),
+                )
+            }
             (&Method::Get, "/api/games/gap-explorer") => (200, Ok(games.gap_explorer.status())),
             (&Method::Post, "/api/games/gap-explorer") => (
                 202,
@@ -736,17 +769,17 @@ fn respond_inner(
             (&Method::Post, "/api/games/gap-line") => (
                 202,
                 command::<crate::coverage_scan::GapLineRequest>(&mut request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.start_line(app, intent)),
+                    .and_then(|intent| games.coverage.start_line(app, intent, surface)),
             ),
             (&Method::Post, "/api/games/gap-line/status") => (
                 200,
                 command::<crate::coverage_scan::GapLineRead>(&mut request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.read_line(app, intent)),
+                    .and_then(|intent| games.coverage.read_line(app, intent, surface)),
             ),
             (&Method::Post, "/api/games/gap-draft") => (
                 200,
                 command::<GapRequest>(&mut request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| app.game_gap_draft(intent)),
+                    .and_then(|intent| app.game_gap_draft_on(intent, surface)),
             ),
             (&Method::Post, "/api/study/relevance") => (
                 200,
@@ -946,7 +979,7 @@ fn respond_inner(
     {
         let reply = if request.url() == "/api/repertoires" {
             content_command(&mut request, |intent: RepertoireCommand| {
-                app.handle_repertoire(intent)
+                app.handle_repertoire_on(intent, surface)
             })?
         } else {
             content_command(&mut request, |intent: TacticCaptureCommand| {
@@ -1087,6 +1120,7 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/gap-line/status" => "game_gap_line_status",
         "/api/games/review" => "game_review",
         "/api/games/gap-analysis" => "game_gap_analysis",
+        "/api/games/gap-analysis/status" => "game_gap_analysis_status",
         "/api/games/gap-explorer" => "game_gap_explorer",
         "/api/games/detectors" => "game_detectors",
         "/api/games/detection" => "game_detection",

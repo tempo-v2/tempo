@@ -41,6 +41,13 @@ pub enum GapKind {
     Forecast,
 }
 
+/// Authoring authority established by the HTTP ingress, independent of wire data.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthoringSurface {
+    Desktop,
+    PhoneBuild,
+}
+
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GapRequest {

@@ -9,7 +9,7 @@ use crate::{
     AppError,
     app_error::{domain, study_input},
     commands::{RepertoireCommand, RepertoireInput},
-    game_model::model_input_stamp,
+    game_model::{AuthoringSurface, model_input_stamp},
     views::ErrorView,
     wire::CONTENT_WIRE_VERSION,
 };
@@ -39,8 +39,16 @@ struct Summary {
 impl Tempo {
     /// Handle local content operations against the same durable learning dataset.
     pub fn handle_repertoire(&mut self, command: RepertoireCommand) -> Value {
+        self.handle_repertoire_on(command, AuthoringSurface::Desktop)
+    }
+
+    pub(crate) fn handle_repertoire_on(
+        &mut self,
+        command: RepertoireCommand,
+        surface: AuthoringSurface,
+    ) -> Value {
         let _diagnostic = crate::diagnostics::Span::new("app.repertoires.handle_repertoire");
-        self.repertoire(command)
+        self.repertoire(command, surface)
             .unwrap_or_else(|error| json!(ErrorView::for_content(error)))
     }
 
@@ -51,6 +59,7 @@ impl Tempo {
         input: &RepertoireInput,
         id: &str,
         base_revision: Revision,
+        surface: AuthoringSurface,
     ) -> Result<String, AppError> {
         let key = self
             .daily
@@ -81,10 +90,28 @@ impl Tempo {
                 "This response would change existing repertoire positions or learning.",
             ));
         }
-        Ok(document_preview(&key, revision, id, input))
+        Ok(match surface {
+            AuthoringSurface::Desktop => document_preview(&key, revision, id, input),
+            AuthoringSurface::PhoneBuild => {
+                scoped_preview(&key, revision, id, input, PHONE_FORECAST)
+            }
+        })
     }
 
-    fn repertoire(&mut self, command: RepertoireCommand) -> Result<Value, AppError> {
+    fn repertoire(
+        &mut self,
+        command: RepertoireCommand,
+        surface: AuthoringSurface,
+    ) -> Result<Value, AppError> {
+        if surface == AuthoringSurface::PhoneBuild
+            && !matches!(&command, RepertoireCommand::List)
+            && !matches!(&command, RepertoireCommand::Save { token, .. } if token.starts_with(PHONE_FORECAST))
+        {
+            return Err(AppError::new(
+                "phone_build_only",
+                "Phone Build can save only replies or lines previewed there.",
+            ));
+        }
         let key = self
             .daily
             .as_ref()
@@ -259,8 +286,11 @@ impl Tempo {
                 Ok(preview(&snapshot, &incoming, &plan, token))
             }
             RepertoireCommand::Save { input, token } => {
+                let from_phone = token.starts_with(PHONE_FORECAST);
                 let (revision_in_token, id) =
-                    if let Some(versioned) = token.strip_prefix(DOCUMENT_PREVIEW) {
+                    if let Some(versioned) = token.strip_prefix(PHONE_FORECAST) {
+                        read_preview(&key, versioned, &(PHONE_FORECAST, &input))?
+                    } else if let Some(versioned) = token.strip_prefix(DOCUMENT_PREVIEW) {
                         read_preview(&key, versioned, &(DOCUMENT_PREVIEW, &input))?
                     } else {
                         read_preview(&key, &token, &input)?
@@ -271,6 +301,9 @@ impl Tempo {
                 }
                 if revision != revision_in_token {
                     return Err(stale_preview());
+                }
+                if from_phone && suspended.contains(id) {
+                    return Err(suspended_repertoire());
                 }
                 let (source, _, plan) = prepare(&snapshot, &input, id)?;
                 let authored = AuthoredRepertoire::parse(&input.pgn)
@@ -426,6 +459,7 @@ impl Tempo {
 // Separate new Preview authority from any legacy receipt-only Save issued at
 // the same content revision. The version is bound into the MAC.
 const DOCUMENT_PREVIEW: &str = "document-v1:";
+const PHONE_FORECAST: &str = "phone-forecast-v1:";
 
 fn document_preview(
     key: &[u8; 32],
@@ -433,8 +467,18 @@ fn document_preview(
     id: &str,
     input: &RepertoireInput,
 ) -> String {
-    let signed = preview_id(key, revision, id, &(DOCUMENT_PREVIEW, input));
-    format!("{DOCUMENT_PREVIEW}{signed}")
+    scoped_preview(key, revision, id, input, DOCUMENT_PREVIEW)
+}
+
+fn scoped_preview(
+    key: &[u8; 32],
+    revision: Revision,
+    id: &str,
+    input: &RepertoireInput,
+    purpose: &str,
+) -> String {
+    let signed = preview_id(key, revision, id, &(purpose, input));
+    format!("{purpose}{signed}")
 }
 
 fn stale_draft() -> AppError {
