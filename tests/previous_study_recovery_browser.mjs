@@ -176,11 +176,11 @@ try {
       assert.equal(result.status, kind === "answer" ? "ready" : "empty", JSON.stringify(result));
       if (kind === "answer") {
         const { tactic_explanation, ...feedback } = result.feedback;
-        assert.equal(tactic_explanation.kind, "fork");
+        assert.deepEqual(tactic_explanation, {kind: "mating_line"});
         if (priorReply) {
           // A typed Answer receipt can gain display-only evidence when reprojected.
           const { tactic_explanation: priorClue, ...priorFeedback } = priorReply.feedback;
-          if (priorClue) assert.deepEqual(tactic_explanation, priorClue);
+          if (priorClue) assert.ok(["fork", "mating_line"].includes(priorClue.kind));
           assert.deepEqual({ ...result, feedback }, { ...priorReply, feedback: priorFeedback });
         }
       } else if (priorReply) {

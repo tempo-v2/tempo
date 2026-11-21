@@ -6,6 +6,7 @@ use crate::game_detection::{
 use crate::{AppError, Tempo};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -15,6 +16,7 @@ use tempo_chess::{DetectorDescriptor, DetectorIdentity, parse_played_games};
 use tempo_store::{SqliteStore, TacticalPositionTask};
 use tempo_types::DatasetId;
 
+mod payoff;
 mod study_presence;
 
 pub(crate) use study_presence::PresenceReport;
@@ -57,13 +59,20 @@ pub(crate) enum TacticalCommand {
     },
 }
 
+struct ReadyPosition {
+    task: TacticalPositionTask,
+    result: DetectionCompletion,
+    continuations: BTreeMap<usize, Vec<String>>,
+}
+
 pub(crate) struct TacticalJobs {
+    payoffs: Option<payoff::Payoffs>,
     descriptor: Option<DetectorDescriptor>,
     analyses: Vec<DetectorIdentity>,
     has_complete_decisions: bool,
     version: String,
     active: Option<(TacticalPositionTask, String)>,
-    ready: Option<(TacticalPositionTask, DetectionCompletion)>,
+    ready: Option<ReadyPosition>,
     next_check: Instant,
     study: StudyPresence,
     on_wall_power: Arc<AtomicBool>,
@@ -105,6 +114,7 @@ impl TacticalJobs {
             });
         }
         Self {
+            payoffs: None,
             descriptor,
             analyses,
             has_complete_decisions,
@@ -125,8 +135,19 @@ impl TacticalJobs {
         }
     }
 
+    pub(crate) fn enable_payoffs(&mut self, engine: crate::tactical_engine::PayoffEngine) {
+        self.payoffs = Some(payoff::Payoffs::new(engine));
+    }
+
+    pub(crate) fn cancel_payoffs(&self) {
+        if let Some(payoffs) = &self.payoffs {
+            payoffs.cancel();
+        }
+    }
+
     pub(crate) fn study_activity(&mut self, detection: &mut GameDetection) {
         self.study.command(Instant::now());
+        self.cancel_payoffs();
         detection.cancel_background();
     }
 
@@ -140,6 +161,7 @@ impl TacticalJobs {
             .report(report, Instant::now())
             .map_err(|message| AppError::new("invalid_presence", message))?
         {
+            self.cancel_payoffs();
             detection.cancel_background();
         }
         Ok(())
@@ -188,6 +210,7 @@ impl TacticalJobs {
         let dataset = app.game_dataset()?;
         let run_allowed = self.waiting().is_none() && !store.analysis_paused(&dataset)?;
         if !run_allowed {
+            self.cancel_payoffs();
             detection.cancel_background();
         }
         if let Some((_, id)) = &self.active
@@ -199,11 +222,29 @@ impl TacticalJobs {
                 result.status,
                 DetectionStatus::Cancelled | DetectionStatus::SourceUnavailable
             ) {
-                self.ready = Some((task, result));
+                if run_allowed && let Some(payoffs) = &mut self.payoffs {
+                    payoffs.start_new_puzzle(&result);
+                }
+                self.ready = Some(ReadyPosition {
+                    task,
+                    result,
+                    continuations: BTreeMap::new(),
+                });
             }
         }
-        if run_allowed && let Some((task, result)) = &self.ready {
-            match app.accept_tactical_analysis(&task.game, result) {
+        if run_allowed && let Some(ready) = &mut self.ready {
+            if let Some(payoffs) = &mut self.payoffs {
+                let Some(lines) = payoffs.new_puzzle_lines() else {
+                    return Ok(());
+                };
+                ready.continuations.extend(lines);
+            }
+            let ReadyPosition {
+                task,
+                result,
+                continuations,
+            } = ready;
+            match app.accept_tactical_analysis(&task.game, result, continuations) {
                 Ok(_) => self.last_error = None,
                 Err(error) if matches!(error.code.as_str(), "stale_source" | "stale_dataset") => {}
                 Err(error) if !error.retryable => {
@@ -215,6 +256,14 @@ impl TacticalJobs {
             self.ready = None;
         }
         if !run_allowed || self.ready.is_some() || self.active.is_some() || !detection.idle() {
+            return Ok(());
+        }
+        // Retained payoff work and the detector share the engine slot. A
+        // durable detection deadline starts only after the retained worker
+        // has returned the slot.
+        if let Some(payoffs) = &mut self.payoffs
+            && payoffs.advance_retained(store, &dataset)?
+        {
             return Ok(());
         }
         let descriptor = self.descriptor.as_ref().expect("configured detector");
@@ -313,6 +362,7 @@ impl TacticalJobs {
             } => store.queue_game_analysis(&dataset_id, &source, &game_id, &learner)?,
             TacticalCommand::Pause { dataset_id } => {
                 store.set_analysis_paused(&dataset_id, true)?;
+                self.cancel_payoffs();
                 detection.cancel_background();
             }
             TacticalCommand::Resume { dataset_id } => {

@@ -33,6 +33,7 @@ pub(super) fn serve(
     ui: &Path,
     port: u16,
     detection: GameDetection,
+    engine: Option<crate::tactical_engine::PayoffEngine>,
 ) -> LocalResult<()> {
     let server = Server::http((Ipv4Addr::LOCALHOST, port))?;
     let address = server.server_addr().to_string();
@@ -53,7 +54,10 @@ pub(super) fn serve(
     let detector = detection
         .complete_decision_detector()
         .unwrap_or("hanging-material");
-    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
+    let mut tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
+    if let Some(engine) = engine {
+        tactics.enable_payoffs(engine);
+    }
     let mut games = Games {
         tactics_report: TacticalReportWorker::start(database)?,
         refresh: GameJobs::start()?,
@@ -597,17 +601,25 @@ fn respond_inner(
             (&Method::Get, "/api/games/detectors") => Ok(games.detection.discovery()),
             (&Method::Post, "/api/games/detection") => {
                 command::<DetectionRequest>(&mut request, MAX_COMMAND_BYTES)
-                    .map(|intent| games.detection.start(app, intent))
+                    .map(|intent| {
+                        let reply = games.detection.start(app, intent);
+                        if reply.started {
+                            games.tactics.cancel_payoffs();
+                        }
+                        reply
+                    })
             }
             (&Method::Post, "/api/games/detection-result") => {
                 command::<DetectionRead>(&mut request, MAX_COMMAND_BYTES)
                     .map(|intent| games.detection.read(app, intent))
             }
             _ => Ok(DetectionReply {
+                started: false,
                 status: 405,
                 body: serde_json::json!({"schema_version": 1, "status": "error", "code": "method_not_allowed"}),
             }),
         }.unwrap_or_else(|error| DetectionReply {
+            started: false,
             status: 400,
             body: serde_json::json!({"schema_version": 1, "status": "error", "code": error.code}),
         });

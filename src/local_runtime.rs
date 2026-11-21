@@ -107,11 +107,18 @@ pub fn backfill_personal_tactics(path: &Path, apply: bool) -> LocalResult<()> {
 
 pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
     let mut registry = DetectorRegistry::default();
-    match crate::tactical_engine::StockfishEvaluator::discover(database) {
-        Ok(evaluator) => registry.register(tempo_chess::PersonalTacticsDetector(evaluator))?,
-        Err(error) => eprintln!("Tempo tactical analysis unavailable: {}", error.message),
-    }
-    serve_with_detectors(
+    let engine = match crate::tactical_engine::StockfishEvaluator::discover(database) {
+        Ok(evaluator) => {
+            let engine = evaluator.payoff_engine();
+            registry.register(tempo_chess::PersonalTacticsDetector(evaluator))?;
+            Some(engine)
+        }
+        Err(error) => {
+            eprintln!("Tempo tactical analysis unavailable: {}", error.message);
+            None
+        }
+    };
+    serve_runtime(
         database,
         ui,
         port,
@@ -120,6 +127,7 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
             deadline: std::time::Duration::from_secs(120),
             ..AnalysisOptions::default()
         },
+        engine,
     )
 }
 
@@ -130,6 +138,17 @@ pub fn serve_with_detectors(
     port: u16,
     detectors: DetectorRegistry,
     analysis_options: AnalysisOptions,
+) -> LocalResult<()> {
+    serve_runtime(database, ui, port, detectors, analysis_options, None)
+}
+
+fn serve_runtime(
+    database: &Path,
+    ui: &Path,
+    port: u16,
+    detectors: DetectorRegistry,
+    analysis_options: AnalysisOptions,
+    engine: Option<crate::tactical_engine::PayoffEngine>,
 ) -> LocalResult<()> {
     if fs::canonicalize(database)?.starts_with(fs::canonicalize(ui)?) {
         return Err("place the study database outside the public UI build".into());
@@ -152,6 +171,7 @@ pub fn serve_with_detectors(
         ui,
         port,
         GameDetection::new(detectors, analysis_options)?,
+        engine,
     )
 }
 
