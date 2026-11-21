@@ -1,7 +1,7 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id};
 use crate::coverage_scan::{GapLineInput, GapLineRequest};
-use crate::game_model::{GapKind, GapRequest, model_input_stamp};
+use crate::game_model::{AuthoringSurface, GapKind, GapRequest, model_input_stamp};
 use crate::maia::{MODEL_KEY, PROFILE_LABEL, checked_distribution};
 use crate::{
     AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
@@ -12,7 +12,9 @@ use tempo_chess::{
     AuthoredRepertoire, ContentKind, GapDraft, LearnerColor, PositionKey, SavedRepertoireResponse,
     compile_repertoire, legal_move_labels,
 };
-use tempo_store::{ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets};
+use tempo_store::{
+    ForecastGap, ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets,
+};
 use tempo_types::{DatasetId, Revision};
 
 struct CheckedGapRepertoire {
@@ -338,9 +340,51 @@ impl Tempo {
         })
     }
 
+    pub(crate) fn authorize_gap_surface(
+        &self,
+        request: &GapRequest,
+        surface: AuthoringSurface,
+    ) -> Result<(), AppError> {
+        if surface == AuthoringSurface::PhoneBuild {
+            self.phone_forecast_gap(request, None)?;
+        }
+        Ok(())
+    }
+
+    fn phone_forecast_gap(
+        &self,
+        gap: &GapRequest,
+        report: Option<&str>,
+    ) -> Result<ForecastGap, AppError> {
+        if gap.gap_kind != GapKind::Forecast {
+            return Err(AppError::new(
+                "phone_build_only",
+                "Choose a missing reply from a repertoire coverage scan.",
+            ));
+        }
+        self.forecast_gap(gap, report)
+    }
+
+    fn forecast_gap(
+        &self,
+        gap: &GapRequest,
+        report: Option<&str>,
+    ) -> Result<ForecastGap, AppError> {
+        self.store
+            .forecast_gaps(&gap.dataset_id, Some(&gap.repertoire_id))?
+            .into_iter()
+            .find(|entry| {
+                report.is_none_or(|id| entry.report_id == id)
+                    && entry.gap.position == gap.position
+                    && entry.gap.actual_move == gap.actual_move
+            })
+            .ok_or_else(|| AppError::new("stale_coverage", "Refresh the gaps for the latest scan."))
+    }
+
     pub(crate) fn gap_line_input(
         &self,
         request: &GapLineRequest,
+        surface: AuthoringSurface,
     ) -> Result<GapLineInput, AppError> {
         let mut gap = request.gap.clone();
         let first = gap
@@ -354,18 +398,11 @@ impl Tempo {
                 "Reopen the gap before drafting a line.",
             ));
         }
-        let forecast = self
-            .store
-            .forecast_gaps(&gap.dataset_id, Some(&gap.repertoire_id))?
-            .into_iter()
-            .find(|entry| {
-                entry.report_id == request.report_id
-                    && entry.gap.position == gap.position
-                    && entry.gap.actual_move == gap.actual_move
-            })
-            .ok_or_else(|| {
-                AppError::new("stale_coverage", "Refresh the gaps for the latest scan.")
-            })?;
+        let report = Some(request.report_id.as_str());
+        let forecast = match surface {
+            AuthoringSurface::Desktop => self.forecast_gap(&gap, report),
+            AuthoringSurface::PhoneBuild => self.phone_forecast_gap(&gap, report),
+        }?;
         let mut line = checked
             .authored
             .coverage_line(&gap.position, &gap.actual_move, checked.color)
@@ -403,16 +440,27 @@ impl Tempo {
         &self,
         input: &RepertoireInput,
         revision: Revision,
+        surface: AuthoringSurface,
     ) -> Result<String, AppError> {
         self.gap_response_token(
             input,
             input.repertoire_id.as_deref().expect("gap repertoire"),
             revision,
+            surface,
         )
     }
 
     pub fn game_gap_draft(&self, request: GapRequest) -> Result<Value, AppError> {
+        self.game_gap_draft_on(request, AuthoringSurface::Desktop)
+    }
+
+    pub(crate) fn game_gap_draft_on(
+        &self,
+        request: GapRequest,
+        surface: AuthoringSurface,
+    ) -> Result<Value, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.game_model.game_gap_draft");
+        self.authorize_gap_surface(&request, surface)?;
         let (
             CheckedGapRepertoire {
                 authored,
@@ -437,6 +485,7 @@ impl Tempo {
                     },
                     &request.repertoire_id,
                     revision,
+                    surface,
                 )
             })
             .transpose()?;

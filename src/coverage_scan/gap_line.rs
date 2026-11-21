@@ -6,7 +6,7 @@ use crate::{
     commands::RepertoireInput,
     explorer::ExplorerClient,
     game_evidence::check_id,
-    game_model::GapRequest,
+    game_model::{AuthoringSurface, GapRequest},
     gap_analysis::{NEARBY_PER_GROUP, evaluate_replies},
     gap_recommendation::SimilarMoves,
     maia::Distribution,
@@ -63,6 +63,7 @@ pub(super) struct LineJobs {
 
 struct LineRun {
     request: GapLineRequest,
+    surface: AuthoringSurface,
     through_move: u8,
     reached: Option<u16>,
     result: Option<Result<Arc<Preview>, AppError>>,
@@ -101,6 +102,7 @@ impl CoverageScan {
         &self,
         app: &Tempo,
         request: GapLineRequest,
+        surface: AuthoringSurface,
     ) -> Result<Value, AppError> {
         check_id(&request.request_id)?;
         let read = GapLineRead {
@@ -110,21 +112,22 @@ impl CoverageScan {
         if let Some(run) = &jobs.latest
             && run.request.request_id == request.request_id
         {
-            if run.request != request {
+            if run.request != request || run.surface != surface {
                 return Err(AppError::new(
                     "invalid_gap_line",
                     "This line request ID is already in use.",
                 ));
             }
             drop(jobs);
-            return self.read_line(app, read);
+            return self.read_line(app, read, surface);
         }
 
         drop(jobs);
-        let input = app.gap_line_input(&request)?;
+        let input = app.gap_line_input(&request, surface)?;
         let mut jobs = self.lines.lock().expect("gap line preview");
         jobs.latest = Some(LineRun {
             request: request.clone(),
+            surface,
             through_move: input.through_move,
             reached: None,
             result: None,
@@ -145,15 +148,20 @@ impl CoverageScan {
             }
         }
         drop(jobs);
-        self.read_line(app, read)
+        self.read_line(app, read, surface)
     }
 
-    pub(crate) fn read_line(&self, app: &Tempo, read: GapLineRead) -> Result<Value, AppError> {
+    pub(crate) fn read_line(
+        &self,
+        app: &Tempo,
+        read: GapLineRead,
+        surface: AuthoringSurface,
+    ) -> Result<Value, AppError> {
         let jobs = self.lines.lock().expect("gap line preview");
         let run = jobs
             .latest
             .as_ref()
-            .filter(|run| run.request.request_id == read.request_id)
+            .filter(|run| run.request.request_id == read.request_id && run.surface == surface)
             .ok_or_else(|| AppError::new("unknown_request", "Request this line again."))?;
         let revision = run
             .request
@@ -176,7 +184,7 @@ impl CoverageScan {
             reply["steps"] = json!(preview.steps);
             reply["stop"] = json!(preview.reason);
             if preview.steps.iter().filter(|step| step.learner).count() > 1 {
-                reply["save_command"] = signed_save(app, &preview.save, revision)?;
+                reply["save_command"] = signed_save(app, &preview.save, revision, surface)?;
             }
         }
         Ok(reply)
@@ -187,8 +195,9 @@ fn signed_save(
     app: &Tempo,
     input: &RepertoireInput,
     revision: Revision,
+    surface: AuthoringSurface,
 ) -> Result<Value, AppError> {
-    let token = app.sign_gap_line(input, revision)?;
+    let token = app.sign_gap_line(input, revision, surface)?;
     let mut save = json!(input);
     save["command"] = json!("save");
     save["token"] = json!(token);

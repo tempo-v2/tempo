@@ -110,7 +110,9 @@ test("phone Study retains its shared commands and denies desktop routes after in
     ["/api/games/detectors", "GET"], ["/api/games/detection", "POST"],
     ["/api/games/detection-result", "POST"], ["/api/games/library", "POST"],
     ["/api/games/review", "POST"], ["/api/games/import", "POST"],
-    ["/api/repertoires", "POST"], ["/api/study/analysis-context", "POST"],
+    ["/api/repertoires", "GET"], ["/api/study/analysis-context", "POST"],
+    ["/api/games/model", "POST"], ["/api/games/gaps", "GET"],
+    ["/api/games/gap-analysis", "GET"], ["/api/games/gap-explorer", "POST"],
     ["/api/study", "PUT"], ["/api/study", "GET"], ["/api/study/presence", "GET"],
   ]) assert.equal((await send(host, route, { method, headers: phoneHeaders, payload: {} })).status, 404, route);
   for (const changes of [
@@ -128,9 +130,38 @@ test("phone Study retains its shared commands and denies desktop routes after in
   assert.deepEqual(databaseRows(database), before);
 
   const { dataset_id } = await post("/api/repertoires", { command: "list" });
+  assert.equal((await post("/api/repertoires", { command: "list" }, phoneHeaders)).dataset_id, dataset_id);
+  assert.equal((await post("/api/repertoires", {
+    command: "preview", dataset_id, name: "Unsupported", learner_color: "white", pgn: "1. d4 *",
+  }, phoneHeaders)).code, "phone_build_only");
+  for (const headers of [{ ...phoneHeaders, Origin: "https://elsewhere.ts.net:8443" },
+    { ...phoneHeaders, "Tailscale-User-Login": "someone@example.invalid" }, noOrigin]) {
+    const denied = await send(host, "/api/repertoires", { method: "POST", headers, payload: { command: "list" } });
+    assert.equal(denied.status, 403);
+  }
+  const globalGaps = await send(host, "/api/games/gaps", {
+    method: "POST", headers: phoneHeaders, payload: { offset: 0 },
+  });
+  assert.equal(globalGaps.status, 400);
+  assert.equal(JSON.parse(globalGaps.body).code, "phone_build_only");
   const input = { dataset_id, name: "Ingress fixture", learner_color: "white", pgn: "1. e4 *" };
   const preview = await post("/api/repertoires", { ...input, command: "preview" });
-  await post("/api/repertoires", { ...input, command: "save", token: preview.token });
+  const save = { ...input, command: "save", token: preview.token };
+  assert.equal((await post("/api/repertoires", save, phoneHeaders)).code, "phone_build_only");
+  const { repertoires: [{ id: repertoire_id }] } = await post("/api/repertoires", save);
+  for (const command of [
+    { command: "read_document" },
+    { command: "rename", name: "Changed on phone" },
+    { command: "set_activity", command_id: "phone-suspend", activity: "suspended" },
+    { command: "reset_progress", command_id: "phone-reset" },
+    { ...input, command: "edit_preview", base_revision: 1 },
+    { command: "marked_preview", name: input.name, learner_color: "white", anchor_fen: "start", lines: [] },
+  ]) assert.equal((await post("/api/repertoires", { ...command, dataset_id, repertoire_id }, phoneHeaders)).code,
+    "phone_build_only", command.command);
+  const scopedGaps = await post("/api/games/gaps", { offset: 0, forecast_repertoire: repertoire_id }, phoneHeaders);
+  assert.deepEqual(scopedGaps.gaps, []);
+  const scan = await post("/api/games/coverage/status", { dataset_id, repertoire_id }, phoneHeaders);
+  assert.equal(scan.status, "idle");
   const issued = await post("/api/study", { command: "next" }, phoneHeaders);
   const resumed = await post("/api/study", { command: "resume", attempt_id: issued.attempt_id });
   assert.equal(resumed.attempt_id, issued.attempt_id);

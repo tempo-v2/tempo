@@ -4,7 +4,7 @@ use crate::{
     AppError, Tempo,
     app_error::domain,
     game_evidence::check_id,
-    game_model::GapRequest,
+    game_model::{AuthoringSurface, GapRequest},
     gap_recommendation::{Recommendation, SimilarMoves, rank_and_recommend},
 };
 use serde::Deserialize;
@@ -25,6 +25,12 @@ pub struct GapAnalysisRequest {
     pub gap: GapRequest,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GapAnalysisRead {
+    request_id: String,
+}
+
 pub(crate) struct GapAnalysisInput {
     pub draft: GapDraft,
     pub catalog: BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>,
@@ -35,36 +41,77 @@ pub(crate) struct GapAnalysisInput {
 
 pub struct GapAnalysis {
     directory: PathBuf,
-    reply: Arc<Mutex<Value>>,
+    reply: Arc<Mutex<AnalysisReply>>,
+}
+
+struct AnalysisReply {
+    view: Value,
+    surface: AuthoringSurface,
+}
+
+impl Default for AnalysisReply {
+    fn default() -> Self {
+        Self {
+            view: json!({"status":"idle"}),
+            surface: AuthoringSurface::Desktop,
+        }
+    }
 }
 
 impl GapAnalysis {
     pub fn new(database: &Path) -> Self {
         Self {
             directory: database.parent().unwrap_or(Path::new(".")).join("maia"),
-            reply: Arc::new(Mutex::new(json!({"status":"idle"}))),
+            reply: Arc::default(),
         }
     }
 
     pub fn status(&self) -> Value {
-        self.reply.lock().expect("gap analysis reply").clone()
+        self.reply.lock().expect("gap analysis reply").view.clone()
+    }
+
+    pub(crate) fn phone_status(&self, read: GapAnalysisRead) -> Result<Value, AppError> {
+        let reply = self.reply.lock().expect("gap analysis reply");
+        if reply.surface == AuthoringSurface::PhoneBuild
+            && reply.view["request_id"].as_str() == Some(&read.request_id)
+        {
+            return Ok(reply.view.clone());
+        }
+        Err(AppError::new(
+            "unknown_request",
+            "Request this position analysis again.",
+        ))
     }
 
     pub fn start(&self, app: &Tempo, request: GapAnalysisRequest) -> Result<Value, AppError> {
+        self.start_on(app, request, AuthoringSurface::Desktop)
+    }
+
+    pub(crate) fn start_on(
+        &self,
+        app: &Tempo,
+        request: GapAnalysisRequest,
+        surface: AuthoringSurface,
+    ) -> Result<Value, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("gap_analysis.dispatch");
         check_id(&request.request_id)?;
-        if self.status()["status"] == "running" {
+        let mut active = self.reply.lock().expect("gap analysis reply");
+        if active.view["status"] == "running" {
             return Err(AppError::new(
                 "analysis_busy",
                 "A position analysis is already running.",
             ));
         }
+        app.authorize_gap_surface(&request.gap, surface)?;
         let input = app.gap_analysis_input(request.gap)?;
         let queued = json!({"status":"running","request_id":request.request_id,"content_revision":input.revision});
         let reply = Arc::clone(&self.reply);
         let id = request.request_id;
         let directory = self.directory.clone();
-        *reply.lock().expect("gap analysis reply") = queued.clone();
+        *active = AnalysisReply {
+            surface,
+            view: queued.clone(),
+        };
         let context = crate::diagnostics::capture_context();
         if let Err(error) = std::thread::Builder::new()
             .name("tempo-gap-analysis".into())
@@ -72,13 +119,13 @@ impl GapAnalysis {
                 crate::diagnostics::with_context(context, || {
                     let _worker = crate::diagnostics::Span::new("gap_analysis.worker");
                     let result = analyze(id, input, &directory, |progress| {
-                        *reply.lock().expect("gap analysis reply") = progress;
+                        reply.lock().expect("gap analysis reply").view = progress;
                     });
-                    *reply.lock().expect("gap analysis reply") = result;
+                    reply.lock().expect("gap analysis reply").view = result;
                 })
             })
         {
-            *self.reply.lock().expect("gap analysis reply") = json!({"status":"idle"});
+            *active = AnalysisReply::default();
             return Err(domain("analysis_unavailable", error));
         }
         Ok(queued)

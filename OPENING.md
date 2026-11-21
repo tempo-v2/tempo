@@ -87,12 +87,17 @@ launchctl bootstrap "gui/$(id -u)" "$PWD/.local/usable-release/com.tempo-v2.usab
 launchctl kickstart "gui/$(id -u)/com.tempo-v2.usable-release"
 ```
 
-## Phone Study over Tailscale
+## Phone Study and Build over Tailscale
 
 Tempo Study opens the regular Study queue and uses the same saved progress as
 desktop Tempo. Open the private HTTPS address in iPhone Safari, then use
 **Share → Add to Home Screen** to keep it handy. The Mac must be awake and
 reachable through Tailscale to start a session or submit a move.
+
+The phone's **Build** tab runs the existing repertoire coverage scan and
+saves reviewed replies or lines to the same repertoire as desktop Tempo.
+The phone route admits the configured owner and accepts repertoire saves
+signed by its forecast gap preview.
 
 On the Mac, install the paired Tempo and UI build with the Serve HTTPS origin
 and your exact Tailscale login. The managed registration saves both values for
