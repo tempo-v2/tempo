@@ -7,7 +7,7 @@ use std::{
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{Receiver, sync_channel},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tempo_chess::{PositionKey, legal_model_moves};
 pub(crate) const MODEL_KEY: &str = "maia2-0.11.0:65aae8465eed5e65df66a24ea7370715579f9e5435098d06fe18bdb1e267e997:rapid:1500:1500:cpu";
@@ -21,6 +21,10 @@ pub(crate) struct Maia {
 
 impl Maia {
     pub(crate) fn start(directory: &Path) -> Result<Self, AppError> {
+        Self::start_until(directory, Instant::now() + Duration::from_secs(30))
+    }
+
+    pub(crate) fn start_until(directory: &Path, deadline: Instant) -> Result<Self, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("maia.start");
         let mut child = Command::new(directory.join("venv/bin/python"))
             .args(["-I", "-u", "-c", include_str!("../tools/maia/infer.py")])
@@ -52,7 +56,9 @@ impl Maia {
             input,
             output,
         };
-        let ready: Value = process.read(Duration::from_secs(30))?;
+        let ready: Value = process.read(
+            Duration::from_secs(30).min(deadline.saturating_duration_since(Instant::now())),
+        )?;
         if ready["ready"] != true {
             return Err(AppError::new(
                 "maia_runtime_unavailable",
@@ -84,10 +90,23 @@ impl Maia {
     }
 
     pub(crate) fn infer(&mut self, position: &PositionKey) -> Result<Distribution, AppError> {
+        self.infer_until(position, Instant::now() + Duration::from_secs(10))
+    }
+
+    pub(crate) fn infer_until(
+        &mut self,
+        position: &PositionKey,
+        deadline: Instant,
+    ) -> Result<Distribution, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("maia.infer");
         let fen = json!(format!("{} 0 1", position.0));
         writeln!(self.input, "{fen}").map_err(|error| domain("maia_request", error))?;
-        checked_distribution(position, self.read(Duration::from_secs(10))?)
+        checked_distribution(
+            position,
+            self.read(
+                Duration::from_secs(10).min(deadline.saturating_duration_since(Instant::now())),
+            )?,
+        )
     }
 }
 
