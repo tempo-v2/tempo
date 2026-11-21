@@ -482,6 +482,81 @@ fn failed_and_timed_out_scans_do_not_block_other_games_or_create_false_misses() 
 }
 
 #[test]
+fn tactical_acceptance_merges_only_exact_matches_and_rejects_conflicting_source_aliases() {
+    for conflict in [false, true] {
+        let (directory, mut app) = disposable();
+        let prepared = prepare_tactical_puzzle(HANGING, &"a1a7".into(), &[]).unwrap();
+        let generated_source = prepared.lookup().target.0;
+        let seed = TacticRecord {
+            namespace: "independent".into(),
+            source_id: "previously-imported".into(),
+            solver_fen: HANGING.into(),
+            solution: vec![if conflict { "g1g2" } else { "a1a7" }.into()],
+            label: "Independent tactic".into(),
+            provenance: vec![],
+        };
+        let target = seed.target_id();
+        let mut catalog = compile_tactics(&[seed]).unwrap();
+        if conflict {
+            // Model an already-retained authoritative alias, never a free-form
+            // provenance token accepted from a newly imported record.
+            catalog
+                .items
+                .get_mut(&target)
+                .unwrap()
+                .provenance
+                .push(generated_source.clone());
+        }
+        let prior =
+            DailyLearning::introduce_capture(&Default::default(), app.components.clock.now())
+                .unwrap();
+        let basis = app.store.tactical_acceptance_basis().unwrap();
+        app.store
+            .commit(Commit {
+                expected_dataset: basis.dataset.clone(),
+                expected_revision: basis.revision,
+                writes: vec![
+                    Write::Catalog(catalog.clone()),
+                    Write::Learning {
+                        target: target.clone(),
+                        state: prior.clone(),
+                    },
+                ],
+            })
+            .unwrap();
+        import(&mut app, "Missed capture", "1. Kg2 Kg7");
+        let (mut detection, mut jobs) = host("source-alias", "miss");
+        let expected_completed = if conflict { 0 } else { 1 };
+        let report = scan(
+            &directory,
+            &mut app,
+            &mut detection,
+            &mut jobs,
+            expected_completed,
+        );
+        let accepted = app.snapshot().unwrap();
+        assert_eq!(accepted.catalog.items.len(), 1);
+        assert_eq!(accepted.learning[&target], prior);
+        if conflict {
+            assert_eq!(report["statistics"]["failed_games"], 1);
+            assert_eq!(report["statistics"]["pending_requests"], 0);
+            assert_eq!(accepted.catalog, catalog);
+        } else {
+            assert_eq!(report["statistics"]["pending_requests"], 1);
+            let content = &accepted.catalog.items[&target];
+            assert_eq!(content.version, catalog.items[&target].version);
+            assert_eq!(content.definition, catalog.items[&target].definition);
+            assert!(content.provenance.contains(&generated_source));
+            let next = app.next_exercise().unwrap().unwrap();
+            assert_eq!(next.attempt.target, target);
+            let command = answer(&mut app, &next, "a1a7", "shared-target-answer");
+            assert_eq!(app.submit(command).unwrap().attempt.id, next.attempt.id);
+            assert!(app.next_exercise().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
 fn deterministic_acceptance_failure_is_recorded_without_blocking_the_archive() {
     let (directory, mut app) = disposable();
     let snapshot = app.store.content_state().unwrap();
