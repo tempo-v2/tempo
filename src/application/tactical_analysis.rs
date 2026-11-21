@@ -64,6 +64,7 @@ impl Tempo {
         game: &TacticalGame,
         completion: &DetectionCompletion,
     ) -> Result<TacticalAcceptanceBasis, AppError> {
+        let _trace = crate::diagnostics::Span::new("tactics.acceptance.basis");
         let basis = self.store.tactical_acceptance_basis()?;
         if completion.request.dataset_id != basis.dataset {
             return Err(AppError::new(
@@ -99,6 +100,7 @@ impl Tempo {
         completion: &DetectionCompletion,
         error: &AppError,
     ) -> Result<TacticalAcceptance, AppError> {
+        let _trace = crate::diagnostics::Span::new("tactics.acceptance.record_failure");
         let basis = self.validate_tactical_source(game, completion)?;
         let analysis = TacticalAnalysis {
             position: completion.position,
@@ -132,6 +134,7 @@ impl Tempo {
         game: &TacticalGame,
         completion: &DetectionCompletion,
     ) -> Result<TacticalAcceptance, AppError> {
+        let mut trace = crate::diagnostics::Span::new("tactics.acceptance");
         let basis = self.validate_tactical_source(game, completion)?;
         let dataset = &basis.dataset;
         let at = self.components.clock.now();
@@ -235,6 +238,16 @@ impl Tempo {
                             GAME_TACTICS_REPORT,
                             address,
                         )?;
+                        let mut plan_trace =
+                            crate::diagnostics::Span::new("tactics.acceptance.plan");
+                        plan_trace.field(
+                            "phase",
+                            if binding.is_some() {
+                                "retained_binding"
+                            } else {
+                                "new_binding"
+                            },
+                        );
                         let prepared = match proposal {
                             DetectionPuzzle::Personal(puzzle) => {
                                 prepare_personal_puzzle(puzzle, &provenance)
@@ -391,6 +404,9 @@ impl Tempo {
             observations,
         };
         targets.retain(|_, change| change.content.is_some() || change.introduction.is_some());
+        trace.field("count", analysis.observations.len());
+        let mut write_trace = crate::diagnostics::Span::new("tactics.acceptance.persist");
+        write_trace.field("count", targets.len());
         let accepted = self.store.commit_tactical_analysis(
             TacticalCommit {
                 expected_revision: basis.revision,
@@ -399,6 +415,12 @@ impl Tempo {
             },
             &analysis,
         )?;
+        drop(write_trace);
+        trace.set_outcome(if accepted.replayed {
+            "replayed"
+        } else {
+            "committed"
+        });
         if let Some(daily) = &mut self.daily {
             for target in &accepted.new_request_targets {
                 daily.queue.clear_deferral(target);
