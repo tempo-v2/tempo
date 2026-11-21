@@ -101,11 +101,14 @@ response headers aid correlation; they do not become durable wire fields.
 | Server records a completed response but the browser times out reading it | Inspect client delivery/body processing, browser scheduling, and the network path. The ordinary command receipt/recovery contract remains the authority on acceptance. |
 | Browser deadline fires well after its configured budget | The browser's timer was delayed. Busy JavaScript, a suspended computer, or background-tab timer throttling can contribute; it is not a direct server-duration measurement. |
 
-The current runtime services HTTP requests in one serialized application loop,
-which also applies selected background results. SQLite's busy timeout is
-5 seconds, as is the UI's small-read wait budget. These are concrete mechanisms
-worth measuring, not a diagnosis of any particular reported wait. Instrumentation
-does not increase those deadlines or change command retry behavior.
+Foreground Study and accepted writes use the serialized application loop. The
+personal tactics report has one worker and one waiting request. Report admission
+can return busy; accepted work keeps its delivery ID across the worker and
+response. Debug logs distinguish time waiting for the worker, cold report
+construction, completed page reads and addressed position detail. Study
+presence records delivery without retaining tab identities or lease payloads.
+Tactical acceptance spans identify the addressed Store phases and commit.
+SQLite's busy timeout and all existing client deadlines stay unchanged.
 
 Use monotonic elapsed durations within each process. Wall-clock timestamps
 help align host snapshots, but a phone and Mac need not have synchronized clocks;

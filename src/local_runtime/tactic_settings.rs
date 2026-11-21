@@ -23,6 +23,7 @@ pub(super) fn handle(
     store: &SqliteStore,
     command: Command,
 ) -> Result<Value, AppError> {
+    let _trace = crate::diagnostics::Span::new("settings.tactics");
     let profile_error = || {
         AppError::new(
             "invalid_profile",
