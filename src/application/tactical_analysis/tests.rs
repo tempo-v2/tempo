@@ -246,7 +246,7 @@ fn accepted_miss_preserves_active_then_is_next_independently_of_display_name() {
 }
 
 #[test]
-fn a_wrong_answer_reveals_verified_geometry_on_an_issued_game_finding() {
+fn a_wrong_answer_explains_the_won_knight_on_an_issued_game_finding() {
     use crate::wire::{StudyCommand, StudyView};
     use tempo_chess::TacticExplanation;
 
@@ -280,8 +280,8 @@ fn a_wrong_answer_reveals_verified_geometry_on_an_issued_game_finding() {
     assert_eq!(view.assessment, Some(tempo_types::Grade::Again));
     assert!(matches!(
         view.feedback.as_ref().unwrap().tactic_explanation.as_ref(),
-        Some(TacticExplanation::Pin { attacker, front, rear })
-            if attacker.square == "a7" && front.square == "c7" && rear.square == "e7"
+        Some(TacticExplanation::HangingPiece { captured })
+            if captured.square == "a7" && captured.role == tempo_chess::PieceRole::Knight
     ));
     let durable = app.snapshot().unwrap();
     assert_eq!(
@@ -2118,4 +2118,60 @@ fn a_deeper_rescan_advances_report_freshness_without_reparsing_the_archive() {
             page_rows: 2,
         }
     );
+}
+
+#[test]
+#[ignore = "requires the configured tactical Python and Stockfish"]
+fn generated_checking_fork_is_extended_before_its_first_request_is_issued() {
+    let (directory, mut app) = disposable();
+    let path = directory.path().join("tactics.sqlite");
+    let engine = crate::tactical_engine::StockfishEvaluator::discover(&path).unwrap();
+    let payoff = engine.payoff_engine();
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(tempo_chess::PersonalTacticsDetector(engine))
+        .unwrap();
+    let mut detection = GameDetection::new(
+        registry,
+        AnalysisOptions {
+            deadline: Duration::from_secs(90),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    detection.payoff_engine = Some(payoff);
+    let mut jobs = TacticalJobs::new(&detection, &["personal-tactics"]);
+    jobs.force_idle_for_test();
+    let dataset = app.game_dataset().unwrap();
+    let fen = "r2qk1nr/ppp3pp/2p1p3/2b5/4P3/8/PPPP1PPP/RNBQK2R w KQkq - 0 1";
+    app.import_game_pgn(GameImport{dataset_id:dataset.clone(),command_id:"fork".into(),learner:"Learner".into(),repertoire_id:None,
+        pgn:format!("[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n[Result \"0-1\"]\n\n1. Qe2 0-1")}).unwrap();
+    let store = tempo_store::SqliteStore::open(path).unwrap();
+    let start = Instant::now();
+    let request = loop {
+        detection.poll(&mut app);
+        jobs.poll(&mut app, &store, &mut detection);
+        if let Some(request) = store.pending_tactical_requests(&dataset).unwrap().pop() {
+            break request;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(85),
+            "{}",
+            read(&app, &jobs, &store)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let issued = app.next_exercise().unwrap().unwrap();
+    assert_eq!(
+        (&issued.attempt.target, issued.attempt.content_version),
+        (&request.target, request.version)
+    );
+    let item = store
+        .issued_item(&dataset, &request.target, request.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.definition.decisions.len(), 2);
+    assert_eq!(item.definition.decisions[0].expected.uci, "d1h5");
+    assert_eq!(item.definition.decisions[0].autoplay[0].uci, "g7g6");
+    assert_eq!(item.definition.decisions[1].expected.uci, "h5c5");
 }

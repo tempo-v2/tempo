@@ -256,6 +256,7 @@ impl Tempo {
                                 prepare_tactical_puzzle(fen, answer, &provenance)
                             }
                         };
+                        let prepared = prepared.map(|puzzle| puzzle.with_payoff(&finding.payoff));
                         let plan = match prepared {
                             Ok(puzzle) => {
                                 let matched = self

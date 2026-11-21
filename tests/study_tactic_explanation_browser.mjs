@@ -194,6 +194,68 @@ try {
   assert.equal(results[3].text, results[0].text);
   console.log("Chrome verified the later pin across sources, flipped board, history, name invariance, exact Answer replay, and Retry Next.");
 
+  for (const missed of [false, true]) {
+    const db = join(scratch, `checking-fork-${missed}.sqlite`);
+    const id = await issue(db, [{
+      namespace: "puzzle-pack", source_id: "checking-fork", label: "Fork", provenance: [],
+      solver_fen: "r2qk1nr/ppp3pp/2p1p3/2b5/4P3/8/PPPP1PPP/RNBQK2R w KQkq - 0 1",
+      solution: ["d1h5", "g7g6", "h5c5"],
+    }]);
+    const url = await serve(db);
+    const page = await browser.newPage();
+    const replies = [];
+    await page.route(api, async route => {
+      const response = await route.fetch();
+      replies.push(await response.text());
+      await route.fulfill({response});
+    });
+    await page.goto(url);
+    await page.getByText("Move 1 of 2").waitFor();
+    if (missed) {
+      await move(page, "d1e2");
+      const clue = page.locator(clueId);
+      await clue.waitFor();
+      assert.match(await clue.innerText(), /Queen fork.*Qh5\+ checks the king on e8 and attacks the bishop on c5/s);
+      await page.waitForFunction(label => {
+        const hashes = [...document.querySelectorAll(label + " g[cgHash]")].map(g => g.getAttribute("cgHash"));
+        return [",h5,e8,green", ",h5,c5,green"].every(key => hashes.some(hash => hash.includes(key)));
+      }, boardLabel);
+    }
+    assert.ok(replies.every(raw => !raw.includes("h5c5") && !raw.includes("Qxc5")));
+    await move(page, "d1h5");
+    await page.getByText("Move 2 of 2").waitFor();
+    await move(page, "h5c5");
+    await page.waitForFunction(() => !document.body.innerText.includes("Move 2 of 2"));
+    assert.deepEqual(durable(db).grades,[{attempt_id:id,grade:missed?"again":"good"}]);
+    await page.close();
+    await stop();
+  }
+  console.log("Chrome verified the fork, spoiler boundary, two playable decisions and one sticky assessment.");
+  for (const example of [
+    {
+      id: "defended-ray", fen: "r3k2r/ppp2pp1/3p3p/4p2P/2B1P2q/3PB2P/PbP2P2/1R1Q1RK1 b kq - 0 1",
+      line: ["h4h3"], wrong: "h4g5", black: true,
+      hint: /^Pawn capture\. Qxh3 takes the pawn on h3\. The opponent has no immediate legal recapture\./,
+    },
+    {
+      id: "mate-in-two", fen: "8/5Q2/k2K4/8/8/8/8/8 w - - 0 1",
+      line: ["d6c5", "a6a5", "f7a2"], wrong: "f7g8", black: false,
+      hint: /^Mating sequence\. Kc5 starts a sequence that ends in checkmate\./,
+    },
+  ]) {
+    const db = join(scratch, `${example.id}.sqlite`);
+    await issue(db, [{namespace: "puzzle-pack", source_id: example.id, label: "Puzzle", provenance: [],
+      solver_fen: example.fen, solution: example.line}]);
+    const url = await serve(db);
+    const page = await browser.newPage();
+    await page.goto(url);
+    await move(page, example.wrong, example.black);
+    const clue = page.locator(clueId);
+    await clue.waitFor();
+    assert.match(await clue.innerText(), example.hint);
+    await page.close();
+    await stop();
+  }
   const freeCapture = join(scratch, "free-capture.sqlite");
   await issue(freeCapture, [{
     namespace: "puzzle-pack", source_id: "free-capture", label: "Pack tactic", provenance: [],

@@ -15,6 +15,7 @@ use tempo_chess::{DetectorDescriptor, DetectorIdentity, parse_played_games};
 use tempo_store::{SqliteStore, TacticalPositionTask};
 use tempo_types::DatasetId;
 
+mod payoff;
 mod study_presence;
 
 pub(crate) use study_presence::PresenceReport;
@@ -58,6 +59,7 @@ pub(crate) enum TacticalCommand {
 }
 
 pub(crate) struct TacticalJobs {
+    payoffs: Option<payoff::Payoffs>,
     descriptor: Option<DetectorDescriptor>,
     analyses: Vec<DetectorIdentity>,
     has_complete_decisions: bool,
@@ -105,6 +107,7 @@ impl TacticalJobs {
             });
         }
         Self {
+            payoffs: None,
             descriptor,
             analyses,
             has_complete_decisions,
@@ -125,8 +128,15 @@ impl TacticalJobs {
         }
     }
 
+    pub(crate) fn enable_payoffs(&mut self, engine: crate::tactical_engine::PayoffEngine) {
+        self.payoffs = Some(payoff::Payoffs::new(engine));
+    }
+
     pub(crate) fn study_activity(&mut self, detection: &mut GameDetection) {
         self.study.command(Instant::now());
+        if let Some(payoffs) = &self.payoffs {
+            payoffs.cancel();
+        }
         detection.cancel_background();
     }
 
@@ -140,6 +150,9 @@ impl TacticalJobs {
             .report(report, Instant::now())
             .map_err(|message| AppError::new("invalid_presence", message))?
         {
+            if let Some(payoffs) = &self.payoffs {
+                payoffs.cancel();
+            }
             detection.cancel_background();
         }
         Ok(())
@@ -187,6 +200,9 @@ impl TacticalJobs {
     ) -> Result<(), AppError> {
         let dataset = app.game_dataset()?;
         let run_allowed = self.waiting().is_none() && !store.analysis_paused(&dataset)?;
+        if let Some(payoffs) = &mut self.payoffs {
+            payoffs.poll(store, &dataset, run_allowed)?;
+        }
         if !run_allowed {
             detection.cancel_background();
         }
@@ -313,6 +329,9 @@ impl TacticalJobs {
             } => store.queue_game_analysis(&dataset_id, &source, &game_id, &learner)?,
             TacticalCommand::Pause { dataset_id } => {
                 store.set_analysis_paused(&dataset_id, true)?;
+                if let Some(payoffs) = &self.payoffs {
+                    payoffs.cancel();
+                }
                 detection.cancel_background();
             }
             TacticalCommand::Resume { dataset_id } => {

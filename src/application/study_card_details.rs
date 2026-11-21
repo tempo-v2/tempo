@@ -66,9 +66,20 @@ impl Tempo {
             return Ok(None);
         }
         let lookup = request.map_or(TacticGameLookup::Related, TacticGameLookup::Request);
-        let game = self
-            .store
-            .tactic_game_origin(dataset, &item.target, item.version, lookup)?;
+        let mut game =
+            self.store
+                .tactic_game_origin(dataset, &item.target, item.version, lookup)?;
+        if game.is_none()
+            && request.is_none()
+            && let Some(origin) = item.payoff_origin_version
+        {
+            game = self.store.tactic_game_origin(
+                dataset,
+                &item.target,
+                origin,
+                TacticGameLookup::Related,
+            )?;
+        }
         Ok(Some(IssuedTacticAttribution {
             title: item.label.clone(),
             provenance: item.provenance.clone(),

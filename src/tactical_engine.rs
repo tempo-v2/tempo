@@ -466,6 +466,69 @@ impl Drop for OwnedProcess {
     }
 }
 
+/// The generator searches the accepted root separately. This does not change
+/// detector identity or invalidate the retained archive of game observations.
+#[derive(Clone)]
+pub(crate) struct PayoffEngine(EngineConfiguration);
+
+impl StockfishEvaluator {
+    pub(crate) fn payoff_engine(&self) -> PayoffEngine {
+        PayoffEngine(self.configuration.clone())
+    }
+}
+
+impl PayoffEngine {
+    pub(crate) fn variation(
+        &self,
+        fen: &str,
+        root: &tempo_chess::ChessAnswer,
+        control: &dyn DetectionControl,
+    ) -> Result<Vec<String>, EvaluationFailure> {
+        let control = YieldToForeground(control);
+        let deadline = Instant::now() + POSITION_TIMEOUT;
+        let _slot = loop {
+            control.check().map_err(EvaluationFailure::Stopped)?;
+            if let Some(slot) = crate::stockfish::background_slot() {
+                break slot;
+            }
+            if Instant::now() >= deadline {
+                return Err(EvaluationFailure::Incomplete);
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        };
+        let mut command = Command::new(&self.0.python);
+        command
+            .args(["-I", "-c", include_str!("../tools/stockfish/payoff.py")])
+            .arg(&self.0.binary)
+            .args([fen, &root.uci])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = OwnedProcess(
+            command
+                .spawn()
+                .map_err(|_| EvaluationFailure::Unavailable)?,
+        );
+        loop {
+            control.check().map_err(EvaluationFailure::Stopped)?;
+            if let Some(status) = child.0.try_wait().map_err(|_| EvaluationFailure::Failed)? {
+                if !status.success() {
+                    return Err(EvaluationFailure::Failed);
+                }
+                let stdout = child.0.stdout.take().ok_or(EvaluationFailure::Failed)?;
+                return serde_json::from_reader(stdout.take(1024))
+                    .map_err(|_| EvaluationFailure::Failed);
+            }
+            if Instant::now() >= deadline {
+                return Err(EvaluationFailure::Incomplete);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

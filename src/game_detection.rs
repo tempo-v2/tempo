@@ -124,6 +124,8 @@ pub(crate) enum DetectionStatus {
 #[derive(Clone, Serialize)]
 pub(crate) struct DetectionFinding {
     #[serde(skip)]
+    pub(crate) payoff: Vec<String>,
+    #[serde(skip)]
     pub(crate) producer: DetectorIdentity,
     #[serde(skip)]
     pub(crate) skipped: Vec<DetectorIdentity>,
@@ -175,6 +177,7 @@ impl DetectionControl for Stop {
 }
 
 struct Work {
+    payoff_engine: Option<crate::tactical_engine::PayoffEngine>,
     position_detectors: Vec<RegisteredDetector>,
     position: Option<tempo_store::TacticalPositionRun>,
     diagnostic_context: Option<String>,
@@ -244,6 +247,7 @@ struct Active {
 }
 
 pub(crate) struct GameDetection {
+    pub(crate) payoff_engine: Option<crate::tactical_engine::PayoffEngine>,
     registry: DetectorRegistry,
     options: AnalysisOptions,
     work: SyncSender<Work>,
@@ -318,6 +322,7 @@ impl GameDetection {
                 }
             })?;
         Ok(Self {
+            payoff_engine: None,
             registry,
             options,
             work,
@@ -460,6 +465,7 @@ impl GameDetection {
         if self
             .work
             .try_send(Work {
+                payoff_engine: self.payoff_engine.clone(),
                 position,
                 position_detectors,
                 diagnostic_context: diagnostic_context.clone(),
@@ -769,7 +775,30 @@ fn detect(task: &Work, cached: &mut Option<CachedDetection>) -> DetectionStatus 
             } else {
                 json!([analysis_key, producer, moment.semantic_fingerprint()])
             };
+            let root = moment.tactical.as_ref().and_then(|assessment| {
+                if let Some(puzzle) = assessment.personal.as_ref().and_then(|p| p.puzzle.as_ref()) {
+                    if puzzle.kind == tempo_chess::PersonalPuzzleKind::OnlyMove
+                        && puzzle.line.len() == 1
+                    {
+                        return Some((&puzzle.fen, &puzzle.line[0]));
+                    }
+                }
+                assessment.puzzle.as_ref().map(|p| (&p.fen, &p.answer))
+            });
+            let payoff = match (&task.payoff_engine, root, task.position) {
+                (Some(engine), Some((fen, answer)), Some(_)) => {
+                    match engine.variation(fen, answer, task.stop.as_ref()) {
+                        Ok(pv) => pv,
+                        Err(tempo_chess::EvaluationFailure::Stopped(reason)) => {
+                            return stopped(reason);
+                        }
+                        Err(_) => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            };
             findings.push(DetectionFinding {
+                payoff,
                 finding_id: digest(&key),
                 producer: producer.clone(),
                 skipped: skipped.clone(),
@@ -1103,6 +1132,7 @@ mod tests {
         let (registry, _observe, _release) = barrier_detector();
         let (work, incoming) = mpsc::sync_channel(1);
         let mut jobs = GameDetection {
+            payoff_engine: None,
             registry,
             options: AnalysisOptions {
                 deadline: Duration::ZERO,

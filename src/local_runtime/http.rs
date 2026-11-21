@@ -32,7 +32,8 @@ pub(super) fn serve(
     database: &Path,
     ui: &Path,
     port: u16,
-    detection: GameDetection,
+    mut detection: GameDetection,
+    engine: Option<crate::tactical_engine::PayoffEngine>,
 ) -> LocalResult<()> {
     let server = Server::http((Ipv4Addr::LOCALHOST, port))?;
     let address = server.server_addr().to_string();
@@ -53,7 +54,11 @@ pub(super) fn serve(
     let detector = detection
         .complete_decision_detector()
         .unwrap_or("hanging-material");
-    let tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
+    let mut tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
+    if let Some(engine) = engine {
+        detection.payoff_engine = Some(engine.clone());
+        tactics.enable_payoffs(engine);
+    }
     let mut games = Games {
         tactics_report: TacticalReportWorker::start(database)?,
         refresh: GameJobs::start()?,
