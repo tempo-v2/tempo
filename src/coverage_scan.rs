@@ -22,6 +22,9 @@ use tempo_chess::{
 use tempo_store::{CoverageSummary, SqliteStore, Store};
 use tempo_types::DatasetId;
 
+mod gap_line;
+pub(crate) use gap_line::{GapLineInput, GapLineRead, GapLineRequest};
+
 const EXPLORER_LIMIT: usize = 128;
 const POSITION_LIMIT: usize = 2_000;
 const RUN_LIMIT: Duration = Duration::from_secs(300);
@@ -61,6 +64,7 @@ pub(crate) struct CoverageScan {
     explorer: Arc<ExplorerClient>,
     cache: Arc<ExplorerCache>,
     run: Arc<Mutex<Option<Run>>>,
+    lines: Arc<Mutex<gap_line::LineJobs>>,
 }
 
 impl CoverageScan {
@@ -70,6 +74,7 @@ impl CoverageScan {
             explorer,
             cache: Default::default(),
             run: Default::default(),
+            lines: Default::default(),
         }
     }
 
@@ -237,20 +242,7 @@ fn scan(
             "The repertoire changed before the scan started.",
         ));
     }
-    let mut sources = Sources {
-        started,
-        store: &store,
-        explorer,
-        cache,
-        directory: database.with_file_name("maia"),
-        engine: None,
-        engine_failed: false,
-        explorer_blocked: false,
-        lookups: 0,
-        explorer_positions: 0,
-        maia_positions: 0,
-        positions: 0,
-    };
+    let mut sources = Sources::new(started + RUN_LIMIT, &store, explorer, cache, database);
     let estimate = estimate(&authored, color, request.through_move, |position, moves| {
         let result = sources.distribution(position, moves);
         progress(sources.positions);
@@ -292,7 +284,7 @@ fn scan(
 }
 
 struct Sources<'a> {
-    started: Instant,
+    deadline: Instant,
     store: &'a SqliteStore,
     explorer: &'a ExplorerClient,
     cache: &'a ExplorerCache,
@@ -306,15 +298,38 @@ struct Sources<'a> {
     positions: usize,
 }
 
-impl Sources<'_> {
+impl<'a> Sources<'a> {
+    fn new(
+        deadline: Instant,
+        store: &'a SqliteStore,
+        explorer: &'a ExplorerClient,
+        cache: &'a ExplorerCache,
+        database: &Path,
+    ) -> Self {
+        Self {
+            deadline,
+            store,
+            explorer,
+            cache,
+            directory: database.with_file_name("maia"),
+            engine: None,
+            engine_failed: false,
+            explorer_blocked: false,
+            lookups: 0,
+            explorer_positions: 0,
+            maia_positions: 0,
+            positions: 0,
+        }
+    }
+
     fn distribution(&mut self, position: &PositionKey, legal: &[String]) -> Distribution {
-        if self.positions >= POSITION_LIMIT || self.started.elapsed() >= RUN_LIMIT {
+        if self.positions >= POSITION_LIMIT || Instant::now() >= self.deadline {
             return Distribution::new();
         }
         self.positions += 1;
         let counts = self.explorer_counts(position, legal);
         let maia = self.maia(position);
-        if self.started.elapsed() >= RUN_LIMIT {
+        if Instant::now() >= self.deadline {
             return Distribution::new();
         }
         self.explorer_positions +=
@@ -340,7 +355,7 @@ impl Sources<'_> {
             &fen,
             legal,
             Some(Ratings::Around1500),
-            Some(self.started + RUN_LIMIT),
+            Some(self.deadline),
         ) else {
             self.explorer_blocked = true;
             return None;
@@ -365,16 +380,16 @@ impl Sources<'_> {
         {
             return Some(moves);
         }
-        if self.engine_failed || self.started.elapsed() >= RUN_LIMIT {
+        if self.engine_failed || Instant::now() >= self.deadline {
             return None;
         }
         if self.engine.is_none() {
-            self.engine = Maia::start_until(&self.directory, self.started + RUN_LIMIT).ok();
+            self.engine = Maia::start_until(&self.directory, self.deadline).ok();
         }
         let result = self
             .engine
             .as_mut()
-            .and_then(|engine| engine.infer_until(position, self.started + RUN_LIMIT).ok());
+            .and_then(|engine| engine.infer_until(position, self.deadline).ok());
         if result.is_none() {
             self.engine_failed = true;
             self.engine = None;

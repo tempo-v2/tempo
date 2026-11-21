@@ -63,6 +63,9 @@ impl Tempo {
         if revision != base_revision {
             return Err(stale_draft());
         }
+        if snapshot.suspended_repertoires.contains(id) {
+            return Err(suspended_repertoire());
+        }
         let (_, _, plan) = prepare(&snapshot, input, id)?;
         if plan.changes.iter().any(|change| {
             change.kind == ChangeKind::Semantic

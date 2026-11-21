@@ -1,11 +1,11 @@
 //! On-demand authoring analysis. Neither result can write content or influence Study.
-use crate::stockfish::stockfish;
+use crate::stockfish::{EngineResult, stockfish_until};
 use crate::{
     AppError, Tempo,
     app_error::domain,
     game_evidence::check_id,
     game_model::GapRequest,
-    gap_recommendation::{SimilarMoves, rank_and_recommend},
+    gap_recommendation::{Recommendation, SimilarMoves, rank_and_recommend},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -13,6 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use tempo_chess::{GapDraft, PositionKey, SavedRepertoireResponse, nearby_repertoire_positions};
 use tempo_types::Revision;
@@ -84,7 +85,7 @@ impl GapAnalysis {
     }
 }
 
-const NEARBY_PER_GROUP: usize = 8;
+pub(crate) const NEARBY_PER_GROUP: usize = 8;
 const MAX_COMPARISON_REPLIES: usize = 16;
 
 fn analyze(
@@ -128,31 +129,13 @@ fn analyze(
     });
     publish(progress.clone());
 
-    let shortlist = similar
-        .ordered()
-        .take(MAX_COMPARISON_REPLIES)
-        .map(|(_, mv)| mv.uci)
-        .collect::<Vec<_>>();
-    let mut engine = stockfish(
+    let (mut engine, recommendation) = evaluate_replies(
+        &mut similar,
         directory,
         &input.draft.fen,
         &input.draft.legal_moves,
-        &shortlist,
-        3,
+        None,
     );
-    let recommendation = engine.as_ref().ok().and_then(|result| {
-        let best = result
-            .comparison
-            .as_ref()
-            .unwrap_or(&result.candidates)
-            .first()?;
-        let scores = result
-            .comparison
-            .iter()
-            .flatten()
-            .map(|mv| (mv.uci.as_str(), mv.centipawns));
-        rank_and_recommend(&mut similar, (&best.uci, best.centipawns), scores)
-    });
     progress["similar_responses"] = json!(similar);
     progress["recommendation"] = json!(recommendation);
     if let Ok(result) = &mut engine
@@ -164,4 +147,34 @@ fn analyze(
     progress["stockfish_error"] = json!(engine.err().map(|error| error.message));
     progress["status"] = json!("complete");
     progress
+}
+
+/// Evaluate the same shortlist for the editor and for a coverage continuation.
+pub(crate) fn evaluate_replies(
+    similar: &mut SimilarMoves<'_>,
+    directory: &Path,
+    fen: &str,
+    legal: &[String],
+    deadline: Option<Instant>,
+) -> (Result<EngineResult, AppError>, Option<Recommendation>) {
+    let shortlist = similar
+        .ordered()
+        .take(MAX_COMPARISON_REPLIES)
+        .map(|(_, mv)| mv.uci)
+        .collect::<Vec<_>>();
+    let engine = stockfish_until(directory, fen, legal, &shortlist, 3, deadline);
+    let recommendation = engine.as_ref().ok().and_then(|result| {
+        let best = result
+            .comparison
+            .as_ref()
+            .unwrap_or(&result.candidates)
+            .first()?;
+        let scores = result
+            .comparison
+            .iter()
+            .flatten()
+            .map(|mv| (mv.uci.as_str(), mv.centipawns));
+        rank_and_recommend(similar, (&best.uci, best.centipawns), scores)
+    });
+    (engine, recommendation)
 }

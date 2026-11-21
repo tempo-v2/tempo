@@ -1,5 +1,6 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id};
+use crate::coverage_scan::{GapLineInput, GapLineRequest};
 use crate::game_model::{GapKind, GapRequest, model_input_stamp};
 use crate::maia::{MODEL_KEY, PROFILE_LABEL, checked_distribution};
 use crate::{
@@ -20,6 +21,7 @@ struct CheckedGap {
     revision: Revision,
     name: String,
     color: LearnerColor,
+    pgn: String,
 }
 
 impl Tempo {
@@ -128,37 +130,35 @@ impl Tempo {
             return Ok(json!({"dataset_id":dataset,"gaps":[]}));
         }
         let books = self.current_game_books(&dataset)?;
-        let mut observed = BTreeMap::new();
+        let observed: BTreeMap<_, _> = candidates
+            .iter()
+            .filter_map(|group| {
+                books
+                    .document_for_gap(&group.gap)
+                    .map(|revision| (&group.gap, (group.games, revision)))
+            })
+            .collect();
         let mut ordered = Vec::new();
-        for group in &candidates {
-            if let Some(revision) = books.document_for_gap(&group.gap) {
-                observed.insert(&group.gap, (group.games, revision));
-                if forecast_book.is_none() {
-                    ordered.push(&group.gap);
-                }
-            }
-        }
-        let visible_observed: std::collections::BTreeSet<_> =
-            ordered.iter().skip(offset).take(101).copied().collect();
         let mut forecast_by_gap = BTreeMap::new();
+        // Store supplies forecasts in descending probability and observed
+        // groups in descending count, both with stable identity ties.
         for forecast in &forecasts {
-            let gap = &forecast.gap;
-            let goes_after_observed = !observed.contains_key(gap);
-            if forecast_book.is_none()
-                && !visible_observed.contains(gap)
-                && (!goes_after_observed || ordered.len() >= offset.saturating_add(101))
-            {
-                continue;
-            }
-            if forecast_book.is_some() && ordered.len() >= offset.saturating_add(101) {
+            if ordered.len() >= offset.saturating_add(101) {
                 break;
             }
+            let gap = &forecast.gap;
             if let Some(revision) = books.document_for_forecast(gap, forecast.stale) {
                 forecast_by_gap.insert(gap, (forecast, revision));
-                if forecast_book.is_some() || goes_after_observed {
-                    ordered.push(gap);
-                }
+                ordered.push(gap);
             }
+        }
+        if forecast_book.is_none() {
+            ordered.extend(
+                candidates
+                    .iter()
+                    .map(|group| &group.gap)
+                    .filter(|gap| observed.contains_key(gap) && !forecast_by_gap.contains_key(gap)),
+            );
         }
         let page: Vec<_> = ordered
             .into_iter()
@@ -185,6 +185,7 @@ impl Tempo {
                     "document_revision":revision, "gap_kind":kind,
                     "forecast":found.map(|(forecast, _)| json!({
                         "probability":forecast.probability, "stale":forecast.stale,
+                        "report_id":forecast.report_id, "through_move":forecast.through_move,
                     })),
                 })
             })
@@ -250,6 +251,7 @@ impl Tempo {
             revision: doc.revision,
             name: item.label,
             color,
+            pgn,
         })
     }
 
@@ -271,6 +273,16 @@ impl Tempo {
         let dataset = request.dataset_id.clone();
         let repertoire_id = request.repertoire_id.clone();
         let (draft, revision) = self.gap_position(request)?;
+        self.gap_analysis_context(dataset, repertoire_id, draft, revision)
+    }
+
+    fn gap_analysis_context(
+        &self,
+        dataset: DatasetId,
+        repertoire_id: String,
+        draft: GapDraft,
+        revision: Revision,
+    ) -> Result<GapAnalysisInput, AppError> {
         let snapshot = self.store.content_state()?;
         let current_revision = snapshot.content_revision;
         if snapshot.dataset != dataset || current_revision != revision {
@@ -314,6 +326,83 @@ impl Tempo {
         })
     }
 
+    pub(crate) fn gap_line_input(
+        &self,
+        request: &GapLineRequest,
+    ) -> Result<GapLineInput, AppError> {
+        let mut gap = request.gap.clone();
+        let first = gap
+            .response
+            .take()
+            .ok_or_else(|| AppError::new("invalid_gap_line", "Choose your first reply."))?;
+        gap.gap_kind = GapKind::Forecast;
+        let checked = self.checked_gap(&gap)?;
+        if gap.base_revision != Some(checked.revision) {
+            return Err(AppError::new(
+                "stale_draft",
+                "Reopen the gap before drafting a line.",
+            ));
+        }
+        let forecast = self
+            .store
+            .forecast_gaps(&gap.dataset_id, Some(&gap.repertoire_id))?
+            .into_iter()
+            .find(|entry| {
+                entry.report_id == request.report_id
+                    && entry.gap.position == gap.position
+                    && entry.gap.actual_move == gap.actual_move
+            })
+            .ok_or_else(|| {
+                AppError::new("stale_coverage", "Refresh the gaps for the latest scan.")
+            })?;
+        let mut line = checked
+            .authored
+            .coverage_line(&gap.position, &gap.actual_move, checked.color)
+            .map_err(|error| domain("stale_gap", error))?;
+        let anchor_fen = line.fen();
+        let first_number = line.move_number();
+        if first_number > u16::from(forecast.through_move) {
+            return Err(AppError::new(
+                "stale_coverage",
+                "The gap is beyond the scan depth.",
+            ));
+        }
+        let first_san = line
+            .play(&checked.authored, &first)
+            .map_err(|error| domain("invalid_gap_line", error))?;
+        let analysis = self.gap_analysis_context(
+            gap.dataset_id,
+            gap.repertoire_id,
+            checked.draft,
+            checked.revision,
+        )?;
+        Ok(GapLineInput {
+            line,
+            anchor_fen,
+            first,
+            first_san,
+            first_number,
+            analysis,
+            book: checked.authored,
+            source: checked.pgn,
+            name: checked.name,
+            color: checked.color,
+            through_move: forecast.through_move,
+        })
+    }
+
+    pub(crate) fn sign_gap_line(
+        &self,
+        input: &RepertoireInput,
+        revision: Revision,
+    ) -> Result<String, AppError> {
+        self.gap_response_token(
+            input,
+            input.repertoire_id.as_deref().expect("gap repertoire"),
+            revision,
+        )
+    }
+
     pub fn game_gap_draft(&self, request: GapRequest) -> Result<Value, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.game_model.game_gap_draft");
         let CheckedGap {
@@ -322,6 +411,7 @@ impl Tempo {
             revision,
             name,
             color,
+            ..
         } = self.checked_gap(&request)?;
         let mut anchor_route = authored.positions[&request.position].prefix.clone();
         anchor_route.push(request.actual_move.clone());
