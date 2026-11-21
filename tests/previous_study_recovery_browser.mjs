@@ -174,7 +174,18 @@ try {
       assert.equal(response.request().postData(), immutableBytes, "candidate replay must send exact old bytes");
       const result = await response.json();
       assert.equal(result.status, kind === "answer" ? "ready" : "empty", JSON.stringify(result));
-      if (priorReply) assert.deepEqual(result, priorReply);
+      if (kind === "answer") {
+        const { tactic_explanation, ...feedback } = result.feedback;
+        assert.equal(tactic_explanation.kind, "fork");
+        if (priorReply) {
+          // A typed Answer receipt can gain display-only evidence when reprojected.
+          const { tactic_explanation: priorClue, ...priorFeedback } = priorReply.feedback;
+          if (priorClue) assert.deepEqual(tactic_explanation, priorClue);
+          assert.deepEqual({ ...result, feedback }, { ...priorReply, feedback: priorFeedback });
+        }
+      } else if (priorReply) {
+        assert.deepEqual(result, priorReply);
+      }
       if (kind === "learn_more_tactics") {
         await page.getByRole("button", { name: "Retry next exercise" }).waitFor();
       } else {

@@ -151,18 +151,10 @@ try {
     await move(page, "e2d3", true);
     await button("Retry").click();
     await page.getByText(/Play Bb5/).waitFor();
-    let text = null;
-    if (capturedFromGame) {
-      await clue.waitFor();
-      text = await clue.innerText();
-      assert.match(text, /After Bb5, the bishop on b5 pins the knight on c6.*king on e8/);
-    } else {
-      assert.equal(await clue.count(), 0);
-      assert.equal(await page.locator(boardLabel + ' g[cgHash*=",green"]').count(), 0);
-    }
-    const fragments = capturedFromGame
-      ? [",e2,b5,blue", ",b5,e8,green", ",c6,green", ",e8,green"]
-      : [",e2,b5,blue"];
+    await clue.waitFor();
+    const text = await clue.innerText();
+    assert.match(text, /^Pin\. After Bb5, the bishop on b5 pins the knight on c6.*king on e8/);
+    const fragments = [",e2,b5,blue", ",b5,e8,green", ",c6,green", ",e8,green"];
     await page.waitForFunction(([label, fragments]) => {
       const shapes = [...document.querySelectorAll(label + " svg.cg-shapes g[cgHash]")]
         .map(shape => shape.getAttribute("cgHash"));
@@ -176,7 +168,7 @@ try {
     assert.equal(await clue.count(), 0);
     assert.equal(await page.locator(boardLabel + ' g[cgHash*=",green"]').count(), 0);
     await button("Return to current position").click();
-    if (capturedFromGame) await clue.waitFor();
+    await clue.waitFor();
     await move(page, solution[2], true);
     await button("Continue").waitFor();
     assert.equal(await clue.count(), 0);
@@ -199,7 +191,31 @@ try {
   }
   assert.deepEqual(results[1], results[0]);
   assert.deepEqual(results[2], results[0]);
-  console.log("Chrome verified the later pin, source matching, ordinary correction for split aliases, flipped board, history, name invariance, exact Answer replay, and Retry Next.");
+  assert.equal(results[3].text, results[0].text);
+  console.log("Chrome verified the later pin across sources, flipped board, history, name invariance, exact Answer replay, and Retry Next.");
+
+  const freeCapture = join(scratch, "free-capture.sqlite");
+  await issue(freeCapture, [{
+    namespace: "puzzle-pack", source_id: "free-capture", label: "Pack tactic", provenance: [],
+    solver_fen: "7k/8/8/8/3n4/8/8/3R3K w - - 0 1", solution: ["d1d4"],
+  }]);
+  const captureUrl = await serve(freeCapture);
+  const page = await browser.newPage();
+  await page.goto(captureUrl);
+  const captureClue = page.locator(clueId);
+  assert.equal(await captureClue.count(), 0);
+  await move(page, "d1d2");
+  await captureClue.waitFor();
+  assert.match(await captureClue.innerText(),
+    /^Hanging piece\. Rxd4 takes the knight on d4\. The opponent has no immediate legal recapture\./);
+  await page.waitForFunction(label => {
+    const shapes = [...document.querySelectorAll(label + " svg.cg-shapes g[cgHash]")]
+      .map(shape => shape.getAttribute("cgHash"));
+    return [",d1,d4,blue", ",d4,green"].every(fragment => shapes.some(shape => shape.includes(fragment)));
+  }, boardLabel);
+  await page.close();
+  await stop();
+  console.log("Chrome verified the hanging-piece label, explanatory text, arrow and ring on a pack tactic.");
 } finally {
   await browser?.close();
   await stop();

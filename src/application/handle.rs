@@ -8,8 +8,8 @@ use crate::{
     views::{EmptyView, LessonView, StudyView},
     wire::STUDY_WIRE_VERSION,
 };
-use tempo_chess::{ContentItem, explain_tactic_move, move_san, project_position};
-use tempo_store::{ActivityMode, AnswerResult, StoredAttempt, StudyScope, TacticGameLookup};
+use tempo_chess::{ContentKind, explain_tactic_move, move_san, project_position};
+use tempo_store::{ActivityMode, AnswerResult, StudyScope};
 use tempo_study::AttemptStatus;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -168,7 +168,7 @@ impl Tempo {
             let tactic_explanation = if source == FeedbackSource::SubmittedMove
                 && attempt.status == AttemptStatus::Active
                 && matches!(record.mode, ActivityMode::Test | ActivityMode::Practice)
-                && self.issued_game_tactic(&record, &issued)
+                && matches!(&issued.definition.kind, ContentKind::Tactic { .. })
             {
                 explain_tactic_move(&decision.fen, &decision.expected)
                     .ok()
@@ -207,27 +207,6 @@ impl Tempo {
         Ok(StudyView::attempt(
             result, board, correction, &record, lesson, history,
         ))
-    }
-
-    fn issued_game_tactic(&self, record: &StoredAttempt, item: &ContentItem) -> bool {
-        if item.definition.is_repertoire() {
-            return false;
-        }
-        if let Some(origin) = &record.tactic_attribution {
-            return origin.game.is_some() || origin.game_capture.is_some();
-        }
-        // Pre-snapshot attempts may still have an exact retained game request.
-        let attempt = &record.attempt;
-        item.game_capture.is_some()
-            || self
-                .store
-                .tactic_game_origin(
-                    &attempt.dataset,
-                    &attempt.target,
-                    attempt.content_version,
-                    TacticGameLookup::LegacyAttempt(&attempt.id),
-                )
-                .is_ok_and(|origin| origin.is_some())
     }
 }
 
