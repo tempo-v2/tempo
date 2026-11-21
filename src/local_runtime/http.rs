@@ -602,9 +602,8 @@ fn respond_inner(
             (&Method::Post, "/api/games/detection") => {
                 command::<DetectionRequest>(&mut request, MAX_COMMAND_BYTES)
                     .map(|intent| {
-                        let was_idle = games.detection.idle();
                         let reply = games.detection.start(app, intent);
-                        if was_idle && !games.detection.idle() {
+                        if reply.started {
                             games.tactics.cancel_payoffs();
                         }
                         reply
@@ -615,10 +614,12 @@ fn respond_inner(
                     .map(|intent| games.detection.read(app, intent))
             }
             _ => Ok(DetectionReply {
+                started: false,
                 status: 405,
                 body: serde_json::json!({"schema_version": 1, "status": "error", "code": "method_not_allowed"}),
             }),
         }.unwrap_or_else(|error| DetectionReply {
+            started: false,
             status: 400,
             body: serde_json::json!({"schema_version": 1, "status": "error", "code": error.code}),
         });

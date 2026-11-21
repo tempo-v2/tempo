@@ -133,6 +133,9 @@ pub(crate) struct DetectionFinding {
 }
 
 pub(crate) struct DetectionReply {
+    /// True only when this call queued new work, including when the wire
+    /// status of a replay is also 202.
+    pub(crate) started: bool,
     pub(crate) status: u16,
     pub(crate) body: Value,
 }
@@ -219,6 +222,7 @@ impl Entry {
             .unwrap()
             .extend(status.as_object().unwrap().clone());
         DetectionReply {
+            started: false,
             status: if matches!(self.status, DetectionStatus::Running) {
                 202
             } else {
@@ -334,6 +338,7 @@ impl GameDetection {
             .map(|registered| descriptor_json(&registered.descriptor))
             .collect();
         DetectionReply {
+            started: false,
             status: 200,
             body: json!({
                 "schema_version": VERSION,
@@ -478,7 +483,8 @@ impl GameDetection {
                 &entry.request.dataset_id,
             );
         }
-        let delivery = entry.reply();
+        let mut delivery = entry.reply();
+        delivery.started = true;
         self.active = Some(Active {
             diagnostic_context,
             entry,
@@ -596,6 +602,7 @@ fn addressed_error(
     dataset_id: &DatasetId,
 ) -> DetectionReply {
     DetectionReply {
+        started: false,
         status,
         body: json!({
             "schema_version": VERSION,
@@ -1147,7 +1154,10 @@ mod tests {
         let (registry, observe, release) = barrier_detector();
         let mut jobs = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
 
-        assert_eq!(jobs.start(&app, a.clone()).status, 202);
+        assert!(jobs.start(&app, a.clone()).started);
+        let running_replay = jobs.start(&app, a.clone());
+        assert_eq!(running_replay.status, 202);
+        assert!(!running_replay.started);
         observe.recv_timeout(Duration::from_secs(2)).unwrap();
         release.send(()).unwrap();
         let a_reply = report(&app, &a, &mut jobs);
