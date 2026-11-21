@@ -139,11 +139,15 @@ impl TacticalJobs {
         self.payoffs = Some(payoff::Payoffs::new(engine));
     }
 
-    pub(crate) fn study_activity(&mut self, detection: &mut GameDetection) {
-        self.study.command(Instant::now());
+    pub(crate) fn cancel_payoffs(&self) {
         if let Some(payoffs) = &self.payoffs {
             payoffs.cancel();
         }
+    }
+
+    pub(crate) fn study_activity(&mut self, detection: &mut GameDetection) {
+        self.study.command(Instant::now());
+        self.cancel_payoffs();
         detection.cancel_background();
     }
 
@@ -157,9 +161,7 @@ impl TacticalJobs {
             .report(report, Instant::now())
             .map_err(|message| AppError::new("invalid_presence", message))?
         {
-            if let Some(payoffs) = &self.payoffs {
-                payoffs.cancel();
-            }
+            self.cancel_payoffs();
             detection.cancel_background();
         }
         Ok(())
@@ -207,10 +209,8 @@ impl TacticalJobs {
     ) -> Result<(), AppError> {
         let dataset = app.game_dataset()?;
         let run_allowed = self.waiting().is_none() && !store.analysis_paused(&dataset)?;
-        if let Some(payoffs) = &mut self.payoffs {
-            payoffs.poll(store, &dataset, run_allowed)?;
-        }
         if !run_allowed {
+            self.cancel_payoffs();
             detection.cancel_background();
         }
         if let Some((_, id)) = &self.active
@@ -256,6 +256,14 @@ impl TacticalJobs {
             self.ready = None;
         }
         if !run_allowed || self.ready.is_some() || self.active.is_some() || !detection.idle() {
+            return Ok(());
+        }
+        // Retained payoff work and the detector share the engine slot. A
+        // durable detection deadline starts only after the retained worker
+        // has returned the slot.
+        if let Some(payoffs) = &mut self.payoffs
+            && payoffs.advance_retained(store, &dataset)?
+        {
             return Ok(());
         }
         let descriptor = self.descriptor.as_ref().expect("configured detector");
@@ -354,9 +362,7 @@ impl TacticalJobs {
             } => store.queue_game_analysis(&dataset_id, &source, &game_id, &learner)?,
             TacticalCommand::Pause { dataset_id } => {
                 store.set_analysis_paused(&dataset_id, true)?;
-                if let Some(payoffs) = &self.payoffs {
-                    payoffs.cancel();
-                }
+                self.cancel_payoffs();
                 detection.cancel_background();
             }
             TacticalCommand::Resume { dataset_id } => {

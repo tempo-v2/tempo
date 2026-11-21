@@ -118,19 +118,12 @@ impl Payoffs {
             job.cancel.store(true, Ordering::Relaxed)
         }
     }
-    pub(super) fn poll(
+    pub(super) fn advance_retained(
         &mut self,
         store: &SqliteStore,
         dataset: &DatasetId,
-        allowed: bool,
-    ) -> Result<(), AppError> {
-        if !allowed {
-            self.cancel();
-            return Ok(());
-        }
-        if self.new_puzzle.is_some() {
-            return Ok(());
-        }
+    ) -> Result<bool, AppError> {
+        debug_assert!(self.new_puzzle.is_none());
         if self.dataset.as_ref() != Some(dataset) {
             self.cancel();
             self.checked.clear();
@@ -142,7 +135,7 @@ impl Payoffs {
             .as_ref()
             .is_some_and(|j| !j.worker.is_finished())
         {
-            return Ok(());
+            return Ok(true);
         }
         if let Some(job) = self.pending.take() {
             let result = job
@@ -174,15 +167,18 @@ impl Payoffs {
                     Err(_) => {} // retry on the next pass
                 }
             }
+            // Release this dispatch turn to game detection before starting
+            // another retained search, even when the retained page has more.
+            return Ok(false);
         }
         if Instant::now() < self.next {
-            return Ok(());
+            return Ok(false);
         }
         let page = store.game_tactic_candidates(dataset, self.before)?;
         if page.is_empty() {
             self.before = i64::MAX;
             self.next = Instant::now() + Duration::from_secs(60);
-            return Ok(());
+            return Ok(false);
         }
         for (id, item) in page {
             self.before = id;
@@ -209,7 +205,7 @@ impl Payoffs {
             });
             break;
         }
-        Ok(())
+        Ok(self.pending.is_some())
     }
 }
 

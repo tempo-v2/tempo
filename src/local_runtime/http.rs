@@ -601,7 +601,10 @@ fn respond_inner(
             (&Method::Get, "/api/games/detectors") => Ok(games.detection.discovery()),
             (&Method::Post, "/api/games/detection") => {
                 command::<DetectionRequest>(&mut request, MAX_COMMAND_BYTES)
-                    .map(|intent| games.detection.start(app, intent))
+                    .map(|intent| {
+                        games.tactics.cancel_payoffs();
+                        games.detection.start(app, intent)
+                    })
             }
             (&Method::Post, "/api/games/detection-result") => {
                 command::<DetectionRead>(&mut request, MAX_COMMAND_BYTES)
