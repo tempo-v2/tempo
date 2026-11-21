@@ -208,15 +208,15 @@ fn report_response(request: Request, result: Result<Value, AppError>) -> LocalRe
         Ok(value) => (200, value),
         Err(error) if error.code == "report_busy" => (
             503,
-            serde_json::json!({"code":error.code,"message":error.message}),
+            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
         ),
         Err(error) if error.code == "report_changed" => (
             409,
-            serde_json::json!({"code":error.code,"message":error.message}),
+            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
         ),
         Err(error) => (
             400,
-            serde_json::json!({"code":error.code,"message":error.message}),
+            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
         ),
     };
     respond_traced(
@@ -539,6 +539,7 @@ fn respond_inner(
         let (status, value) = if request.method() == &Method::Post {
             let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
             let report_discovery = header(&request, "X-Tempo-Tactics-Report") == Some("2");
+            let report_stamp = header(&request, "X-Tempo-Tactics-Report-Generation") == Some("1");
             match command::<crate::tactical_jobs::TacticalRead>(&mut request, MAX_COMMAND_BYTES)
                 .and_then(|read| {
                     let dataset = read.dataset_id.clone();
@@ -549,11 +550,14 @@ fn respond_inner(
                                 "status": "unavailable", "message": "Reload Tempo to view personal tactical analysis."}));
                         }
                         if value["status"] != "unavailable" {
-                            let generation = profile_store.tactical_report_generation(&dataset)?;
                             value["report_schema"] = serde_json::json!(2);
-                            value["report_generation"] = serde_json::json!(report_generation(
-                                games.tactics.report_version(), generation.evidence,
-                            ));
+                            if report_stamp {
+                                let generation =
+                                    profile_store.tactical_report_generation(&dataset)?;
+                                value["report_generation"] = serde_json::json!(report_generation(
+                                    games.tactics.report_version(), generation.evidence,
+                                ));
+                            }
                         }
                     }
                     Ok(value)
