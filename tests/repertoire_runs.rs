@@ -318,6 +318,38 @@ fn forks_and_transpositions_do_not_choose_context_from_document_order() {
 }
 
 #[test]
+fn a_repeated_target_stops_the_run_in_either_variation_order() {
+    let lines = [
+        "1. Nf3 Nf6 2. Ng1 Ng8 (2... e6 3. d4) 3. Nf3 *",
+        "1. Nf3 Nf6 2. Ng1 e6 (2... Ng8 3. Nf3) 3. d4 *",
+    ];
+    for pgn in lines {
+        let mut f = Fixture::new(pgn);
+        f.rank_first(&f.targets[0], 20_001, &[]);
+        let first = f.next();
+        assert_eq!(first["target_id"], f.targets[0].0);
+        let staged = f.app.snapshot().unwrap().repertoire_run.unwrap();
+        assert_eq!(
+            staged
+                .steps
+                .iter()
+                .map(|step| &step.target)
+                .collect::<Vec<_>>(),
+            f.targets[..2].iter().collect::<Vec<_>>()
+        );
+        let accepted = f.command(address("answer", &first, "nf3", Some("g1f3")));
+        assert_eq!(accepted["assessment"], "good");
+        let second = f.next();
+        assert_eq!(second["target_id"], f.targets[1].0);
+        let accepted = f.command(address("answer", &second, "ng1", Some("f3g1")));
+        assert_eq!(accepted["assessment"], "good");
+        let snapshot = f.app.snapshot().unwrap();
+        assert!(snapshot.repertoire_run.is_none());
+        assert_eq!(snapshot.assessments.len(), 2);
+    }
+}
+
+#[test]
 fn a_changed_answer_or_suspension_drops_unused_steps_without_touching_the_warmup_result() {
     for change in ["answer", "suspension"] {
         let mut f = Fixture::line();

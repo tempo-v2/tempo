@@ -298,7 +298,7 @@ impl Tempo {
             DailyActivity::Teach => ActivityMode::Teach,
             DailyActivity::Repair => ActivityMode::Repair,
             DailyActivity::Test => ActivityMode::Test,
-            DailyActivity::Practice => ActivityMode::Practice,
+            DailyActivity::Practice | DailyActivity::RepertoireWarmup => ActivityMode::Practice,
         };
         let exercise = Exercise {
             target: item.target.clone(),
@@ -314,7 +314,7 @@ impl Tempo {
             )
         })
         .map_err(|error| domain("invalid_content", error))?;
-        let repertoire_warmup = run.is_some() && mode == ActivityMode::Practice;
+        let repertoire_warmup = choice.activity == DailyActivity::RepertoireWarmup;
         let run_lead_in = run
             .as_ref()
             .filter(|run| !(run.skipped_warmup && run.head() == run.steps[0].issued.as_ref()))
@@ -396,13 +396,11 @@ impl Tempo {
             choice.immediate_request,
             ordering,
         )?;
-        if !repertoire_warmup {
-            self.daily
-                .as_mut()
-                .expect("daily release")
-                .queue
-                .issued(&choice, at.day);
-        }
+        self.daily
+            .as_mut()
+            .expect("daily release")
+            .queue
+            .issued(&choice, at.day);
         Ok(AnswerResult {
             attempt,
             feedback: None,

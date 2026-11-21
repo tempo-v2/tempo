@@ -4,7 +4,7 @@ use crate::AppError;
 use std::collections::BTreeMap;
 use tempo_chess::{ContentKind, RepertoireStudyStep, repertoire_study_routes};
 use tempo_learning::RepertoireRecall;
-use tempo_queue::{DailyActivity, DailyChoice, DailyOrderingEffect, DailySelection};
+use tempo_queue::{DailyChoice, DailySelection};
 use tempo_store::{
     ActivityMode, AnswerResult, RepertoireRun, RepertoireRunStep, StudyScope, StudyState, Write,
 };
@@ -40,24 +40,11 @@ impl Tempo {
         };
         if connect_repertoires
             && snapshot.repertoire_run.is_none()
-            && let Some(run) = self.plan_repertoire_run(snapshot, at, selection, &choice.target)?
+            && let Some((first_choice, run)) =
+                self.plan_repertoire_run(snapshot, at, selection, choice)?
         {
-            let first = &run.steps[0];
-            let choice = if first.mode == ActivityMode::Practice {
-                DailyChoice {
-                    ordering: DailyOrderingEffect::Preserve,
-                    immediate_request: None,
-                    target: first.target.clone(),
-                    activity: DailyActivity::Practice,
-                    route: None,
-                    new_kind: None,
-                    relevance: None,
-                }
-            } else {
-                choice.clone()
-            };
             return self
-                .issue_daily_with_run(snapshot, at, choice, Some(run))
+                .issue_daily_with_run(snapshot, at, first_choice, Some(run))
                 .map(Some);
         }
         self.issue_daily(snapshot, at, choice.clone()).map(Some)
@@ -85,8 +72,9 @@ impl Tempo {
         snapshot: &StudyState,
         at: StudyTime,
         selection: &DailySelection,
-        anchor: &TargetId,
-    ) -> Result<Option<RepertoireRun>, AppError> {
+        selected: &DailyChoice,
+    ) -> Result<Option<(DailyChoice, RepertoireRun)>, AppError> {
+        let anchor = &selected.target;
         let Some((item, _)) = snapshot.target(anchor)? else {
             return Ok(None);
         };
@@ -125,6 +113,7 @@ impl Tempo {
         let Some(&(first, index)) = occurrences.first() else {
             return Ok(None);
         };
+        let mut first_choice = selected.clone();
         let mut steps = Vec::new();
         let mut anchor_step = run_step(&first[index], ActivityMode::Test);
         anchor_step.lead_in = None; // Use the standalone lead-in when entering here.
@@ -139,21 +128,20 @@ impl Tempo {
                             && &route[i].lead_in == incoming
                     })
                 });
-            let deferred = self
-                .daily
-                .as_ref()
-                .expect("daily release")
-                .queue
-                .is_deferred(&parent.target, at.day);
             if unique_parent
-                && &parent.target != anchor
-                && !deferred
                 && self.recall_fact(snapshot, at, &parent.target)? == RepertoireRecall::Familiar
+                && let Some(choice) = self
+                    .daily
+                    .as_ref()
+                    .expect("daily release")
+                    .queue
+                    .repertoire_warmup(selection, &parent.target)
             {
                 let mut warmup = run_step(parent, ActivityMode::Practice);
                 warmup.lead_in = None;
                 steps.push(warmup);
                 anchor_step.lead_in = incoming.clone();
+                first_choice = choice;
             }
         }
         steps.push(anchor_step);
@@ -164,7 +152,12 @@ impl Tempo {
                 .iter()
                 .filter_map(|&(route, i)| route.get(i + 1))
             {
-                if next.lead_in.is_none() || steps.iter().any(|step| step.target == next.target) {
+                if steps.iter().any(|step| step.target == next.target) {
+                    // A variation that returns here sets a run boundary.
+                    successor = None;
+                    break;
+                }
+                if next.lead_in.is_none() {
                     continue;
                 }
                 let eligible = match eligibility.get(&next.target) {
@@ -194,12 +187,15 @@ impl Tempo {
                 route.get(*i) == Some(successor)
             });
         }
-        Ok((steps.len() > 1).then_some(RepertoireRun {
-            repertoire: repertoire.clone(),
-            source_id,
-            steps,
-            skipped_warmup: false,
-        }))
+        Ok((steps.len() > 1).then_some((
+            first_choice,
+            RepertoireRun {
+                repertoire: repertoire.clone(),
+                source_id,
+                steps,
+                skipped_warmup: false,
+            },
+        )))
     }
 
     fn continuation(
