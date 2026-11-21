@@ -85,26 +85,26 @@ fn rank_group(nearby: &[NearbyPosition]) -> Vec<SimilarMove<'_>> {
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "basis", rename_all = "snake_case")]
-pub(crate) enum Recommendation<'a> {
+pub(crate) enum Recommendation {
     Similar {
-        uci: &'a str,
+        uci: String,
         scope: RepertoireScope,
         position_count: usize,
         loss_centipawns: u32,
     },
     Stockfish {
-        uci: &'a str,
+        uci: String,
         nearest_loss_centipawns: u32,
     },
 }
 
-pub(crate) fn rank_and_recommend<'a>(
-    similar: &mut SimilarMoves<'a>,
-    best: (&'a str, Option<i32>),
-    scores: impl IntoIterator<Item = (&'a str, Option<i32>)>,
-) -> Option<Recommendation<'a>> {
+pub(crate) fn rank_and_recommend<'score>(
+    similar: &mut SimilarMoves<'_>,
+    best: (&str, Option<i32>),
+    scores: impl IntoIterator<Item = (&'score str, Option<i32>)>,
+) -> Option<Recommendation> {
     let scores: BTreeMap<_, _> = scores.into_iter().collect();
-    let loss = |uci| {
+    let loss = |uci: &str| {
         if uci == best.0 {
             Some(0)
         } else {
@@ -124,7 +124,7 @@ pub(crate) fn rank_and_recommend<'a>(
         };
         if loss <= 50 {
             return Some(Recommendation::Similar {
-                uci: candidate.uci,
+                uci: candidate.uci.to_owned(),
                 scope,
                 position_count: candidate.position_count,
                 loss_centipawns: loss,
@@ -137,7 +137,7 @@ pub(crate) fn rank_and_recommend<'a>(
         && loss > 150
     {
         return Some(Recommendation::Stockfish {
-            uci: best.0,
+            uci: best.0.to_owned(),
             nearest_loss_centipawns: loss,
         });
     }
@@ -196,7 +196,7 @@ mod tests {
                 [("e4d5", Some(-70)), ("g1f3", Some(-29))]
             ),
             Some(Recommendation::Similar {
-                uci: "g1f3",
+                uci: "g1f3".into(),
                 scope: RepertoireScope::Current,
                 position_count: 1,
                 loss_centipawns: 49,
@@ -209,7 +209,7 @@ mod tests {
                 [("e4d5", Some(-70)), ("g1f3", Some(-31))]
             ),
             Some(Recommendation::Similar {
-                uci: "d2d4",
+                uci: "d2d4".into(),
                 scope: RepertoireScope::Other,
                 position_count: 1,
                 loss_centipawns: 0,
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(
             rank_and_recommend(&mut ranked, ("c2c4", Some(138)), scores),
             Some(Recommendation::Similar {
-                uci: "c2c4",
+                uci: "c2c4".into(),
                 scope: RepertoireScope::Current,
                 position_count: 1,
                 loss_centipawns: 0,
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(
             rank_and_recommend(&mut ranked, ("c2c4", Some(138)), scores),
             Some(Recommendation::Similar {
-                uci: "f1e2",
+                uci: "f1e2".into(),
                 scope: RepertoireScope::Current,
                 position_count: 2,
                 loss_centipawns: 21,
@@ -280,7 +280,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Some(Recommendation::Similar { uci: "h2h3", .. })
+            Some(Recommendation::Similar { uci, .. }) if uci == "h2h3"
         ));
         assert_eq!(
             ranked.current.iter().map(|mv| mv.uci).collect::<Vec<_>>(),
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(
             decide(50),
             Some(Recommendation::Similar {
-                uci: "g1f3",
+                uci: "g1f3".into(),
                 scope: RepertoireScope::Current,
                 position_count: 1,
                 loss_centipawns: 50,
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(
             decide(151),
             Some(Recommendation::Stockfish {
-                uci: "d2d4",
+                uci: "d2d4".into(),
                 nearest_loss_centipawns: 151,
             })
         );
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(
             rank_and_recommend(&mut ranked, ("g1f3", None), [("e4d5", Some(-150))]),
             Some(Recommendation::Similar {
-                uci: "g1f3",
+                uci: "g1f3".into(),
                 scope: RepertoireScope::Current,
                 position_count: 1,
                 loss_centipawns: 0,
@@ -348,5 +348,13 @@ mod tests {
             rank_and_recommend(&mut SimilarMoves::default(), ("d2d4", Some(20)), []),
             None
         );
+    }
+}
+
+impl Recommendation {
+    pub(crate) fn into_move(self) -> String {
+        match self {
+            Self::Similar { uci, .. } | Self::Stockfish { uci, .. } => uci,
+        }
     }
 }

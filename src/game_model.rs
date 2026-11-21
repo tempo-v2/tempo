@@ -33,7 +33,7 @@ pub struct ModelRequest {
     pub dataset_id: DatasetId,
 }
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GapKind {
     #[default]
@@ -41,7 +41,7 @@ pub enum GapKind {
     Forecast,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GapRequest {
     pub dataset_id: DatasetId,

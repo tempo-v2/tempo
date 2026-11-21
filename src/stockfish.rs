@@ -72,9 +72,35 @@ pub(crate) fn stockfish(
     shortlist: &[&str],
     candidate_count: usize,
 ) -> Result<EngineResult, AppError> {
+    stockfish_until(
+        directory,
+        fen,
+        legal_moves,
+        shortlist,
+        candidate_count,
+        None,
+    )
+}
+
+pub(crate) fn stockfish_until(
+    directory: &Path,
+    fen: &str,
+    legal_moves: &[String],
+    shortlist: &[&str],
+    candidate_count: usize,
+    deadline: Option<Instant>,
+) -> Result<EngineResult, AppError> {
+    let remaining = |limit: Duration| {
+        deadline.map_or(limit, |end| {
+            limit.min(end.saturating_duration_since(Instant::now()))
+        })
+    };
     let _diagnostic = crate::diagnostics::Span::new("engine.evaluate");
     let _request = Foreground::request();
-    let started = Instant::now();
+    // A line starts as soon as the first response is staged. The editor may
+    // still be evaluating that starting board on the shared engine.
+    let slot_wait = if deadline.is_some() { 10 } else { 2 };
+    let slot_deadline = Instant::now() + remaining(Duration::from_secs(slot_wait));
     let _slot = loop {
         match ENGINE_SLOT.try_lock() {
             Ok(slot) => break slot,
@@ -86,7 +112,7 @@ pub(crate) fn stockfish(
             }
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
-        if started.elapsed() >= Duration::from_secs(2) {
+        if Instant::now() >= slot_deadline {
             return Err(if BACKGROUND_OWNS_SLOT.load(Ordering::SeqCst) {
                 AppError::new(
                     "background_engine_busy",
@@ -132,8 +158,15 @@ pub(crate) fn stockfish(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    let timeout = remaining(Duration::from_secs(8));
+    if timeout.is_zero() {
+        return Err(AppError::new(
+            "engine_timeout",
+            "The line preview reached its time limit.",
+        ));
+    }
     let mut process = start_engine_wrapper(&mut command)?;
-    wait_for_engine(&mut process, Duration::from_secs(8))?;
+    wait_for_engine(&mut process, timeout)?;
     let output = process
         .wait_with_output()
         .map_err(|error| domain("engine_unavailable", error))?;

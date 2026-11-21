@@ -637,6 +637,8 @@ fn respond_inner(
             | "/api/games/coverage/status"
             | "/api/games/gaps"
             | "/api/games/gap-draft"
+            | "/api/games/gap-line"
+            | "/api/games/gap-line/status"
             | "/api/games/review"
             | "/api/games/gap-analysis"
             | "/api/games/gap-explorer"
@@ -717,6 +719,16 @@ fn respond_inner(
                 200,
                 command::<crate::GameReviewRead>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|request| app.game_review(request)),
+            ),
+            (&Method::Post, "/api/games/gap-line") => (
+                202,
+                command::<crate::coverage_scan::GapLineRequest>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.coverage.start_line(app, intent)),
+            ),
+            (&Method::Post, "/api/games/gap-line/status") => (
+                200,
+                command::<crate::coverage_scan::GapLineRead>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| games.coverage.read_line(app, intent)),
             ),
             (&Method::Post, "/api/games/gap-draft") => (
                 200,
@@ -1053,6 +1065,8 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/coverage/status" => "repertoire_coverage_status",
         "/api/games/gaps" => "game_gaps",
         "/api/games/gap-draft" => "game_gap_draft",
+        "/api/games/gap-line" => "game_gap_line",
+        "/api/games/gap-line/status" => "game_gap_line_status",
         "/api/games/review" => "game_review",
         "/api/games/gap-analysis" => "game_gap_analysis",
         "/api/games/gap-explorer" => "game_gap_explorer",
