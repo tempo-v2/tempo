@@ -53,6 +53,11 @@ pub(crate) fn game_learner(game: &TacticalGame) -> Result<tempo_chess::LearnerCo
     })
 }
 
+enum DetectionPuzzle<'a> {
+    Personal(&'a tempo_chess::PersonalPuzzle),
+    Capture(&'a str, &'a tempo_chess::ChessAnswer),
+}
+
 impl Tempo {
     fn validate_tactical_source(
         &self,
@@ -201,83 +206,92 @@ impl Tempo {
                         game.game.source, game.game.id, game.learner, moment.occurrence
                     )];
                     let personal = assessment.kind == tempo_chess::TacticalKind::PersonalTactics;
-                    let plan = if personal {
-                        let evidence = assessment.personal.as_ref().ok_or_else(|| {
-                            AppError::new(
-                                "invalid_tactical_result",
-                                "The personal detector omitted its evidence.",
-                            )
-                        })?;
-                        evidence
-                            .puzzle
-                            .as_ref()
-                            .map(|puzzle| plan_personal_puzzle(&catalog, puzzle, &provenance))
-                    } else {
-                        assessment.puzzle.as_ref().map(|puzzle| {
-                            plan_tactical_puzzle(&catalog, &puzzle.fen, &puzzle.answer, &provenance)
-                        })
-                    }
-                    .transpose()
-                    .map_err(|e| domain("invalid_tactical_puzzle", e))?;
                     let ply = moment
                         .occurrence
                         .try_into()
                         .map_err(|_| AppError::new("invalid_game", "Game is too long."))?;
                     let motif = assessment.kind.code();
+                    let producer_id = &finding.producer.id;
                     let address = if personal {
-                        tempo_store::TacticalRequestAddress::Decision { ply }
+                        tempo_store::TacticalRequestAddress::Decision {
+                            ply,
+                            motif,
+                            producer_id,
+                        }
                     } else {
                         tempo_store::TacticalRequestAddress::Finding {
                             ply,
                             motif,
-                            producer_id: &finding.producer.id,
+                            producer_id,
                         }
                     };
-                    let issued = if plan.is_some() {
-                        self.store.issued_tactical_request(
+                    let personal_puzzle = if personal {
+                        assessment
+                            .personal
+                            .as_ref()
+                            .ok_or_else(|| {
+                                AppError::new(
+                                    "invalid_tactical_result",
+                                    "The personal detector omitted its evidence.",
+                                )
+                            })?
+                            .puzzle
+                            .as_ref()
+                    } else {
+                        None
+                    };
+                    let proposal = if personal {
+                        personal_puzzle.map(DetectionPuzzle::Personal)
+                    } else {
+                        assessment
+                            .puzzle
+                            .as_ref()
+                            .map(|puzzle| DetectionPuzzle::Capture(&puzzle.fen, &puzzle.answer))
+                    };
+                    let train = if let Some(proposal) = proposal {
+                        let binding = self.store.tactical_training_binding(
                             &dataset,
                             game,
                             GAME_TACTICS_REPORT,
                             address,
-                        )?
-                    } else {
-                        None
-                    };
-                    let train = if let Some((plan, issued)) = plan.as_ref().zip(issued.as_ref()) {
-                        let current = plan
-                            .content
-                            .catalog
-                            .items
-                            .get(&plan.target)
-                            .expect("planned puzzle exists");
-                        let proposed = TacticalPuzzleRef {
-                            target: plan.target.clone(),
-                            version: current.version,
+                        )?;
+                        let plan = match proposal {
+                            DetectionPuzzle::Personal(puzzle) => {
+                                plan_personal_puzzle(&catalog, puzzle, &provenance)
+                            }
+                            DetectionPuzzle::Capture(fen, answer) => {
+                                plan_tactical_puzzle(&catalog, fen, answer, &provenance)
+                            }
                         };
-                        // An issued Finding keeps its original binding. Preserve
-                        // this immutable report's proposal for acceptance replay.
-                        // Decision reports already expose a revised issue as superseded.
-                        (!personal || proposed == *issued).then_some(proposed)
-                    } else if let Some(plan) = plan {
-                        catalog = plan.content.catalog;
-                        let item = catalog
-                            .items
-                            .get(&plan.target)
-                            .expect("planned puzzle exists");
-                        let prior = learning
-                            .get(&plan.target)
-                            .or_else(|| snapshot.as_ref()?.learning.get(&plan.target))
-                            .cloned()
-                            .unwrap_or_default();
-                        if !prior.introduced {
-                            let introduced = DailyLearning::introduce_capture(&prior, at)
-                                .map_err(|e| domain("learning_error", e))?;
-                            learning.insert(plan.target.clone(), introduced);
+                        if let Some(binding) = binding {
+                            // The detached proposal keeps old receipt fingerprints
+                            // comparable. Failure to resolve it cannot prevent the
+                            // report or affect the accepted content.
+                            let proposed = plan.ok().map(|plan| TacticalPuzzleRef {
+                                version: plan.content.catalog.items[&plan.target].version,
+                                target: plan.target,
+                            });
+                            proposed.or(Some(binding))
+                        } else {
+                            let plan =
+                                plan.map_err(|error| domain("invalid_tactical_puzzle", error))?;
+                            catalog = plan.content.catalog;
+                            let item = &catalog.items[&plan.target];
+                            let prior = learning
+                                .get(&plan.target)
+                                .or_else(|| snapshot.as_ref()?.learning.get(&plan.target))
+                                .cloned()
+                                .unwrap_or_default();
+                            if !prior.introduced {
+                                let introduced = DailyLearning::introduce_capture(&prior, at)
+                                    .map_err(|error| domain("learning_error", error))?;
+                                learning.insert(plan.target.clone(), introduced);
+                            }
+                            Some(TacticalPuzzleRef {
+                                target: plan.target,
+                                version: item.version,
+                            })
                         }
-                        Some(TacticalPuzzleRef {
-                            target: plan.target,
-                            version: item.version,
-                        })
                     } else {
                         None
                     };

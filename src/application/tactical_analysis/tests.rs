@@ -541,7 +541,11 @@ fn adjacent_requests_alternate_with_due_work_and_preserve_issuance_on_restart() 
     let requested = app.store.pending_tactical_requests(&dataset).unwrap();
     let first = app.next_exercise().unwrap().unwrap();
     assert_eq!(first.attempt.target, requested[0].target);
-    let issued = app.store.stored_attempt(&first.attempt.id).unwrap().unwrap();
+    let issued = app
+        .store
+        .stored_attempt(&first.attempt.id)
+        .unwrap()
+        .unwrap();
     assert_eq!(issued.opponent_lead_in.unwrap().uci, "h8g7");
     let after_first = app.snapshot().unwrap();
     drop(app);
@@ -570,7 +574,10 @@ fn adjacent_requests_alternate_with_due_work_and_preserve_issuance_on_restart() 
     let after_review = app.snapshot().unwrap();
     drop(app);
     let mut app = local_runtime::open(&path).unwrap();
-    assert_eq!(app.next_exercise().unwrap().unwrap().attempt, review.attempt);
+    assert_eq!(
+        app.next_exercise().unwrap().unwrap().attempt,
+        review.attempt
+    );
     assert_eq!(app.snapshot().unwrap(), after_review);
     assert!(!app.store.regular_review_owed(&dataset).unwrap());
     assert_eq!(
@@ -590,14 +597,23 @@ fn adjacent_requests_alternate_with_due_work_and_preserve_issuance_on_restart() 
     // because Queue's first regular issuance cleared the persisted turn.
     let second = app.next_exercise().unwrap().unwrap();
     assert_eq!(second.attempt.target, requested[1].target);
-    let issued = app.store.stored_attempt(&second.attempt.id).unwrap().unwrap();
+    let issued = app
+        .store
+        .stored_attempt(&second.attempt.id)
+        .unwrap()
+        .unwrap();
     assert!(issued.opponent_lead_in.is_none());
     assert!(
         app.store
             .has_pending_tactical_request_for_attempt(&dataset, &second.attempt.id)
             .unwrap()
     );
-    assert!(app.store.pending_tactical_requests(&dataset).unwrap().is_empty());
+    assert!(
+        app.store
+            .pending_tactical_requests(&dataset)
+            .unwrap()
+            .is_empty()
+    );
     answer(&mut app, &second, "a1a7", "second-miss");
     let spare = app.next_exercise().unwrap().unwrap();
     let spare_target = if review_answer == "e2e4" {
@@ -1141,7 +1157,37 @@ fn a_revised_tactic_preserves_the_issued_attempt_without_introducing_new_learnin
     }).unwrap();
     let (mut old_detector, mut old_jobs) = host("before", "good");
     scan(&directory, &mut app, &mut old_detector, &mut old_jobs, 1);
+    let original = app
+        .store
+        .pending_tactical_requests(&dataset)
+        .unwrap()
+        .remove(0);
+    let before = app.store.content_state().unwrap();
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(tempo_chess::PersonalTacticsDetector(Evaluator {
+            revision: "revised-before-issuance",
+            outcome: "different",
+        }))
+        .unwrap();
+    let mut early_detector = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+    let mut early_jobs = TacticalJobs::new(&early_detector, &["personal-tactics"]);
+    scan(
+        &directory,
+        &mut app,
+        &mut early_detector,
+        &mut early_jobs,
+        1,
+    );
+    assert_eq!(
+        app.store.pending_tactical_requests(&dataset).unwrap(),
+        vec![original.clone()]
+    );
+    assert_eq!(app.store.content_state().unwrap().catalog, before.catalog);
+    assert_eq!(app.store.content_state().unwrap().learning, before.learning);
     let issued = app.next_exercise().unwrap().unwrap();
+    assert_eq!(issued.attempt.target, original.target);
+    assert_eq!(issued.attempt.content_version, original.version);
     let prior = app.store.content_state().unwrap();
     let mut registry = DetectorRegistry::default();
     registry
@@ -1326,33 +1372,175 @@ fn revised_issued_or_fulfilled_finding_does_not_introduce_an_alternate_due_puzzl
 }
 
 #[test]
-#[ignore = "unissued replacement remains blocked on durable automatic-introduction ownership"]
-fn revised_unissued_finding_cannot_leave_obsolete_due_puzzle() {
+fn revised_unissued_finding_reports_new_answer_and_serves_retained_puzzle() {
     let (directory, mut app) = disposable();
     import_two_captures(&mut app);
     let (mut detection, mut jobs) = choice_host("v1", "d4d7");
     let original = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
-    let original_target = app
-        .snapshot()
+    let dataset = app.game_dataset().unwrap();
+    let original_request = app
+        .store
+        .pending_tactical_requests(&dataset)
         .unwrap()
-        .catalog
-        .items
-        .keys()
-        .next()
-        .unwrap()
-        .clone();
+        .remove(0);
+    let before = app.snapshot().unwrap();
+
     let (mut detection, mut jobs) = choice_host("v2", "d4h4");
     let revised = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
     assert_eq!(
         revised["observations"][0]["request_id"],
         original["observations"][0]["request_id"]
     );
-    let next = app.next_exercise().unwrap().unwrap();
-    assert_ne!(next.attempt.target, original_target);
-    answer(&mut app, &next, "d4h4", "revised-answer");
+    assert_eq!(
+        revised["observations"][0]["puzzle"],
+        original["observations"][0]["puzzle"]
+    );
+    assert_eq!(
+        revised["observations"][0]["details"]["assessment"]["puzzle"]["answer"]["uci"],
+        "d4h4"
+    );
+    assert_eq!(
+        app.store.pending_tactical_requests(&dataset).unwrap(),
+        vec![original_request.clone()]
+    );
+    let revised_snapshot = app.snapshot().unwrap();
+    assert_eq!(revised_snapshot.catalog, before.catalog);
+    assert_eq!(revised_snapshot.learning, before.learning);
+    assert_eq!(revised_snapshot.content_history, before.content_history);
+
+    let time = app.components.clock.now();
+    drop(app);
+    let mut reopened = local_runtime::open(&directory.path().join("tactics.sqlite")).unwrap();
+    reopened.components.clock = Box::new(FixedClock(time));
+    let next = reopened.next_exercise().unwrap().unwrap();
+    assert_eq!(next.attempt.target, original_request.target);
+    assert_eq!(next.attempt.content_version, original_request.version);
+    answer(&mut reopened, &next, "d4d7", "retained-answer");
+    assert!(reopened.next_exercise().unwrap().is_none());
+}
+
+#[test]
+fn cancelled_or_abandoned_finding_keeps_its_binding_without_creating_alternate_work() {
+    for abandon in [false, true] {
+        let (directory, mut app) = disposable();
+        import_two_captures(&mut app);
+        let (mut detection, mut jobs) = choice_host("original", "d4d7");
+        scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+        let dataset = app.game_dataset().unwrap();
+        let request = app
+            .store
+            .pending_tactical_requests(&dataset)
+            .unwrap()
+            .remove(0);
+        let before = app.snapshot().unwrap();
+        let skip = if abandon {
+            let issue = app.next_exercise().unwrap().unwrap();
+            let command = crate::AbandonCommand {
+                dataset_id: dataset.clone(),
+                attempt_id: issue.attempt.id,
+                expected_revision: issue.attempt.revision,
+                submission_id: "skip-original-before-rescan".into(),
+            };
+            let reply = app.skip(command.clone()).unwrap();
+            Some((command, reply))
+        } else {
+            let (mut detection, mut jobs) = choice_host("invalidated", "b1c1");
+            let invalidated = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+            assert_eq!(invalidated["statistics"]["pending_requests"], 0);
+            let cancelled = app.snapshot().unwrap();
+            assert_eq!(cancelled.catalog, before.catalog);
+            assert_eq!(cancelled.learning, before.learning);
+            None
+        };
+
+        let (mut detection, mut jobs) = choice_host("revised", "d4h4");
+        let revised = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+        assert_eq!(
+            revised["observations"][0]["details"]["assessment"]["puzzle"]["answer"]["uci"],
+            "d4h4"
+        );
+        let after = app.snapshot().unwrap();
+        assert_eq!(after.catalog, before.catalog);
+        assert_eq!(after.learning, before.learning);
+        assert_eq!(after.assessments, before.assessments);
+        let pending = app.store.pending_tactical_requests(&dataset).unwrap();
+        if let Some((command, reply)) = skip {
+            assert_eq!(pending, vec![request]);
+            assert_eq!(app.skip(command).unwrap(), reply);
+            assert!(app.next_exercise().unwrap().is_none());
+        } else {
+            assert!(pending.is_empty());
+            let due = app.next_exercise().unwrap().unwrap();
+            assert_eq!(due.attempt.target, request.target);
+            assert!(
+                !app.store
+                    .has_pending_tactical_request_for_attempt(&dataset, &due.attempt.id)
+                    .unwrap()
+            );
+            answer(&mut app, &due, "d4d7", "retained-ordinary-due");
+            assert!(app.next_exercise().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn rescan_reports_a_pinned_inactive_puzzle_without_reactivation_or_retargeting() {
+    let (directory, mut app) = disposable();
+    import_two_captures(&mut app);
+    let (mut detection, mut jobs) = choice_host("original", "d4d7");
+    scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    let before = app.snapshot().unwrap();
+    let target = before.catalog.items.keys().next().unwrap().clone();
+    let mut catalog = before.catalog;
+    catalog.items.get_mut(&target).unwrap().status = tempo_chess::ContentStatus::Retired;
+    app.store
+        .commit(Commit {
+            expected_dataset: before.dataset,
+            expected_revision: before.revision,
+            writes: vec![Write::Catalog(catalog.clone())],
+        })
+        .unwrap();
+    for (revision, best) in [("unchanged-retired", "d4d7"), ("changed-retired", "d4h4")] {
+        let (mut detection, mut jobs) = choice_host(revision, best);
+        let report = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+        assert_eq!(
+            report["observations"][0]["details"]["assessment"]["puzzle"]["answer"]["uci"],
+            best
+        );
+        assert_eq!(app.snapshot().unwrap().catalog, catalog);
+        assert_eq!(app.snapshot().unwrap().learning, before.learning);
+        assert!(app.next_exercise().unwrap().is_none());
+    }
+    let version = catalog.items.get_mut(&target).unwrap();
+    version.status = tempo_chess::ContentStatus::Active;
+    version.version = tempo_types::ContentVersion(version.version.0 + 1);
+    let snapshot = app.snapshot().unwrap();
+    let dataset = snapshot.dataset.clone();
+    app.store
+        .commit(Commit {
+            expected_dataset: dataset.clone(),
+            expected_revision: snapshot.revision,
+            writes: vec![Write::Catalog(catalog.clone())],
+        })
+        .unwrap();
+    let (mut detection, mut jobs) = choice_host("outdated-binding-version", "d4h4");
+    scan(&directory, &mut app, &mut detection, &mut jobs, 1);
     assert!(
-        app.next_exercise().unwrap().is_none(),
-        "the obsolete puzzle still appears in ordinary due selection"
+        app.store
+            .pending_tactical_requests(&dataset)
+            .unwrap()
+            .is_empty()
+    );
+    let current_due = app.next_exercise().unwrap().unwrap();
+    assert_eq!(current_due.attempt.target, target);
+    assert_eq!(
+        current_due.attempt.content_version,
+        catalog.items[&target].version
+    );
+    assert!(
+        !app.store
+            .has_pending_tactical_request_for_attempt(&dataset, &current_due.attempt.id)
+            .unwrap()
     );
 }
 
@@ -1388,6 +1576,11 @@ fn a_tactical_request_does_not_record_whether_it_introduced_prior_learning() {
         let saved = app.snapshot().unwrap();
         assert!(saved.attempts.is_empty());
         assert!(saved.assessments.is_empty());
+        let (mut detector, mut jobs) = choice_host("v2", "d4h4");
+        scan(&directory, &mut app, &mut detector, &mut jobs, 1);
+        let revised = app.snapshot().unwrap();
+        assert_eq!(revised.catalog, saved.catalog);
+        assert_eq!(revised.learning, saved.learning);
         (
             report,
             request,
