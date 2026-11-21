@@ -104,20 +104,25 @@ def bounded_command(command: list[str], *, timeout: float = 2.0,
     return (b"".join(chunks).decode("utf-8", errors="replace"), failure)
 
 
-def process_kind(name: str) -> str:
+def process_identity(name: str) -> tuple[str, str]:
+    # Emit fixed names even when a recognized pattern has a private suffix.
     lower = name.lower()
     if lower == "tempo":
-        return "tempo"
+        return "tempo", "tempo"
     if lower in {"rustc", "cargo", "rust-analyzer", "clippy-driver", "cc",
                  "gcc", "g++", "clang", "clang++", "ld", "lld", "cc1", "cc1plus"}:
-        return "compiler_or_build_tool"
-    if lower in {"stockfish", "lc0"} or lower.startswith("stockfish-"):
-        return "chess_engine"
+        return lower, "compiler_or_build_tool"
+    if lower == "stockfish" or lower.startswith("stockfish-"):
+        return "stockfish", "chess_engine"
+    if lower == "lc0":
+        return "lc0", "chess_engine"
     if lower in {"node", "nodejs", "npm", "npx"}:
-        return "javascript_runtime"
+        return lower, "javascript_runtime"
     if re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", lower):
-        return "python_runtime"
-    return "other"
+        return "python", "python_runtime"
+    if lower in {"google chrome", "chromium"}:
+        return lower, "browser"
+    return "other", "other"
 
 
 def parse_processes(text: str, observed_pid: int | None = None) -> dict[str, Any]:
@@ -133,11 +138,12 @@ def parse_processes(text: str, observed_pid: int | None = None) -> dict[str, Any
             continue
         if pid <= 0 or parent < 0 or not math.isfinite(cpu) or cpu < 0 or rss < 0:
             continue
-        # comm can be an absolute executable path on macOS. Never export it.
+        # comm can be an absolute executable path on macOS. Identify it
+        # locally and export only the canonical label and broad role.
         name = parts[4].rstrip("/").rsplit("/", 1)[-1]
-        name = "".join(c for c in name if c.isprintable())[:80] or "unknown"
-        rows.append({"pid": pid, "parent_pid": parent, "executable": name,
-                     "kind_hint": process_kind(name), "cpu_percent_ps": cpu,
+        label, kind = process_identity(name)
+        rows.append({"pid": pid, "parent_pid": parent, "executable": label,
+                     "kind_hint": kind, "cpu_percent_ps": cpu,
                      "rss_bytes": rss * 1024})
     rows.sort(key=lambda row: (-row["cpu_percent_ps"], -row["rss_bytes"], row["pid"]))
     return {"top_processes": rows[:MAX_PROCESSES],

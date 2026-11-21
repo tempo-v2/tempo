@@ -16,7 +16,7 @@ SPEC.loader.exec_module(diagnose)
 
 
 class Processes(unittest.TestCase):
-    def test_real_ps_columns_keep_basename_and_exact_pid_outside_top_twenty(self):
+    def test_real_ps_columns_keep_known_label_and_exact_pid_outside_top_twenty(self):
         text = "12 1 0.1 4096 /Users/private/project/tempo\n"
         text += "15 1 14.5 600 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
         text += "\n".join(f"{100+i} 1 {80-i}.5 100 /private/compiler/rustc" for i in range(25))
@@ -27,8 +27,24 @@ class Processes(unittest.TestCase):
         self.assertEqual(actual["observed_process"]["rss_bytes"], 4096 * 1024)
         self.assertNotIn("/Users", json.dumps(actual))
         chrome = diagnose.parse_processes(text, 15)["observed_process"]
-        self.assertEqual(chrome["executable"], "Google Chrome")
+        self.assertEqual(chrome["executable"], "google chrome")
+        self.assertEqual(chrome["kind_hint"], "browser")
         self.assertNotIn(".app", json.dumps(chrome))
+
+    def test_private_executable_names_and_engine_suffixes_are_redacted(self):
+        text = ("12 7 25.0 4096 /private/path/secret-tool\n"
+                "13 7 20.0 100 /private/path/stockfish-secret-build\n"
+                "14 7 5.0 100 /private/path/python3.11\n")
+        export = diagnose.parse_processes(text, 12)
+        self.assertEqual(
+            [(row["pid"], row["executable"], row["kind_hint"]) for row in export["top_processes"]],
+            [(12, "other", "other"), (13, "stockfish", "chess_engine"),
+             (14, "python", "python_runtime")],
+        )
+        self.assertEqual(export["observed_process"]["parent_pid"], 7)
+        self.assertNotIn("secret", json.dumps(export))
+        self.assertNotIn("/private/path", json.dumps(export))
+        self.assertNotIn("python3.11", json.dumps(export))
 
     def test_invalid_process_fields_do_not_poison_json(self):
         actual = diagnose.parse_processes("1 0 nan 3 bad\n2 1 inf 4 bad\n-2 0 0 3 bad\n3 1 1 -1 bad\n4 1 2 5 stockfish")

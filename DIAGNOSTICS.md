@@ -126,10 +126,10 @@ processes cannot be attributed to a particular job without additional evidence.
 
 ## Export bounds and privacy
 
-The host export includes only executable basenames, PIDs/parent PIDs, sampled
-CPU/RSS, host CPU count/load, and selected memory counters. It excludes full
-command lines, process environments, hostnames, usernames, and executable paths.
-This makes it useful for a bug report without copying the retained study data.
+The host export includes known process labels and broad role hints, PIDs and
+parent PIDs, sampled CPU/RSS, host CPU count/load, and selected memory counters.
+Unknown executables appear as `other`. The export omits private executable names and
+paths, command lines, process environments, hostnames and usernames.
 
 With `--log-dir`, the collector reads at most five matching regular log files,
 at most the final 512 KiB from each, and retains at most 2,000 allowlisted events.
@@ -142,7 +142,7 @@ not a complete historical audit. Original log files stay in place.
 
 Run the collector's focused checks with
 `python3 -m unittest discover -s tempo/tools/tests -p test_diagnose.py -v`
-from the assembled workspace. They cover process-path removal, units on both
+from the assembled workspace. They cover process-name and path redaction, units on both
 platforms, actual child timeout and output bounds, log filtering and truncation,
 unavailable tools, interruption, invalid duration, and overwrite prevention.
 macOS parsing fixtures are separate from a real macOS execution; record which
