@@ -24,10 +24,7 @@ impl Tempo {
             let at = self.components.clock.now();
             let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
             let selection = self.daily_selection(&snapshot, at, extra)?;
-            return selection
-                .next
-                .map(|choice| self.issue_daily(&snapshot, at, choice))
-                .transpose();
+            return self.issue_next_daily(&snapshot, at, &selection, false);
         }
         let at = self.components.clock.now();
         let context = QueueOrderContext {
@@ -76,6 +73,7 @@ impl Tempo {
             relevance_reason: None,
             lesson: None,
             opponent_lead_in,
+            repertoire_warmup: false,
             acceptance: None,
             revealed_decision: None,
         };

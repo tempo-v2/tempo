@@ -20,8 +20,8 @@ use tempo_queue::{
     ImmediateRecall, Line, RelevanceReason, TargetRelevance,
 };
 use tempo_store::{
-    ActivityMode, AnswerResult, Commit, Store, StoredAttempt, StudyOrderingWrite, StudyScope,
-    StudyState, Write,
+    ActivityMode, AnswerResult, Commit, RepertoireRun, Store, StoredAttempt, StudyOrderingWrite,
+    StudyScope, StudyState, Write,
 };
 use tempo_study::{Exercise, start_selected_exercise};
 use tempo_types::{DatasetId, StudyTime};
@@ -280,6 +280,16 @@ impl Tempo {
         at: StudyTime,
         choice: DailyChoice,
     ) -> Result<AnswerResult, AppError> {
+        self.issue_daily_with_run(snapshot, at, choice, None)
+    }
+
+    pub(super) fn issue_daily_with_run(
+        &mut self,
+        snapshot: &StudyState,
+        at: StudyTime,
+        choice: DailyChoice,
+        mut run: Option<RepertoireRun>,
+    ) -> Result<AnswerResult, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.daily.issue_daily");
         let (item, learning) = snapshot
             .target(&choice.target)?
@@ -288,7 +298,7 @@ impl Tempo {
             DailyActivity::Teach => ActivityMode::Teach,
             DailyActivity::Repair => ActivityMode::Repair,
             DailyActivity::Test => ActivityMode::Test,
-            DailyActivity::Practice => ActivityMode::Practice,
+            DailyActivity::Practice | DailyActivity::RepertoireWarmup => ActivityMode::Practice,
         };
         let exercise = Exercise {
             target: item.target.clone(),
@@ -304,6 +314,11 @@ impl Tempo {
             )
         })
         .map_err(|error| domain("invalid_content", error))?;
+        let repertoire_warmup = choice.activity == DailyActivity::RepertoireWarmup;
+        let run_lead_in = run
+            .as_ref()
+            .filter(|run| !(run.skipped_warmup && run.head() == run.steps[0].issued.as_ref()))
+            .and_then(|run| run.next()?.lead_in.clone());
         let mut record = StoredAttempt {
             attempt: attempt.clone(),
             issued_at: at,
@@ -336,6 +351,7 @@ impl Tempo {
                 _ => None,
             },
             opponent_lead_in: None,
+            repertoire_warmup,
             acceptance: None,
             revealed_decision: None,
         };
@@ -344,16 +360,27 @@ impl Tempo {
         } else if mode == ActivityMode::Repair {
             self.repair_lead_in(&record, item)
         } else {
-            item.verified_opponent_lead_in()
+            run_lead_in.or_else(|| item.verified_opponent_lead_in())
         };
         let scope = StudyScope {
             target: Some(&item.target),
             ..StudyScope::default()
         };
-        let writes = vec![
+        let mut writes = vec![
             Write::Issue(record),
             Write::Active(Some(attempt.id.clone())),
         ];
+        if let Some(run) = &mut run {
+            let step = run
+                .steps
+                .iter_mut()
+                .find(|step| step.issued.is_none())
+                .ok_or_else(|| AppError::new("stale_activity", "Repertoire run has finished."))?;
+            step.issued = Some(attempt.id.clone());
+        }
+        if run.is_some() || snapshot.repertoire_run.is_some() {
+            writes.push(Write::RepertoireRun(run));
+        }
         let ordering = match choice.ordering {
             DailyOrderingEffect::Preserve => StudyOrderingWrite::Preserve,
             DailyOrderingEffect::OweRegularReview => StudyOrderingWrite::OweRegularReview,

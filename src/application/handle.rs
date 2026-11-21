@@ -14,9 +14,19 @@ use tempo_study::AttemptStatus;
 impl Tempo {
     /// Handle one decoded transport intent, returning an attempt, empty, or error view.
     pub fn handle(&mut self, command: StudyCommand) -> StudyView {
+        self.handle_study(command, false)
+            .without_repertoire_context()
+    }
+
+    /// Opt in to issuing and presenting connected repertoire reviews.
+    pub fn handle_with_repertoire_runs(&mut self, command: StudyCommand) -> StudyView {
+        self.handle_study(command, true)
+    }
+
+    fn handle_study(&mut self, command: StudyCommand, connect_repertoires: bool) -> StudyView {
         let _diagnostic = crate::diagnostics::Span::new("app.handle.handle");
         let result: Result<StudyView, AppError> = match command {
-            StudyCommand::Next => self.next_view(),
+            StudyCommand::Next => self.next_view(connect_repertoires),
             StudyCommand::StudyStatus => self.study_status(),
             StudyCommand::PracticeTactics => self.practice_tactics(),
             StudyCommand::LearnMoreTactics {
@@ -27,7 +37,7 @@ impl Tempo {
                 if let Some(daily) = &mut self.daily {
                     daily.queue.resume_skipped();
                 }
-                self.next_view()
+                self.next_view(connect_repertoires)
             }
             StudyCommand::Resume { attempt_id } => self
                 .resume(&attempt_id)
@@ -67,7 +77,7 @@ impl Tempo {
         Ok(self.daily_summary(snapshot.dataset, selection))
     }
 
-    fn next_view(&mut self) -> Result<StudyView, AppError> {
+    fn next_view(&mut self, connect_repertoires: bool) -> Result<StudyView, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.handle.next_view");
         let active = self.store.study_state(StudyScope::default())?;
         if let Some(id) = &active.active_attempt {
@@ -84,8 +94,9 @@ impl Tempo {
             let at = self.components.clock.now();
             let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
             let selection = self.daily_selection(&snapshot, at, extra)?;
-            if let Some(choice) = selection.next {
-                let result = self.issue_daily(&snapshot, at, choice)?;
+            if let Some(result) =
+                self.issue_next_daily(&snapshot, at, &selection, connect_repertoires)?
+            {
                 return self.project(result);
             }
             return Ok(self.daily_summary(snapshot.dataset, selection));
