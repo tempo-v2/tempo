@@ -34,6 +34,7 @@ impl Tempo {
         let (catalog, learning) = snapshot.complete_catalog()?;
         let mut source = QueueSource {
             catalog,
+            excluded: &snapshot.excluded_tactics,
             learning,
             queue: self.fixture.as_ref().expect("fixture app").queue.as_ref(),
             today: at.day,

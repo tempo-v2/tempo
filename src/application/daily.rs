@@ -104,11 +104,11 @@ impl Tempo {
         };
         evidence.regular_review_owed = self.store.regular_review_owed(&snapshot.dataset)?;
         for request in self.store.pending_tactical_requests(&snapshot.dataset)? {
-            let Some(item) = catalog
-                .items
-                .get(&request.target)
-                .filter(|item| item.active() && item.version == request.version)
-            else {
+            let Some(item) = catalog.items.get(&request.target).filter(|item| {
+                item.active()
+                    && item.version == request.version
+                    && !snapshot.excluded_tactics.contains(&item.target)
+            }) else {
                 continue;
             };
             let Some(state) = learning.get(&request.target) else {
@@ -147,7 +147,9 @@ impl Tempo {
                         DailyKind::Tactic => {}
                     }
                 }
-                if super::repertoires::is_suspended(item, &snapshot.suspended_repertoires) {
+                if super::repertoires::is_suspended(item, &snapshot.suspended_repertoires)
+                    || snapshot.excluded_tactics.contains(&item.target)
+                {
                     return None;
                 }
                 if kind == DailyKind::Tactic

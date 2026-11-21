@@ -40,6 +40,11 @@ pub enum SavedStudyReviewCommand {
         id: i64,
         submission_id: String,
     },
+    ExcludeTactic {
+        dataset_id: DatasetId,
+        id: i64,
+        submission_id: String,
+    },
 }
 
 impl Tempo {
@@ -134,13 +139,24 @@ impl Tempo {
                 dataset_id,
                 id,
                 submission_id,
+            }
+            | SavedStudyReviewCommand::ExcludeTactic {
+                dataset_id,
+                id,
+                submission_id,
             } => {
-                let fingerprint = command_fingerprint("remove", &command)?;
+                let (kind, status, change) = match command {
+                    SavedStudyReviewCommand::ExcludeTactic { .. } => (
+                        "exclude_tactic",
+                        "excluded",
+                        ReviewWrite::ExcludeTactic(*id),
+                    ),
+                    _ => ("remove", "removed", ReviewWrite::Remove(*id)),
+                };
+                let fingerprint = command_fingerprint(kind, &command)?;
                 let key = command_key(dataset_id, submission_id, &fingerprint)?;
-                let id = self
-                    .store
-                    .write_saved_review(&key, ReviewWrite::Remove(*id))?;
-                Ok(json!({"status": "removed", "id": id, "submission_id": submission_id}))
+                let id = self.store.write_saved_review(&key, change)?;
+                Ok(json!({"status": status, "id": id, "submission_id": submission_id}))
             }
         }
     }
@@ -180,7 +196,7 @@ impl Tempo {
             .active
             .as_ref()
             .is_some_and(|active| !active.mode.guided())
-            || !(source_disclosed || later_disclosed)
+            || !(source_disclosed || later_disclosed || context.excluded_from_study)
         {
             return Ok(json!({"status": "study_required", "id": id}));
         }

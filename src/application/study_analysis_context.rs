@@ -48,7 +48,13 @@ impl Tempo {
             "app.study_analysis_context.project_saved_study_analysis",
         );
         let issued = self.analysis_issued_item(record)?;
-        self.project_study_analysis(record, &issued, index)
+        let mut origin = self.project_study_analysis(record, &issued, index)?;
+        origin["cardDetails"] = json!(self.project_card_details(
+            record,
+            &issued,
+            record.attempt.status != AttemptStatus::Active,
+        )?);
+        Ok(origin)
     }
 
     fn project_study_analysis(

@@ -77,6 +77,7 @@ function assertReplayPreservedRows(after, before) {
       "repertoire_coverage",
       "repertoire_coverage_gaps",
       "repertoire_run_steps",
+      "study_exclusions",
     ].includes(name));
     assert.deepEqual(rows, []);
   }
