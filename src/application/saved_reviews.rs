@@ -45,6 +45,7 @@ pub enum SavedStudyReviewCommand {
 impl Tempo {
     /// Marking authorizes saving an address only. It never discloses the move.
     pub fn save_study_review(&mut self, command: SaveStudyReview) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.saved_reviews.save_study_review");
         let fingerprint = command_fingerprint("save", &command)?;
         let key = command_key(&command.dataset_id, &command.submission_id, &fingerprint)?;
         let dataset = self.store.study_state(Default::default())?.dataset;
@@ -113,6 +114,7 @@ impl Tempo {
         &mut self,
         command: SavedStudyReviewCommand,
     ) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.saved_reviews.saved_study_reviews");
         match &command {
             SavedStudyReviewCommand::List { dataset_id, before } => {
                 let mut rows = self.store.saved_review_page(dataset_id, *before)?;

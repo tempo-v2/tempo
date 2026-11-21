@@ -13,6 +13,7 @@ impl Tempo {
     /// The event is tied to the compared content version. Only a newly committed
     /// event updates queue history; replay returns the saved learning transition.
     pub fn again(&mut self, command: AgainCommand) -> Result<Transition, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.again.again");
         let fingerprint =
             serde_json::to_string(&("again", &command)).map_err(|e| domain("codec_error", e))?;
         let submission =

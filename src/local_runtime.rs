@@ -133,6 +133,8 @@ pub fn serve_with_detectors(
     if fs::canonicalize(database)?.starts_with(fs::canonicalize(ui)?) {
         return Err("place the study database outside the public UI build".into());
     }
+    let _diagnostics = crate::diagnostics::init(database);
+    let _startup = crate::diagnostics::Span::new("runtime.startup");
     let mut app = open(database)?;
     app.bootstrap_model_inputs()?;
     app.reconcile_legacy_game_requests()?;
@@ -141,6 +143,7 @@ pub fn serve_with_detectors(
         "Choice encounters examined={}, repaired={}, unresolved={}",
         encounters.examined, encounters.repaired, encounters.unresolved
     );
+    drop(_startup);
     http::serve(
         &mut app,
         &SqliteStore::open(database)?,

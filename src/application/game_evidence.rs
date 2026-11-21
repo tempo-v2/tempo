@@ -99,6 +99,7 @@ impl Tempo {
     }
 
     pub fn game_history(&mut self) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.game_history");
         let history = self.store.game_history()?;
         let books = if history
             .results
@@ -151,6 +152,7 @@ impl Tempo {
     }
 
     pub fn import_game_pgn(&mut self, request: GameImport) -> Result<GameReport, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.import_game_pgn");
         check_id(&request.command_id)?;
         let key = fingerprint("pgn", &request)?;
         if let Some(report) = self.replay_game(&request.dataset_id, &request.command_id, &key)? {
@@ -202,6 +204,7 @@ impl Tempo {
         fetched: FetchedGames,
         backfill: Option<&crate::game_backfill::BackfillJob>,
     ) -> Result<GameReport, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.ingest_provider_games");
         let at = self.components.clock.now().unix_ms;
         let games = fetched
             .games
@@ -277,6 +280,7 @@ impl Tempo {
         &mut self,
         request: crate::game_evidence::ChooseGameCorrection,
     ) -> Result<GameReport, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.choose_game_correction");
         check_id(&request.command_id)?;
         let fingerprint = fingerprint("choose_correction", &request)?;
         if let Some(report) =
@@ -358,6 +362,7 @@ impl Tempo {
         &mut self,
         request: crate::game_evidence::ReprocessGames,
     ) -> Result<GameReport, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.reprocess_games");
         check_id(&request.command_id)?;
         let fingerprint = fingerprint("reprocess", &request)?;
         if let Some(report) =
@@ -406,6 +411,8 @@ impl Tempo {
     /// Upgrade only outstanding legacy obligations backed by stored evidence.
     /// Each game transaction can safely be replayed if startup was interrupted.
     pub fn reconcile_legacy_game_requests(&mut self) -> Result<(), AppError> {
+        let _diagnostic =
+            crate::diagnostics::Span::new("app.game_evidence.reconcile_legacy_game_requests");
         let snapshot = self.store.content_state()?;
         let mut batches = BTreeMap::<_, BTreeSet<_>>::new();
         let mut reconciled = BTreeSet::new();
@@ -504,6 +511,8 @@ impl Tempo {
 
     /// Repair choice-bearing encounters using current Chess facts, without an acceptance command.
     pub fn reconcile_choice_encounters(&mut self) -> Result<EncounterRepairReport, AppError> {
+        let _diagnostic =
+            crate::diagnostics::Span::new("app.game_evidence.reconcile_choice_encounters");
         let mut report = EncounterRepairReport::default();
         let mut cursor = None;
         let mut snapshot = self.store.content_state()?;
@@ -887,13 +896,15 @@ impl Tempo {
                         ended_at_ms: game.end_ms,
                     },
                 };
-                let mut transition = DailyLearning::assess_game(
-                    self.components.learning.as_ref(),
-                    prior,
-                    &input,
-                    key.version,
-                    decision.previous_move.clone(),
-                )
+                let mut transition = crate::diagnostics::measure("learning.assess_game", || {
+                    DailyLearning::assess_game(
+                        self.components.learning.as_ref(),
+                        prior,
+                        &input,
+                        key.version,
+                        decision.previous_move.clone(),
+                    )
+                })
                 .map_err(|error| domain("learning_error", error))?;
                 if legacy_plies.is_none() {
                     transition.state.game_review = None;
@@ -991,6 +1002,7 @@ impl Tempo {
         &mut self,
         dataset: &DatasetId,
     ) -> Result<Arc<GameBooks>, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.current_game_books");
         let basis = self
             .store
             .game_comparison_basis(dataset)?

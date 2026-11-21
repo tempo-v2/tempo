@@ -33,6 +33,7 @@ fn opening_name(opening: &PlayedOpening) -> Option<String> {
 
 impl Tempo {
     pub fn game_library(&self, request: GameLibraryRead) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.game_library.game_library");
         let page = self
             .store
             .game_library(&request.dataset_id, request.through, request.before)?;

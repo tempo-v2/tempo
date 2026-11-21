@@ -16,6 +16,10 @@ pub struct AppError {
 }
 impl AppError {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
+        crate::diagnostics::emit(
+            "application.error",
+            serde_json::json!({"level":"warn", "error_code":code}),
+        );
         Self {
             code: code.into(),
             message: message.into(),
@@ -37,6 +41,10 @@ impl From<StoreError> for AppError {
             StoreError::Invalid(_) => "store_invalid",
             StoreError::Unsupported(_) => "unsupported_capability",
         };
+        crate::diagnostics::emit(
+            "application.error",
+            serde_json::json!({"level":"warn", "error_code":code}),
+        );
         Self {
             code: code.into(),
             message: value.to_string(),

@@ -1,16 +1,17 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
 use super::{LocalResult, tactic_settings};
 use crate::{
-    AppError, Tempo,
+    AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
+    diagnostics::{Span, capture_context, with_context},
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{GameModel, GapRequest, ModelRequest},
     gap_analysis::{GapAnalysis, GapAnalysisRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
+    personal_tactics_report::{ReportCache, report_generation},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
-use crate::{SaveStudyReview, SavedStudyReviewCommand};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
@@ -42,6 +43,12 @@ pub(super) fn serve(
         phone: PhoneStudy::load(ui)?,
     };
     println!("Tempo study at {}", surfaces.origin);
+    crate::diagnostics::emit(
+        "runtime.listening",
+        serde_json::json!({
+            "listen_port": surfaces.address.rsplit(':').next().and_then(|port| port.parse::<u16>().ok())
+        }),
+    );
     let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
     let detector = detection
         .complete_decision_detector()
@@ -71,6 +78,7 @@ pub(super) fn serve(
             continue;
         }
         if Instant::now() >= next_model_check {
+            let mut trace = crate::diagnostics::Span::new("loop.model_schedule");
             let scheduled = (|| -> LocalResult<()> {
                 let marker = profile_store.game_comparison_marker()?;
                 if model_marker.as_ref() != Some(&marker) {
@@ -81,13 +89,30 @@ pub(super) fn serve(
             })();
             if let Err(error) = scheduled {
                 eprintln!("Tempo model scheduling: {error}");
+                trace.set_outcome("error");
+                crate::diagnostics::emit(
+                    "runtime.error",
+                    serde_json::json!({
+                        "operation": "loop.model_schedule", "error_code": "model_scheduling_failed"
+                    }),
+                );
             }
             next_model_check = Instant::now() + Duration::from_millis(250);
         }
-        games.refresh.poll(app);
-        games.detection.poll(app);
-        games.tactics.poll(app, profile_store, &mut games.detection);
+        {
+            let _trace = crate::diagnostics::Span::new("loop.refresh_apply");
+            games.refresh.poll(app);
+        }
+        {
+            let _trace = crate::diagnostics::Span::new("loop.detection_apply");
+            games.detection.poll(app);
+        }
+        {
+            let _trace = crate::diagnostics::Span::new("loop.tactics_apply");
+            games.tactics.poll(app, profile_store, &mut games.detection);
+        }
         if !games.refresh.active() {
+            let _trace = crate::diagnostics::Span::new("loop.backfill_apply");
             games.backfill.poll(app);
         }
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
@@ -95,6 +120,12 @@ pub(super) fn serve(
         };
         if let Err(error) = respond(app, profile_store, &mut games, request, &surfaces) {
             eprintln!("Tempo HTTP: {error}");
+            crate::diagnostics::emit(
+                "runtime.error",
+                serde_json::json!({
+                    "operation": "http.request", "error_code": "http_io_error"
+                }),
+            );
         }
     }
 }
@@ -103,6 +134,8 @@ struct TacticalReportWork {
     request: Request,
     read: crate::personal_tactics_report::ReportRequest,
     version: String,
+    delivery: Option<String>,
+    enqueued: Instant,
 }
 
 /// Keep archive aggregation out of the serialized foreground Study owner.
@@ -115,39 +148,57 @@ impl TacticalReportWorker {
         std::thread::Builder::new()
             .name("tempo-tactics-report".into())
             .spawn(move || {
+                let mut cache = ReportCache::default();
                 while let Ok(task) = work.recv() {
-                    let result =
-                        crate::personal_tactics_report::read(&store, &task.version, task.read);
-                    if let Err(error) = report_response(task.request, result) {
-                        eprintln!("Tempo tactical report: {error}");
-                    }
+                    with_context(task.delivery, || {
+                        let mut trace = Span::new("tactics.report.worker");
+                        trace.field("queue_wait_ms", task.enqueued.elapsed().as_millis() as u64);
+                        let result = cache.read(&store, &task.version, task.read);
+                        trace.set_outcome(if result.is_ok() { "ready" } else { "error" });
+                        if let Err(error) = report_response(task.request, result) {
+                            trace.set_outcome("io_error");
+                            eprintln!("Tempo tactical report: {error}");
+                        }
+                    });
                 }
             })?;
         Ok(Self(sender))
     }
 
     fn submit(&self, mut request: Request, version: &str) -> LocalResult<()> {
+        let mut trace = Span::new("tactics.report.admission");
         let read = match command(&mut request, MAX_COMMAND_BYTES) {
             Ok(read) => read,
-            Err(error) => return report_response(request, Err(error)),
+            Err(error) => {
+                trace.set_outcome("invalid");
+                return report_response(request, Err(error));
+            }
         };
         let task = TacticalReportWork {
             request,
             read,
             version: version.to_owned(),
+            delivery: capture_context(),
+            enqueued: Instant::now(),
         };
         match self.0.try_send(task) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                trace.set_outcome("admitted");
+                Ok(())
+            }
             Err(
                 std::sync::mpsc::TrySendError::Full(task)
                 | std::sync::mpsc::TrySendError::Disconnected(task),
-            ) => report_response(
-                task.request,
-                Err(AppError::new(
-                    "report_busy",
-                    "The tactics report is busy. Try again.",
-                )),
-            ),
+            ) => {
+                trace.set_outcome("busy");
+                report_response(
+                    task.request,
+                    Err(AppError::new(
+                        "report_busy",
+                        "The tactics report is busy. Try again.",
+                    )),
+                )
+            }
         }
     }
 }
@@ -157,14 +208,19 @@ fn report_response(request: Request, result: Result<Value, AppError>) -> LocalRe
         Ok(value) => (200, value),
         Err(error) if error.code == "report_busy" => (
             503,
-            serde_json::json!({"code":error.code,"message":error.message}),
+            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
+        ),
+        Err(error) if error.code == "report_changed" => (
+            409,
+            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
         ),
         Err(error) => (
             400,
-            serde_json::json!({"code":error.code,"message":error.message}),
+            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
         ),
     };
-    request.respond(
+    respond_traced(
+        request,
         body(
             "application/json; charset=utf-8",
             serde_json::to_vec(&value)?,
@@ -386,23 +442,58 @@ fn respond(
     app: &mut Tempo,
     profile_store: &SqliteStore,
     games: &mut Games,
+    request: Request,
+    surfaces: &HttpSurfaces,
+) -> LocalResult<()> {
+    let context = crate::diagnostics::RequestContext::new(header(&request, "X-Tempo-Request-Id"));
+    let mut trace = crate::diagnostics::Span::new("http.request");
+    trace.field("request_id", context.id());
+    trace.field(
+        "method",
+        match request.method() {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Head => "HEAD",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
+            Method::Options => "OPTIONS",
+            Method::Patch => "PATCH",
+            _ => "OTHER",
+        },
+    );
+    trace.field("route", diagnostic_route(request.url()));
+    let result = respond_inner(app, profile_store, games, request, surfaces);
+    trace.set_outcome(if result.is_ok() {
+        "returned"
+    } else {
+        "io_error"
+    });
+    result
+}
+
+fn respond_inner(
+    app: &mut Tempo,
+    profile_store: &SqliteStore,
+    games: &mut Games,
     mut request: Request,
     surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
     let public = match surfaces.assets_for(&request) {
         Ok(assets) => assets,
-        Err(status) => return Ok(request.respond(Response::empty(status))?),
+        Err(status) => return Ok(respond_traced(request, Response::empty(status))?),
     };
     // Older open tabs have strict v5 reply validators. The opt-in changes
     // display only, independent of submission identity and saved receipts.
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     let opponent_context = header(&request, "X-Tempo-Study-Opponent-Moves") == Some("1");
     if request.method() == &Method::Post && request.url() == "/api/study/presence" {
+        let _trace = Span::new("study.presence");
         let result = command(&mut request, 1024)
             .and_then(|report| games.tactics.study_presence(report, &mut games.detection));
         let status = if result.is_ok() { 204 } else { 400 };
-        request.respond(Response::empty(StatusCode(status)))?;
+        respond_traced(request, Response::empty(StatusCode(status)))?;
     } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/command" {
+        let _trace = Span::new("tactics.command");
         let result =
             command::<crate::tactical_jobs::TacticalCommand>(&mut request, MAX_COMMAND_BYTES)
                 .and_then(|intent| {
@@ -417,7 +508,8 @@ fn respond(
                 serde_json::json!({"code":error.code,"message":error.message}),
             ),
         };
-        request.respond(
+        respond_traced(
+            request,
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&value)?,
@@ -425,6 +517,7 @@ fn respond(
             .with_status_code(StatusCode(status)),
         )?;
     } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/position" {
+        let _trace = Span::new("tactics.report.detail");
         let result = command::<crate::personal_tactics_report::PositionRequest>(
             &mut request,
             MAX_COMMAND_BYTES,
@@ -436,44 +529,40 @@ fn respond(
                 read,
             )
         });
-        let (status, value) = match result {
-            Ok(value) => (200, value),
-            Err(error) => (
-                400,
-                serde_json::json!({"code":error.code,"message":error.message}),
-            ),
-        };
-        request.respond(
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&value)?,
-            )
-            .with_status_code(StatusCode(status)),
-        )?;
+        report_response(request, result)?;
     } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/report" {
         games
             .tactics_report
             .submit(request, games.tactics.report_version())?;
     } else if request.url() == "/api/games/tactics" {
+        let _trace = Span::new("tactics.status");
         let (status, value) = if request.method() == &Method::Post {
             let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
             let report_discovery = header(&request, "X-Tempo-Tactics-Report") == Some("2");
+            let report_stamp = header(&request, "X-Tempo-Tactics-Report-Generation") == Some("1");
             match command::<crate::tactical_jobs::TacticalRead>(&mut request, MAX_COMMAND_BYTES)
-                .and_then(|read| games.tactics.read(app, profile_store, read, wait_reason))
-            {
-                Ok(mut value) => {
-                    if !report_discovery && games.tactics.has_personal_report() {
-                        value = serde_json::json!({"schema_version": 1, "dataset_id": value["dataset_id"],
-                            "status": "unavailable", "message": "Reload Tempo to view personal tactical analysis."});
+                .and_then(|read| {
+                    let dataset = read.dataset_id.clone();
+                    let mut value = games.tactics.read(app, profile_store, read, wait_reason)?;
+                    if games.tactics.has_personal_report() {
+                        if !report_discovery {
+                            return Ok(serde_json::json!({"schema_version": 1, "dataset_id": dataset,
+                                "status": "unavailable", "message": "Reload Tempo to view personal tactical analysis."}));
+                        }
+                        if value["status"] != "unavailable" {
+                            value["report_schema"] = serde_json::json!(2);
+                            if report_stamp {
+                                let generation =
+                                    profile_store.tactical_report_generation(&dataset)?;
+                                value["report_generation"] = serde_json::json!(report_generation(
+                                    games.tactics.report_version(), generation.evidence,
+                                ));
+                            }
+                        }
                     }
-                    if report_discovery
-                        && games.tactics.has_personal_report()
-                        && value["status"] != "unavailable"
-                    {
-                        value["report_schema"] = serde_json::json!(2);
-                    }
-                    (200, value)
-                }
+                    Ok(value)
+                }) {
+                Ok(value) => (200, value),
                 Err(error) => (
                     400,
                     serde_json::json!({"schema_version":1,"status":"error","code":error.code,"message":error.message}),
@@ -485,7 +574,8 @@ fn respond(
                 serde_json::json!({"schema_version":1,"status":"error","code":"method_not_allowed"}),
             )
         };
-        request.respond(
+        respond_traced(
+            request,
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&value)?,
@@ -515,7 +605,8 @@ fn respond(
             status: 400,
             body: serde_json::json!({"schema_version": 1, "status": "error", "code": error.code}),
         });
-        request.respond(
+        respond_traced(
+            request,
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&reply.body)?,
@@ -695,7 +786,8 @@ fn respond(
                 serde_json::json!(ErrorView::for_content(error)),
             ),
         };
-        request.respond(
+        respond_traced(
+            request,
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&reply)?,
@@ -707,19 +799,25 @@ fn respond(
         let reply = command(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
             .unwrap_or_else(|error| serde_json::json!(ErrorView::for_content(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post && request.url() == "/api/tactics-collection" {
         let reply = command::<crate::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
             .and_then(|intent| app.read_tactics(intent))
             .map(|content| serde_json::json!(content))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post
         && matches!(
             request.url(),
@@ -733,19 +831,25 @@ fn respond(
                 .and_then(|intent| app.saved_study_reviews(intent)),
         }
         .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
         let reply = command::<Option<crate::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
             .and_then(|known| app.study_progress(known.as_ref()))
             .map(|progress| serde_json::json!(progress))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post && request.url() == "/api/study" {
         let reply = command::<StudyCommand>(&mut request, MAX_COMMAND_BYTES)
             .map(|intent| {
@@ -765,10 +869,13 @@ fn respond(
         } else {
             reply.without_opponent_context()
         };
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Post
         && matches!(request.url(), "/api/repertoires" | "/api/tactics")
     {
@@ -781,20 +888,23 @@ fn respond(
                 app.handle_tactic_capture(intent)
             })?
         };
-        request.respond(body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&reply)?,
-        ))?;
+        respond_traced(
+            request,
+            body(
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&reply)?,
+            ),
+        )?;
     } else if request.method() == &Method::Get {
         if let Some(asset) = public.get(asset_path(&request)) {
-            request.respond(body(asset.mime, asset.bytes.clone()).with_header(
+            respond_traced(request, body(asset.mime, asset.bytes.clone()).with_header(
                 field("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'"),
             ))?;
         } else {
-            request.respond(Response::empty(StatusCode(404)))?;
+            respond_traced(request, Response::empty(StatusCode(404)))?;
         }
     } else {
-        request.respond(Response::empty(StatusCode(405)))?;
+        respond_traced(request, Response::empty(StatusCode(405)))?;
     }
     Ok(())
 }
@@ -822,30 +932,40 @@ fn json_command<T: DeserializeOwned>(
     if mime != Some("application/json") {
         return Err(invalid("Use an application/json command."));
     }
+    let mut body_trace = crate::diagnostics::Span::new("http.read_body");
     let size = request.body_length();
     let mut bytes = Vec::new();
     if let Some(max_bytes) = max_bytes {
         let Some(size) = size.filter(|size| *size <= max_bytes) else {
+            body_trace.set_outcome("invalid_size");
             return Err(AppError::new(
                 "invalid_command",
                 format!("Send a command body of at most {} KiB.", max_bytes / 1024),
             ));
         };
         bytes.resize(size, 0);
-        request
-            .as_reader()
-            .read_exact(&mut bytes)
-            .map_err(|_| invalid("Could not read the command."))?;
+        request.as_reader().read_exact(&mut bytes).map_err(|_| {
+            body_trace.set_outcome("io_error");
+            invalid("Could not read the command.")
+        })?;
     } else {
-        request
-            .as_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|_| invalid("Could not read the command."))?;
+        request.as_reader().read_to_end(&mut bytes).map_err(|_| {
+            body_trace.set_outcome("io_error");
+            invalid("Could not read the command.")
+        })?;
         if size.is_some_and(|size| bytes.len() != size) {
+            body_trace.set_outcome("invalid_size");
             return Err(invalid("Could not read the command."));
         }
     }
-    serde_json::from_slice(&bytes).map_err(|_| invalid("The command is invalid."))
+    body_trace.field("bytes", bytes.len());
+    drop(body_trace);
+    let mut decode_trace = crate::diagnostics::Span::new("http.decode_body");
+    let result = serde_json::from_slice(&bytes).map_err(|_| invalid("The command is invalid."));
+    if result.is_err() {
+        decode_trace.set_outcome("invalid_json");
+    }
+    result
 }
 
 fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
@@ -865,4 +985,96 @@ fn body(mime: &str, bytes: Vec<u8>) -> Response<std::io::Cursor<Vec<u8>>> {
         .with_header(field("Content-Type", mime))
         .with_header(field("Cache-Control", "no-store"))
         .with_header(field("X-Content-Type-Options", "nosniff"))
+}
+
+/// Diagnostics only use known route templates; URLs and query strings are never recorded.
+fn diagnostic_route(url: &str) -> &'static str {
+    match url.split('?').next().unwrap_or_default() {
+        "/api/study" => "study",
+        "/api/study-progress" => "study_progress",
+        "/api/study/relevance" => "study_relevance",
+        "/api/study/game-context" => "study_game_context",
+        "/api/study/analysis-context" => "study_analysis_context",
+        "/api/study/analysis-line" => "study_analysis_line",
+        "/api/study/review-mark" => "study_review_mark",
+        "/api/study/saved-reviews" => "study_saved_reviews",
+        "/api/study/presence" => "study_presence",
+        "/api/repertoires" => "repertoires",
+        "/api/tactics" => "tactics",
+        "/api/tactics-collection" => "tactics_collection",
+        "/api/tactic-settings" => "tactic_settings",
+        "/api/games" => "games",
+        "/api/games/library" => "game_library",
+        "/api/games/job" => "game_refresh_status",
+        "/api/games/import" => "game_import",
+        "/api/games/refresh" => "game_refresh",
+        "/api/games/choose" => "game_choose",
+        "/api/games/reprocess" => "game_reprocess",
+        "/api/games/backfill" => "game_backfill",
+        "/api/games/backfill/retry" => "game_backfill_retry",
+        "/api/games/model" => "game_model",
+        "/api/games/gaps" => "game_gaps",
+        "/api/games/gap-draft" => "game_gap_draft",
+        "/api/games/review" => "game_review",
+        "/api/games/gap-analysis" => "game_gap_analysis",
+        "/api/games/gap-explorer" => "game_gap_explorer",
+        "/api/games/detectors" => "game_detectors",
+        "/api/games/detection" => "game_detection",
+        "/api/games/detection-result" => "game_detection_result",
+        "/api/games/tactics" => "tactics_status",
+        "/api/games/tactics/command" => "tactics_command",
+        "/api/games/tactics/position" => "tactics_position",
+        "/api/games/tactics/report" => "tactics_report",
+        "/api/analysis/evidence" => "analysis_evidence",
+        "/api/analysis/result" => "analysis_result",
+        "/" | "/index.html" => "ui_index",
+        path if path.starts_with("/assets/") => "ui_asset",
+        _ => "other",
+    }
+}
+
+/// A completed write records transport delivery only, never command acceptance.
+fn respond_traced<R: std::io::Read>(
+    request: Request,
+    mut response: Response<R>,
+) -> std::io::Result<()> {
+    let mut trace = crate::diagnostics::Span::new("http.write_response");
+    let status = response.status_code().0;
+    trace.field("status_code", status);
+    if let Some(id) = crate::diagnostics::current_request_id() {
+        response.add_header(field("X-Tempo-Request-Id", &id));
+    }
+    if let Some(id) = crate::diagnostics::run_id() {
+        response.add_header(field("X-Tempo-Run-Id", &id));
+    }
+    let result = request.respond(response);
+    let outcome = if result.is_ok() {
+        "written"
+    } else {
+        "io_error"
+    };
+    trace.set_outcome(outcome);
+    crate::diagnostics::emit(
+        "http.response",
+        serde_json::json!({
+            "operation":"http.write_response", "status_code":status, "outcome":outcome
+        }),
+    );
+    result
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::diagnostic_route;
+
+    #[test]
+    fn routes_never_include_payloads_or_query_values() {
+        assert_eq!(diagnostic_route("/api/study?token=secret"), "study");
+        assert_eq!(diagnostic_route("/api/private-player-name"), "other");
+        assert_eq!(
+            diagnostic_route("/assets/private-build-name.js"),
+            "ui_asset"
+        );
+        assert_eq!(diagnostic_route("https://example.com/api/study"), "other");
+    }
 }

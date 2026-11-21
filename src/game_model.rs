@@ -201,6 +201,7 @@ impl ModelJobs {
 
 impl GameModel {
     pub fn new(database: &Path) -> Result<Self, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("model.initialize");
         let (wake, queued) = sync_channel(1);
         let jobs = Arc::new(Mutex::new(ModelJobs::default()));
         let worker_jobs = Arc::clone(&jobs);
@@ -215,6 +216,7 @@ impl GameModel {
     }
 
     pub fn status(&self, app: &Tempo) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("model.status");
         let dataset = app.game_dataset()?;
         let mut status = {
             let jobs = self.jobs.lock().expect("model jobs");
@@ -231,6 +233,7 @@ impl GameModel {
     }
 
     pub fn start(&self, app: &Tempo, request: ModelRequest) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("model.dispatch");
         if app.game_dataset()? != request.dataset_id {
             return Err(AppError::new(
                 "stale_dataset",
@@ -247,6 +250,7 @@ impl GameModel {
     }
 
     pub fn project_cached(&self, dataset: DatasetId) -> Result<(), AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("model.schedule_cache");
         self.jobs.lock().expect("model jobs").request(
             WorkIntent::CacheRefresh,
             dataset,
@@ -277,6 +281,10 @@ fn model_worker(database: &Path, queued: Receiver<()>, jobs: &Mutex<ModelJobs>) 
             (next, retry_delay)
         };
         if let Some((dataset, intent, failures)) = next {
+            let mut trace = crate::diagnostics::Span::new(match intent {
+                WorkIntent::Analyze => "model.inference_job",
+                WorkIntent::CacheRefresh => "model.cached_projection",
+            });
             let explicit = intent == WorkIntent::Analyze;
             let outcome = run(
                 database,
@@ -293,6 +301,11 @@ fn model_worker(database: &Path, queued: Receiver<()>, jobs: &Mutex<ModelJobs>) 
                     }
                 },
             );
+            trace.set_outcome(match &outcome {
+                Ok((_, None)) => "complete",
+                Ok((_, Some(_))) => "incomplete",
+                Err(_) => "error",
+            });
             if explicit {
                 let mut state = jobs.lock().expect("model jobs");
                 state.active_explicit = None;
@@ -339,6 +352,7 @@ struct PreparedBook {
 
 impl PreparedBook {
     fn new(source: ProjectionBook) -> Result<Self, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("model.initialize");
         let authored = AuthoredRepertoire::parse(&source.pgn)
             .map_err(|error| domain("invalid_repertoire", error))?;
         let mut targets = BTreeMap::new();
@@ -467,6 +481,7 @@ fn run(
     intent: WorkIntent,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<(usize, Option<AppError>), AppError> {
+    let _diagnostic = crate::diagnostics::Span::new("model.run");
     let mut store = SqliteStore::open(database)?;
     let input = store.projection_books(dataset, intent.projection_scope())?;
     if input.is_empty() && intent == WorkIntent::Analyze {

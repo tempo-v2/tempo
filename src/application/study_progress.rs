@@ -34,6 +34,7 @@ impl Tempo {
         &self,
         known: Option<&ProgressStamp>,
     ) -> Result<Option<StudyProgress>, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.study_progress.study_progress");
         let daily = self
             .daily
             .as_ref()

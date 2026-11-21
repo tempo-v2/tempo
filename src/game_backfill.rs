@@ -207,6 +207,7 @@ pub struct BackfillCoordinator {
 
 impl BackfillCoordinator {
     pub fn start(app: &Tempo) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let _diagnostic = crate::diagnostics::Span::new("backfill.initialize");
         let (requests, receive) = sync_channel::<Request>(1);
         let (send, replies) = sync_channel(1);
         std::thread::Builder::new()
@@ -214,10 +215,10 @@ impl BackfillCoordinator {
             .spawn(move || {
                 let mut providers = PublicGames::default();
                 while let Ok((source, account, range)) = receive.recv() {
-                    if send
-                        .send(providers.fetch(source, &account, &range))
-                        .is_err()
-                    {
+                    let mut trace = crate::diagnostics::Span::new("backfill.fetch");
+                    let result = providers.fetch(source, &account, &range);
+                    trace.set_outcome(if result.is_ok() { "returned" } else { "error" });
+                    if send.send(result).is_err() {
                         break;
                     }
                 }
@@ -237,6 +238,7 @@ impl BackfillCoordinator {
     }
 
     pub fn current_status(&mut self, app: &Tempo) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("backfill.status");
         self.reconcile_dataset(app, app.game_dataset()?)?;
         Ok(self.status())
     }
@@ -268,6 +270,7 @@ impl BackfillCoordinator {
         app: &mut Tempo,
         mut request: BackfillRequest,
     ) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("backfill.begin");
         check_id(&request.command_id)?;
         self.require_dataset(app, &request.dataset_id)?;
         for account in [&mut request.lichess, &mut request.chess_com]
@@ -315,6 +318,7 @@ impl BackfillCoordinator {
     }
 
     pub fn retry(&mut self, app: &mut Tempo, request: BackfillRetry) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("backfill.retry");
         check_id(&request.command_id)?;
         check_id(&request.job_id)?;
         self.require_dataset(app, &request.dataset_id)?;
@@ -380,6 +384,7 @@ impl BackfillCoordinator {
     }
 
     pub fn poll(&mut self, app: &mut Tempo) {
+        let _diagnostic = crate::diagnostics::Span::new("backfill.poll");
         if app
             .game_dataset()
             .and_then(|active| self.reconcile_dataset(app, active))
@@ -404,6 +409,7 @@ impl BackfillCoordinator {
     }
 
     fn advance(&mut self, app: &mut Tempo) -> Result<(), AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("backfill.advance");
         let job = self.job.as_mut().expect("active job");
         if let Some(mut applying) = self.applying.take() {
             let window = &job.windows[applying.index];
@@ -562,6 +568,7 @@ impl BackfillCoordinator {
 }
 
 fn split_window(app: &mut Tempo, job: &mut BackfillJob, index: usize) -> Result<(), AppError> {
+    let _diagnostic = crate::diagnostics::Span::new("backfill.split_window");
     let window = &job.windows[index];
     let middle = window.from_ms + (window.to_ms - window.from_ms) / 2;
     let mut next = job.clone();

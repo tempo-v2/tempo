@@ -17,6 +17,7 @@ use tempo_study::{check_open::check_open, complete_ungraded};
 
 impl Tempo {
     pub(super) fn acknowledge(&mut self, command: SubmitCommand) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.teach.acknowledge");
         let scope = StudyScope {
             attempt: Some(&command.attempt_id),
             submission: Some(&command.submission_id),
@@ -35,7 +36,10 @@ impl Tempo {
                 "This activity is a blind test.",
             ));
         }
-        check_open(&old.attempt, command.expected_revision).map_err(study_input)?;
+        crate::diagnostics::measure("study.check_open", || {
+            check_open(&old.attempt, command.expected_revision)
+        })
+        .map_err(study_input)?;
         let (item, prior) = snapshot
             .target(&old.attempt.target)?
             .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
@@ -47,15 +51,17 @@ impl Tempo {
                 ),
                 _ => AppError::new("invalid_content", "The shown move is unavailable."),
             })?;
-        let attempt = complete_ungraded(&old.attempt, command.expected_revision, next)
-            .map_err(study_input)?;
+        let attempt = crate::diagnostics::measure("study.complete_ungraded", || {
+            complete_ungraded(&old.attempt, command.expected_revision, next)
+        })
+        .map_err(study_input)?;
         let at = self.components.clock.now();
         let state = match old.mode {
-            ActivityMode::Repair => {
+            ActivityMode::Repair => crate::diagnostics::measure("learning.repair", || {
                 DailyLearning::repair(prior, item.version, old.issued_miss_revision, at)
-            }
+            }),
             _ if prior.miss_revision != old.issued_miss_revision => Ok(prior.clone()),
-            _ => DailyLearning::teach(prior, at),
+            _ => crate::diagnostics::measure("learning.teach", || DailyLearning::teach(prior, at)),
         }
         .map_err(|error| domain("learning_error", error))?;
         let reply = AnswerResult {

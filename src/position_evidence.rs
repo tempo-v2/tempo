@@ -87,6 +87,7 @@ pub struct EvidenceRead {
 }
 
 struct Job {
+    diagnostic_context: Option<String>,
     request: EvidenceRequest,
     key: PositionKey,
     legal: Vec<String>,
@@ -137,6 +138,7 @@ impl PositionEvidence {
         }
     }
     pub fn read(&self, read: EvidenceRead) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("evidence.read");
         self.jobs
             .lock()
             .expect("position evidence")
@@ -151,6 +153,7 @@ impl PositionEvidence {
             })
     }
     pub fn start(&self, request: EvidenceRequest) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("evidence.dispatch");
         check_id(&request.request_id)?;
         let key = StandardPositionCanonicalizer
             .canonicalize(&request.fen)
@@ -197,6 +200,7 @@ impl PositionEvidence {
         if let Some(old) = jobs.waiting.insert(
             source,
             Job {
+                diagnostic_context: crate::diagnostics::capture_context(),
                 request,
                 key,
                 legal,
@@ -234,7 +238,12 @@ fn run_source(source: Source, state: Arc<Mutex<Jobs>>, services: Arc<Services>) 
                 }
             }
         };
-        let result = services.read(&job);
+        let result = crate::diagnostics::with_context(job.diagnostic_context.clone(), || {
+            let mut trace = crate::diagnostics::Span::new("evidence.worker");
+            let result = services.read(&job);
+            trace.set_outcome(if result.is_ok() { "complete" } else { "error" });
+            result
+        });
         let r = job.request;
         let mut reply = json!({"fen":r.fen,"request_id":r.request_id,"source":source});
         match result {
@@ -257,6 +266,7 @@ fn run_source(source: Source, state: Arc<Mutex<Jobs>>, services: Arc<Services>) 
 
 impl Services {
     fn read(&self, job: &Job) -> Result<Value, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("evidence.source_read");
         let r = &job.request;
         match r.source {
             Source::Stockfish => {
@@ -291,7 +301,10 @@ impl Services {
                     } else if job.legal.is_empty() {
                         BTreeMap::new()
                     } else {
-                        let mut worker = self.maia.lock().expect("interactive Maia");
+                        let mut worker = {
+                            let _wait = crate::diagnostics::Span::new("maia.lock_wait");
+                            self.maia.lock().expect("interactive Maia")
+                        };
                         if worker.is_none() {
                             *worker = Some(Maia::start(&self.directory)?);
                         }
@@ -373,6 +386,7 @@ mod tests {
         let make_job = |fen: &str| {
             let key = StandardPositionCanonicalizer.canonicalize(fen).unwrap();
             Job {
+                diagnostic_context: None,
                 legal: legal_model_moves(&key).unwrap(),
                 key,
                 request: EvidenceRequest {

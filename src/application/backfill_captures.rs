@@ -13,6 +13,8 @@ impl Tempo {
         saved_sources: &BTreeSet<String>,
         apply: bool,
     ) -> Result<Value, AppError> {
+        let _diagnostic =
+            crate::diagnostics::Span::new("app.backfill_captures.backfill_personal_tactics");
         if self.daily.is_none() {
             return Err(AppError::new("unsupported", "Use the local study release."));
         }
@@ -43,8 +45,10 @@ impl Tempo {
             let prior = &snapshot.learning[&item.target];
             let state = if !prior.introduced {
                 introduced += 1;
-                DailyLearning::introduce_capture(prior, at)
-                    .map_err(|error| domain("learning_error", error))?
+                crate::diagnostics::measure("learning.introduce_capture", || {
+                    DailyLearning::introduce_capture(prior, at)
+                })
+                .map_err(|error| domain("learning_error", error))?
             } else if prior.due.is_some_and(|due| due > at.day) {
                 brought_forward += 1;
                 let mut state = prior.clone();

@@ -16,11 +16,12 @@ use tempo_chess::ContentItem;
 use tempo_learning::{DailyAction, ImmediateRecallMode};
 use tempo_queue::{
     DailyActivity, DailyAdmissions, DailyCandidate, DailyChoice, DailyContext, DailyEvidence,
-    DailyKind, DailySelection, DailySelectionInput, DailySession, ImmediateRecall, Line,
-    RelevanceReason, TargetRelevance,
+    DailyKind, DailyOrderingEffect, DailySelection, DailySelectionInput, DailySession,
+    ImmediateRecall, Line, RelevanceReason, TargetRelevance,
 };
 use tempo_store::{
-    ActivityMode, AnswerResult, Commit, Store, StoredAttempt, StudyScope, StudyState, Write,
+    ActivityMode, AnswerResult, Commit, Store, StoredAttempt, StudyOrderingWrite, StudyScope,
+    StudyState, Write,
 };
 use tempo_study::{Exercise, start_selected_exercise};
 use tempo_types::{DatasetId, StudyTime};
@@ -59,6 +60,7 @@ impl Tempo {
         preview_key: [u8; 32],
         more_tactics: usize,
     ) -> Result<Self, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.daily.daily");
         let mut app = Self::assemble(store, components, None)?;
         app.daily = Some(DailyStudy {
             limits,
@@ -77,6 +79,7 @@ impl Tempo {
         at: StudyTime,
         extra_tactics: usize,
     ) -> Result<DailySelection, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.daily.daily_selection");
         let daily = self.daily.as_ref().expect("daily release");
         let (catalog, learning) = snapshot.complete_catalog()?;
         let mut admissions = DailyAdmissions::default();
@@ -215,20 +218,22 @@ impl Tempo {
             }
             _ => None,
         };
-        Ok(daily.queue.select_daily(DailySelectionInput {
-            context: DailyContext {
-                seed,
-                today: at.day,
-                repertoire_limit: daily.limits.repertoire,
-                tactics_limit: daily.limits.tactics.saturating_add(extra_tactics),
-            },
-            candidates: &candidates,
-            routes: &routes,
-            admissions,
-            required_activity,
-            new_tactic_order: order.as_ref(),
-            capture_priority: &capture_priority,
-            evidence: &evidence,
+        Ok(crate::diagnostics::measure("queue.select_daily", || {
+            daily.queue.select_daily(DailySelectionInput {
+                context: DailyContext {
+                    seed,
+                    today: at.day,
+                    repertoire_limit: daily.limits.repertoire,
+                    tactics_limit: daily.limits.tactics.saturating_add(extra_tactics),
+                },
+                candidates: &candidates,
+                routes: &routes,
+                admissions,
+                required_activity,
+                new_tactic_order: order.as_ref(),
+                capture_priority: &capture_priority,
+                evidence: &evidence,
+            })
         }))
     }
 
@@ -250,6 +255,7 @@ impl Tempo {
         dataset_id: DatasetId,
         selection: DailySelection,
     ) -> StudyView {
+        let _diagnostic = crate::diagnostics::Span::new("app.daily.daily_summary");
         let more = self.daily.as_ref().expect("daily release").more_tactics;
         let done = selection.outstanding == 0;
         StudyView::Empty(EmptyView {
@@ -274,6 +280,7 @@ impl Tempo {
         at: StudyTime,
         choice: DailyChoice,
     ) -> Result<AnswerResult, AppError> {
+        let _diagnostic = crate::diagnostics::Span::new("app.daily.issue_daily");
         let (item, learning) = snapshot
             .target(&choice.target)?
             .ok_or_else(|| AppError::new("stale_content", "selected target is unavailable"))?;
@@ -288,12 +295,14 @@ impl Tempo {
             version: item.version,
             definition: item.definition.clone(),
         };
-        let attempt = start_selected_exercise(
-            &exercise,
-            self.components.grader.as_ref(),
-            snapshot.dataset.clone(),
-            || self.components.ids.next_id(),
-        )
+        let attempt = crate::diagnostics::measure("study.start_selected_exercise", || {
+            start_selected_exercise(
+                &exercise,
+                self.components.grader.as_ref(),
+                snapshot.dataset.clone(),
+                || self.components.ids.next_id(),
+            )
+        })
         .map_err(|error| domain("invalid_content", error))?;
         let mut record = StoredAttempt {
             attempt: attempt.clone(),
@@ -345,19 +354,21 @@ impl Tempo {
             Write::Issue(record),
             Write::Active(Some(attempt.id.clone())),
         ];
-        if let Some(request_id) = choice.immediate_request {
-            self.store.commit_immediate_recall(
-                Commit {
-                    expected_revision: snapshot.revision,
-                    expected_dataset: snapshot.dataset.clone(),
-                    writes,
-                },
-                scope,
-                request_id,
-            )?;
-        } else {
-            self.commit_study(snapshot, writes, scope)?;
-        }
+        let ordering = match choice.ordering {
+            DailyOrderingEffect::Preserve => StudyOrderingWrite::Preserve,
+            DailyOrderingEffect::OweRegularReview => StudyOrderingWrite::OweRegularReview,
+            DailyOrderingEffect::SatisfyRegularReview => StudyOrderingWrite::SatisfyRegularReview,
+        };
+        self.store.commit_daily_issuance(
+            Commit {
+                expected_revision: snapshot.revision,
+                expected_dataset: snapshot.dataset.clone(),
+                writes,
+            },
+            scope,
+            choice.immediate_request,
+            ordering,
+        )?;
         self.daily
             .as_mut()
             .expect("daily release")
