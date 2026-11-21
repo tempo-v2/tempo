@@ -62,11 +62,15 @@ impl Tempo {
                     .get_mut(&change.target)
                     .expect("planned target");
                 let lead_in = std::mem::take(&mut retained.opponent_lead_in);
+                let game_capture = retained.game_capture.take();
                 retained.clone_from(existing);
-                change.kind = if lead_in == retained.opponent_lead_in {
+                change.kind = if lead_in == retained.opponent_lead_in
+                    && game_capture == retained.game_capture
+                {
                     ChangeKind::Unchanged
                 } else {
                     retained.opponent_lead_in = lead_in;
+                    retained.game_capture = game_capture;
                     ChangeKind::Metadata
                 };
             }

@@ -1,6 +1,5 @@
 //! Dispatch a transport intent and project the board from the issued definition.
 use super::Tempo;
-use super::tactic_catalog_facts::legacy_game_capture;
 use crate::{
     AppError,
     app_error::domain,
@@ -215,11 +214,11 @@ impl Tempo {
             return false;
         }
         if let Some(origin) = &record.tactic_attribution {
-            return origin.game.is_some() || legacy_game_capture(&origin.provenance);
+            return origin.game.is_some() || origin.game_capture.is_some();
         }
         // Pre-snapshot attempts may still have an exact retained game request.
         let attempt = &record.attempt;
-        legacy_game_capture(&item.provenance)
+        item.game_capture.is_some()
             || self
                 .store
                 .tactic_game_origin(

@@ -841,7 +841,7 @@ fn practice_failure_and_cross_midnight_allowance_replay_preserve_learning() {
 
 #[test]
 fn later_tactic_correction_uses_the_issued_move_and_explicit_game_capture() {
-    use tempo_chess::{TacticRecord, compile_tactics};
+    use tempo_chess::{GameCapture, TacticRecord, compile_tactics};
 
     for from_game in [true, false] {
         let directory = tempfile::tempdir().unwrap();
@@ -855,20 +855,39 @@ fn later_tactic_correction_uses_the_issued_move_and_explicit_game_capture() {
             },
             0,
         );
-        let mut provenance = vec!["tempo1:source_kind:game".into()];
-        if from_game {
-            provenance.push("tempo1:capture:fixture".into());
-        }
-        let catalog = compile_tactics(&[TacticRecord {
+        let primary = TacticRecord {
             namespace: "explanation-fixture".into(),
             source_id: "later-pin".into(),
             solver_fen: "4k3/7p/2n5/8/8/8/4B3/6K1 w - - 0 1".into(),
             solution: ["g1h1", "h7h6", "e2b5"].map(str::to_owned).to_vec(),
             label: "A tactic from a game".into(),
-            provenance,
-        }])
-        .unwrap();
+            provenance: vec![
+                "tempo1:capture:manual".into(),
+                "tempo1:source_kind:manual".into(),
+            ],
+        };
+        let alias = TacticRecord {
+            source_id: "same-pin-with-an-unattached-tag".into(),
+            provenance: vec!["tempo1:source_kind:game".into()],
+            ..primary.clone()
+        };
+        let target = primary.target_id();
+        let mut catalog = compile_tactics(&[primary, alias]).unwrap();
+        if from_game {
+            catalog.items.get_mut(&target).unwrap().game_capture = Some(GameCapture {
+                capture_id: "reviewed-capture-record".into(),
+            });
+        }
         app.apply_tactic_transfer(&catalog).unwrap();
+        let imported = app.snapshot().unwrap();
+        assert_eq!(imported.catalog.items.len(), 1);
+        let merged = imported.catalog.items.values().next().unwrap();
+        assert!(
+            merged
+                .provenance
+                .iter()
+                .any(|value| value == "tempo1:capture:manual")
+        );
         let first = study(&mut app, json!({"command":"next"}));
         assert_eq!(first["activity"], "test");
         assert!(first["feedback"].is_null());

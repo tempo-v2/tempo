@@ -111,14 +111,3 @@ pub(crate) fn saved_pgn_source(source: &str) -> bool {
         .strip_prefix("pgn:")
         .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|c| c.is_ascii_hexdigit()))
 }
-
-/// The Tempo 1 converter retains the capture record and its recorded source kind.
-pub(super) fn legacy_game_capture(provenance: &[String]) -> bool {
-    provenance.iter().any(|entry| {
-        entry
-            .strip_prefix("tempo1:capture:")
-            .is_some_and(|id| !id.trim().is_empty())
-    }) && provenance
-        .iter()
-        .any(|entry| entry == "tempo1:source_kind:game")
-}

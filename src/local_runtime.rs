@@ -1,6 +1,7 @@
 //! File-backed composition for the matched local study release.
 mod http;
 mod import;
+pub use import::{GameCaptureBackfill, backfill_game_capture_origins};
 mod study_lead_ins;
 pub use study_lead_ins::backfill_study_lead_ins;
 mod tactic_settings;

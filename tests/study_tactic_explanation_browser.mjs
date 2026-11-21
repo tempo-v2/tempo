@@ -16,6 +16,7 @@ const api = "**/api/study";
 const boardLabel = '[aria-label="Study chessboard"]';
 const clueId = "#study-tactic-clue";
 const seed = join(scratch, "baseline.sqlite");
+const splitAliasSeed = join(scratch, "split-origin.sqlite");
 const solution = ["g1h1", "h7h6", "e2b5"];
 let server, browser;
 
@@ -76,26 +77,36 @@ function durable(db) {
 
 try {
   const transfer = join(scratch, "tactics.json");
-  await writeFile(transfer, JSON.stringify({
-    schema_version: 1,
-    puzzles: [{
-      namespace: "study-feedback-fixture", source_id: "later-pin", label: "Game tactic",
-      solver_fen: "4k3/7p/2n5/8/8/8/4B3/6K1 w - - 0 1", solution,
-      provenance: ["tempo1:capture:later-pin", "tempo1:source_kind:game"],
-    }],
-  }));
-  execFileSync(binary, ["init", seed]);
-  execFileSync(binary, ["import-tactics", seed, transfer]);
-  const seedUrl = await serve(seed);
-  const issued = await post(seedUrl, { command: "next" });
-  assert.equal(issued.activity, "test");
-  await stop();
+  const solver_fen = "4k3/7p/2n5/8/8/8/4B3/6K1 w - - 0 1";
+  const base = { namespace: "tempo1-card", source_id: "later-pin", label: "Game tactic", solver_fen, solution };
+  const captured = {
+    ...base, provenance: ["tempo1:capture:later-pin", "tempo1:source_kind:game"],
+    legacy_game_captures: [{ capture_id: "later-pin", solver_fen, solution }],
+  };
+  const manual = { ...base, provenance: ["tempo1:capture:manual", "tempo1:source_kind:manual"] };
+  const orphan = {
+    ...base, source_id: "orphan-game-tag", provenance: ["tempo1:source_kind:game"],
+    legacy_game_captures: [{ capture_id: "different-line", solver_fen, solution: ["e2d3"] }],
+  };
+  async function issue(database, puzzles) {
+    await writeFile(transfer, JSON.stringify({ schema_version: 1, puzzles }));
+    execFileSync(binary, ["init", database]);
+    execFileSync(binary, ["import-tactics", database, transfer]);
+    const seedUrl = await serve(database);
+    const issued = await post(seedUrl, { command: "next" });
+    assert.equal(issued.activity, "test");
+    await stop();
+    return issued.attempt_id;
+  }
+  const gameAttempt = await issue(seed, [captured]);
+  const splitAliasAttempt = await issue(splitAliasSeed, [manual, orphan]);
 
   browser = await chromium.launch({ channel: "chrome", headless: true });
   const results = [];
-  for (const [index, name] of ["Game tactic", "Renamed", null].entries()) {
+  for (const [index, name] of ["Game tactic", "Renamed", null, "Split origin"].entries()) {
+    const capturedFromGame = index !== 3;
     const db = join(scratch, `case-${index}.sqlite`);
-    await copyFile(seed, db);
+    await copyFile(capturedFromGame ? seed : splitAliasSeed, db);
     const url = await serve(db);
     const page = await browser.newPage({ viewport: { width: 1250, height: 850 } });
     page.setDefaultTimeout(8000);
@@ -139,10 +150,19 @@ try {
     await page.locator(".study-board .orientation-black").waitFor();
     await move(page, "e2d3", true);
     await button("Retry").click();
-    await clue.waitFor();
-    const text = await clue.innerText();
-    assert.match(text, /After Bb5, the bishop on b5 pins the knight on c6.*king on e8/);
-    const fragments = [",e2,b5,blue", ",b5,e8,green", ",c6,green", ",e8,green"];
+    await page.getByText(/Play Bb5/).waitFor();
+    let text = null;
+    if (capturedFromGame) {
+      await clue.waitFor();
+      text = await clue.innerText();
+      assert.match(text, /After Bb5, the bishop on b5 pins the knight on c6.*king on e8/);
+    } else {
+      assert.equal(await clue.count(), 0);
+      assert.equal(await page.locator(boardLabel + ' g[cgHash*=",green"]').count(), 0);
+    }
+    const fragments = capturedFromGame
+      ? [",e2,b5,blue", ",b5,e8,green", ",c6,green", ",e8,green"]
+      : [",e2,b5,blue"];
     await page.waitForFunction(([label, fragments]) => {
       const shapes = [...document.querySelectorAll(label + " svg.cg-shapes g[cgHash]")]
         .map(shape => shape.getAttribute("cgHash"));
@@ -156,13 +176,15 @@ try {
     assert.equal(await clue.count(), 0);
     assert.equal(await page.locator(boardLabel + ' g[cgHash*=",green"]').count(), 0);
     await button("Return to current position").click();
-    await clue.waitFor();
+    if (capturedFromGame) await clue.waitFor();
     await move(page, solution[2], true);
     await button("Continue").waitFor();
     assert.equal(await clue.count(), 0);
     await page.getByText("Completed after correction. Review recorded as Again.").waitFor();
     const beforeNext = durable(db);
-    assert.deepEqual(beforeNext.grades, [{ attempt_id: issued.attempt_id, grade: "again" }]);
+    assert.deepEqual(beforeNext.grades, [{
+      attempt_id: capturedFromGame ? gameAttempt : splitAliasAttempt, grade: "again",
+    }]);
     assert.equal(beforeNext.receipts.length, 3);
     failNext = true;
     await button("Continue").click();
@@ -177,7 +199,7 @@ try {
   }
   assert.deepEqual(results[1], results[0]);
   assert.deepEqual(results[2], results[0]);
-  console.log("Chrome verified the later pin, flipped board, history, name invariance, exact Answer replay, and Retry Next.");
+  console.log("Chrome verified the later pin, source matching, ordinary correction for split aliases, flipped board, history, name invariance, exact Answer replay, and Retry Next.");
 } finally {
   await browser?.close();
   await stop();
