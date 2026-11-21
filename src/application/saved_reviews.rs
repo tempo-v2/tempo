@@ -1,9 +1,14 @@
 //! Save references to reached Study decisions and disclose them through Analysis.
 use super::{Tempo, study_analysis_context::analysis_disclosure};
-use crate::{AppError, app_error::domain};
+use crate::{
+    AppError,
+    app_error::{domain, study_input},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tempo_store::{AcceptanceKind, ReviewCommandKey, ReviewPosition, ReviewWrite};
+use tempo_store::{
+    AcceptanceKind, ReviewCommandKey, ReviewPosition, ReviewWrite, TacticExclusionRead,
+};
 use tempo_study::AttemptStatus;
 use tempo_types::{AttemptId, ContentVersion, DatasetId};
 
@@ -139,24 +144,42 @@ impl Tempo {
                 dataset_id,
                 id,
                 submission_id,
+            } => {
+                let fingerprint = command_fingerprint("remove", &command)?;
+                let key = command_key(dataset_id, submission_id, &fingerprint)?;
+                let id = self
+                    .store
+                    .write_saved_review(&key, ReviewWrite::Remove(*id))?;
+                Ok(json!({"status": "removed", "id": id, "submission_id": submission_id}))
             }
-            | SavedStudyReviewCommand::ExcludeTactic {
+            SavedStudyReviewCommand::ExcludeTactic {
                 dataset_id,
                 id,
                 submission_id,
             } => {
-                let (kind, status, change) = match command {
-                    SavedStudyReviewCommand::ExcludeTactic { .. } => (
-                        "exclude_tactic",
-                        "excluded",
-                        ReviewWrite::ExcludeTactic(*id),
-                    ),
-                    _ => ("remove", "removed", ReviewWrite::Remove(*id)),
-                };
-                let fingerprint = command_fingerprint(kind, &command)?;
+                let fingerprint = command_fingerprint("exclude_tactic", &command)?;
                 let key = command_key(dataset_id, submission_id, &fingerprint)?;
-                let id = self.store.write_saved_review(&key, change)?;
-                Ok(json!({"status": status, "id": id, "submission_id": submission_id}))
+                let id = match self.store.tactic_exclusion(&key, *id)? {
+                    TacticExclusionRead::Accepted(id) => id,
+                    TacticExclusionRead::Pending { revision, active } => {
+                        let abandoned = active
+                            .as_deref()
+                            .map(|attempt| {
+                                tempo_study::abandon(attempt, attempt.revision).map(Box::new)
+                            })
+                            .transpose()
+                            .map_err(study_input)?;
+                        self.store.write_saved_review(
+                            &key,
+                            ReviewWrite::ExcludeTactic {
+                                id: *id,
+                                expected_revision: revision,
+                                abandoned,
+                            },
+                        )?
+                    }
+                };
+                Ok(json!({"status": "excluded", "id": id, "submission_id": submission_id}))
             }
         }
     }

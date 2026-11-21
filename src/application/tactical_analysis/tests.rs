@@ -282,6 +282,39 @@ fn study_removal_keeps_game_origin_and_blocks_the_retained_request_after_rescan(
         })
     );
     let before = app.snapshot().unwrap();
+    let key = tempo_store::ReviewCommandKey {
+        dataset,
+        submission: "invalid-exclusion",
+        fingerprint: "invalid-exclusion-fixture",
+    };
+    let mark_id = marked["id"].as_i64().unwrap();
+    let wrong_revision = tempo_types::Revision(before.revision.0 + 1);
+    for revision in [wrong_revision, before.revision] {
+        assert!(
+            app.store
+                .write_saved_review(
+                    &key,
+                    tempo_store::ReviewWrite::ExcludeTactic {
+                        id: mark_id,
+                        expected_revision: revision,
+                        abandoned: None,
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(app.snapshot().unwrap(), before);
+        assert!(app.store.saved_review_receipt(&key).unwrap().is_none());
+        assert!(
+            !app.store
+                .study_state(tempo_store::StudyScope {
+                    target: Some(target),
+                    ..Default::default()
+                })
+                .unwrap()
+                .excluded_tactics
+                .contains(target)
+        );
+    }
     let removal = json!({
         "command": "exclude_tactic", "dataset_id": dataset,
         "id": marked["id"], "submission_id": "exclude-game-card",
