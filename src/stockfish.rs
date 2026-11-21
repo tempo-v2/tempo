@@ -97,7 +97,10 @@ pub(crate) fn stockfish_until(
     };
     let _diagnostic = crate::diagnostics::Span::new("engine.evaluate");
     let _request = Foreground::request();
-    let slot_deadline = Instant::now() + remaining(Duration::from_secs(2));
+    // A line starts as soon as the first response is staged. The editor may
+    // still be evaluating that starting board on the shared engine.
+    let slot_wait = if deadline.is_some() { 10 } else { 2 };
+    let slot_deadline = Instant::now() + remaining(Duration::from_secs(slot_wait));
     let _slot = loop {
         match ENGINE_SLOT.try_lock() {
             Ok(slot) => break slot,
