@@ -691,24 +691,11 @@ fn respond_inner(
                 command::<crate::coverage_scan::ReadCoverage>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.coverage.read(app, intent)),
             ),
-            (&Method::Get, "/api/games/gaps") => (
-                200,
-                games
-                    .coverage
-                    .gaps(app, None)
-                    .and_then(|forecast| app.opponent_gaps_with_forecasts(0, None, forecast)),
-            ),
+            (&Method::Get, "/api/games/gaps") => (200, app.opponent_gaps(0)),
             (&Method::Post, "/api/games/gaps") => (
                 200,
                 command::<GapPage>(&mut request, MAX_COMMAND_BYTES).and_then(|page| {
-                    let forecast = games
-                        .coverage
-                        .gaps(app, page.forecast_repertoire.as_deref())?;
-                    app.opponent_gaps_with_forecasts(
-                        page.offset,
-                        page.forecast_repertoire.as_deref(),
-                        forecast,
-                    )
+                    app.opponent_gap_page(page.offset, page.forecast_repertoire.as_deref())
                 }),
             ),
             (&Method::Get, "/api/games/gap-analysis") => (200, Ok(games.gap_analysis.status())),

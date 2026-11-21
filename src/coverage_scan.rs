@@ -16,10 +16,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempo_chess::{
-    AuthoredRepertoire, ContentKind, LearnerColor, PositionCanonicalizer, PositionKey, START_FEN,
-    StandardPositionCanonicalizer, legal_model_moves, legal_successors,
+    AuthoredRepertoire, ContentKind, LearnerColor, LearnerResponse, PositionCanonicalizer,
+    PositionKey, START_FEN, StandardPositionCanonicalizer, legal_successors,
 };
-use tempo_store::{CoverageSummary, ForecastGap, SqliteStore, Store};
+use tempo_store::{CoverageSummary, SqliteStore, Store};
 use tempo_types::DatasetId;
 
 const EXPLORER_LIMIT: usize = 128;
@@ -78,8 +78,7 @@ impl CoverageScan {
             return Err(stale_dataset());
         }
         let run = self.run.lock().expect("coverage scan");
-        let store = SqliteStore::open_read_only(&self.database)?;
-        let saved = store.coverage_summary(&request.dataset_id, &request.repertoire_id)?;
+        let saved = app.coverage_summary(&request.dataset_id, &request.repertoire_id)?;
         let active = run.as_ref().filter(|run| {
             run.request.dataset_id == request.dataset_id
                 && run.request.repertoire_id == request.repertoire_id
@@ -92,18 +91,9 @@ impl CoverageScan {
             "request_id": active.map(|run| &run.request.request_id),
             "positions": active.map(|run| run.positions),
             "error": active.and_then(|run| run.error.as_ref()).map(|error| &error.message),
-            "report": saved.as_ref().map(|(summary, _)| summary),
-            "stale": saved.is_some_and(|(_, stale)| stale),
+            "report": saved.as_ref().map(|saved| &saved.summary),
+            "stale": saved.is_some_and(|saved| saved.stale),
         }))
-    }
-
-    pub(crate) fn gaps(
-        &self,
-        app: &Tempo,
-        repertoire: Option<&str>,
-    ) -> Result<Vec<ForecastGap>, AppError> {
-        Ok(SqliteStore::open_read_only(&self.database)?
-            .forecast_gaps(&app.game_dataset()?, repertoire)?)
     }
 
     pub(crate) fn start(&self, app: &Tempo, request: StartCoverage) -> Result<Value, AppError> {
@@ -142,9 +132,8 @@ impl CoverageScan {
                     ));
                 }
             }
-            let store = SqliteStore::open_read_only(&self.database)?;
-            let saved = store.coverage_summary(&request.dataset_id, &request.repertoire_id)?;
-            if let Some((saved, _)) = &saved
+            let saved = app.coverage_summary(&request.dataset_id, &request.repertoire_id)?;
+            if let Some(saved) = saved.as_ref().map(|saved| &saved.summary)
                 && saved.request_id == request.request_id
             {
                 if saved.target_percent != request.target_percent
@@ -158,7 +147,7 @@ impl CoverageScan {
                 drop(active);
                 return self.read(app, address);
             }
-            if saved.as_ref().map(|(report, _)| &report.request_id)
+            if saved.as_ref().map(|saved| &saved.summary.request_id)
                 != request.prior_report_id.as_ref()
             {
                 return Err(AppError::new(
@@ -473,24 +462,29 @@ fn estimate(
         .canonicalize(START_FEN)
         .map_err(|error| domain("invalid_repertoire", error))?;
     let white = color == LearnerColor::White;
-    let plies = 2 * through_move - u8::from(white);
-    let mut frontier = BTreeMap::from([(root, 1.0_f64)]);
+    let start = if white {
+        match book
+            .learner_response(&root, color)
+            .map_err(|error| domain("invalid_repertoire", error))?
+        {
+            LearnerResponse::Prepared(next) => next.clone(),
+            _ => {
+                return Err(AppError::new(
+                    "invalid_repertoire",
+                    "The verified repertoire lacks its starting move.",
+                ));
+            }
+        }
+    } else {
+        root
+    };
+    let mut frontier = BTreeMap::from([(start, 1.0_f64)]);
     let mut probabilities = BTreeMap::new();
-    let mut terminal = BTreeMap::new();
-    for ply in 0..plies {
+    let mut responses = BTreeMap::new();
+    for _ in 0..(through_move - u8::from(white)) {
         let mut current: Vec<_> = std::mem::take(&mut frontier).into_iter().collect();
         current.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (position, mass) in current {
-            if (ply % 2 == 0) == white {
-                let next = book.saved_successor(&position, color).ok_or_else(|| {
-                    AppError::new(
-                        "invalid_repertoire",
-                        "The verified repertoire lacks its starting move.",
-                    )
-                })?;
-                *frontier.entry(next.clone()).or_default() += mass;
-                continue;
-            }
             let next =
                 legal_successors(&position).map_err(|error| domain("invalid_repertoire", error))?;
             if next.is_empty() {
@@ -510,18 +504,24 @@ fn estimate(
                     continue;
                 };
                 attributed += path;
-                if book.saved_successor(after, color).is_some() {
-                    *frontier.entry(after.clone()).or_default() += path;
-                } else if *terminal
-                    .entry(after.clone())
-                    .or_insert_with(|| legal_model_moves(after).is_ok_and(|moves| moves.is_empty()))
-                {
-                    result.covered += path;
-                } else {
-                    *result
-                        .gaps
-                        .entry((position.clone(), played.clone()))
-                        .or_default() += path;
+                let response = match responses.entry(after.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::btree_map::Entry::Vacant(entry) => *entry.insert(
+                        book.learner_response(after, color)
+                            .map_err(|error| domain("invalid_repertoire", error))?,
+                    ),
+                };
+                match response {
+                    LearnerResponse::Prepared(next) => {
+                        *frontier.entry(next.clone()).or_default() += path
+                    }
+                    LearnerResponse::Terminal => result.covered += path,
+                    LearnerResponse::Missing => {
+                        *result
+                            .gaps
+                            .entry((position.clone(), played.clone()))
+                            .or_default() += path;
+                    }
                 }
             }
             result.unresolved += (mass - attributed).max(0.0);

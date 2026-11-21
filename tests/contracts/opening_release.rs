@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicI32, Ordering},
     },
 };
-use tempo::{Clock, DailyComponents, CounterIds, IntroductionLimits, Tempo, wire::StudyCommand};
+use tempo::{Clock, CounterIds, DailyComponents, IntroductionLimits, Tempo, wire::StudyCommand};
 use tempo_chess::{Catalog, ImportRequest, LearnerColor, LegalSequenceGrader, compile_repertoire};
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::{SqliteStore, Store};
@@ -906,6 +906,67 @@ fn captures_interrupt_only_the_next_selection_and_cost_no_introductions() {
         "already_applied"
     );
     assert_eq!(app.snapshot().unwrap(), graded);
+}
+
+#[test]
+fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
+    use tempo_chess::{PositionCanonicalizer, StandardPositionCanonicalizer};
+    use tempo_store::CoverageSummary;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("forecast-response.sqlite");
+    let mut app = open(
+        &database,
+        Arc::new(AtomicI32::new(20_000)),
+        IntroductionLimits::default(),
+        0,
+    );
+    let (_, saved) = preview_and_save(&mut app, "1. e4 e5 (1... c5) 2. Nf3 *", "Book", None);
+    let id = saved["repertoires"][0]["id"].as_str().unwrap();
+    let dataset = "opening-proof".into();
+    let mut store = SqliteStore::open(&database).unwrap();
+    let book = store.coverage_book(&dataset, id).unwrap().unwrap();
+    let position = StandardPositionCanonicalizer
+        .canonicalize("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+        .unwrap();
+    store
+        .publish_coverage(
+            &dataset,
+            id,
+            &book.input_key,
+            None,
+            &CoverageSummary {
+                request_id: "coverage-contract".into(),
+                through_move: 2,
+                target_percent: 90,
+                covered: 0.75,
+                unresolved: 0.0,
+                positions: 1,
+                explorer_positions: 0,
+                maia_positions: 1,
+                scanned_at_ms: 1,
+            },
+            &[(position, "c7c5".into(), 0.25)],
+        )
+        .unwrap();
+    let page = app.opponent_gaps(0).unwrap();
+    let [gap] = page["gaps"].as_array().unwrap().as_slice() else {
+        panic!("{page}")
+    };
+    assert_eq!(gap["games"], 0);
+    assert_eq!(gap["gap_kind"], "forecast");
+    assert_eq!(gap["forecast"]["probability"], 0.25);
+    let draft = app
+        .game_gap_draft(
+            serde_json::from_value(json!({
+                "dataset_id": dataset, "repertoire_id":id, "position":gap["position"],
+                "actual_move":gap["actual_move"], "document_revision":gap["document_revision"],
+                "gap_kind":gap["gap_kind"], "response":"g1f3",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(draft["save_token"].is_string(), "{draft}");
 }
 
 #[test]
@@ -2756,12 +2817,18 @@ fn study_analysis_exports_all_puzzle_plies_after_concession() {
             ContentVersion(view["content_version"].as_u64().unwrap()),
         )
     };
-    assert_eq!(context(&app, &view).unwrap_err().code, "analysis_requires_concession");
+    assert_eq!(
+        context(&app, &view).unwrap_err().code,
+        "analysis_requires_concession"
+    );
     assert_eq!(
         issued_analysis_line(&app, &view).unwrap_err().code,
         "analysis_requires_concession"
     );
-    let closed = study(&mut app, activity_command("concede", &view, "puzzle-analysis"));
+    let closed = study(
+        &mut app,
+        activity_command("concede", &view, "puzzle-analysis"),
+    );
     assert_eq!(closed["assessment"], "again");
     let before = app.snapshot().unwrap();
     let origin = context(&app, &closed).unwrap();
@@ -2771,7 +2838,10 @@ fn study_analysis_exports_all_puzzle_plies_after_concession() {
     let line = &exported["line"];
     assert_eq!(exported["scope"], "full_line");
     assert!(line["start_fen"].as_str().unwrap().contains(" b "));
-    let moves: Vec<_> = line["moves"].as_array().unwrap().iter()
+    let moves: Vec<_> = line["moves"]
+        .as_array()
+        .unwrap()
+        .iter()
         .map(|ply| ply["notation"].as_str().unwrap())
         .collect();
     assert_eq!(moves, ["1... c5", "2. Nf3", "2... d6", "3. d4"]);

@@ -11,9 +11,7 @@ use tempo_chess::{
     AuthoredRepertoire, ContentKind, GapDraft, LearnerColor, PositionKey, SavedRepertoireResponse,
     compile_repertoire, legal_move_labels,
 };
-use tempo_store::{
-    ForecastGap, ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets,
-};
+use tempo_store::{ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets};
 use tempo_types::{DatasetId, Revision};
 
 struct CheckedGap {
@@ -99,19 +97,33 @@ impl Tempo {
         ))
     }
 
-    pub fn opponent_gaps(&mut self, offset: usize) -> Result<Value, AppError> {
-        self.opponent_gaps_with_forecasts(offset, None, Vec::new())
+    pub(crate) fn coverage_summary(
+        &self,
+        dataset: &DatasetId,
+        repertoire: &str,
+    ) -> Result<Option<tempo_store::SavedCoverage>, AppError> {
+        if &self.game_dataset()? != dataset {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
+        }
+        Ok(self.store.coverage_summary(dataset, repertoire)?)
     }
 
-    pub(crate) fn opponent_gaps_with_forecasts(
+    pub fn opponent_gaps(&mut self, offset: usize) -> Result<Value, AppError> {
+        self.opponent_gap_page(offset, None)
+    }
+
+    pub(crate) fn opponent_gap_page(
         &mut self,
         offset: usize,
         forecast_book: Option<&str>,
-        forecasts: Vec<ForecastGap>,
     ) -> Result<Value, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.game_model.opponent_gaps");
         let dataset = self.game_dataset()?;
         let candidates = self.store.opponent_gaps(&dataset)?;
+        let forecasts = self.store.forecast_gaps(&dataset, forecast_book)?;
         if candidates.is_empty() && forecasts.is_empty() {
             return Ok(json!({"dataset_id":dataset,"gaps":[]}));
         }
