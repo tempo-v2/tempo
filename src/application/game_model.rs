@@ -7,7 +7,7 @@ use crate::{
     AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tempo_chess::{
     AuthoredRepertoire, ContentKind, GapDraft, LearnerColor, PositionKey, SavedRepertoireResponse,
     compile_repertoire, legal_move_labels,
@@ -130,50 +130,47 @@ impl Tempo {
             return Ok(json!({"dataset_id":dataset,"gaps":[]}));
         }
         let books = self.current_game_books(&dataset)?;
-        let observed: BTreeMap<_, _> = candidates
+        let observed_counts: BTreeMap<_, _> = candidates
             .iter()
-            .filter_map(|group| {
-                books
-                    .document_for_gap(&group.gap)
-                    .map(|revision| (&group.gap, (group.games, revision)))
-            })
+            .map(|group| (&group.gap, group.games))
             .collect();
         let mut ordered = Vec::new();
-        let mut forecast_by_gap = BTreeMap::new();
+        let mut forecast_keys = BTreeSet::new();
+        let limit = offset.saturating_add(101);
         // Store supplies forecasts in descending probability and observed
         // groups in descending count, both with stable identity ties.
         for forecast in &forecasts {
-            if ordered.len() >= offset.saturating_add(101) {
+            if ordered.len() == limit {
                 break;
             }
             let gap = &forecast.gap;
             if let Some(revision) = books.document_for_forecast(gap, forecast.stale) {
-                forecast_by_gap.insert(gap, (forecast, revision));
-                ordered.push(gap);
+                forecast_keys.insert(gap);
+                ordered.push((gap, revision, Some(forecast)));
             }
         }
         if forecast_book.is_none() {
-            ordered.extend(
-                candidates
-                    .iter()
-                    .map(|group| &group.gap)
-                    .filter(|gap| observed.contains_key(gap) && !forecast_by_gap.contains_key(gap)),
-            );
+            for group in &candidates {
+                if ordered.len() == limit {
+                    break;
+                }
+                if !forecast_keys.contains(&group.gap)
+                    && let Some(revision) = books.document_for_gap(&group.gap)
+                {
+                    ordered.push((&group.gap, revision, None));
+                }
+            }
         }
         let page: Vec<_> = ordered
             .into_iter()
             .skip(offset)
             .take(101)
-            .map(|gap| {
-                let found = forecast_by_gap.get(gap);
-                let (games, revision, kind) = if let Some((games, revision)) = observed.get(gap) {
-                    (*games, *revision, "observed")
+            .map(|(gap, revision, forecast)| {
+                let games = observed_counts.get(gap).copied().unwrap_or(0);
+                let kind = if forecast.is_some() {
+                    "forecast"
                 } else {
-                    (
-                        0,
-                        found.expect("a forecast row has a forecast").1,
-                        "forecast",
-                    )
+                    "observed"
                 };
                 let labels = legal_move_labels(&format!("{} 0 1", gap.position.0)).ok();
                 let san = labels
@@ -183,7 +180,7 @@ impl Tempo {
                     "repertoire_id":gap.repertoire_id, "position":gap.position,
                     "actual_move":gap.actual_move, "actual_san":san, "games":games,
                     "document_revision":revision, "gap_kind":kind,
-                    "forecast":found.map(|(forecast, _)| json!({
+                    "forecast":forecast.map(|forecast| json!({
                         "probability":forecast.probability, "stale":forecast.stale,
                         "report_id":forecast.report_id, "through_move":forecast.through_move,
                     })),

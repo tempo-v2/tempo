@@ -68,6 +68,7 @@ struct LineRun {
 
 struct Preview {
     anchor_fen: String,
+    anchor_route: Vec<String>,
     steps: Vec<Step>,
     reason: Stop,
     save: RepertoireInput,
@@ -169,6 +170,7 @@ impl CoverageScan {
             let preview = result?;
             reply["status"] = json!("ready");
             reply["anchor_fen"] = json!(preview.anchor_fen);
+            reply["anchor_route"] = json!(preview.anchor_route);
             reply["steps"] = json!(preview.steps);
             reply["stop"] = json!(preview.reason);
             if preview.steps.iter().filter(|step| step.learner).count() > 1 {
@@ -279,6 +281,7 @@ fn preview(
     }
     Ok(Preview {
         anchor_fen: input.anchor_fen,
+        anchor_route: accepted.anchor_route().to_vec(),
         steps,
         reason,
         save: RepertoireInput {
