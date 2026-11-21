@@ -1675,3 +1675,246 @@ fn a_tactical_request_does_not_record_whether_it_introduced_prior_learning() {
         "the request and Learning state cannot distinguish a pre-existing ungraded introduction"
     );
 }
+
+#[test]
+fn report_cache_bounds_warm_page_and_detail_work_as_the_archive_grows() {
+    use crate::personal_tactics_report::{ReportCache, WorkCounts, read_position};
+
+    for games in [36, 100] {
+        let (directory, mut app) = disposable();
+        let store =
+            tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
+        let dataset = app.game_dataset().unwrap();
+        let mut registry = DetectorRegistry::default();
+        registry
+            .register(tempo_chess::PersonalTacticsDetector(Evaluator {
+                revision: "report-cache",
+                outcome: "good",
+            }))
+            .unwrap();
+        let mut detector = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+        let mut jobs = TacticalJobs::new(&detector, &["personal-tactics"]);
+        for start in (0..games).step_by(30) {
+            let end = (start + 30).min(games);
+            let pgn = (start..end)
+                .map(|number| {
+                    let (fen, clock) = if number == 0 {
+                        ("7k/n7/8/8/8/8/7P/R5K1 w - - 0 1", "120+1")
+                    } else {
+                        (HANGING, if number == 1 { "120+1" } else { "60" })
+                    };
+                    format!(
+                        "[White \"Learner\"]\n[Black \"Opponent{number}\"]\n[TimeControl \"{clock}\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n[Result \"0-1\"]\n\n1. Kg2 0-1"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            assert_eq!(
+                app.import_game_pgn(GameImport {
+                    dataset_id: dataset.clone(),
+                    command_id: format!("report-cache-{start}"),
+                    learner: "Learner".into(),
+                    repertoire_id: None,
+                    pgn,
+                })
+                .unwrap()
+                .new_games as usize,
+                end - start
+            );
+            scan(&directory, &mut app, &mut detector, &mut jobs, end as u64);
+        }
+        let version = jobs.report_version();
+        let mut cache = ReportCache::default();
+        let request = |fields: Value| {
+            let mut input = json!({"dataset_id": dataset});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            serde_json::from_value(input).unwrap()
+        };
+        let first = cache.read(&store, version, request(json!({}))).unwrap();
+        assert_eq!(first["filtered_games"], games);
+        assert_eq!(first["loss_comparison"]["with_miss"]["losses"], games);
+        let first_work = WorkCounts {
+            pgns: games,
+            decisions: games,
+            aggregates: 1,
+            similarity: 0,
+            page_rows: 30,
+        };
+        assert_eq!(cache.work, first_work);
+        let stamp = &first["report_generation"];
+        let older_query = json!({"before": first["next_before"], "report_generation": stamp});
+        let older = cache.read(&store, version, request(older_query)).unwrap();
+        let older_len = (games - 30).min(30);
+        assert_eq!(older["games"].as_array().unwrap().len(), older_len);
+        assert_eq!(older["report_generation"], *stamp);
+        assert_eq!(older["loss_comparison"], first["loss_comparison"]);
+        assert_eq!(
+            cache.work,
+            WorkCounts {
+                page_rows: 30 + older_len,
+                ..first_work
+            }
+        );
+
+        let id = &older["games"][0]["id"];
+        let detail = read_position(
+            &store,
+            version,
+            serde_json::from_value(json!({"dataset_id":dataset,"id":id,"report_generation":stamp}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detail["detail"], older["detail"]);
+        let before_filter = cache.work;
+        let sparse_query = json!({"filters":{"clock":{"seconds":120,"increment":1}}});
+        let sparse = cache
+            .read(&store, version, request(sparse_query.clone()))
+            .unwrap();
+        assert_eq!(sparse["filtered_games"], 2);
+        assert_eq!(sparse["games"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            cache.work,
+            WorkCounts {
+                aggregates: before_filter.aggregates + 1,
+                page_rows: before_filter.page_rows + 2,
+                ..before_filter
+            }
+        );
+
+        let anchor = &sparse["games"][0]["id"];
+        let other = &sparse["games"][1]["id"];
+        let similar = |anchor: &Value| {
+            json!({
+                "filters":sparse_query["filters"], "anchor":anchor, "report_generation":stamp
+            })
+        };
+        let peers = cache
+            .read(&store, version, request(similar(anchor)))
+            .unwrap();
+        assert_eq!(peers["games"].as_array().unwrap().len(), 1);
+        assert_eq!(peers["games"][0]["id"], *other);
+        assert_eq!(peers["loss_comparison"], sparse["loss_comparison"]);
+        let reversed = cache
+            .read(&store, version, request(similar(other)))
+            .unwrap();
+        assert_eq!(reversed["games"][0]["id"], *anchor);
+        let before_repeat = cache.work;
+        assert_eq!(
+            cache
+                .read(&store, version, request(similar(anchor)))
+                .unwrap(),
+            peers
+        );
+        assert_eq!(
+            cache.work,
+            WorkCounts {
+                page_rows: before_repeat.page_rows + 1,
+                ..before_repeat
+            }
+        );
+
+        let rebuilt = ReportCache::default()
+            .read(&store, version, request(json!({})))
+            .unwrap();
+        assert_eq!(rebuilt, first);
+    }
+}
+
+#[test]
+fn a_deeper_rescan_advances_report_freshness_without_reparsing_the_archive() {
+    use crate::personal_tactics_report::{ReportCache, WorkCounts, read_position};
+    struct DeeperEvaluator(Evaluator);
+    impl TacticalEvaluator for DeeperEvaluator {
+        fn descriptor(&self) -> EvaluationProvenance {
+            self.0.descriptor()
+        }
+        fn evaluate(
+            &self,
+            request: &TacticalEvaluationRequest,
+            control: &dyn DetectionControl,
+        ) -> Result<RootEvaluation, EvaluationFailure> {
+            if control.deeper_search() {
+                self.0.evaluate(request, control)
+            } else {
+                Err(EvaluationFailure::Incomplete)
+            }
+        }
+    }
+
+    let (directory, mut app) = disposable();
+    let store = tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
+    let dataset = app.game_dataset().unwrap();
+    import(&mut app, "Deeper", "1. Rxa7");
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(tempo_chess::PersonalTacticsDetector(DeeperEvaluator(
+            Evaluator {
+                revision: "depth-stable",
+                outcome: "good",
+            },
+        )))
+        .unwrap();
+    let mut detector = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+    let mut jobs = TacticalJobs::new(&detector, &["personal-tactics"]);
+    jobs.force_idle_for_test();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        detector.poll(&mut app);
+        jobs.poll(&mut app, &store, &mut detector);
+        let status = read(&mut app, &jobs, &store);
+        if status["statistics"]["retryable_positions"] == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected a retryable position: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut cache = ReportCache::default();
+    let unpinned = || serde_json::from_value(json!({"dataset_id":dataset})).unwrap();
+    let before = cache
+        .read(&store, jobs.report_version(), unpinned())
+        .unwrap();
+    let generation = store.tactical_report_generation(&dataset).unwrap();
+    assert_eq!(before["loss_comparison"]["analyzed"], 0);
+    assert_eq!(before["games"].as_array().unwrap().len(), 1);
+    assert_eq!(before["games"][0]["outcome"], "uncertain");
+
+    store
+        .retry_position_analysis(&dataset, jobs.report_version())
+        .unwrap();
+    scan(&directory, &mut app, &mut detector, &mut jobs, 1);
+    let new_generation = store.tactical_report_generation(&dataset).unwrap();
+    assert_eq!(new_generation.archive, generation.archive);
+    assert!(new_generation.evidence > generation.evidence);
+    let version = jobs.report_version();
+    let id = &before["games"][0]["id"];
+    let stale =
+        json!({"dataset_id":dataset,"id":id,"report_generation":before["report_generation"]});
+    assert_eq!(
+        read_position(&store, version, serde_json::from_value(stale).unwrap())
+            .unwrap_err()
+            .code,
+        "report_changed"
+    );
+    let after = cache.read(&store, version, unpinned()).unwrap();
+    assert_eq!(after["games"].as_array().unwrap().len(), 1);
+    assert_eq!(after["games"][0]["id"], *id);
+    assert_eq!(after["games"][0]["outcome"], "played_tactic");
+    assert_eq!(after["loss_comparison"]["analyzed"], 1);
+    assert_ne!(before["report_generation"], after["report_generation"]);
+    assert_eq!(
+        cache.work,
+        WorkCounts {
+            pgns: 1,
+            decisions: 2,
+            aggregates: 2,
+            similarity: 0,
+            page_rows: 2,
+        }
+    );
+}
