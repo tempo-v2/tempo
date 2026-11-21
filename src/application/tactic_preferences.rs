@@ -29,7 +29,7 @@ pub enum TacticThemes {
 #[derive(Deserialize, Serialize)]
 pub struct TacticTheme {
     pub id: String,
-    name: String,
+    pub(super) name: String,
     group: String,
 }
 

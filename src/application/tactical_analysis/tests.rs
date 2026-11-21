@@ -246,6 +246,145 @@ fn accepted_miss_preserves_active_then_is_next_independently_of_display_name() {
 }
 
 #[test]
+fn study_removal_keeps_game_origin_and_blocks_the_retained_request_after_rescan() {
+    let (directory, mut app) = disposable();
+    let (mut detection, mut jobs) = host("1", "miss");
+    import(&mut app, "Source opponent", "1. Kg2 Kg7");
+    scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    let issued = app.next_exercise().unwrap().unwrap().attempt;
+    let dataset = &issued.dataset;
+    let target = &issued.target;
+    let marked = app.save_study_review(serde_json::from_value(json!({
+        "dataset_id": dataset, "attempt_id": issued.id, "content_version": issued.content_version,
+        "position": { "kind": "decision", "index": 0 }, "submission_id": "mark-game-card",
+    })).unwrap()).unwrap();
+    let read_details = |app: &Tempo, revision| {
+        app.study_card_details(dataset, &issued.id, revision, issued.content_version)
+    };
+    assert_eq!(
+        read_details(&app, issued.revision).unwrap_err().code,
+        "card_details_unavailable"
+    );
+    let missed = app
+        .submit(SubmitCommand {
+            dataset_id: dataset.clone(),
+            attempt_id: issued.id.clone(),
+            expected_revision: issued.revision,
+            submission_id: "miss-game-card".into(),
+            answer: "g1g2".into(),
+        })
+        .unwrap()
+        .attempt;
+    assert_eq!(
+        read_details(&app, missed.revision).unwrap()["details"],
+        json!({
+            "kind": "tactic", "sources": ["Game finding"],
+        })
+    );
+    let before = app.snapshot().unwrap();
+    let key = tempo_store::ReviewCommandKey {
+        dataset,
+        submission: "invalid-exclusion",
+        fingerprint: "invalid-exclusion-fixture",
+    };
+    let mark_id = marked["id"].as_i64().unwrap();
+    let wrong_revision = tempo_types::Revision(before.revision.0 + 1);
+    for revision in [wrong_revision, before.revision] {
+        assert!(
+            app.store
+                .write_saved_review(
+                    &key,
+                    tempo_store::ReviewWrite::ExcludeTactic {
+                        id: mark_id,
+                        expected_revision: revision,
+                        abandoned: None,
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(app.snapshot().unwrap(), before);
+        assert!(app.store.saved_review_receipt(&key).unwrap().is_none());
+        assert!(
+            !app.store
+                .study_state(tempo_store::StudyScope {
+                    target: Some(target),
+                    ..Default::default()
+                })
+                .unwrap()
+                .excluded_tactics
+                .contains(target)
+        );
+    }
+    let removal = json!({
+        "command": "exclude_tactic", "dataset_id": dataset,
+        "id": marked["id"], "submission_id": "exclude-game-card",
+    });
+    let exclude = |app: &mut Tempo| {
+        app.saved_study_reviews(serde_json::from_value(removal.clone()).unwrap())
+            .unwrap()
+    };
+    assert_eq!(exclude(&mut app)["status"], "excluded");
+    let after = app.snapshot().unwrap();
+    let reporting_store =
+        tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
+    let report = read(&app, &jobs, &reporting_store);
+    assert_eq!(report["statistics"]["pending_requests"], 0);
+    assert!(report["observations"][0]["request_id"].is_null());
+    assert_eq!(after.learning, before.learning);
+    assert_eq!(after.assessments, before.assessments);
+    assert_eq!(after.catalog, before.catalog);
+    assert!(after.active_attempt.is_none());
+    let abandoned = &after.attempts[&issued.id].attempt;
+    let details = read_details(&app, abandoned.revision).unwrap();
+    assert_eq!(
+        details["details"]["explanation"]["game"]["black"],
+        "Source opponent"
+    );
+    assert_eq!(details["details"]["explanation"]["game"]["half_move"], 1);
+    assert_eq!(
+        details["details"]["explanation"]["game"]["finding"],
+        "Hanging material"
+    );
+    assert_eq!(exclude(&mut app)["status"], "excluded");
+    assert_eq!(app.snapshot().unwrap(), after);
+    let (mut revised_worker, mut revised_jobs) = host("2", "miss");
+    scan(
+        &directory,
+        &mut app,
+        &mut revised_worker,
+        &mut revised_jobs,
+        1,
+    );
+    assert!(app.next_exercise().unwrap().is_none());
+    assert!(
+        app.store
+            .study_state(tempo_store::StudyScope {
+                target: Some(target),
+                ..Default::default()
+            })
+            .unwrap()
+            .excluded_tactics
+            .contains(target)
+    );
+
+    let current = app.snapshot().unwrap();
+    let mut revised_catalog = current.catalog;
+    let item = revised_catalog.items.get_mut(target).unwrap();
+    item.version = tempo_types::ContentVersion(issued.content_version.0 + 1);
+    item.label = "New catalog title".into();
+    item.definition.decisions[0].expected = "g1g2".into();
+    app.store
+        .commit(Commit {
+            expected_revision: current.revision,
+            expected_dataset: dataset.clone(),
+            writes: vec![Write::Catalog(revised_catalog)],
+        })
+        .unwrap();
+    assert_eq!(read_details(&app, abandoned.revision).unwrap(), details);
+    assert!(app.next_exercise().unwrap().is_none());
+}
+
+#[test]
 fn later_occurrence_survives_old_completion_reuses_learning_and_replays_after_restart() {
     let (directory, mut app) = disposable();
     let (mut detection, mut jobs) = host("1", "miss");
@@ -269,7 +408,23 @@ fn later_occurrence_survives_old_completion_reuses_learning_and_replays_after_re
         ActivityMode::Practice
     );
     let practice = answer(&mut app, &second, "a1a7", "second-puzzle-answer");
-    assert_eq!(app.submit(practice).unwrap().assessment, None);
+    let second_saved = app.submit(practice).unwrap();
+    assert_eq!(second_saved.assessment, None);
+    for (saved, opponent) in [
+        (&first_saved, "First opponent"),
+        (&second_saved, "Second opponent"),
+    ] {
+        let attempt = &saved.attempt;
+        let details = app
+            .study_card_details(
+                &attempt.dataset,
+                &attempt.id,
+                attempt.revision,
+                attempt.content_version,
+            )
+            .unwrap();
+        assert_eq!(details["details"]["explanation"]["game"]["black"], opponent);
+    }
     assert_eq!(
         app.snapshot().unwrap().learning[&first.attempt.target],
         learned

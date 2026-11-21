@@ -1,9 +1,14 @@
 //! Save references to reached Study decisions and disclose them through Analysis.
 use super::{Tempo, study_analysis_context::analysis_disclosure};
-use crate::{AppError, app_error::domain};
+use crate::{
+    AppError,
+    app_error::{domain, study_input},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tempo_store::{AcceptanceKind, ReviewCommandKey, ReviewPosition, ReviewWrite};
+use tempo_store::{
+    AcceptanceKind, ReviewCommandKey, ReviewPosition, ReviewWrite, TacticExclusionRead,
+};
 use tempo_study::AttemptStatus;
 use tempo_types::{AttemptId, ContentVersion, DatasetId};
 
@@ -35,11 +40,30 @@ pub enum SavedStudyReviewCommand {
         dataset_id: DatasetId,
         id: i64,
     },
+    Check {
+        dataset_id: DatasetId,
+        id: i64,
+    },
+    CardDetails {
+        dataset_id: DatasetId,
+        id: i64,
+    },
     Remove {
         dataset_id: DatasetId,
         id: i64,
         submission_id: String,
     },
+    ExcludeTactic {
+        dataset_id: DatasetId,
+        id: i64,
+        submission_id: String,
+    },
+}
+
+enum SavedReviewRead {
+    Analysis,
+    Authorization,
+    CardDetails,
 }
 
 impl Tempo {
@@ -128,7 +152,13 @@ impl Tempo {
                 Ok(json!({"status": "saved_reviews", "rows": rows, "next": next}))
             }
             SavedStudyReviewCommand::Open { dataset_id, id } => {
-                self.open_study_review(dataset_id, *id)
+                self.read_study_review(dataset_id, *id, SavedReviewRead::Analysis)
+            }
+            SavedStudyReviewCommand::Check { dataset_id, id } => {
+                self.read_study_review(dataset_id, *id, SavedReviewRead::Authorization)
+            }
+            SavedStudyReviewCommand::CardDetails { dataset_id, id } => {
+                self.read_study_review(dataset_id, *id, SavedReviewRead::CardDetails)
             }
             SavedStudyReviewCommand::Remove {
                 dataset_id,
@@ -142,10 +172,44 @@ impl Tempo {
                     .write_saved_review(&key, ReviewWrite::Remove(*id))?;
                 Ok(json!({"status": "removed", "id": id, "submission_id": submission_id}))
             }
+            SavedStudyReviewCommand::ExcludeTactic {
+                dataset_id,
+                id,
+                submission_id,
+            } => {
+                let fingerprint = command_fingerprint("exclude_tactic", &command)?;
+                let key = command_key(dataset_id, submission_id, &fingerprint)?;
+                let id = match self.store.tactic_exclusion(&key, *id)? {
+                    TacticExclusionRead::Accepted(id) => id,
+                    TacticExclusionRead::Pending { revision, active } => {
+                        let abandoned = active
+                            .as_deref()
+                            .map(|attempt| {
+                                tempo_study::abandon(attempt, attempt.revision).map(Box::new)
+                            })
+                            .transpose()
+                            .map_err(study_input)?;
+                        self.store.write_saved_review(
+                            &key,
+                            ReviewWrite::ExcludeTactic {
+                                id: *id,
+                                expected_revision: revision,
+                                abandoned,
+                            },
+                        )?
+                    }
+                };
+                Ok(json!({"status": "excluded", "id": id, "submission_id": submission_id}))
+            }
         }
     }
 
-    fn open_study_review(&self, dataset: &DatasetId, id: i64) -> Result<Value, AppError> {
+    fn read_study_review(
+        &self,
+        dataset: &DatasetId,
+        id: i64,
+        view: SavedReviewRead,
+    ) -> Result<Value, AppError> {
         let context = self
             .store
             .saved_review_context(dataset, id)?
@@ -180,12 +244,21 @@ impl Tempo {
             .active
             .as_ref()
             .is_some_and(|active| !active.mode.guided())
-            || !(source_disclosed || later_disclosed)
+            || !(source_disclosed || later_disclosed || context.excluded_from_study)
         {
             return Ok(json!({"status": "study_required", "id": id}));
         }
-        let origin = self.project_saved_study_analysis(source, context.decision_index)?;
-        Ok(json!({"status": "review_context", "id": id, "origin": origin}))
+        match view {
+            SavedReviewRead::Authorization => Ok(json!({"status": "review_available", "id": id})),
+            SavedReviewRead::Analysis => {
+                let origin = self.project_saved_study_analysis(source, context.decision_index)?;
+                Ok(json!({"status": "review_context", "id": id, "origin": origin}))
+            }
+            SavedReviewRead::CardDetails => {
+                let details = self.project_saved_card_details(source)?;
+                Ok(json!({"status": "card_details", "id": id, "details": details}))
+            }
+        }
     }
 }
 

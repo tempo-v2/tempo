@@ -32,6 +32,12 @@ impl Tempo {
         let (item, _) = snapshot
             .target(&record.attempt.target)?
             .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
+        if snapshot.excluded_tactics.contains(&item.target) {
+            return Err(AppError::new(
+                "stale_activity",
+                "This tactic was removed from Study.",
+            ));
+        }
         if super::repertoires::is_suspended(item, &snapshot.suspended_repertoires) {
             return Err(super::repertoires::suspended_repertoire());
         }
