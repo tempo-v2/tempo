@@ -9,15 +9,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempo_chess::{
-    DetectorIdentity, TacticalAssessment, TacticalOutcome, parse_played_games,
-    plan_personal_puzzle, plan_tactical_puzzle,
+    Catalog, DetectorIdentity, TacticalAssessment, TacticalOutcome, parse_played_games,
+    prepare_personal_puzzle, prepare_tactical_puzzle,
 };
 use tempo_learning::DailyLearning;
 use tempo_store::{
-    Commit, TacticalAcceptance, TacticalAnalysis, TacticalAnalysisStatus, TacticalGame,
-    TacticalObservation, TacticalPuzzleRef, Write,
+    TacticalAcceptance, TacticalAcceptanceBasis, TacticalAnalysis, TacticalAnalysisStatus,
+    TacticalCommit, TacticalGame, TacticalObservation, TacticalPuzzleRef, TacticalTargetChange,
 };
-use tempo_types::DatasetId;
+use tempo_types::{DatasetId, TargetId};
 
 // A report groups game tactics across upgrades and changes in its detector set.
 pub(crate) const GAME_TACTICS_REPORT: &str = "game-tactics";
@@ -63,9 +63,9 @@ impl Tempo {
         &self,
         game: &TacticalGame,
         completion: &DetectionCompletion,
-    ) -> Result<DatasetId, AppError> {
-        let dataset = self.game_dataset()?;
-        if completion.request.dataset_id != dataset {
+    ) -> Result<TacticalAcceptanceBasis, AppError> {
+        let basis = self.store.tactical_acceptance_basis()?;
+        if completion.request.dataset_id != basis.dataset {
             return Err(AppError::new(
                 "stale_dataset",
                 "The analyzed dataset has changed.",
@@ -73,7 +73,7 @@ impl Tempo {
         }
         let current = self
             .store
-            .stored_game(&dataset, &game.game.source, &game.game.id)?
+            .stored_game(&basis.dataset, &game.game.source, &game.game.id)?
             .ok_or_else(|| AppError::new("stale_source", "The analyzed game is unavailable."))?;
         if current.mainline_signature != game.game.mainline_signature
             || current.pgn != completion.source.pgn
@@ -86,7 +86,7 @@ impl Tempo {
                 "The analyzed game has changed.",
             ));
         }
-        Ok(dataset)
+        Ok(basis)
     }
 
     /// Persist an application composition failure without applying any of the
@@ -99,14 +99,7 @@ impl Tempo {
         completion: &DetectionCompletion,
         error: &AppError,
     ) -> Result<TacticalAcceptance, AppError> {
-        let dataset = self.validate_tactical_source(game, completion)?;
-        let snapshot = self.store.study_state(Default::default())?;
-        if snapshot.dataset != dataset {
-            return Err(AppError::new(
-                "stale_dataset",
-                "The analyzed dataset has changed.",
-            ));
-        }
+        let basis = self.validate_tactical_source(game, completion)?;
         let analysis = TacticalAnalysis {
             position: completion.position,
             source: game.game.source.clone(),
@@ -125,10 +118,10 @@ impl Tempo {
             observations: Vec::new(),
         };
         Ok(self.store.commit_tactical_analysis(
-            Commit {
-                expected_revision: snapshot.revision,
-                expected_dataset: dataset,
-                writes: Vec::new(),
+            TacticalCommit {
+                expected_revision: basis.revision,
+                expected_dataset: basis.dataset,
+                targets: BTreeMap::new(),
             },
             &analysis,
         )?)
@@ -139,23 +132,10 @@ impl Tempo {
         game: &TacticalGame,
         completion: &DetectionCompletion,
     ) -> Result<TacticalAcceptance, AppError> {
-        let dataset = self.validate_tactical_source(game, completion)?;
-        let needs_puzzle = matches!(&completion.status, DetectionStatus::Complete { findings, .. }
-            if findings.iter().any(|finding| finding.moment.tactical.as_ref().is_some_and(|assessment| assessment.puzzle.is_some() || assessment.personal.as_ref().is_some_and(|evidence| evidence.puzzle.is_some()))));
-        let snapshot = needs_puzzle
-            .then(|| self.store.content_state())
-            .transpose()?;
-        let revision = if let Some(snapshot) = &snapshot {
-            snapshot.revision
-        } else {
-            self.store.study_state(Default::default())?.revision
-        };
+        let basis = self.validate_tactical_source(game, completion)?;
+        let dataset = &basis.dataset;
         let at = self.components.clock.now();
-        let mut catalog = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.catalog.clone())
-            .unwrap_or_default();
-        let mut learning = BTreeMap::new();
+        let mut targets: BTreeMap<TargetId, TacticalTargetChange> = BTreeMap::new();
         let mut observations = Vec::new();
         let mut decisions_scanned = 0;
         let (status, error) = match &completion.status {
@@ -250,47 +230,82 @@ impl Tempo {
                     };
                     let train = if let Some(proposal) = proposal {
                         let binding = self.store.tactical_training_binding(
-                            &dataset,
+                            dataset,
                             game,
                             GAME_TACTICS_REPORT,
                             address,
                         )?;
-                        let plan = match proposal {
+                        let prepared = match proposal {
                             DetectionPuzzle::Personal(puzzle) => {
-                                plan_personal_puzzle(&catalog, puzzle, &provenance)
+                                prepare_personal_puzzle(puzzle, &provenance)
                             }
                             DetectionPuzzle::Capture(fen, answer) => {
-                                plan_tactical_puzzle(&catalog, fen, answer, &provenance)
+                                prepare_tactical_puzzle(fen, answer, &provenance)
                             }
                         };
-                        if let Some(binding) = binding {
-                            // The detached proposal keeps old receipt fingerprints
-                            // comparable. Failure to resolve it cannot prevent the
-                            // report or affect the accepted content.
-                            let proposed = plan.ok().map(|plan| TacticalPuzzleRef {
-                                version: plan.content.catalog.items[&plan.target].version,
-                                target: plan.target,
-                            });
-                            proposed.or(Some(binding))
-                        } else {
-                            let plan =
-                                plan.map_err(|error| domain("invalid_tactical_puzzle", error))?;
-                            catalog = plan.content.catalog;
-                            let item = &catalog.items[&plan.target];
-                            let prior = learning
-                                .get(&plan.target)
-                                .or_else(|| snapshot.as_ref()?.learning.get(&plan.target))
-                                .cloned()
-                                .unwrap_or_default();
-                            if !prior.introduced {
-                                let introduced = DailyLearning::introduce_capture(&prior, at)
-                                    .map_err(|error| domain("learning_error", error))?;
-                                learning.insert(plan.target.clone(), introduced);
+                        let plan = match prepared {
+                            Ok(puzzle) => {
+                                let matched = self
+                                    .store
+                                    .tactical_content_matches(dataset, &puzzle.lookup())?;
+                                let mut catalog = Catalog {
+                                    items: matched
+                                        .into_iter()
+                                        .map(|item| (item.target.clone(), item))
+                                        .collect(),
+                                    lines: Vec::new(),
+                                };
+                                catalog.items.extend(targets.iter().filter_map(
+                                    |(target, change)| {
+                                        change.content.clone().map(|item| (target.clone(), item))
+                                    },
+                                ));
+                                puzzle.plan(&catalog).map(|mut plan| {
+                                    let item = plan
+                                        .content
+                                        .catalog
+                                        .items
+                                        .remove(&plan.target)
+                                        .expect("planned tactic");
+                                    let changed = catalog.items.get(&item.target) != Some(&item);
+                                    (item, changed)
+                                })
                             }
-                            Some(TacticalPuzzleRef {
-                                target: plan.target,
+                            Err(error) => Err(error),
+                        };
+                        if let Some(binding) = binding {
+                            // Legacy receipts can include the detached proposal.
+                            // Its resolution changes no retained content or Learning.
+                            plan.ok()
+                                .map(|(item, _)| TacticalPuzzleRef {
+                                    target: item.target,
+                                    version: item.version,
+                                })
+                                .or(Some(binding))
+                        } else {
+                            let (item, changed) =
+                                plan.map_err(|error| domain("invalid_tactical_puzzle", error))?;
+                            let staged = targets.entry(item.target.clone()).or_default();
+                            if staged.introduction.is_none() {
+                                let prior = self
+                                    .store
+                                    .tactical_target_learning(dataset, &item.target)?
+                                    .unwrap_or_default();
+                                if !prior.introduced {
+                                    staged.introduction = Some(
+                                        DailyLearning::introduce_capture(&prior, at)
+                                            .map_err(|error| domain("learning_error", error))?,
+                                    );
+                                }
+                            }
+                            let puzzle = TacticalPuzzleRef {
+                                target: item.target.clone(),
                                 version: item.version,
-                            })
+                            };
+                            if changed {
+                                staged.content = Some(item);
+                            }
+                            Some(puzzle)
                         }
                     } else {
                         None
@@ -361,15 +376,6 @@ impl Tempo {
                 Some("The detector did not produce a complete valid result.".into()),
             ),
         };
-        let mut writes = Vec::new();
-        if snapshot.is_some_and(|snapshot| catalog != snapshot.catalog) {
-            writes.push(Write::Catalog(catalog));
-        }
-        writes.extend(
-            learning
-                .into_iter()
-                .map(|(target, state)| Write::Learning { target, state }),
-        );
         let analysis = TacticalAnalysis {
             position: completion.position,
             source: game.game.source.clone(),
@@ -384,11 +390,12 @@ impl Tempo {
             error,
             observations,
         };
+        targets.retain(|_, change| change.content.is_some() || change.introduction.is_some());
         let accepted = self.store.commit_tactical_analysis(
-            Commit {
-                expected_revision: revision,
-                expected_dataset: dataset,
-                writes,
+            TacticalCommit {
+                expected_revision: basis.revision,
+                expected_dataset: basis.dataset,
+                targets,
             },
             &analysis,
         )?;

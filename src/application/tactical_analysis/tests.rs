@@ -13,7 +13,7 @@ use tempo_chess::{
     HangingMaterialConfig, HangingMaterialDetector, RootEvaluation, RootScore, ScoreBound,
     TacticRecord, TacticalEvaluationRequest, TacticalEvaluator, compile_tactics,
 };
-use tempo_store::{ActivityMode, Store};
+use tempo_store::{ActivityMode, Commit, Store, Write};
 
 const HANGING: &str = "7k/n7/8/8/8/8/8/R5K1 w - - 0 1";
 
