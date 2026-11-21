@@ -19,6 +19,7 @@ import re
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -284,6 +285,91 @@ class RuntimeDiagnostics(unittest.TestCase):
                         self.assertTrue(logs.is_file())
                         # A second independent request also remains responsive.
                         self.assertEqual(json.loads(server.request()[2]), expected)
+
+    def test_tactics_worker_and_addressed_routes_export_without_a_server(self):
+        logs = self.root / "tactics-logs"
+
+        def post(server, path, payload):
+            return server.request(json.dumps(payload).encode(), path=path)
+
+        def operation(request_id, name):
+            return wait_event(
+                logs,
+                lambda e: e.get("request_id") == request_id
+                and e.get("event") == "span.end"
+                and e.get("operation") == name,
+            )
+
+        with Server(self.database, self.ui, logs) as server:
+            dataset = json.loads(server.request()[2])["dataset_id"]
+            query = {"dataset_id": dataset}
+            status, headers, payload, report_id = post(server, "/api/games/tactics/report", query)
+            self.assertEqual(status, 200)
+            report = json.loads(payload)
+            self.assertEqual(report["dataset_id"], dataset)
+            self.assertEqual(report["games"], [])
+            self.assertEqual(operation(report_id, "http.request")["route"], "tactics_report")
+            self.assertEqual(operation(report_id, "tactics.report.admission")["outcome"], "admitted")
+            worker = operation(report_id, "tactics.report.worker")
+            self.assertEqual(worker["outcome"], "ready")
+            self.assertGreaterEqual(worker["queue_wait_ms"], 0)
+            self.assertEqual(headers["X-Tempo-Request-Id"], report_id)
+            self.assertEqual(headers["X-Tempo-Run-Id"], worker["run_id"])
+
+            status, _, payload, warm_id = post(
+                server, "/api/games/tactics/report", {**query, "report_generation": report["report_generation"]},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(payload), report)
+            self.assertNotEqual(warm_id, report_id)
+            self.assertEqual(operation(warm_id, "tactics.report.worker")["outcome"], "ready")
+
+            status, headers, payload, detail_id = post(
+                server, "/api/games/tactics/position",
+                {**query, "id": 1, "report_generation": report["report_generation"]},
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(payload)["code"], "unknown_position")
+            self.assertEqual(headers["X-Tempo-Request-Id"], detail_id)
+            operation(detail_id, "tactics.report.detail")
+
+            tab = str(uuid.uuid4())
+            status, headers, _, presence_id = post(
+                server, "/api/study/presence", {"tab": tab, "sequence": 1, "state": "active"},
+            )
+            self.assertEqual(status, 204)
+            self.assertEqual(headers["X-Tempo-Request-Id"], presence_id)
+            operation(presence_id, "study.presence")
+
+            status, _, _, settings_id = post(server, "/api/tactic-settings", {"command": "get"})
+            self.assertEqual(status, 200)
+            operation(settings_id, "settings.tactics")
+
+        output = self.root / "offline-export.json"
+        subprocess.run(
+            [sys.executable, str(WORKSPACE / "tempo" / "tools" / "diagnose.py"),
+             "--duration", "1", "--interval", "1", "--log-dir", str(logs), "--output", str(output)],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        bundle = json.loads(output.read_text())
+        self.assertEqual(bundle["diagnostic_logs"]["status"], "captured")
+        self.assertTrue(bundle["samples"])
+        events = bundle["diagnostic_logs"]["events"]
+        self.assertLessEqual(len(events), bundle["diagnostic_logs"]["bounds"]["events"])
+        exported_worker = next(
+            event for event in events if event.get("request_id") == report_id
+            and event.get("event") == "span.end" and event.get("operation") == "tactics.report.worker"
+        )
+        self.assertEqual(exported_worker["queue_wait_ms"], worker["queue_wait_ms"])
+        exported_response = next(
+            event for event in events if event.get("request_id") == report_id and event["event"] == "http.response"
+        )
+        self.assertEqual(exported_response["run_id"], exported_worker["run_id"])
+        self.assertEqual(exported_response["status_code"], 200)
+        self.assertNotIn(tab, json.dumps(events))
+        self.assertNotIn(dataset, json.dumps(events))
 
     def test_real_sqlite_wait_has_request_stall_and_recovery_evidence(self):
         logs = self.root / "lock-logs"
