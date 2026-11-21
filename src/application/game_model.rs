@@ -1,6 +1,6 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id};
-use crate::game_model::{GapRequest, model_input_stamp};
+use crate::game_model::{GapKind, GapRequest, model_input_stamp};
 use crate::maia::{MODEL_KEY, PROFILE_LABEL, checked_distribution};
 use crate::{
     AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
@@ -11,7 +11,9 @@ use tempo_chess::{
     AuthoredRepertoire, ContentKind, GapDraft, LearnerColor, PositionKey, SavedRepertoireResponse,
     compile_repertoire, legal_move_labels,
 };
-use tempo_store::{ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets};
+use tempo_store::{
+    ForecastGap, ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets,
+};
 use tempo_types::{DatasetId, Revision};
 
 struct CheckedGap {
@@ -98,36 +100,85 @@ impl Tempo {
     }
 
     pub fn opponent_gaps(&mut self, offset: usize) -> Result<Value, AppError> {
+        self.opponent_gaps_with_forecasts(offset, None, Vec::new())
+    }
+
+    pub(crate) fn opponent_gaps_with_forecasts(
+        &mut self,
+        offset: usize,
+        forecast_book: Option<&str>,
+        forecasts: Vec<ForecastGap>,
+    ) -> Result<Value, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.game_model.opponent_gaps");
         let dataset = self.game_dataset()?;
         let candidates = self.store.opponent_gaps(&dataset)?;
-        if candidates.is_empty() {
+        if candidates.is_empty() && forecasts.is_empty() {
             return Ok(json!({"dataset_id":dataset,"gaps":[]}));
         }
         let books = self.current_game_books(&dataset)?;
-        let verified = candidates
+        let mut observed = BTreeMap::new();
+        let mut ordered = Vec::new();
+        for group in &candidates {
+            if let Some(revision) = books.document_for_gap(&group.gap) {
+                observed.insert(&group.gap, (group.games, revision));
+                if forecast_book.is_none() {
+                    ordered.push(&group.gap);
+                }
+            }
+        }
+        let visible_observed: std::collections::BTreeSet<_> =
+            ordered.iter().skip(offset).take(101).copied().collect();
+        let mut forecast_by_gap = BTreeMap::new();
+        for forecast in &forecasts {
+            let gap = &forecast.gap;
+            let goes_after_observed = !observed.contains_key(gap);
+            if forecast_book.is_none()
+                && !visible_observed.contains(gap)
+                && (!goes_after_observed || ordered.len() >= offset.saturating_add(101))
+            {
+                continue;
+            }
+            if forecast_book.is_some() && ordered.len() >= offset.saturating_add(101) {
+                break;
+            }
+            if let Some(revision) = books.document_for_forecast(gap, forecast.stale) {
+                forecast_by_gap.insert(gap, (forecast, revision));
+                if forecast_book.is_some() || goes_after_observed {
+                    ordered.push(gap);
+                }
+            }
+        }
+        let page: Vec<_> = ordered
             .into_iter()
-            .filter_map(|group| {
-                let document_revision = books.document_for_gap(&group.gap)?;
-                Some((group, document_revision))
-            })
             .skip(offset)
             .take(101)
-            .map(|(group, document_revision)| {
-                let labels = legal_move_labels(&format!("{} 0 1", group.gap.position.0)).ok();
+            .map(|gap| {
+                let found = forecast_by_gap.get(gap);
+                let (games, revision, kind) = if let Some((games, revision)) = observed.get(gap) {
+                    (*games, *revision, "observed")
+                } else {
+                    (
+                        0,
+                        found.expect("a forecast row has a forecast").1,
+                        "forecast",
+                    )
+                };
+                let labels = legal_move_labels(&format!("{} 0 1", gap.position.0)).ok();
                 let san = labels
                     .as_ref()
-                    .and_then(|moves| moves.get(&group.gap.actual_move));
+                    .and_then(|moves| moves.get(&gap.actual_move));
                 json!({
-                    "repertoire_id": group.gap.repertoire_id, "position": group.gap.position,
-                    "actual_move": group.gap.actual_move, "actual_san": san, "games": group.games,
-                    "document_revision": document_revision,
+                    "repertoire_id":gap.repertoire_id, "position":gap.position,
+                    "actual_move":gap.actual_move, "actual_san":san, "games":games,
+                    "document_revision":revision, "gap_kind":kind,
+                    "forecast":found.map(|(forecast, _)| json!({
+                        "probability":forecast.probability, "stale":forecast.stale,
+                    })),
                 })
             })
-            .collect::<Vec<_>>();
+            .collect();
         Ok(
-            json!({"dataset_id":dataset,"gaps":verified.iter().take(100).collect::<Vec<_>>(),
-            "more":verified.len() > 100}),
+            json!({"dataset_id":dataset,"gaps":page.iter().take(100).collect::<Vec<_>>(),"more":page.len()>100}),
         )
     }
 
@@ -169,15 +220,18 @@ impl Tempo {
             .map_err(|error| domain("invalid_content", error))?;
         let authored =
             AuthoredRepertoire::parse(&pgn).map_err(|error| domain("invalid_repertoire", error))?;
-        let draft = authored
-            .gap_draft(
-                &pgn,
-                &request.position,
-                &request.actual_move,
-                color,
-                request.response.as_deref(),
-            )
-            .map_err(|error| domain("stale_gap", error))?;
+        let draft = match request.gap_kind {
+            GapKind::Observed => AuthoredRepertoire::gap_draft,
+            GapKind::Forecast => AuthoredRepertoire::forecast_gap_draft,
+        }(
+            &authored,
+            &pgn,
+            &request.position,
+            &request.actual_move,
+            color,
+            request.response.as_deref(),
+        )
+        .map_err(|error| domain("stale_gap", error))?;
         Ok(CheckedGap {
             authored,
             draft,

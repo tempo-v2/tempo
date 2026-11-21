@@ -6,7 +6,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{Mutex, TryLockError},
     time::{Duration, Instant},
 };
 pub(crate) const TOKEN_FILE: &str = "lichess-explorer.token";
@@ -70,6 +70,18 @@ pub(crate) struct Statistics {
     moves: Vec<MoveCounts>,
 }
 
+impl Statistics {
+    pub(crate) fn move_counts(&self) -> (u64, std::collections::BTreeMap<String, u64>) {
+        let total = self.counts.buckets().into_iter().sum();
+        let moves = self
+            .moves
+            .iter()
+            .map(|mv| (mv.uci.clone(), mv.counts.buckets().into_iter().sum()))
+            .collect();
+        (total, moves)
+    }
+}
+
 pub struct ExplorerClient {
     pub(crate) token_path: PathBuf,
     connection: Mutex<()>,
@@ -97,17 +109,49 @@ impl ExplorerClient {
         legal: &[String],
         ratings: Option<Ratings>,
     ) -> Result<Statistics, &'static str> {
+        self.position_until(fen, legal, ratings, None)
+    }
+
+    pub(crate) fn position_until(
+        &self,
+        fen: &str,
+        legal: &[String],
+        ratings: Option<Ratings>,
+        deadline: Option<Instant>,
+    ) -> Result<Statistics, &'static str> {
         let mut trace = crate::diagnostics::Span::new("explorer.position");
         // Rated, Masters, and Fix Response share one outbound connection budget.
         let _connection = {
             let _wait = crate::diagnostics::Span::new("explorer.lock_wait");
-            self.connection.lock().expect("Explorer connection")
+            if let Some(deadline) = deadline {
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err("timeout");
+                    }
+                    match self.connection.try_lock() {
+                        Ok(guard) => break guard,
+                        Err(TryLockError::WouldBlock) => {
+                            std::thread::sleep(remaining.min(Duration::from_millis(20)));
+                        }
+                        Err(TryLockError::Poisoned(_)) => return Err("offline"),
+                    }
+                }
+            } else {
+                self.connection.lock().expect("Explorer connection")
+            }
         };
         if self.limited() {
             trace.set_outcome("rate_limited");
             return Err("rate_limited");
         }
-        let result = lookup(&self.token_path, fen, legal, ratings);
+        let timeout = deadline.map_or(Duration::from_secs(8), |deadline| {
+            Duration::from_secs(8).min(deadline.saturating_duration_since(Instant::now()))
+        });
+        if timeout < Duration::from_millis(1) {
+            return Err("timeout");
+        }
+        let result = lookup(&self.token_path, fen, legal, ratings, timeout);
         trace.set_outcome(result.as_ref().err().copied().unwrap_or("complete"));
         if matches!(result, Err("rate_limited")) {
             *self.retry_after.lock().expect("Explorer retry deadline") =
@@ -143,9 +187,10 @@ fn lookup(
     fen: &str,
     legal: &[String],
     ratings: Option<Ratings>,
+    timeout: Duration,
 ) -> Result<Statistics, &'static str> {
     let mut trace = crate::diagnostics::Span::new("explorer.lookup");
-    trace.field("timeout_ms", 8_000);
+    trace.field("timeout_ms", timeout.as_millis());
     let token = token(path)?;
     let mut command = Command::new("/usr/bin/curl");
     command.args([
@@ -154,7 +199,7 @@ fn lookup(
         "--connect-timeout",
         "3",
         "--max-time",
-        "8",
+        &format!("{:.3}", timeout.as_secs_f64()),
         "--max-filesize",
         "131072",
         "--proto",
