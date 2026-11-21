@@ -840,7 +840,7 @@ fn practice_failure_and_cross_midnight_allowance_replay_preserve_learning() {
 }
 
 #[test]
-fn later_tactic_correction_uses_the_issued_move_and_explicit_game_capture() {
+fn later_tactic_correction_uses_the_issued_move_regardless_of_capture_attribution() {
     use tempo_chess::{GameCapture, TacticRecord, compile_tactics};
 
     for from_game in [true, false] {
@@ -903,11 +903,7 @@ fn later_tactic_correction_uses_the_issued_move_and_explicit_game_capture() {
         miss["answer"] = json!({"uci":"e2d3"});
         let missed = study(&mut app, miss.clone());
         assert_eq!(missed["feedback"]["correction_uci"], "e2b5");
-        if from_game {
-            assert_eq!(missed["feedback"]["tactic_explanation"]["kind"], "pin");
-        } else {
-            assert!(missed["feedback"].get("tactic_explanation").is_none());
-        }
+        assert_eq!(missed["feedback"]["tactic_explanation"]["kind"], "pin");
         let mut correction = activity_command("answer", &missed, "finish");
         correction["answer"] = json!({"uci":"e2b5"});
         let completed = study(&mut app, correction);
