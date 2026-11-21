@@ -491,6 +491,7 @@ fn respond_inner(
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     let opponent_context = header(&request, "X-Tempo-Study-Opponent-Moves") == Some("1");
     let repertoire_runs = header(&request, "X-Tempo-Study-Repertoire-Runs") == Some("1");
+    let tactic_explanation = header(&request, "X-Tempo-Study-Tactic-Explanation") == Some("1");
     if request.method() == &Method::Post && request.url() == "/api/study/presence" {
         let _trace = Span::new("study.presence");
         let result = command(&mut request, 1024)
@@ -915,6 +916,11 @@ fn respond_inner(
             reply
         } else {
             reply.without_opponent_context()
+        };
+        let reply = if tactic_explanation {
+            reply
+        } else {
+            reply.without_tactic_explanation()
         };
         respond_traced(
             request,

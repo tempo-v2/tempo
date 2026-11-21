@@ -62,7 +62,8 @@ fn stdio() -> Result<(), Box<dyn Error + Send + Sync>> {
             Ok(command) => app
                 .handle(command)
                 .without_move_details()
-                .without_opponent_context(),
+                .without_opponent_context()
+                .without_tactic_explanation(),
             Err(error) => StudyView::from(AppError::new("invalid_command", error.to_string())),
         };
         serde_json::to_writer(&mut output, &view)?;

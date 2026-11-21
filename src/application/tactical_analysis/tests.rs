@@ -246,6 +246,52 @@ fn accepted_miss_preserves_active_then_is_next_independently_of_display_name() {
 }
 
 #[test]
+fn a_wrong_answer_reveals_verified_geometry_on_an_issued_game_finding() {
+    use crate::wire::{StudyCommand, StudyView};
+    use tempo_chess::TacticExplanation;
+
+    let (directory, mut app) = disposable();
+    let (mut detection, mut jobs) = host("1", "miss");
+    let imported = app.import_game_pgn(GameImport {
+        dataset_id: app.game_dataset().unwrap(),
+        command_id: "import-pin".into(),
+        learner: "Learner".into(),
+        repertoire_id: None,
+        pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"8/n1n1k3/8/8/8/8/8/R5K1 w - - 0 1\"]\n[Result \"0-1\"]\n\n1. Kg2 Kf7 0-1".into(),
+    }).unwrap();
+    assert_eq!(imported.new_games, 1);
+    let report = scan(&directory, &mut app, &mut detection, &mut jobs, 1);
+    assert_eq!(report["statistics"]["pending_requests"], 1);
+    let StudyView::Attempt(issued) = app.handle(StudyCommand::Next) else {
+        panic!("expected a game tactic");
+    };
+    assert!(issued.feedback.is_none());
+    let command = StudyCommand::Answer(SubmitCommand {
+        dataset_id: issued.dataset_id,
+        attempt_id: issued.attempt_id,
+        expected_revision: issued.revision,
+        submission_id: "miss-game-pin".into(),
+        answer: "g1g2".into(),
+    });
+    let missed = app.handle(command.clone());
+    let StudyView::Attempt(view) = &missed else {
+        panic!("expected correction");
+    };
+    assert_eq!(view.assessment, Some(tempo_types::Grade::Again));
+    assert!(matches!(
+        view.feedback.as_ref().unwrap().tactic_explanation.as_ref(),
+        Some(TacticExplanation::Pin { attacker, front, rear })
+            if attacker.square == "a7" && front.square == "c7" && rear.square == "e7"
+    ));
+    let durable = app.snapshot().unwrap();
+    assert_eq!(
+        serde_json::to_value(app.handle(command)).unwrap(),
+        serde_json::to_value(missed).unwrap(),
+    );
+    assert_eq!(app.snapshot().unwrap(), durable);
+}
+
+#[test]
 fn study_removal_keeps_game_origin_and_blocks_the_retained_request_after_rescan() {
     let (directory, mut app) = disposable();
     let (mut detection, mut jobs) = host("1", "miss");

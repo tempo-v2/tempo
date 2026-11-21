@@ -840,6 +840,69 @@ fn practice_failure_and_cross_midnight_allowance_replay_preserve_learning() {
 }
 
 #[test]
+fn later_tactic_correction_uses_the_issued_move_and_explicit_game_capture() {
+    use tempo_chess::{TacticRecord, compile_tactics};
+
+    for from_game in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("later-miss.sqlite");
+        let mut app = open(
+            &db,
+            Arc::new(AtomicI32::new(20_000)),
+            IntroductionLimits {
+                repertoire: 0,
+                tactics: 1,
+            },
+            0,
+        );
+        let mut provenance = vec!["tempo1:source_kind:game".into()];
+        if from_game {
+            provenance.push("tempo1:capture:fixture".into());
+        }
+        let catalog = compile_tactics(&[TacticRecord {
+            namespace: "explanation-fixture".into(),
+            source_id: "later-pin".into(),
+            solver_fen: "4k3/7p/2n5/8/8/8/4B3/6K1 w - - 0 1".into(),
+            solution: ["g1h1", "h7h6", "e2b5"].map(str::to_owned).to_vec(),
+            label: "A tactic from a game".into(),
+            provenance,
+        }])
+        .unwrap();
+        app.apply_tactic_transfer(&catalog).unwrap();
+        let first = study(&mut app, json!({"command":"next"}));
+        assert_eq!(first["activity"], "test");
+        assert!(first["feedback"].is_null());
+        let mut advance = activity_command("answer", &first, "first");
+        advance["answer"] = json!({"uci":"g1h1"});
+        let second = study(&mut app, advance);
+        assert_eq!(second["prompt"]["decision_index"], 1);
+        assert!(second["feedback"].get("tactic_explanation").is_none());
+        let shown = study(&mut app, activity_command("give_up", &second, "show"));
+        assert_eq!(shown["feedback"]["correction_uci"], "e2b5");
+        assert!(shown["feedback"].get("tactic_explanation").is_none());
+        let mut miss = activity_command("answer", &shown, "wrong");
+        miss["answer"] = json!({"uci":"e2d3"});
+        let missed = study(&mut app, miss.clone());
+        assert_eq!(missed["feedback"]["correction_uci"], "e2b5");
+        if from_game {
+            assert_eq!(missed["feedback"]["tactic_explanation"]["kind"], "pin");
+        } else {
+            assert!(missed["feedback"].get("tactic_explanation").is_none());
+        }
+        let mut correction = activity_command("answer", &missed, "finish");
+        correction["answer"] = json!({"uci":"e2b5"});
+        let completed = study(&mut app, correction);
+        assert_eq!(completed["status"], "complete");
+        assert_eq!(completed["assessment"], "again");
+        assert!(completed["feedback"].get("tactic_explanation").is_none());
+        let durable = app.snapshot().unwrap();
+        assert_eq!(durable.assessments.len(), 1);
+        assert_eq!(study(&mut app, miss), missed);
+        assert_eq!(app.snapshot().unwrap(), durable);
+    }
+}
+
+#[test]
 fn captures_interrupt_only_the_next_selection_and_cost_no_introductions() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("personal-captures.sqlite");
