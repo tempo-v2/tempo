@@ -362,6 +362,7 @@ impl PhoneStudy {
                     | "/api/study/relevance"
                     | "/api/study/game-context"
                     | "/api/study/review-mark"
+                    | "/api/study/card-details"
             ),
             _ => false,
         }
@@ -645,6 +646,7 @@ fn respond_inner(
             | "/api/study/game-context"
             | "/api/study/analysis-context"
             | "/api/study/analysis-line"
+            | "/api/study/card-details"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
             (&Method::Post, "/api/analysis/evidence") => (
@@ -762,6 +764,17 @@ fn respond_inner(
                     .map(|line| serde_json::json!(line))
                 }),
             ),
+            (&Method::Post, "/api/study/card-details") => (
+                200,
+                command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                    app.study_card_details(
+                        &intent.dataset_id,
+                        &intent.attempt_id,
+                        intent.revision,
+                        intent.content_version,
+                    )
+                }),
+            ),
             (&Method::Post, "/api/study/game-context") => (
                 200,
                 command::<StudyAttemptRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
@@ -865,7 +878,8 @@ fn respond_inner(
             body(
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&reply)?,
-            ),
+            )
+            .with_header(field("Cache-Control", "no-store")),
         )?;
     } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
         let reply = command::<Option<crate::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
@@ -1030,6 +1044,7 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/study/analysis-context" => "study_analysis_context",
         "/api/study/analysis-line" => "study_analysis_line",
         "/api/study/review-mark" => "study_review_mark",
+        "/api/study/card-details" => "study_card_details",
         "/api/study/saved-reviews" => "study_saved_reviews",
         "/api/study/presence" => "study_presence",
         "/api/repertoires" => "repertoires",

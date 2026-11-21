@@ -14,6 +14,7 @@ use tempo_types::{StudyDay, TargetId};
 
 pub(super) struct QueueSource<'a> {
     pub(super) catalog: &'a Catalog,
+    pub(super) excluded: &'a BTreeSet<TargetId>,
     pub(super) learning: &'a BTreeMap<TargetId, LearningState>,
     pub(super) queue: &'a dyn QueuePolicy,
     pub(super) today: StudyDay,
@@ -32,7 +33,7 @@ impl QuestionSource for QueueSource<'_> {
                 let learning = &self.learning[&item.target];
                 Candidate {
                     target: item.target.clone(),
-                    active: item.active(),
+                    active: item.active() && !self.excluded.contains(&item.target),
                     introduced: learning.introduced,
                     due: learning.due,
                     repeat_pending: learning.repeat_pending,

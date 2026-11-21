@@ -79,6 +79,7 @@ impl Tempo {
                     .map(|entry| entry.target.clone())
                     .collect();
                 let mut writes = Vec::new();
+                let mut ready_for_review = 0;
                 for target in targets {
                     let item = plan
                         .content
@@ -94,11 +95,13 @@ impl Tempo {
                             })
                             .map_err(|error| domain("learning_error", error))?;
                         CaptureOrigin::record_personal_capture(&mut item.provenance);
+                        ready_for_review +=
+                            usize::from(!snapshot.excluded_tactics.contains(&target));
                         writes.push(Write::Learning { target, state });
                     }
                 }
                 let reply = json!({ "schema_version": CONTENT_WIRE_VERSION, "status": "tactics_saved",
-                    "count": selected.len(), "ready_for_review": writes.len(), "alternate_solutions": plan.alternate_solutions });
+                    "count": selected.len(), "ready_for_review": ready_for_review, "alternate_solutions": plan.alternate_solutions });
                 let payload = reply.to_string();
                 self.commit_catalog(
                     &snapshot,

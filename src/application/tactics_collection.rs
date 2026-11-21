@@ -42,6 +42,7 @@ pub struct TacticDetail {
     pub fen: String,
     pub learner_color: LearnerColor,
     pub availability: ContentStatus,
+    pub removed_from_study: bool,
     pub solution_blocked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub solution: Option<RevealedLine>,
@@ -115,6 +116,7 @@ impl Tempo {
                     fen: board.display_fen,
                     learner_color: board.learner_color,
                     availability: item.status,
+                    removed_from_study: state.excluded_tactics.contains(&target),
                     solution_blocked: blocked,
                     solution,
                 })))

@@ -28,6 +28,7 @@ mod receipts;
 mod repertoire_runs;
 mod repertoires;
 mod study_analysis_context;
+mod study_card_details;
 pub use study_analysis_context::StudyAnalysisLine;
 mod study_game_context;
 
