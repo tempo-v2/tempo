@@ -22,6 +22,9 @@ pub struct AttemptView {
     /// The opponent move into this board, when the issued line establishes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opponent_move: Option<OpponentMoveView>,
+    /// Presentation for the optional Practice before a scheduled repertoire review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repertoire_context: Option<RepertoirePresentation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional public display text. Consumers may render or omit it.
     pub exercise_name: Option<String>,
@@ -52,6 +55,12 @@ pub struct AttemptView {
     pub feedback: Option<AttemptFeedback>,
     /// The attempt's lifetime grade, including an earlier miss during correction.
     pub assessment: Option<Grade>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepertoirePresentation {
+    Warmup,
 }
 
 /// Display-only context projected for the current board, including on resume.

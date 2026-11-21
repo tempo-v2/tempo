@@ -486,6 +486,7 @@ fn respond_inner(
     // display only, independent of submission identity and saved receipts.
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     let opponent_context = header(&request, "X-Tempo-Study-Opponent-Moves") == Some("1");
+    let repertoire_runs = header(&request, "X-Tempo-Study-Repertoire-Runs") == Some("1");
     if request.method() == &Method::Post && request.url() == "/api/study/presence" {
         let _trace = Span::new("study.presence");
         let result = command(&mut request, 1024)
@@ -856,7 +857,11 @@ fn respond_inner(
                 if !matches!(intent, StudyCommand::StudyStatus) {
                     games.tactics.study_activity(&mut games.detection);
                 }
-                app.handle(intent)
+                if repertoire_runs {
+                    app.handle_with_repertoire_runs(intent)
+                } else {
+                    app.handle(intent)
+                }
             })
             .unwrap_or_else(Into::into);
         let reply = if move_details {

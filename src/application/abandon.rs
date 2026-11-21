@@ -62,7 +62,19 @@ impl Tempo {
         if snapshot.active_attempt.as_ref() == Some(&command.attempt_id) {
             writes.push(Write::Active(None));
         }
-        let at = skip.then(|| self.components.clock.now());
+        let in_run = snapshot
+            .repertoire_run
+            .as_ref()
+            .is_some_and(|run| run.head() == Some(&command.attempt_id));
+        let skip_warmup = skip && in_run && old.repertoire_warmup;
+        if in_run {
+            writes.push(if skip_warmup {
+                Write::SkipRepertoireWarmup(command.attempt_id.clone())
+            } else {
+                Write::RepertoireRun(None)
+            });
+        }
+        let at = (skip && !skip_warmup).then(|| self.components.clock.now());
         self.commit_study(&snapshot, writes, scope)?;
         if let (Some(at), Some(daily)) = (at, &mut self.daily) {
             daily.queue.defer(result.attempt.target.clone(), at.day);

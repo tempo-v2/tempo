@@ -1,5 +1,5 @@
 //! The three reply shapes a presentation client must handle.
-use super::attempt_view::{AttemptFeedback, OpponentMoveView};
+use super::attempt_view::{AttemptFeedback, OpponentMoveView, RepertoirePresentation};
 use crate::views::{AttemptView, EmptyView, ErrorView, LessonView};
 use crate::{AppError, wire::STUDY_WIRE_VERSION};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,13 @@ impl StudyView {
         self
     }
 
+    pub fn without_repertoire_context(mut self) -> Self {
+        if let Self::Attempt(view) = &mut self {
+            view.repertoire_context = None;
+        }
+        self
+    }
+
     pub(crate) fn attempt(
         value: AnswerResult,
         board: PositionDisplay,
@@ -71,6 +78,9 @@ impl StudyView {
                 record.mode
             },
             corrective_repair: (record.mode == tempo_store::ActivityMode::Repair).then_some(true),
+            repertoire_context: record
+                .repertoire_warmup
+                .then_some(RepertoirePresentation::Warmup),
             lesson,
             opponent_move: if attempt.state.decision_index == 0 {
                 record
