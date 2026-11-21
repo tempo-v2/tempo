@@ -469,15 +469,27 @@ impl Drop for OwnedProcess {
 /// The generator searches the accepted root separately. This does not change
 /// detector identity or invalidate the retained archive of game observations.
 #[derive(Clone)]
-pub(crate) struct PayoffEngine(EngineConfiguration);
+pub(crate) struct PayoffEngine {
+    configuration: EngineConfiguration,
+    budget: Duration,
+}
 
 impl StockfishEvaluator {
     pub(crate) fn payoff_engine(&self) -> PayoffEngine {
-        PayoffEngine(self.configuration.clone())
+        PayoffEngine {
+            configuration: self.configuration.clone(),
+            budget: POSITION_TIMEOUT,
+        }
     }
 }
 
 impl PayoffEngine {
+    #[cfg(test)]
+    pub(crate) fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
+    }
+
     pub(crate) fn variation(
         &self,
         fen: &str,
@@ -485,21 +497,21 @@ impl PayoffEngine {
         control: &dyn DetectionControl,
     ) -> Result<Vec<String>, EvaluationFailure> {
         let control = YieldToForeground(control);
-        let deadline = Instant::now() + POSITION_TIMEOUT;
+        let deadline = Instant::now() + self.budget;
         let _slot = loop {
             control.check().map_err(EvaluationFailure::Stopped)?;
-            if let Some(slot) = crate::stockfish::background_slot() {
-                break slot;
-            }
             if Instant::now() >= deadline {
                 return Err(EvaluationFailure::Incomplete);
             }
+            if let Some(slot) = crate::stockfish::background_slot() {
+                break slot;
+            }
             std::thread::sleep(Duration::from_millis(15));
         };
-        let mut command = Command::new(&self.0.python);
+        let mut command = Command::new(&self.configuration.python);
         command
             .args(["-I", "-c", include_str!("../tools/stockfish/payoff.py")])
-            .arg(&self.0.binary)
+            .arg(&self.configuration.binary)
             .args([fen, &root.uci])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

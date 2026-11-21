@@ -58,6 +58,52 @@ enum DetectionPuzzle<'a> {
     Capture(&'a str, &'a tempo_chess::ChessAnswer),
 }
 
+impl<'a> DetectionPuzzle<'a> {
+    fn from_assessment(assessment: &'a TacticalAssessment) -> Result<Option<Self>, AppError> {
+        if assessment.kind == tempo_chess::TacticalKind::PersonalTactics {
+            let evidence = assessment.personal.as_ref().ok_or_else(|| {
+                AppError::new(
+                    "invalid_tactical_result",
+                    "The personal detector omitted its evidence.",
+                )
+            })?;
+            Ok(evidence.puzzle.as_ref().map(Self::Personal))
+        } else {
+            Ok(assessment
+                .puzzle
+                .as_ref()
+                .map(|puzzle| Self::Capture(&puzzle.fen, &puzzle.answer)))
+        }
+    }
+}
+
+pub(crate) fn continuation_roots(
+    completion: &DetectionCompletion,
+) -> Vec<(usize, String, tempo_chess::ChessAnswer)> {
+    let DetectionStatus::Complete { findings, .. } = &completion.status else {
+        return Vec::new();
+    };
+    findings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, finding)| {
+            let proposal =
+                DetectionPuzzle::from_assessment(finding.moment.tactical.as_ref()?).ok()??;
+            let (fen, answer) = match proposal {
+                DetectionPuzzle::Personal(puzzle)
+                    if puzzle.kind == tempo_chess::PersonalPuzzleKind::OnlyMove
+                        && puzzle.line.len() == 1 =>
+                {
+                    (puzzle.fen.as_str(), &puzzle.line[0])
+                }
+                DetectionPuzzle::Capture(fen, answer) => (fen, answer),
+                _ => return None,
+            };
+            Some((index, fen.to_owned(), answer.clone()))
+        })
+        .collect()
+}
+
 impl Tempo {
     fn validate_tactical_source(
         &self,
@@ -133,6 +179,7 @@ impl Tempo {
         &mut self,
         game: &TacticalGame,
         completion: &DetectionCompletion,
+        continuations: &BTreeMap<usize, Vec<String>>,
     ) -> Result<TacticalAcceptance, AppError> {
         let mut trace = crate::diagnostics::Span::new("tactics.acceptance");
         let basis = self.validate_tactical_source(game, completion)?;
@@ -169,7 +216,7 @@ impl Tempo {
                         .map_err(|_| AppError::new("invalid_game", "Game is too long."))?;
                 }
                 let mut inconclusive = false;
-                for finding in findings {
+                for (index, finding) in findings.iter().enumerate() {
                     let moment = &finding.moment;
                     let assessment = moment.tactical.as_ref().ok_or_else(|| {
                         AppError::new(
@@ -208,29 +255,7 @@ impl Tempo {
                             producer_id,
                         }
                     };
-                    let personal_puzzle = if personal {
-                        assessment
-                            .personal
-                            .as_ref()
-                            .ok_or_else(|| {
-                                AppError::new(
-                                    "invalid_tactical_result",
-                                    "The personal detector omitted its evidence.",
-                                )
-                            })?
-                            .puzzle
-                            .as_ref()
-                    } else {
-                        None
-                    };
-                    let proposal = if personal {
-                        personal_puzzle.map(DetectionPuzzle::Personal)
-                    } else {
-                        assessment
-                            .puzzle
-                            .as_ref()
-                            .map(|puzzle| DetectionPuzzle::Capture(&puzzle.fen, &puzzle.answer))
-                    };
+                    let proposal = DetectionPuzzle::from_assessment(assessment)?;
                     let train = if let Some(proposal) = proposal {
                         let binding = self.store.tactical_training_binding(
                             dataset,
@@ -256,7 +281,10 @@ impl Tempo {
                                 prepare_tactical_puzzle(fen, answer, &provenance)
                             }
                         };
-                        let prepared = prepared.map(|puzzle| puzzle.with_payoff(&finding.payoff));
+                        let prepared = prepared.map(|puzzle| match continuations.get(&index) {
+                            Some(line) => puzzle.with_payoff(line),
+                            None => puzzle,
+                        });
                         let plan = match prepared {
                             Ok(puzzle) => {
                                 let matched = self

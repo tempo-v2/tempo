@@ -1,16 +1,22 @@
 //! Upgrade retained generated definitions while the normal analysis window is open.
-use crate::AppError;
 use crate::tactical_engine::PayoffEngine;
+use crate::{
+    AppError, application::tactical_analysis::continuation_roots,
+    game_detection::DetectionCompletion,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use std::{collections::BTreeSet, thread::JoinHandle};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    thread::JoinHandle,
+};
 use tempo_chess::{
     ContentItem, DetectionControl, DetectionStop, EvaluationFailure, short_generated_decision,
 };
-use tempo_store::SqliteStore;
+use tempo_store::{SqliteStore, TacticPayoffPublication};
 use tempo_types::DatasetId;
 use tempo_types::{ContentVersion, TargetId};
 
@@ -33,6 +39,11 @@ struct Pending {
     worker: JoinHandle<Result<Vec<String>, EvaluationFailure>>,
 }
 
+struct NewPuzzleSearch {
+    cancel: Arc<AtomicBool>,
+    worker: JoinHandle<BTreeMap<usize, Vec<String>>>,
+}
+
 pub(super) struct Payoffs {
     engine: PayoffEngine,
     dataset: Option<DatasetId>,
@@ -42,6 +53,7 @@ pub(super) struct Payoffs {
     // for this version. A target held by an earlier request is revisited.
     checked: BTreeSet<(TargetId, ContentVersion)>,
     pending: Option<Pending>,
+    new_puzzle: Option<NewPuzzleSearch>,
 }
 
 impl Payoffs {
@@ -53,9 +65,55 @@ impl Payoffs {
             next: Instant::now(),
             checked: BTreeSet::new(),
             pending: None,
+            new_puzzle: None,
         }
     }
+    pub(super) fn start_new_puzzle(&mut self, result: &DetectionCompletion) {
+        let roots = continuation_roots(result);
+        if roots.is_empty() {
+            return;
+        }
+        let engine = self.engine.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let control = Cancel(cancel.clone());
+        self.new_puzzle = Some(NewPuzzleSearch {
+            cancel,
+            worker: std::thread::spawn(move || {
+                roots
+                    .into_iter()
+                    .filter_map(|(index, fen, answer)| {
+                        engine
+                            .variation(&fen, &answer, &control)
+                            .ok()
+                            .map(|line| (index, line))
+                    })
+                    .collect()
+            }),
+        });
+    }
+
+    // The completed detection stays available even if this optional search
+    // stops, times out, or fails. Pending denotes only continuation work.
+    pub(super) fn new_puzzle_lines(&mut self) -> Option<BTreeMap<usize, Vec<String>>> {
+        if self
+            .new_puzzle
+            .as_ref()
+            .is_some_and(|job| !job.worker.is_finished())
+        {
+            return None;
+        }
+        Some(
+            self.new_puzzle
+                .take()
+                .and_then(|job| job.worker.join().ok())
+                .unwrap_or_default(),
+        )
+    }
+
     pub(super) fn cancel(&self) {
+        if let Some(job) = &self.new_puzzle {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(job) = &self.pending {
             job.cancel.store(true, Ordering::Relaxed)
         }
@@ -68,6 +126,9 @@ impl Payoffs {
     ) -> Result<(), AppError> {
         if !allowed {
             self.cancel();
+            return Ok(());
+        }
+        if self.new_puzzle.is_some() {
             return Ok(());
         }
         if self.dataset.as_ref() != Some(dataset) {
@@ -95,7 +156,11 @@ impl Payoffs {
                             .map_err(|e| AppError::new("invalid_tactic", e.to_string()))?;
                         let done = match candidate {
                             Some(extension) => {
-                                store.publish_tactic_payoff(dataset, job.id, &extension)?
+                                matches!(
+                                    store.publish_tactic_payoff(dataset, job.id, &extension)?,
+                                    TacticPayoffPublication::Published
+                                        | TacticPayoffPublication::ConflictingDefinition
+                                )
                             }
                             None => true,
                         };
@@ -124,7 +189,9 @@ impl Payoffs {
             let Some(decision) = short_generated_decision(&item) else {
                 continue;
             };
-            if self.checked.contains(&(item.target.clone(), item.version)) {
+            if self.checked.contains(&(item.target.clone(), item.version))
+                || store.tactic_payoff_held(dataset, &item)?
+            {
                 continue;
             }
             let decision = decision.clone();
@@ -149,6 +216,9 @@ impl Payoffs {
 impl Drop for Payoffs {
     fn drop(&mut self) {
         self.cancel();
+        if let Some(job) = self.new_puzzle.take() {
+            let _ = job.worker.join();
+        }
         if let Some(pending) = self.pending.take() {
             let _ = pending.worker.join();
         }

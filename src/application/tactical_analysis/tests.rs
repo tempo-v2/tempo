@@ -2123,10 +2123,23 @@ fn a_deeper_rescan_advances_report_freshness_without_reparsing_the_archive() {
 #[test]
 #[ignore = "requires the configured tactical Python and Stockfish"]
 fn generated_checking_fork_is_extended_before_its_first_request_is_issued() {
+    assert_generated_checking_fork(false);
+}
+
+#[test]
+#[ignore = "requires the configured tactical Python and Stockfish"]
+fn optional_continuation_deadline_preserves_an_admitted_puzzle() {
+    assert_generated_checking_fork(true);
+}
+
+fn assert_generated_checking_fork(expire_search: bool) {
     let (directory, mut app) = disposable();
     let path = directory.path().join("tactics.sqlite");
     let engine = crate::tactical_engine::StockfishEvaluator::discover(&path).unwrap();
-    let payoff = engine.payoff_engine();
+    let mut payoff = engine.payoff_engine();
+    if expire_search {
+        payoff = payoff.with_budget(Duration::ZERO);
+    }
     let mut registry = DetectorRegistry::default();
     registry
         .register(tempo_chess::PersonalTacticsDetector(engine))
@@ -2139,8 +2152,8 @@ fn generated_checking_fork_is_extended_before_its_first_request_is_issued() {
         },
     )
     .unwrap();
-    detection.payoff_engine = Some(payoff);
     let mut jobs = TacticalJobs::new(&detection, &["personal-tactics"]);
+    jobs.enable_payoffs(payoff);
     jobs.force_idle_for_test();
     let dataset = app.game_dataset().unwrap();
     let fen = "r2qk1nr/ppp3pp/2p1p3/2b5/4P3/8/PPPP1PPP/RNBQK2R w KQkq - 0 1";
@@ -2170,8 +2183,15 @@ fn generated_checking_fork_is_extended_before_its_first_request_is_issued() {
         .issued_item(&dataset, &request.target, request.version)
         .unwrap()
         .unwrap();
-    assert_eq!(item.definition.decisions.len(), 2);
+    assert_eq!(
+        item.definition.decisions.len(),
+        if expire_search { 1 } else { 2 }
+    );
     assert_eq!(item.definition.decisions[0].expected.uci, "d1h5");
-    assert_eq!(item.definition.decisions[0].autoplay[0].uci, "g7g6");
-    assert_eq!(item.definition.decisions[1].expected.uci, "h5c5");
+    if expire_search {
+        assert!(item.definition.decisions[0].autoplay.is_empty());
+    } else {
+        assert_eq!(item.definition.decisions[0].autoplay[0].uci, "g7g6");
+        assert_eq!(item.definition.decisions[1].expected.uci, "h5c5");
+    }
 }

@@ -6,6 +6,7 @@ use crate::game_detection::{
 use crate::{AppError, Tempo};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -58,6 +59,12 @@ pub(crate) enum TacticalCommand {
     },
 }
 
+struct ReadyPosition {
+    task: TacticalPositionTask,
+    result: DetectionCompletion,
+    continuations: BTreeMap<usize, Vec<String>>,
+}
+
 pub(crate) struct TacticalJobs {
     payoffs: Option<payoff::Payoffs>,
     descriptor: Option<DetectorDescriptor>,
@@ -65,7 +72,7 @@ pub(crate) struct TacticalJobs {
     has_complete_decisions: bool,
     version: String,
     active: Option<(TacticalPositionTask, String)>,
-    ready: Option<(TacticalPositionTask, DetectionCompletion)>,
+    ready: Option<ReadyPosition>,
     next_check: Instant,
     study: StudyPresence,
     on_wall_power: Arc<AtomicBool>,
@@ -215,11 +222,29 @@ impl TacticalJobs {
                 result.status,
                 DetectionStatus::Cancelled | DetectionStatus::SourceUnavailable
             ) {
-                self.ready = Some((task, result));
+                if run_allowed && let Some(payoffs) = &mut self.payoffs {
+                    payoffs.start_new_puzzle(&result);
+                }
+                self.ready = Some(ReadyPosition {
+                    task,
+                    result,
+                    continuations: BTreeMap::new(),
+                });
             }
         }
-        if run_allowed && let Some((task, result)) = &self.ready {
-            match app.accept_tactical_analysis(&task.game, result) {
+        if run_allowed && let Some(ready) = &mut self.ready {
+            if let Some(payoffs) = &mut self.payoffs {
+                let Some(lines) = payoffs.new_puzzle_lines() else {
+                    return Ok(());
+                };
+                ready.continuations.extend(lines);
+            }
+            let ReadyPosition {
+                task,
+                result,
+                continuations,
+            } = ready;
+            match app.accept_tactical_analysis(&task.game, result, continuations) {
                 Ok(_) => self.last_error = None,
                 Err(error) if matches!(error.code.as_str(), "stale_source" | "stale_dataset") => {}
                 Err(error) if !error.retryable => {
