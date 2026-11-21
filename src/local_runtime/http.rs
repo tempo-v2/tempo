@@ -602,8 +602,12 @@ fn respond_inner(
             (&Method::Post, "/api/games/detection") => {
                 command::<DetectionRequest>(&mut request, MAX_COMMAND_BYTES)
                     .map(|intent| {
-                        games.tactics.cancel_payoffs();
-                        games.detection.start(app, intent)
+                        let was_idle = games.detection.idle();
+                        let reply = games.detection.start(app, intent);
+                        if was_idle && !games.detection.idle() {
+                            games.tactics.cancel_payoffs();
+                        }
+                        reply
                     })
             }
             (&Method::Post, "/api/games/detection-result") => {
