@@ -15,13 +15,17 @@ use tempo_chess::{
 use tempo_store::{ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets};
 use tempo_types::{DatasetId, Revision};
 
-struct CheckedGap {
+struct CheckedGapRepertoire {
     authored: AuthoredRepertoire,
-    draft: GapDraft,
     revision: Revision,
     name: String,
     color: LearnerColor,
     pgn: String,
+}
+
+struct GapAnalysisContext {
+    catalog: BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>,
+    names: BTreeMap<String, String>,
 }
 
 impl Tempo {
@@ -192,7 +196,10 @@ impl Tempo {
         )
     }
 
-    fn checked_gap(&self, request: &GapRequest) -> Result<CheckedGap, AppError> {
+    fn checked_gap_repertoire(
+        &self,
+        request: &GapRequest,
+    ) -> Result<CheckedGapRepertoire, AppError> {
         let doc = self.store.repertoire_document(&request.repertoire_id)?;
         if doc.dataset != request.dataset_id {
             return Err(AppError::new(
@@ -230,21 +237,8 @@ impl Tempo {
             .map_err(|error| domain("invalid_content", error))?;
         let authored =
             AuthoredRepertoire::parse(&pgn).map_err(|error| domain("invalid_repertoire", error))?;
-        let draft = match request.gap_kind {
-            GapKind::Observed => AuthoredRepertoire::gap_draft,
-            GapKind::Forecast => AuthoredRepertoire::forecast_gap_draft,
-        }(
-            &authored,
-            &pgn,
-            &request.position,
-            &request.actual_move,
-            color,
-            request.response.as_deref(),
-        )
-        .map_err(|error| domain("stale_gap", error))?;
-        Ok(CheckedGap {
+        Ok(CheckedGapRepertoire {
             authored,
-            draft,
             revision: doc.revision,
             name: item.label,
             color,
@@ -252,15 +246,33 @@ impl Tempo {
         })
     }
 
+    fn checked_gap(
+        &self,
+        request: &GapRequest,
+    ) -> Result<(CheckedGapRepertoire, GapDraft), AppError> {
+        let book = self.checked_gap_repertoire(request)?;
+        let draft = match request.gap_kind {
+            GapKind::Observed => AuthoredRepertoire::gap_draft,
+            GapKind::Forecast => AuthoredRepertoire::forecast_gap_draft,
+        }(
+            &book.authored,
+            &book.pgn,
+            &request.position,
+            &request.actual_move,
+            book.color,
+            request.response.as_deref(),
+        )
+        .map_err(|error| domain("stale_gap", error))?;
+        Ok((book, draft))
+    }
+
     pub(crate) fn gap_position(
         &self,
         mut request: GapRequest,
     ) -> Result<(GapDraft, Revision), AppError> {
         request.response = None;
-        let CheckedGap {
-            draft, revision, ..
-        } = self.checked_gap(&request)?;
-        Ok((draft, revision))
+        let (book, draft) = self.checked_gap(&request)?;
+        Ok((draft, book.revision))
     }
 
     pub(crate) fn gap_analysis_input(
@@ -270,25 +282,31 @@ impl Tempo {
         let dataset = request.dataset_id.clone();
         let repertoire_id = request.repertoire_id.clone();
         let (draft, revision) = self.gap_position(request)?;
-        self.gap_analysis_context(dataset, repertoire_id, draft, revision)
+        let context = self.gap_analysis_context(&dataset, &repertoire_id, revision)?;
+        Ok(GapAnalysisInput {
+            draft,
+            catalog: context.catalog,
+            repertoire_id,
+            repertoire_names: context.names,
+            revision,
+        })
     }
 
     fn gap_analysis_context(
         &self,
-        dataset: DatasetId,
-        repertoire_id: String,
-        draft: GapDraft,
+        dataset: &DatasetId,
+        repertoire_id: &str,
         revision: Revision,
-    ) -> Result<GapAnalysisInput, AppError> {
+    ) -> Result<GapAnalysisContext, AppError> {
         let snapshot = self.store.content_state()?;
         let current_revision = snapshot.content_revision;
-        if snapshot.dataset != dataset || current_revision != revision {
+        if &snapshot.dataset != dataset || current_revision != revision {
             return Err(AppError::new(
                 "stale_repertoire",
                 "The repertoire changed. Open the gap again.",
             ));
         }
-        if snapshot.suspended_repertoires.contains(&repertoire_id) {
+        if snapshot.suspended_repertoires.contains(repertoire_id) {
             return Err(super::repertoires::suspended_repertoire());
         }
         let mut catalog = BTreeMap::<PositionKey, Vec<SavedRepertoireResponse>>::new();
@@ -314,12 +332,9 @@ impl Tempo {
                     });
             }
         }
-        Ok(GapAnalysisInput {
-            draft,
+        Ok(GapAnalysisContext {
             catalog,
-            repertoire_id,
-            repertoire_names,
-            revision,
+            names: repertoire_names,
         })
     }
 
@@ -332,8 +347,7 @@ impl Tempo {
             .response
             .take()
             .ok_or_else(|| AppError::new("invalid_gap_line", "Choose your first reply."))?;
-        gap.gap_kind = GapKind::Forecast;
-        let checked = self.checked_gap(&gap)?;
+        let checked = self.checked_gap_repertoire(&gap)?;
         if gap.base_revision != Some(checked.revision) {
             return Err(AppError::new(
                 "stale_draft",
@@ -367,19 +381,16 @@ impl Tempo {
         let first_san = line
             .play(&checked.authored, &first)
             .map_err(|error| domain("invalid_gap_line", error))?;
-        let analysis = self.gap_analysis_context(
-            gap.dataset_id,
-            gap.repertoire_id,
-            checked.draft,
-            checked.revision,
-        )?;
+        let catalog = self
+            .gap_analysis_context(&gap.dataset_id, &gap.repertoire_id, checked.revision)?
+            .catalog;
         Ok(GapLineInput {
             line,
             anchor_fen,
             first,
             first_san,
             first_number,
-            analysis,
+            catalog,
             book: checked.authored,
             source: checked.pgn,
             name: checked.name,
@@ -402,16 +413,16 @@ impl Tempo {
 
     pub fn game_gap_draft(&self, request: GapRequest) -> Result<Value, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.game_model.game_gap_draft");
-        let CheckedGap {
-            authored,
+        let (
+            CheckedGapRepertoire {
+                authored,
+                revision,
+                name,
+                color,
+                ..
+            },
             draft,
-            revision,
-            name,
-            color,
-            ..
-        } = self.checked_gap(&request)?;
-        let mut anchor_route = authored.positions[&request.position].prefix.clone();
-        anchor_route.push(request.actual_move.clone());
+        ) = self.checked_gap(&request)?;
         let save_token = draft
             .pgn
             .as_ref()
@@ -470,7 +481,7 @@ impl Tempo {
         });
         Ok(json!({
             "draft": draft,
-            "anchor_route": anchor_route,
+            "anchor_route": draft.anchor_route,
             "content_revision": revision,
             "save_token": save_token,
             "repertoire_name": name,

@@ -7,19 +7,21 @@ use crate::{
     explorer::ExplorerClient,
     game_evidence::check_id,
     game_model::GapRequest,
-    gap_analysis::{GapAnalysisInput, NEARBY_PER_GROUP, evaluate_replies},
+    gap_analysis::{NEARBY_PER_GROUP, evaluate_replies},
     gap_recommendation::SimilarMoves,
     maia::Distribution,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tempo_chess::{
-    AuthoredRepertoire, CoverageLine, LearnerColor, PositionKey, nearby_repertoire_positions,
+    AuthoredRepertoire, CoverageLine, LearnerColor, PositionKey, SavedRepertoireResponse,
+    nearby_repertoire_positions,
 };
 use tempo_store::SqliteStore;
 use tempo_types::Revision;
@@ -44,7 +46,7 @@ pub(crate) struct GapLineInput {
     pub first: String,
     pub first_san: String,
     pub first_number: u16,
-    pub analysis: GapAnalysisInput,
+    pub catalog: BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>,
     pub book: AuthoredRepertoire,
     pub source: String,
     pub name: String,
@@ -255,8 +257,8 @@ fn preview(
         |fen, legal| {
             let nearby = nearby_repertoire_positions(
                 fen,
-                &input.analysis.repertoire_id,
-                &input.analysis.catalog,
+                &request.gap.repertoire_id,
+                &input.catalog,
                 NEARBY_PER_GROUP,
             );
             let mut similar = nearby.as_ref().map(SimilarMoves::rank).unwrap_or_default();
