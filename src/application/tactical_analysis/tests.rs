@@ -247,7 +247,19 @@ fn accepted_miss_preserves_active_then_is_next_independently_of_display_name() {
 
 #[test]
 fn a_wrong_answer_explains_the_won_knight_on_an_issued_game_finding() {
-    use crate::wire::{StudyCommand, StudyView};
+    assert_capture_explanation(false);
+}
+
+#[test]
+fn show_move_explains_the_won_knight_on_an_issued_game_finding() {
+    assert_capture_explanation(true);
+}
+
+fn assert_capture_explanation(reveal: bool) {
+    use crate::{
+        AbandonCommand,
+        wire::{StudyCommand, StudyView},
+    };
     use tempo_chess::TacticExplanation;
 
     let (directory, mut app) = disposable();
@@ -266,13 +278,22 @@ fn a_wrong_answer_explains_the_won_knight_on_an_issued_game_finding() {
         panic!("expected a game tactic");
     };
     assert!(issued.feedback.is_none());
-    let command = StudyCommand::Answer(SubmitCommand {
-        dataset_id: issued.dataset_id,
-        attempt_id: issued.attempt_id,
-        expected_revision: issued.revision,
-        submission_id: "miss-game-pin".into(),
-        answer: "g1g2".into(),
-    });
+    let command = if reveal {
+        StudyCommand::GiveUp(AbandonCommand {
+            dataset_id: issued.dataset_id,
+            attempt_id: issued.attempt_id,
+            expected_revision: issued.revision,
+            submission_id: "reveal-game-capture".into(),
+        })
+    } else {
+        StudyCommand::Answer(SubmitCommand {
+            dataset_id: issued.dataset_id,
+            attempt_id: issued.attempt_id,
+            expected_revision: issued.revision,
+            submission_id: "miss-game-capture".into(),
+            answer: "g1g2".into(),
+        })
+    };
     let missed = app.handle(command.clone());
     let StudyView::Attempt(view) = &missed else {
         panic!("expected correction");
@@ -1429,7 +1450,7 @@ fn a_revised_tactic_preserves_the_issued_attempt_without_introducing_new_learnin
     let store = tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
     let dataset = app.game_dataset().unwrap();
     app.import_game_pgn(GameImport { dataset_id: dataset.clone(), command_id: "rescan".into(), learner: "Learner".into(), repertoire_id: None,
-        pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"7k/n7/8/4p3/3P4/8/8/R5K1 w - - 0 1\"]\n\n1. Kg2 0-1".into(),
+        pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"4k3/n4n2/8/4p2B/3P4/8/8/R5K1 w - - 0 1\"]\n\n1. Kg2 0-1".into(),
     }).unwrap();
     let (mut old_detector, mut old_jobs) = host("before", "good");
     scan(&directory, &mut app, &mut old_detector, &mut old_jobs, 1);
@@ -1518,7 +1539,9 @@ fn a_revised_tactic_preserves_the_issued_attempt_without_introducing_new_learnin
     );
 }
 
-const TWO_CAPTURES: &str = "k7/3n4/8/8/3Q3r/8/8/1K6 w - - 0 1";
+// The initial queen capture uniquely wins the larger prize. The revised
+// analysis can still report the rook capture while Study retains its binding.
+const TWO_CAPTURES: &str = "k7/3q4/8/8/3Q3r/8/8/1K6 w - - 0 1";
 
 struct ChoiceEvaluator {
     revision: &'static str,
