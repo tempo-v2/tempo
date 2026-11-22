@@ -898,12 +898,15 @@ fn later_tactic_correction_uses_the_issued_move_regardless_of_capture_attributio
         assert!(second["feedback"].get("tactic_explanation").is_none());
         let shown = study(&mut app, activity_command("give_up", &second, "show"));
         assert_eq!(shown["feedback"]["correction_uci"], "e2b5");
-        assert!(shown["feedback"].get("tactic_explanation").is_none());
+        assert_eq!(shown["feedback"]["tactic_explanation"]["kind"], "pin");
         let mut miss = activity_command("answer", &shown, "wrong");
         miss["answer"] = json!({"uci":"e2d3"});
         let missed = study(&mut app, miss.clone());
         assert_eq!(missed["feedback"]["correction_uci"], "e2b5");
-        assert_eq!(missed["feedback"]["tactic_explanation"]["kind"], "pin");
+        assert_eq!(
+            missed["feedback"]["tactic_explanation"],
+            shown["feedback"]["tactic_explanation"]
+        );
         let mut correction = activity_command("answer", &missed, "finish");
         correction["answer"] = json!({"uci":"e2b5"});
         let completed = study(&mut app, correction);

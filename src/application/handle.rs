@@ -15,6 +15,7 @@ use tempo_study::AttemptStatus;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FeedbackSource {
     SubmittedMove,
+    RevealedMove,
     Other,
 }
 
@@ -55,9 +56,9 @@ impl Tempo {
             StudyCommand::Acknowledge(command) => self
                 .acknowledge(command)
                 .and_then(|value| self.project(value)),
-            StudyCommand::GiveUp(command) => {
-                self.give_up(command).and_then(|value| self.project(value))
-            }
+            StudyCommand::GiveUp(command) => self
+                .give_up(command)
+                .and_then(|value| self.project_result(value, FeedbackSource::RevealedMove)),
             StudyCommand::Concede(command) => {
                 self.concede(command).and_then(|value| self.project(value))
             }
@@ -165,8 +166,10 @@ impl Tempo {
             let uci = &decision.expected.uci;
             let san =
                 move_san(&decision.fen, uci).map_err(|error| domain("invalid_content", error))?;
-            let tactic_explanation = if source == FeedbackSource::SubmittedMove
-                && attempt.status == AttemptStatus::Active
+            let tactic_explanation = if matches!(
+                source,
+                FeedbackSource::SubmittedMove | FeedbackSource::RevealedMove
+            ) && attempt.status == AttemptStatus::Active
                 && matches!(record.mode, ActivityMode::Test | ActivityMode::Practice)
                 && matches!(&issued.definition.kind, ContentKind::Tactic { .. })
             {
