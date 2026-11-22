@@ -38,11 +38,8 @@ pub mod game_backfill;
 pub mod game_model;
 
 pub mod explorer;
-pub mod gap_analysis;
 pub mod gap_explorer;
-mod gap_recommendation;
 mod maia;
-mod stockfish;
 
 pub mod local_runtime;
 

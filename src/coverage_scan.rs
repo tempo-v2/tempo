@@ -21,9 +21,6 @@ use tempo_chess::{
 use tempo_store::{CoverageLineSetting, CoverageSummary, SqliteStore, Store};
 use tempo_types::DatasetId;
 
-mod gap_line;
-pub(crate) use gap_line::{GapLineInput, GapLineRead, GapLineRequest};
-
 const EXPLORER_LIMIT: usize = 128;
 const POSITION_LIMIT: usize = 2_000;
 const RUN_LIMIT: Duration = Duration::from_secs(300);
@@ -65,7 +62,6 @@ pub(crate) struct CoverageScan {
     explorer: Arc<ExplorerClient>,
     cache: Arc<ExplorerCache>,
     run: Arc<Mutex<Option<Run>>>,
-    lines: Arc<Mutex<gap_line::LineJobs>>,
 }
 
 impl CoverageScan {
@@ -75,7 +71,6 @@ impl CoverageScan {
             explorer,
             cache: Default::default(),
             run: Default::default(),
-            lines: Default::default(),
         }
     }
 

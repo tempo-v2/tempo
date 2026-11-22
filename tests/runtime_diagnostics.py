@@ -460,6 +460,20 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(replayed, reply)
 
+    def test_gap_line_preview_retirement_does_no_work(self):
+        logs = self.root / "gap-line-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            for path in ("/api/games/gap-line", "/api/games/gap-line/status"):
+                status, _, payload, delivery = server.request(b"{}", path=path)
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("gap_line.", "engine.", "sqlite.", "app."))
+                    for e in events
+                ))
+
     def test_standalone_gap_analysis_retirement_does_no_work(self):
         logs = self.root / "gap-analysis-retirement-logs"
         with Server(self.database, self.ui, logs) as server:

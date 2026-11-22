@@ -1,14 +1,12 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id};
-use crate::coverage_scan::{GapLineInput, GapLineRequest};
 use crate::game_model::{AuthoringSurface, GapKind, GapRequest, model_input_stamp};
 use crate::maia::{MODEL_KEY, PROFILE_LABEL, checked_distribution};
 use crate::{AppError, app_error::domain, commands::RepertoireInput};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use tempo_chess::{
-    AuthoredRepertoire, ContentKind, GapDraft, LearnerColor, PositionKey, SavedRepertoireResponse,
-    compile_repertoire, legal_move_labels,
+    AuthoredRepertoire, GapDraft, LearnerColor, compile_repertoire, legal_move_labels,
 };
 use tempo_store::{
     CoverageEditBasis, ForecastGap, ModelAuthority, ProjectionStatus, StoreError, model_lines,
@@ -292,45 +290,6 @@ impl Tempo {
         Ok((draft, book.revision))
     }
 
-    fn gap_analysis_context(
-        &self,
-        dataset: &DatasetId,
-        repertoire_id: &str,
-        revision: Revision,
-    ) -> Result<BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>, AppError> {
-        let snapshot = self.store.content_state()?;
-        let current_revision = snapshot.content_revision;
-        if &snapshot.dataset != dataset || current_revision != revision {
-            return Err(AppError::new(
-                "stale_repertoire",
-                "The repertoire changed. Open the gap again.",
-            ));
-        }
-        if snapshot.suspended_repertoires.contains(repertoire_id) {
-            return Err(super::repertoires::suspended_repertoire());
-        }
-        let mut catalog = BTreeMap::<PositionKey, Vec<SavedRepertoireResponse>>::new();
-        for item in snapshot.catalog.items.values().filter(|item| item.active()) {
-            if let ContentKind::Repertoire {
-                position,
-                repertoire,
-            } = &item.definition.kind
-            {
-                if snapshot.suspended_repertoires.contains(repertoire) {
-                    continue;
-                }
-                catalog
-                    .entry(position.clone())
-                    .or_default()
-                    .push(SavedRepertoireResponse {
-                        repertoire_id: repertoire.clone(),
-                        answer: item.definition.decisions[0].expected.clone(),
-                    });
-            }
-        }
-        Ok(catalog)
-    }
-
     pub(crate) fn authorize_gap_surface(
         &self,
         request: &GapRequest,
@@ -370,100 +329,6 @@ impl Tempo {
                     && entry.gap.actual_move == gap.actual_move
             })
             .ok_or_else(|| AppError::new("stale_coverage", "Refresh the gaps for the latest scan."))
-    }
-
-    pub(crate) fn gap_line_input(
-        &self,
-        request: &GapLineRequest,
-        surface: AuthoringSurface,
-    ) -> Result<GapLineInput, AppError> {
-        let mut gap = request.gap.clone();
-        let first = gap
-            .response
-            .take()
-            .ok_or_else(|| AppError::new("invalid_gap_line", "Choose your first reply."))?;
-        let checked = self.checked_gap_repertoire(&gap)?;
-        if gap.base_revision != Some(checked.revision) {
-            return Err(AppError::new(
-                "stale_draft",
-                "Reopen the gap before drafting a line.",
-            ));
-        }
-        if gap
-            .report_id
-            .as_ref()
-            .is_some_and(|id| id != &request.report_id)
-        {
-            return Err(AppError::new(
-                "stale_coverage",
-                "Reopen the gap from the latest scan.",
-            ));
-        }
-        let report = Some(request.report_id.as_str());
-        let forecast = match surface {
-            AuthoringSurface::Desktop => self.forecast_gap(&gap, report),
-            AuthoringSurface::PhoneBuild => self.phone_forecast_gap(&gap, report),
-        }?;
-        let mut line = checked
-            .authored
-            .coverage_line_from(
-                &forecast.starting_line.moves,
-                &gap.position,
-                &gap.actual_move,
-                checked.color,
-            )
-            .map_err(|error| domain("stale_gap", error))?;
-        let anchor_fen = line.fen();
-        let first_number = line.move_number();
-        if first_number > u16::from(forecast.through_move) {
-            return Err(AppError::new(
-                "stale_coverage",
-                "The gap is beyond the scan depth.",
-            ));
-        }
-        let first_san = line
-            .play(&checked.authored, &first)
-            .map_err(|error| domain("invalid_gap_line", error))?;
-        let catalog =
-            self.gap_analysis_context(&gap.dataset_id, &gap.repertoire_id, checked.revision)?;
-        Ok(GapLineInput {
-            line,
-            anchor_fen,
-            first,
-            first_san,
-            first_number,
-            catalog,
-            book: checked.authored,
-            source: checked.pgn,
-            name: checked.name,
-            color: checked.color,
-            through_move: forecast.through_move,
-            forecast: forecast.edit_basis(),
-        })
-    }
-
-    pub(crate) fn sign_gap_line(
-        &self,
-        input: &RepertoireInput,
-        revision: Revision,
-        surface: AuthoringSurface,
-        request: &GapLineRequest,
-        basis: &CoverageEditBasis,
-    ) -> Result<String, AppError> {
-        let forecast = self.forecast_gap(&request.gap, Some(&request.report_id))?;
-        if forecast.edit_basis() != *basis {
-            return Err(AppError::new(
-                "stale_coverage",
-                "Reopen the gap from the latest scan.",
-            ));
-        }
-        self.gap_response_token(
-            input,
-            input.repertoire_id.as_deref().expect("gap repertoire"),
-            revision,
-            surface,
-            Some(basis),
-        )
     }
 
     pub fn game_gap_draft(&self, request: GapRequest) -> Result<Value, AppError> {

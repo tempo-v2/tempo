@@ -199,25 +199,6 @@ The displayed local coverage sums authored replies that have a saved learner
 response. Study also uses a separate modeled reach across authored routes
 where personal exposure is absent.
 
-Opening a gap shows similar repertoire responses alongside a bounded
-Stockfish search. Nearby positions are ranked by pawn files, piece placement
-and castling rights. Tempo tries the most common reusable replies in the
-current repertoire first, then other saved repertoires for the same side.
-For replies backed by the same number of positions, a better comparable
-Stockfish evaluation wins the tie. Structural closeness breaks remaining ties.
-
-Tempo suggests the first reply within 50 centipawns of Stockfish's best.
-If the best comparable repertoire reply is 51–150 centipawns behind, the
-selection stays blank. Stockfish is suggested when every shortlisted reply
-can be compared and is more than 150 centipawns behind. Missing evidence can
-leave the selection blank. The arrow previews the suggestion on the original
-board. Play a different move or clear the suggestion any time before saving.
-
-The local comparison uses the existing Maia Python environment and the local
-Stockfish executable. It examines up to eight distinct nearby positions per
-group and compares up to sixteen distinct repertoire replies. Opening,
-comparing, staging and clearing are read-only.
-
 Lichess Explorer is optional. [Create a Lichess access token][explorer-token],
 name it “Tempo Explorer” and leave the permissions unchecked. Save only the
 token in a private plain-text file named `lichess-explorer.token` beside the

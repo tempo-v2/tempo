@@ -506,6 +506,21 @@ fn respond_inner(
             body("application/json; charset=utf-8", json_bytes(&retired)?)
                 .with_status_code(StatusCode::GONE),
         )?;
+    } else if request.method() == &Method::POST
+        && matches!(
+            request.url(),
+            "/api/games/gap-line" | "/api/games/gap-line/status"
+        )
+    {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Automatic gap-line previews have been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
     } else if matches!(
         request.url(),
         "/api/games"
@@ -524,8 +539,6 @@ fn respond_inner(
             | "/api/games/coverage/starting-line/save"
             | "/api/games/gaps"
             | "/api/games/gap-draft"
-            | "/api/games/gap-line"
-            | "/api/games/gap-line/status"
             | "/api/games/review"
             | "/api/games/gap-explorer"
             | "/api/study/relevance"
@@ -619,16 +632,6 @@ fn respond_inner(
                 200,
                 command::<crate::GameReviewRead>(&request, MAX_COMMAND_BYTES)
                     .and_then(|request| app.game_review(request)),
-            ),
-            (&Method::POST, "/api/games/gap-line") => (
-                202,
-                command::<crate::coverage_scan::GapLineRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.start_line(app, intent, surface)),
-            ),
-            (&Method::POST, "/api/games/gap-line/status") => (
-                200,
-                command::<crate::coverage_scan::GapLineRead>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.read_line(app, intent, surface)),
             ),
             (&Method::POST, "/api/games/gap-draft") => (
                 200,
@@ -932,8 +935,6 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/coverage/status" => "repertoire_coverage_status",
         "/api/games/gaps" => "game_gaps",
         "/api/games/gap-draft" => "game_gap_draft",
-        "/api/games/gap-line" => "game_gap_line",
-        "/api/games/gap-line/status" => "game_gap_line_status",
         "/api/games/review" => "game_review",
         "/api/games/gap-explorer" => "game_gap_explorer",
         "/" | "/index.html" => "ui_index",
