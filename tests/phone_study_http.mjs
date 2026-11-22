@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { databaseRows } from "./support/game_detection_readback.mjs";
 
 const binary = resolve(process.env.TEMPO_BINARY || "target/debug/tempo");
@@ -92,6 +93,26 @@ test("phone Study retains its shared commands and denies desktop routes after in
   assert.deepEqual(await send(host, "/", { headers: phoneHeaders }), { status: 200, body: "Phone fixture" });
   const desktop = await post("/api/study-progress", null);
   assert.deepEqual(await post("/api/study-progress", null, phoneHeaders), desktop);
+  const sql = new DatabaseSync(database, { timeout: 5000 });
+  const { policy } = sql.prepare("SELECT policy FROM store_state WHERE singleton=1").get();
+  const { user_version } = sql.prepare("PRAGMA user_version").get();
+  try {
+    sql.prepare("UPDATE store_state SET policy='not-json' WHERE singleton=1").run();
+    const expected = { status: "ready", dataset_id: desktop.dataset_id, schema_version: user_version };
+    for (const headers of [{}, phoneHeaders]) {
+      const context = await send(host, "/api/context", { headers });
+      assert.equal(context.status, 200, context.body);
+      assert.deepEqual(JSON.parse(context.body), expected);
+    }
+    assert.equal((await post("/api/study", { command: "study_status" })).status, "error");
+    assert.equal((await send(host, "/api/context", {
+      headers: { ...phoneHeaders, "Tailscale-User-Login": "other@example.invalid" },
+    })).status, 403);
+  } finally {
+    sql.prepare("UPDATE store_state SET policy=? WHERE singleton=1").run(policy);
+    sql.close();
+  }
+
   assert.equal((await send(host, "/api/games/detectors")).status, 200);
   assert.equal((await send(host, "/api/games")).status, 200);
 
