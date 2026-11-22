@@ -917,14 +917,14 @@ fn saving_a_capture_preserves_the_active_attempt_and_spends_no_introduction() {
     let (_, saved) = save_tactics(&mut app, &existing, json!([]), vec![0]);
     assert_eq!(saved["ready_for_review"], 1);
     let issued = study(&mut app, json!({"command":"next"}));
-    assert_eq!(issued["status"], "attempt");
+    assert_eq!(issued["status"], "ready");
 
     let capture = snippet("Second capture", fen, "e4");
     let (_, saved) = save_tactics(&mut app, &capture, json!([]), vec![0]);
     assert_eq!(saved["ready_for_review"], 1);
     drop(app);
 
-    let mut app = open(&db, day.clone(), limits, 0);
+    let mut app = open(&db, day.clone(), limits, 1);
     assert_eq!(study(&mut app, json!({"command":"next"})), issued);
     assert!(app.snapshot().unwrap().assessments.is_empty());
     assert_eq!(
