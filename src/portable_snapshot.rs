@@ -27,13 +27,14 @@ mod tests {
 
     #[test]
     fn portability_carries_content_and_learning_without_live_attempt_identity() {
+        const CURRENT_PORTABLE_SCHEMA: u32 = 5;
         let (mut app, _directory) = crate::components::test_study();
         app.next_exercise().unwrap();
         let text = app.export(&JsonSnapshotCodec).unwrap();
         let portable = JsonSnapshotCodec.decode(&text).unwrap();
         assert_eq!(portable.learning, app.snapshot().unwrap().learning);
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], CURRENT_PORTABLE_SCHEMA);
         assert!(json.get("dataset").is_none());
         assert!(json.get("attempts").is_none());
         assert!(json.get("receipts").is_none());

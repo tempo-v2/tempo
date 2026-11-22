@@ -28,8 +28,8 @@ pub struct EmptyView {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Tempo,
-        wire::{StudyCommand, StudyView},
+        IntroductionLimits, Tempo,
+        wire::{STUDY_WIRE_VERSION, StudyCommand, StudyView},
     };
     use tempo_chess::Catalog;
 
@@ -39,16 +39,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store =
             crate::components::test_store(&directory, "empty", Catalog::default(), &components);
-        let mut app =
-            Tempo::daily(Box::new(store), components, Default::default(), [42; 32], 0).unwrap();
+        let limits = IntroductionLimits::default();
+        let mut app = Tempo::daily(Box::new(store), components, limits, [42; 32], 0).unwrap();
         let StudyView::Empty(view) = app.handle(StudyCommand::Next) else {
             panic!("no content means no eligible exercise");
         };
         assert_eq!(
             serde_json::to_value(view).unwrap(),
             serde_json::json!({
-                "schema_version": 5, "status": "empty", "dataset_id": "empty",
-                "done": true, "outstanding": 0, "repertoire_remaining": 0, "tactics_remaining": 0,
+                "schema_version": STUDY_WIRE_VERSION, "status": "empty", "dataset_id": "empty",
+                "done": true, "outstanding": 0,
+                "repertoire_remaining": limits.repertoire, "tactics_remaining": limits.tactics,
                 "can_practice_tactics": false, "can_learn_more_tactics": false, "learn_more_count": 0
             })
         );
