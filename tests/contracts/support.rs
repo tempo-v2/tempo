@@ -8,7 +8,7 @@ use tempo_store::{
     SqliteStore, Store, StoreError, StudyOrderingWrite, StudyScope, StudyState, TacticalRequest,
     Write,
 };
-use tempo_types::{DatasetId, Revision, StudyDay, StudyTime, TargetId};
+use tempo_types::{AttemptId, DatasetId, Revision, StudyDay, StudyTime, TargetId};
 
 struct FailOnceStore {
     store: SqliteStore,
@@ -18,6 +18,12 @@ struct FailOnceStore {
 impl DatasetIdentity for FailOnceStore {
     fn dataset_id(&self) -> Result<DatasetId, StoreError> {
         self.store.dataset_id()
+    }
+}
+
+impl tempo_store::AddressedResume for FailOnceStore {
+    fn resume_state(&self, id: &AttemptId) -> Result<tempo_store::ResumeState, StoreError> {
+        self.store.resume_state(id)
     }
 }
 

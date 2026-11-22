@@ -186,7 +186,19 @@ test("phone Study retains its shared commands and denies desktop routes after in
   const scan = await post("/api/games/coverage/status", { dataset_id, repertoire_id }, phoneHeaders);
   assert.equal(scan.status, "idle");
   const issued = await post("/api/study", { command: "next" }, phoneHeaders);
-  const resumed = await post("/api/study", { command: "resume", attempt_id: issued.attempt_id });
+  const resumeSql = new DatabaseSync(database, { timeout: 5000 });
+  const { state: learningBeforeResume } = resumeSql.prepare(
+    "SELECT state FROM learning WHERE target_id=?"
+  ).get(issued.target_id);
+  let resumed;
+  try {
+    resumeSql.prepare("UPDATE learning SET state='not-json' WHERE target_id=?").run(issued.target_id);
+    resumed = await post("/api/study", { command: "resume", attempt_id: issued.attempt_id });
+    assert.equal(resumed.status, "ready");
+  } finally {
+    resumeSql.prepare("UPDATE learning SET state=? WHERE target_id=?").run(learningBeforeResume, issued.target_id);
+    resumeSql.close();
+  }
   assert.equal(resumed.attempt_id, issued.attempt_id);
   assert.equal(resumed.dataset_id, dataset_id);
   const command = {

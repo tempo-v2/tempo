@@ -8,7 +8,7 @@ use crate::{
     views::{LessonView, StudyView},
 };
 use tempo_chess::{ContentKind, explain_issued_tactic, move_san, project_position};
-use tempo_store::{ActivityMode, AnswerResult, StudyScope};
+use tempo_store::{ActivityMode, AnswerResult, StoredAttempt, StudyScope};
 use tempo_study::AttemptStatus;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,9 +36,12 @@ impl Tempo {
                 }
                 self.next_view()
             }
-            StudyCommand::Resume { attempt_id } => self
-                .resume(&attempt_id)
-                .and_then(|value| self.project(value)),
+            StudyCommand::Resume { attempt_id } => {
+                self.resume_record(&attempt_id).and_then(|record| {
+                    let result = super::resume::resume_result(&record)?;
+                    self.project_stored_result(result, FeedbackSource::Other, &record)
+                })
+            }
             StudyCommand::Answer(command) => self
                 .submit(command)
                 .and_then(|value| self.project_result(value, FeedbackSource::SubmittedMove)),
@@ -112,6 +115,16 @@ impl Tempo {
             .store
             .stored_attempt(&attempt.id)?
             .ok_or_else(|| AppError::new("unknown_attempt", "Issued activity is missing."))?;
+        self.project_stored_result(result, source, &record)
+    }
+
+    fn project_stored_result(
+        &self,
+        result: AnswerResult,
+        source: FeedbackSource,
+        record: &StoredAttempt,
+    ) -> Result<StudyView, AppError> {
+        let attempt = &result.attempt;
         // Immutable definitions keep replay deterministic after content replacement.
         let issued = self
             .store
@@ -178,7 +191,7 @@ impl Tempo {
             .transpose()
             .map_err(|error| domain("invalid_content", error))?;
         Ok(StudyView::attempt(
-            result, board, correction, &record, lesson, history,
+            result, board, correction, record, lesson, history,
         ))
     }
 }
