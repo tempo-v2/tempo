@@ -97,20 +97,6 @@ impl Tempo {
         ))
     }
 
-    pub(crate) fn coverage_summary(
-        &self,
-        dataset: &DatasetId,
-        repertoire: &str,
-    ) -> Result<Option<tempo_store::SavedCoverage>, AppError> {
-        if &self.game_dataset()? != dataset {
-            return Err(AppError::new(
-                "stale_dataset",
-                "The active dataset changed.",
-            ));
-        }
-        Ok(self.store.coverage_summary(dataset, repertoire)?)
-    }
-
     pub fn opponent_gaps(&mut self, offset: usize) -> Result<Value, AppError> {
         self.opponent_gap_page(offset, None)
     }
@@ -279,15 +265,6 @@ impl Tempo {
         }
         .map_err(|error| domain("stale_gap", error))?;
         Ok((book, draft, basis))
-    }
-
-    pub(crate) fn gap_position(
-        &self,
-        mut request: GapRequest,
-    ) -> Result<(GapDraft, Revision), AppError> {
-        request.response = None;
-        let (book, draft, _) = self.checked_gap(&request)?;
-        Ok((draft, book.revision))
     }
 
     pub(crate) fn authorize_gap_surface(

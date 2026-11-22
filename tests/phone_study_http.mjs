@@ -218,8 +218,11 @@ test("phone Study retains its shared commands and denies desktop routes after in
     "phone_build_only", command.command);
   const scopedGaps = await post("/api/games/gaps", { offset: 0, forecast_repertoire: repertoire_id }, phoneHeaders);
   assert.deepEqual(scopedGaps.gaps, []);
-  const scan = await post("/api/games/coverage/status", { dataset_id, repertoire_id }, phoneHeaders);
-  assert.equal(scan.status, "idle");
+  for (const path of ["/api/games/coverage", "/api/games/coverage/status"]) {
+    const retired = await send(host, path, { method: "POST", headers: phoneHeaders, payload: { dataset_id, repertoire_id } });
+    assert.equal(retired.status, 410);
+    assert.equal(JSON.parse(retired.body).code, "retired_feature");
+  }
   const issued = await post("/api/study", { command: "next" }, phoneHeaders);
   const resumeSql = new DatabaseSync(database, { timeout: 5000 });
   const { state: learningBeforeResume } = resumeSql.prepare(

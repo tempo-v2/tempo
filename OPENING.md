@@ -92,10 +92,8 @@ desktop Tempo. Open the private HTTPS address in iPhone Safari, then use
 **Share → Add to Home Screen** to keep it handy. The Mac must be awake and
 reachable through Tailscale to start a session or submit a move.
 
-The phone's **Build** tab runs the existing repertoire coverage scan and
-saves reviewed replies or lines to the same repertoire as desktop Tempo.
-The phone route admits the configured owner and accepts repertoire saves
-signed by its forecast gap preview.
+The phone's **Build** tab opens saved coverage gaps and lets the configured
+owner save a reviewed reply with a signed preview.
 
 On the Mac, install the paired Tempo and UI build with the Serve HTTPS origin
 and your exact Tailscale login. The managed registration saves both values for
@@ -198,14 +196,3 @@ reuse them after interruption. An unavailable probability stays unknown.
 The displayed local coverage sums authored replies that have a saved learner
 response. Study also uses a separate modeled reach across authored routes
 where personal exposure is absent.
-
-Lichess Explorer is optional. [Create a Lichess access token][explorer-token],
-name it “Tempo Explorer” and leave the permissions unchecked. Save only the
-token in a private plain-text file named `lichess-explorer.token` beside the
-active SQLite database. The Explorer setup panel shows the exact file path and
-can copy it. Choose **Retry Explorer** to pick up the file without restarting
-Tempo. The server sends only the current board position and the selected Rapid
-rating filter. You can remove the file or revoke the token in Lichess at any
-time. Local analysis and repertoire saves are available independently.
-
-[explorer-token]: https://lichess.org/account/oauth/token/create

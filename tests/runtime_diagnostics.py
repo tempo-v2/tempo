@@ -460,6 +460,51 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(replayed, reply)
 
+    def test_coverage_scan_and_explorer_retirement_preserves_starting_line_save(self):
+        logs = self.root / "coverage-scan-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            for method, path in (
+                ("POST", "/api/games/coverage"),
+                ("POST", "/api/games/coverage/status"),
+                ("GET", "/api/games/gap-explorer"),
+                ("POST", "/api/games/gap-explorer"),
+            ):
+                status, _, payload, delivery = server.request(
+                    None if method == "GET" else b"{}", method=method, path=path
+                )
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("coverage.", "explorer.", "sqlite.", "app."))
+                    for e in events
+                ))
+
+            def post(path, command):
+                status, _, payload, _ = server.request(json.dumps(command).encode(), path=path)
+                self.assertEqual(status, 200)
+                result = json.loads(payload)
+                self.assertNotEqual(result.get("status"), "error", result.get("code"))
+                return result
+
+            _, _, context, _ = server.request(None, path="/api/context", method="GET")
+            dataset = json.loads(context)["dataset_id"]
+            draft = {"dataset_id": dataset, "name": "Coverage save fixture", "learner_color": "white",
+                     "pgn": "1. e4 e5 2. Nf3 *"}
+            preview = post("/api/repertoires", {"command": "preview", **draft})
+            saved_book = post("/api/repertoires", {"command": "save", **draft, "token": preview["token"]})
+            repertoire = next(item["id"] for item in saved_book["repertoires"] if item["name"] == draft["name"])
+            old_command = {"dataset_id": dataset, "repertoire_id": repertoire,
+                           "candidate": ["e2e4"], "save_at_revision": 0}
+            old_route = "/api/games/coverage/starting-line"
+            saved = post(old_route, old_command)["saved"]
+            self.assertEqual(saved, {"revision": 1, "moves": ["e2e4"]})
+            self.assertEqual(post(old_route + "/save", old_command)["saved"], saved)
+            self.assertEqual(post(old_route, {
+                "dataset_id": dataset, "repertoire_id": repertoire, "candidate": None,
+            })["saved"], saved)
+
     def test_gap_line_preview_retirement_does_no_work(self):
         logs = self.root / "gap-line-retirement-logs"
         with Server(self.database, self.ui, logs) as server:

@@ -8,7 +8,6 @@ use crate::{
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
-    gap_explorer::{GapExplorer, GapExplorerRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use hyper::{
@@ -56,13 +55,10 @@ pub(super) fn serve(
             "listen_port": surfaces.address.rsplit(':').next().and_then(|port| port.parse::<u16>().ok())
         }),
     );
-    let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
     let mut games = Games {
         refresh: GameJobs::start()?,
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
-        coverage: crate::coverage_scan::CoverageScan::new(database, explorer.clone()),
-        gap_explorer: GapExplorer::with_client(explorer),
     };
     let mut model_marker = None;
     let mut next_model_check = Instant::now();
@@ -122,8 +118,6 @@ struct Games {
     refresh: GameJobs,
     backfill: BackfillCoordinator,
     model: GameModel,
-    coverage: crate::coverage_scan::CoverageScan,
-    gap_explorer: GapExplorer,
 }
 
 #[derive(serde::Deserialize)]
@@ -522,6 +516,22 @@ fn respond_inner(
                 .with_status_code(StatusCode::GONE),
         )?;
     } else if matches!(
+        (request.method(), request.url()),
+        (
+            &Method::POST,
+            "/api/games/coverage" | "/api/games/coverage/status"
+        ) | (&Method::GET | &Method::POST, "/api/games/gap-explorer")
+    ) {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Coverage scans and gap Explorer have been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
+    } else if matches!(
         request.url(),
         "/api/games"
             | "/api/games/library"
@@ -533,14 +543,11 @@ fn respond_inner(
             | "/api/games/backfill"
             | "/api/games/backfill/retry"
             | "/api/games/model"
-            | "/api/games/coverage"
-            | "/api/games/coverage/status"
             | "/api/games/coverage/starting-line"
             | "/api/games/coverage/starting-line/save"
             | "/api/games/gaps"
             | "/api/games/gap-draft"
             | "/api/games/review"
-            | "/api/games/gap-explorer"
             | "/api/study/relevance"
             | "/api/study/game-context"
             | "/api/study/analysis-context"
@@ -571,16 +578,6 @@ fn respond_inner(
                 202,
                 command::<ModelRequest>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.model.start(app, intent)),
-            ),
-            (&Method::POST, "/api/games/coverage") => (
-                202,
-                command::<crate::coverage_scan::StartCoverage>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.start(app, intent)),
-            ),
-            (&Method::POST, "/api/games/coverage/status") => (
-                200,
-                command::<crate::coverage_scan::ReadCoverage>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.read(app, intent)),
             ),
             (&Method::POST, "/api/games/coverage/starting-line") => (
                 200,
@@ -621,12 +618,6 @@ fn respond_inner(
                     }
                     app.opponent_gap_page(page.offset, page.forecast_repertoire.as_deref())
                 }),
-            ),
-            (&Method::GET, "/api/games/gap-explorer") => (200, Ok(games.gap_explorer.status())),
-            (&Method::POST, "/api/games/gap-explorer") => (
-                202,
-                command::<GapExplorerRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.gap_explorer.start(app, intent)),
             ),
             (&Method::POST, "/api/games/review") => (
                 200,
@@ -929,14 +920,11 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/backfill" => "game_backfill",
         "/api/games/backfill/retry" => "game_backfill_retry",
         "/api/games/model" => "game_model",
-        "/api/games/coverage" => "repertoire_coverage_start",
         "/api/games/coverage/starting-line/save" => "save_repertoire_coverage_starting_line",
         "/api/games/coverage/starting-line" => "repertoire_coverage_starting_line",
-        "/api/games/coverage/status" => "repertoire_coverage_status",
         "/api/games/gaps" => "game_gaps",
         "/api/games/gap-draft" => "game_gap_draft",
         "/api/games/review" => "game_review",
-        "/api/games/gap-explorer" => "game_gap_explorer",
         "/" | "/index.html" => "ui_index",
         path if path.starts_with("/assets/") => "ui_asset",
         _ => "other",

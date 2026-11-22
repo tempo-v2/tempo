@@ -37,10 +37,6 @@ pub mod game_evidence;
 pub mod game_backfill;
 pub mod game_model;
 
-pub mod explorer;
-pub mod gap_explorer;
 mod maia;
 
 pub mod local_runtime;
-
-mod coverage_scan;
