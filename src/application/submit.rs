@@ -172,8 +172,7 @@ impl Tempo {
             let policy = self.components.learning.as_ref();
             let transition = if self.daily.is_some() {
                 crate::diagnostics::measure("learning.assess_test", || {
-                    DailyLearning::assess_test(
-                        policy,
+                    policy.assess_test(
                         prior,
                         &input,
                         old.attempt.content_version,
