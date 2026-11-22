@@ -28,7 +28,9 @@ impl Tempo {
         let result: Result<StudyView, AppError> = match command {
             StudyCommand::Next => self.next_view(),
             StudyCommand::StudyStatus => self.study_status(),
-            StudyCommand::PracticeTactics => Err(super::optional_tactics::retired_optional_tactics()),
+            StudyCommand::PracticeTactics => {
+                Err(super::optional_tactics::retired_optional_tactics())
+            }
             StudyCommand::LearnMoreTactics {
                 dataset_id,
                 submission_id,
@@ -76,18 +78,16 @@ impl Tempo {
 
     fn next_view(&mut self) -> Result<StudyView, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.handle.next_view");
-        let active = self.store.study_state(StudyScope::default())?;
-        if let Some(id) = &active.active_attempt
-            && !self.retire_active_warmup(&active, id)?
-        {
-            return self.project(self.resume_from(&active, id)?);
+        if let Some(record) = self.active_next_record()? {
+            return self.project_resume_record(&record);
         }
         let snapshot = self.store.study_state(StudyScope {
             catalog: true,
             ..StudyScope::default()
         })?;
-        if let Some(id) = &snapshot.active_attempt {
-            return self.project(self.resume_from(&snapshot, id)?);
+        if snapshot.active_attempt.is_some() {
+            let record = self.next_after_selection_race()?;
+            return self.project_resume_record(&record);
         }
         let at = self.components.clock.now();
         let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
@@ -117,10 +117,13 @@ impl Tempo {
     }
 
     fn project_resume(&self, id: &tempo_types::AttemptId) -> Result<StudyView, AppError> {
-        let record = self.resume_record(id)?;
-        let result = super::resume::resume_result(&record)?;
+        self.project_resume_record(&self.resume_record(id)?)
+    }
+
+    fn project_resume_record(&self, record: &StoredAttempt) -> Result<StudyView, AppError> {
+        let result = super::resume::resume_result(record)?;
         let attempt = &result.attempt;
-        let lesson_read = if guided(&record, &attempt.status) && record.lesson.is_none() {
+        let lesson_read = if guided(record, &attempt.status) && record.lesson.is_none() {
             StudyLessonRead::Guided
         } else {
             StudyLessonRead::Omit
@@ -136,7 +139,7 @@ impl Tempo {
             .ok_or_else(|| AppError::new("invalid_content", "issued definition is missing"))?;
         self.project_definition(
             result,
-            &record,
+            record,
             &issued.exercise.definition,
             issued.legacy_lesson.as_ref(),
             |_| None,

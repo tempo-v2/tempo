@@ -8,7 +8,8 @@ use crate::{
     app_error::{domain, study_input},
 };
 use tempo_store::{
-    AnswerResult, Commit, Receipt, ReceiptResult, StoredAttempt, StudyScope, StudyState, Write,
+    ActivityMode, AnswerResult, Commit, Receipt, ReceiptResult, StoredAttempt, StudyScope,
+    StudyState, Write,
 };
 
 use tempo_types::AttemptId;
@@ -35,16 +36,19 @@ impl Tempo {
         self.leave(command, true)
     }
 
-    /// Next can retire a previously issued warm-up without grading it.
-    pub(super) fn retire_active_warmup(
+    /// Next can retire previously issued Practice or a warm-up without grading it.
+    pub(super) fn retire_legacy_active(
         &mut self,
         snapshot: &StudyState,
         id: &AttemptId,
     ) -> Result<bool, AppError> {
+        if snapshot.active_attempt.as_ref() != Some(id) {
+            return Ok(false);
+        }
         let Some(record) = snapshot
             .attempts
             .get(id)
-            .filter(|record| record.repertoire_warmup)
+            .filter(|record| record.repertoire_warmup || record.mode == ActivityMode::Practice)
         else {
             return Ok(false);
         };

@@ -24,6 +24,10 @@ impl tempo_store::AddressedResume for FailOnceStore {
     fn resume_state(&self, id: &AttemptId) -> Result<tempo_store::ResumeState, StoreError> {
         self.store.resume_state(id)
     }
+
+    fn active_resume_state(&self) -> Result<tempo_store::ResumeState, StoreError> {
+        self.store.active_resume_state()
+    }
 }
 
 impl tempo_store::StudyContentRead for FailOnceStore {
