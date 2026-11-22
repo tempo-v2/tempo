@@ -1,7 +1,7 @@
 //! File-backed composition for the matched local study release.
 mod http;
 mod import;
-mod tactic_settings;
+pub(crate) mod tactic_settings;
 
 use crate::game_detection::{AnalysisOptions, DetectorRegistry, GameDetection};
 use crate::{AttemptIds, Clock, DailyComponents, IntroductionLimits, TacticThemes, Tempo};
@@ -63,29 +63,6 @@ pub fn init(path: &Path) -> LocalResult<()> {
         Some(&serde_json::to_string(&profile)?),
     )?;
     println!("Created dataset {} at {}", dataset.0, path.display());
-    Ok(())
-}
-
-pub fn configure(
-    path: &Path,
-    repertoire: usize,
-    tactics: usize,
-    more: Option<usize>,
-) -> LocalResult<()> {
-    let store = SqliteStore::open(path)?;
-    let previous = stored_profile(&store)?;
-    let mut profile: Profile = serde_json::from_str(&previous)?;
-    profile.introductions = IntroductionLimits {
-        repertoire,
-        tactics,
-    };
-    if let Some(more) = more {
-        profile.more_tactics = more;
-    }
-    store.update_local_profile(&previous, &serde_json::to_string(&profile)?)?;
-    println!(
-        "Saved daily introduction limits of {repertoire} opening positions and {tactics} tactics. Restart Tempo to apply them."
-    );
     Ok(())
 }
 

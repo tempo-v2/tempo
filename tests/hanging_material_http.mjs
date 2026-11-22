@@ -126,7 +126,6 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     await writeFile(transfer, JSON.stringify({ schema_version: 1, puzzles: [seed] }));
     execFileSync(binary, ["init", database]);
     execFileSync(binary, ["import-tactics", database, transfer]);
-    execFileSync(binary, ["configure", database, "0", "1"]);
     host = await start(database, ui);
 
     async function api(route, body) {
@@ -137,6 +136,13 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
       assert.ok(response.status === 200 || response.status === 202, JSON.stringify(value));
       return value;
     }
+    const settings = await api("tactic-settings", { command: "get" });
+    const saved = await api("tactic-settings", {
+      command: "save", dataset_id: settings.dataset_id, expected_revision: settings.revision,
+      new_openings_per_day: 0, new_tactics_per_day: 1, selection: settings.selection,
+    });
+    assert.equal(saved.status, "tactic_settings");
+
     let serial = 0, stored = null, loseAnswer = false, interruptNext = false, lostReply;
     const sent = [];
     function controller() {

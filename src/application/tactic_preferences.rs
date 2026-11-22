@@ -51,6 +51,17 @@ impl TacticThemes {
 }
 
 impl Tempo {
+    pub(crate) fn apply_local_study_settings(
+        &mut self,
+        limits: crate::IntroductionLimits,
+        themes: Option<TacticThemes>,
+    ) {
+        if let Some(daily) = &mut self.daily {
+            daily.limits = limits;
+            daily.tactic_themes = themes;
+        }
+    }
+
     pub fn set_local_tactic_preferences(&mut self, limit: usize, themes: Option<TacticThemes>) {
         let _diagnostic =
             crate::diagnostics::Span::new("app.tactic_preferences.set_local_tactic_preferences");

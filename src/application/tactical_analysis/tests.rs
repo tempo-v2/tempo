@@ -87,8 +87,22 @@ fn disposable() -> (tempfile::TempDir, Tempo) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("tactics.sqlite");
     local_runtime::init(&path).unwrap();
-    local_runtime::configure(&path, 0, 0, None).unwrap();
     let mut app = local_runtime::open(&path).unwrap();
+    let store = tempo_store::SqliteStore::open(&path).unwrap();
+    use local_runtime::tactic_settings::{Command, handle};
+    let settings = handle(&mut app, &store, Command::Get).unwrap();
+    handle(
+        &mut app,
+        &store,
+        Command::Save {
+            dataset_id: serde_json::from_value(settings["dataset_id"].clone()).unwrap(),
+            expected_revision: settings["revision"].as_str().unwrap().into(),
+            new_tactics_per_day: 0,
+            new_openings_per_day: Some(0),
+            selection: crate::TacticThemes::Any,
+        },
+    )
+    .unwrap();
     app.components.clock = Box::new(FixedClock(app.components.clock.now()));
     (directory, app)
 }
