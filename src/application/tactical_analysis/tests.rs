@@ -1429,7 +1429,7 @@ fn a_revised_tactic_preserves_the_issued_attempt_without_introducing_new_learnin
     let store = tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
     let dataset = app.game_dataset().unwrap();
     app.import_game_pgn(GameImport { dataset_id: dataset.clone(), command_id: "rescan".into(), learner: "Learner".into(), repertoire_id: None,
-        pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"7k/n7/8/4q3/3P4/8/8/R5K1 w - - 0 1\"]\n\n1. Kg2 0-1".into(),
+        pgn: "[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"7k/n7/8/4p3/3P4/8/8/R5K1 w - - 0 1\"]\n\n1. Kg2 0-1".into(),
     }).unwrap();
     let (mut old_detector, mut old_jobs) = host("before", "good");
     scan(&directory, &mut app, &mut old_detector, &mut old_jobs, 1);
@@ -2128,7 +2128,7 @@ fn generated_checking_fork_is_extended_before_its_first_request_is_issued() {
 
 #[test]
 #[ignore = "requires the configured tactical Python and Stockfish"]
-fn optional_continuation_deadline_preserves_an_admitted_puzzle() {
+fn optional_continuation_deadline_preserves_the_finding_and_withholds_the_puzzle() {
     assert_generated_checking_fork(true);
 }
 
@@ -2142,7 +2142,10 @@ fn assert_generated_checking_fork(expire_search: bool) {
     }
     let mut registry = DetectorRegistry::default();
     registry
-        .register(tempo_chess::PersonalTacticsDetector(engine))
+        .register(tempo_chess::PersonalTacticsDetector(ChoiceEvaluator {
+            revision: "checking-fork",
+            best: "d1h5",
+        }))
         .unwrap();
     let mut detection = GameDetection::new(
         registry,
@@ -2161,6 +2164,25 @@ fn assert_generated_checking_fork(expire_search: bool) {
         pgn:format!("[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n[Result \"0-1\"]\n\n1. Qe2 0-1")}).unwrap();
     let store = tempo_store::SqliteStore::open(path).unwrap();
     let start = Instant::now();
+    if expire_search {
+        loop {
+            detection.poll(&mut app);
+            jobs.poll(&mut app, &store, &mut detection);
+            let report = read(&app, &jobs, &store);
+            if report["statistics"]["decisions_scanned"] == 1 {
+                assert!(
+                    store
+                        .pending_tactical_requests(&dataset)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(app.next_exercise().unwrap().is_none());
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(85), "{report}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
     let request = loop {
         detection.poll(&mut app);
         jobs.poll(&mut app, &store, &mut detection);
@@ -2183,15 +2205,64 @@ fn assert_generated_checking_fork(expire_search: bool) {
         .issued_item(&dataset, &request.target, request.version)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        item.definition.decisions.len(),
-        if expire_search { 1 } else { 2 }
-    );
+    assert_eq!(item.definition.decisions.len(), 2);
     assert_eq!(item.definition.decisions[0].expected.uci, "d1h5");
-    if expire_search {
-        assert!(item.definition.decisions[0].autoplay.is_empty());
-    } else {
-        assert_eq!(item.definition.decisions[0].autoplay[0].uci, "g7g6");
-        assert_eq!(item.definition.decisions[1].expected.uci, "h5c5");
-    }
+    assert_eq!(item.definition.decisions[0].autoplay[0].uci, "g7g6");
+    assert_eq!(item.definition.decisions[1].expected.uci, "h5c5");
+}
+
+#[test]
+#[ignore = "requires the configured tactical Python and Stockfish"]
+fn pictured_game_lesson_ends_at_the_rook_and_measures_the_actual_turn() {
+    let (dir, mut app) = disposable();
+    let path = dir.path().join("tactics.sqlite");
+    let store = tempo_store::SqliteStore::open(&path).unwrap();
+    let dataset = app.game_dataset().unwrap();
+    let fen = "4r1k1/B1p1P3/7p/1rpp1bp1/5p2/1B4P1/PPP4P/R3Q1K1 w - - 0 1";
+    let engine = crate::tactical_engine::StockfishEvaluator::discover(&path).unwrap();
+    let mut registry = DetectorRegistry::default();
+    registry
+        .register(tempo_chess::PersonalTacticsDetector(ChoiceEvaluator {
+            revision: "pictured-fork-v1",
+            best: "b3d5",
+        }))
+        .unwrap();
+    let mut detector = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
+    let mut jobs = TacticalJobs::new(&detector, &["personal-tactics"]);
+    jobs.enable_payoffs(engine.payoff_engine());
+    jobs.force_idle_for_test();
+    app.import_game_pgn(GameImport {
+        dataset_id: dataset.clone(), command_id: "pictured-game".into(), learner: "Learner".into(), repertoire_id: None,
+        pgn: format!("[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n[Result \"0-1\"]\n\n1. Bxc5 0-1"),
+    }).unwrap();
+    scan(&dir, &mut app, &mut detector, &mut jobs, 1);
+    let report = crate::personal_tactics_report::read(
+        &store,
+        jobs.report_version(),
+        serde_json::from_value(json!({"dataset_id":dataset})).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["simple_tactics"]["missed"], 1);
+    assert_eq!(
+        report["detail"]["details"]["recognition"]["motifs"],
+        json!(["hanging_material"])
+    );
+    let first = app.next_exercise().unwrap().unwrap();
+    let issued = store.stored_attempt(&first.attempt.id).unwrap().unwrap();
+    assert_eq!(
+        issued.tactic_attribution.unwrap().game.unwrap().black,
+        "Opponent"
+    );
+    answer(&mut app, &first, "b3d5", "fork-pawn");
+    drop(app);
+    let mut app = local_runtime::open(&path).unwrap();
+    let second = app.next_exercise().unwrap().unwrap();
+    assert_eq!(second.attempt.id, first.attempt.id);
+    answer(&mut app, &second, "d5c6", "fork-setup");
+    let third = app.next_exercise().unwrap().unwrap();
+    let command = answer(&mut app, &third, "c6e8", "fork-rook");
+    let saved = app.submit(command).unwrap();
+    assert_eq!(saved.attempt.status, tempo_study::AttemptStatus::Complete);
+    assert_eq!(saved.assessment.unwrap(), tempo_types::Grade::Good);
+    assert_eq!(app.snapshot().unwrap().assessments.len(), 1);
 }

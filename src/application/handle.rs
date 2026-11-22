@@ -8,7 +8,7 @@ use crate::{
     views::{EmptyView, LessonView, StudyView},
     wire::STUDY_WIRE_VERSION,
 };
-use tempo_chess::{ContentKind, explain_tactic_decision, move_san, project_position};
+use tempo_chess::{ContentKind, explain_issued_tactic, move_san, project_position};
 use tempo_store::{ActivityMode, AnswerResult, StudyScope};
 use tempo_study::AttemptStatus;
 
@@ -170,11 +170,9 @@ impl Tempo {
                 && matches!(record.mode, ActivityMode::Test | ActivityMode::Practice)
                 && matches!(&issued.definition.kind, ContentKind::Tactic { .. })
             {
-                explain_tactic_decision(
-                    &issued.definition.decisions[attempt.state.decision_index..],
-                )
-                .ok()
-                .flatten()
+                explain_issued_tactic(&issued, attempt.state.decision_index)
+                    .ok()
+                    .flatten()
             } else {
                 None
             };

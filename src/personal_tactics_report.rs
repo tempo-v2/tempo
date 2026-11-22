@@ -399,6 +399,7 @@ impl ReportCache {
         Ok(
             json!({"schema_version":2,"dataset_id":dataset,"report_generation":stamp,"games":entries,
             "detail":detail,"next_before":next_before,"loss_comparison":aggregate.comparison,
+            "simple_tactics":aggregate.simple_tactics,
             "prior_today":aggregate.prior_today,"prior_hour":aggregate.prior_hour,
             "filtered_games":aggregate.selected,"archive_games":archive.games.len(),"clocks":archive.clocks,
             "learner_bands":archive.learner_bands,"opponent_bands":archive.opponent_bands,"sources":archive.sources}),
@@ -527,6 +528,7 @@ struct Decision {
     game: usize,
     motifs: BTreeSet<Motif>,
     accepted_motifs: BTreeSet<Motif>,
+    recognition: Option<tempo_chess::TacticRecognition>,
 }
 
 struct Evidence {
@@ -590,6 +592,7 @@ impl Evidence {
                     game,
                     motifs,
                     accepted_motifs,
+                    recognition: row.recognition,
                 })
             })
             .collect();
@@ -602,7 +605,47 @@ impl Evidence {
     }
 }
 
+#[derive(Default, Serialize)]
+struct SimpleTactics {
+    found: usize,
+    missed: usize,
+    alternatives: usize,
+    unclear: usize,
+    awaiting_verification: usize,
+}
+
+impl SimpleTactics {
+    fn observe(&mut self, row: &Decision, motif: Option<Motif>) {
+        let Some(verified) = &row.recognition else {
+            if row
+                .accepted_motifs
+                .iter()
+                .any(|kind| motif.is_none_or(|m| m == *kind))
+            {
+                self.awaiting_verification += 1;
+            }
+            return;
+        };
+        if motif.is_some_and(|kind| !verified.motifs.contains(&kind)) {
+            return;
+        }
+        match verified.outcome {
+            TacticalOutcome::PlayedTactic if motif.is_some() && motif != verified.played_motif => {
+                self.alternatives += 1;
+            }
+            TacticalOutcome::PlayedTactic => self.found += 1,
+            TacticalOutcome::MissedTactic => self.missed += 1,
+            TacticalOutcome::GoodAlternative => self.alternatives += 1,
+            TacticalOutcome::UnclearMiss
+            | TacticalOutcome::UnclearPlay
+            | TacticalOutcome::Uncertain => self.unclear += 1,
+            _ => {}
+        }
+    }
+}
+
 struct Aggregate {
+    simple_tactics: SimpleTactics,
     selected: usize,
     comparison: Value,
     prior_today: Value,
@@ -621,6 +664,7 @@ impl Query {
         let selected: Vec<_> = archive.games.iter().map(|g| filters.includes(g)).collect();
         let mut chances = vec![Chances::default(); archive.games.len()];
         let mut findings = Vec::new();
+        let mut simple_tactics = SimpleTactics::default();
         for (index, row) in evidence
             .rows
             .iter()
@@ -628,6 +672,7 @@ impl Query {
             .filter(|(_, row)| selected[row.game])
         {
             chances[row.game].observe(row, filters.motif);
+            simple_tactics.observe(row, filters.motif);
             if filters
                 .motif
                 .is_none_or(|motif| row.motifs.contains(&motif))
@@ -656,6 +701,7 @@ impl Query {
                 .collect::<Vec<_>>(),"possible_break":possible_break})
         };
         let aggregate = Aggregate {
+            simple_tactics,
             selected: games.len(),
             comparison: loss_comparison(&games),
             prior_today: pattern(true),
@@ -908,6 +954,7 @@ mod tests {
             position: 0,
             motifs: BTreeSet::from([Motif::Fork]),
             accepted_motifs: BTreeSet::from([Motif::Fork]),
+            recognition: None,
         };
         let clear = row(1, TacticalOutcome::MissedTactic);
         let ambiguous = row(2, TacticalOutcome::UnclearMiss);
