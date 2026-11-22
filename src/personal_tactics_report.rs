@@ -626,7 +626,7 @@ impl SimpleTactics {
             }
             return;
         };
-        if motif.is_some_and(|kind| !verified.motifs.contains(&kind)) {
+        if !verified.has_opportunity(motif) {
             return;
         }
         match verified.outcome {
@@ -940,6 +940,38 @@ mod tests {
             prior_today: Some(prior),
             prior_hour: Some(prior),
             fully_analyzed: true,
+        }
+    }
+
+    #[test]
+    fn summary_counts_only_verified_opportunities() {
+        let row = |recognition| Decision {
+            id: 1,
+            ply: 0,
+            outcome: TacticalOutcome::UnclearMiss,
+            position: 0,
+            game: 0,
+            motifs: BTreeSet::from([Motif::Fork]),
+            accepted_motifs: BTreeSet::from([Motif::Fork]),
+            recognition,
+        };
+        let rejected = row(Some(tempo_chess::TacticRecognition {
+            motifs: BTreeSet::new(),
+            outcome: TacticalOutcome::Uncertain,
+            played_motif: None,
+        }));
+        let unclear = row(Some(tempo_chess::TacticRecognition {
+            motifs: BTreeSet::from([Motif::Fork]),
+            outcome: TacticalOutcome::UnclearMiss,
+            played_motif: None,
+        }));
+        for motif in [None, Some(Motif::Fork)] {
+            let mut totals = SimpleTactics::default();
+            totals.observe(&row(None), motif);
+            totals.observe(&rejected, motif);
+            totals.observe(&unclear, motif);
+            assert_eq!(totals.unclear, 1);
+            assert_eq!(totals.awaiting_verification, 1);
         }
     }
 
