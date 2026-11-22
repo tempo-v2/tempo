@@ -328,6 +328,7 @@ impl Tempo {
             issued_at: at,
             issued_revision: Some(snapshot.revision),
             issued_miss_revision: learning.miss_revision,
+            issued_work: None,
             mode,
             route: choice.route.clone(),
             first_introduction: choice.new_kind.is_some(),
