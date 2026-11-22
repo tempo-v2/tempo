@@ -9,7 +9,6 @@ pub(crate) use coverage_settings::{CoverageLineSave, PreviousCoverageLineRequest
 mod current_attempt;
 
 mod daily;
-mod export;
 mod game_backfill;
 mod game_evidence;
 mod game_library;
@@ -28,7 +27,6 @@ mod study_card_details;
 pub use study_analysis_context::StudyAnalysisLine;
 mod study_game_context;
 
-mod restore;
 mod resume;
 mod saved_reviews;
 pub use saved_reviews::{SaveStudyReview, SavedStudyReviewCommand};

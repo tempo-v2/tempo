@@ -1,8 +1,5 @@
 use super::super::*;
-use crate::{
-    DailyComponents, FixedClock, IntroductionLimits, JsonSnapshotCodec,
-    adapters::public_games::Game,
-};
+use crate::{DailyComponents, FixedClock, IntroductionLimits, adapters::public_games::Game};
 use std::path::{Path, PathBuf};
 use tempo_chess::Catalog;
 use tempo_learning::{DailyLearning, LearningPolicy};
@@ -268,12 +265,16 @@ fn refresh_replay_rejects_changed_input_and_replaced_dataset() {
     assert_eq!(fixture.jobs.status, before);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), bytes);
 
-    let portable = fixture.app.export(&JsonSnapshotCodec).unwrap();
-    fixture
-        .app
-        .restore(DatasetId::from("dataset-b"), &portable, &JsonSnapshotCodec)
-        .unwrap();
-    let replaced = std::fs::read(&fixture.path).unwrap();
+    let replacement = fixture.path.with_file_name("replacement.sqlite");
+    let store = SqliteStore::create(
+        &replacement,
+        DatasetId::from("dataset-b"),
+        Catalog::default(),
+        DailyLearning::default().settings(),
+    )
+    .unwrap();
+    fixture.app = app(store);
+    let replaced = std::fs::read(&replacement).unwrap();
     let old = fixture
         .jobs
         .refresh(&fixture.app, intent("refresh-a", "dataset-a"), true)
@@ -281,7 +282,8 @@ fn refresh_replay_rejects_changed_input_and_replaced_dataset() {
         .unwrap();
     assert_eq!(old.code, "stale_dataset");
     assert_eq!(fixture.jobs.status, before);
-    assert_eq!(std::fs::read(&fixture.path).unwrap(), replaced);
+    assert_eq!(std::fs::read(&replacement).unwrap(), replaced);
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), bytes);
     fixture.assert_no_fetch();
 }
 

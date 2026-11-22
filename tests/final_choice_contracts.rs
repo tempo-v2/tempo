@@ -189,7 +189,7 @@ fn startup_recovers_a_no_grade_choice_written_entirely_under_schema9() {
 }
 
 #[test]
-fn portable_choice_attribution_survives_restore_and_reimport() {
+fn choice_attribution_survives_reopen_and_reimport() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("native-choice.sqlite");
     let day = Arc::new(AtomicI32::new(20_004));
@@ -222,9 +222,6 @@ fn portable_choice_attribution_survives_restore_and_reimport() {
         .unwrap();
     assert_eq!(failure_rows.len(), 1);
     assert_eq!(failure_rows[0].chosen_position, None);
-    // The baseline native observation recovery was separately executed and is
-    // recorded in portable-choice-proof.log. Preserve the selected-result
-    // identity here without depending on internal SQLite table layout.
     let parent_id = result["comparison_id"].as_str().unwrap();
     let child_id = blake3::hash(json!([parent_id, 1usize, corrected]).to_string().as_bytes())
         .to_hex()
@@ -233,82 +230,21 @@ fn portable_choice_attribution_survives_restore_and_reimport() {
         accepted.results[0].comparison_id.as_deref(),
         Some(child_id.as_str())
     );
-    eprintln!(
-        "native no-new-grade choice retains its selected-result comparison identity; no new chosen failure row"
-    );
-    let package = source.export(&tempo::JsonSnapshotCodec).unwrap();
-    let payload: Value = serde_json::from_str(&package).unwrap();
-    eprintln!("exported portable format {}", payload["schema_version"]);
-    assert_eq!(
-        payload["resolved_game_choices"].as_array().unwrap().len(),
-        1
-    );
     let before_learning = source.snapshot().unwrap().learning;
-    let restored_db = directory.path().join("restored-choice.sqlite");
-    let mut restored = open(&restored_db, day.clone(), IntroductionLimits::default(), 0);
-    restored
-        .restore(
-            "new-choice-dataset".into(),
-            &package,
-            &tempo::JsonSnapshotCodec,
-        )
-        .unwrap();
-    drop(restored);
-    let mut restored = open(&restored_db, day.clone(), IntroductionLimits::default(), 1);
-    let reimported = date_only_import(&mut restored, "reimported", "2024.10.06", "1. c4 e5");
+    drop(source);
+    let mut reopened = open(&db, day, IntroductionLimits::default(), 1);
+    let reimported = date_only_import(&mut reopened, "reimported", "2024.10.06", "1. c4 e5");
     assert_eq!(reimported["results"][0]["effect"], "already_addressed");
     assert!(reimported["results"][0].get("choices").is_none());
-    assert_eq!(restored.snapshot().unwrap().learning, before_learning);
-    let relevance = SqliteStore::open(&restored_db)
+    assert_eq!(reopened.snapshot().unwrap().learning, before_learning);
+    let relevance = SqliteStore::open(&db)
         .unwrap()
-        .game_relevance(&restored.snapshot().unwrap().dataset, "")
+        .game_relevance(&reopened.snapshot().unwrap().dataset, "")
         .unwrap();
-    eprintln!(
-        "portable no-new-grade choice after restore/reimport: exposure={}, misses={}",
-        relevance[&corrected].exposure, relevance[&corrected].misses
-    );
-    assert_eq!(relevance[&corrected].exposure, 1);
     assert_eq!(
-        relevance[&corrected].misses, 1,
-        "New exports must carry accepted selection attribution independently of a grade"
+        (relevance[&corrected].exposure, relevance[&corrected].misses),
+        (1, 1)
     );
-
-    let legacy_db = directory.path().join("old-choice.sqlite");
-    let mut old = open(&legacy_db, day, IntroductionLimits::default(), 0);
-    let mut malformed = payload.clone();
-    malformed["resolved_game_choices"][0]["attribution"]["answer_version"] = json!(0);
-    assert!(
-        old.restore(
-            "rejected".into(),
-            &malformed.to_string(),
-            &tempo::JsonSnapshotCodec
-        )
-        .is_err()
-    );
-    assert!(old.snapshot().unwrap().catalog.items.is_empty());
-
-    let mut legacy = payload;
-    legacy["schema_version"] = json!(4);
-    legacy["resolved_game_choices"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("attribution");
-    old.restore(
-        "old-choice-dataset".into(),
-        &legacy.to_string(),
-        &tempo::JsonSnapshotCodec,
-    )
-    .unwrap();
-    let reimported = date_only_import(&mut old, "reimported", "2024.10.06", "1. c4 e5");
-    assert_eq!(reimported["results"][0]["effect"], "already_addressed");
-    assert!(reimported["results"][0].get("choices").is_none());
-    let store = SqliteStore::open(&legacy_db).unwrap();
-    let dataset = old.snapshot().unwrap().dataset;
-    assert_eq!(
-        store.game_relevance(&dataset, "").unwrap()[&corrected].misses,
-        0
-    );
-    assert_eq!(old.snapshot().unwrap().learning, before_learning);
 }
 
 #[test]
@@ -353,40 +289,25 @@ fn old_choice_stays_closed_without_version_upgrade_or_reset_regrading() {
     assert_eq!(app.snapshot().unwrap().learning, changed.learning);
     preview_and_save(&mut app, "1. e4 *", &name, Some(&rep));
     assert!(!app.snapshot().unwrap().catalog.items[&target].active());
-    let export = app.export(&tempo::JsonSnapshotCodec).unwrap();
-    let mut legacy: Value = serde_json::from_str(&export).unwrap();
-    legacy["schema_version"] = json!(3);
-    legacy
-        .as_object_mut()
-        .unwrap()
-        .remove("resolved_game_choices");
-    for (label, data) in [
-        ("legacy-three", legacy.to_string()),
-        ("retired-five", export),
-    ] {
-        let path = directory.path().join(format!("{label}.sqlite"));
-        let mut restored = open(&path, day.clone(), IntroductionLimits::default(), 0);
-        restored
-            .restore(label.into(), &data, &tempo::JsonSnapshotCodec)
-            .unwrap();
-        let restored_item = &restored.snapshot().unwrap().catalog.items[&target];
-        assert!(!restored_item.active());
-        assert!(old_version.0 < restored_item.version.0);
-        let restored_store = SqliteStore::open(&path).unwrap();
-        let result = &game["results"][0];
-        let choices = restored_store
-            .game_choices(
-                &label.into(),
-                result["source"].as_str().unwrap(),
-                result["game_id"].as_str().unwrap(),
-            )
-            .unwrap();
-        let saved = choices[choice["position"].as_str().unwrap()]
-            .as_ref()
-            .unwrap();
-        assert_eq!(saved.target, target);
-        assert_eq!(saved.answer_version, old_version);
-    }
+    drop(app);
+    let mut app = open(&db, day, IntroductionLimits::default(), 1);
+    let snapshot = app.snapshot().unwrap();
+    let retired_item = &snapshot.catalog.items[&target];
+    assert!(!retired_item.active());
+    assert!(old_version.0 < retired_item.version.0);
+    let result = &game["results"][0];
+    let choices = store
+        .game_choices(
+            &dataset,
+            result["source"].as_str().unwrap(),
+            result["game_id"].as_str().unwrap(),
+        )
+        .unwrap();
+    let saved = choices[choice["position"].as_str().unwrap()]
+        .as_ref()
+        .unwrap();
+    assert_eq!(saved.target, target);
+    assert_eq!(saved.answer_version, old_version);
 
     date_only_import(
         &mut app,

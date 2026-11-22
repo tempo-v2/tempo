@@ -7,8 +7,6 @@ mod durable_repertoire;
 #[path = "contracts/opening_release.rs"]
 mod opening_release;
 
-#[path = "contracts/portable_restore.rs"]
-mod portable_restore;
 #[path = "contracts/study_journeys.rs"]
 mod study_journeys;
 #[path = "contracts/submission_recovery.rs"]

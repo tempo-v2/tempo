@@ -49,7 +49,6 @@ transport boundary. Your `src/views/` files remain the homes of those view conce
 | --- | --- | --- | --- |
 | `SubmitCommand` / `AbandonCommand` | UI controller or another caller | Application operation | Copy the latest **attempt revision**, allocate one submission ID per user action, reuse the whole command for retries. |
 | [`GameRange`](src/game_range.rs) | Refresh caller | `GameJobs` | Inclusive observation-time endpoints; the provider validates their order. |
-| [`PortableSnapshot`](src/portable_snapshot.rs) | Export or a codec | Codec or restore | Content, learning and policy only. It omits source dataset ID, attempts, active pointer and receipts. |
 | [`AppError`](src/app_error.rs) | Application error mapping | Caller or error view | Stable code plus message and retryability; the caller need not parse a domain error string. |
 | [`AttemptView`](src/views/attempt_view.rs) | Application result mapping | UI | Prompt, feedback, identities and lifetime assessment; no answer key or scheduler state. |
 | [`EmptyView`](src/views/empty_view.rs) | Next with no eligible item | UI | Empty **now**, so another request can be useful after facts change. |
@@ -69,7 +68,6 @@ of the application; dependency ownership stays in the composition root.
 | [`Clock`](src/ports/clock.rs) | Supply real application time or a controlled timeline | [`FixedClock`](src/adapters/fixed_clock.rs); the port's test injects a clock and checks the issued timestamp. |
 | [`AttemptIds`](src/ports/attempt_ids.rs) | Supply identities unique across durable restarts | [`CounterIds`](src/adapters/counter_ids.rs); the port's test reserves one ID and proves resume does not allocate another. |
 | [`ChessGrader`](src/ports/chess_grader.rs) | Bind a replacement grader to the concrete chess associated types | `ExactSequenceGrader`; the alias's test starts a two-decision exercise through a trait object. |
-| [`SnapshotCodec`](src/ports/snapshot_codec.rs) | Change the portable representation | [`JsonSnapshotCodec`](src/adapters/json_snapshot_codec.rs); the port's example plugs in a tagged encoding without changing Tempo. |
 
 Domain policy ports stay in their owning crates: Queue decides eligibility and
 ordering, Study advances the attempt using its grader, Chess interprets content,
@@ -93,9 +91,10 @@ which owns the model update, corrective obligation and human Test cadence.
 Store commits the results and command receipt together.
 
 Content import updates the current dataset and preserves learning unless the
-definition actually changes. Portable restore requires an empty destination,
-compatible settings/memory and a fresh dataset identity. It is not an undo or a
-merge into a live dataset.
+definition actually changes. Recovery uses a complete SQLite backup, including
+the dataset identity, issued attempts, learning and accepted command receipts.
+The managed launcher verifies SQLite integrity and foreign keys on its backup
+and rehearses the candidate on a separate copy.
 
 ## Read and run one scenario
 

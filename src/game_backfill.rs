@@ -601,7 +601,7 @@ mod tests {
     use serde_json::{from_value, json};
     use tempo_chess::{Catalog, LegalSequenceGrader};
     use tempo_learning::{DailyLearning, LearningPolicy};
-    use tempo_store::SqliteStore;
+    use tempo_store::{Commit, SqliteStore, Store, Write};
     use tempo_types::{StudyDay, StudyTime};
 
     fn fixture_coordinator(
@@ -628,6 +628,16 @@ mod tests {
     }
 
     fn dataset_boundary_app(path: &std::path::Path) -> Tempo {
+        if !path.exists() {
+            SqliteStore::create(
+                path,
+                DatasetId::from("dataset-a"),
+                Catalog::default(),
+                DailyLearning::default().settings(),
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(path).unwrap();
         let components = DailyComponents {
             clock: Box::new(FixedClock(StudyTime {
                 day: StudyDay(20_000),
@@ -636,13 +646,6 @@ mod tests {
             learning: Box::new(DailyLearning::default()),
             ..crate::components::test_components()
         };
-        let store = SqliteStore::create(
-            path,
-            DatasetId::from("dataset-a"),
-            Catalog::default(),
-            components.learning.settings(),
-        )
-        .unwrap();
         Tempo::daily(
             Box::new(store),
             components,
@@ -664,17 +667,29 @@ mod tests {
         }
     }
 
-    fn restore_empty_dataset(app: &mut Tempo, dataset: &str) {
-        let codec = crate::JsonSnapshotCodec;
-        let portable = app.export(&codec).unwrap();
-        app.restore(DatasetId::from(dataset), &portable, &codec)
+    fn switch_fixture_dataset(path: &std::path::Path, dataset: &str) -> Tempo {
+        let mut store = SqliteStore::open(path).unwrap();
+        let before = store.snapshot().unwrap();
+        store
+            .commit(Commit {
+                expected_dataset: before.dataset,
+                expected_revision: before.revision,
+                writes: vec![Write::Restore {
+                    dataset: DatasetId::from(dataset),
+                    catalog: Catalog::default(),
+                    learning: Default::default(),
+                    policy: before.policy,
+                }],
+            })
             .unwrap();
+        dataset_boundary_app(path)
     }
 
     #[test]
     fn historical_begin_replay_is_scoped_to_the_active_dataset() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = dataset_boundary_app(&dir.path().join("begin.sqlite"));
+        let path = dir.path().join("begin.sqlite");
+        let mut app = dataset_boundary_app(&path);
         let (mut jobs, provider, response) = fixture_coordinator(&app);
         let begin = dataset_boundary_begin("history-a", "dataset-a");
         jobs.begin(&mut app, begin.clone()).unwrap();
@@ -710,7 +725,7 @@ mod tests {
         }
         assert_eq!(jobs.status()["status"], "complete");
         let retained = saved(&app);
-        restore_empty_dataset(&mut app, "dataset-b");
+        app = switch_fixture_dataset(&path, "dataset-b");
         assert_eq!(
             jobs.begin(&mut app, begin.clone()).unwrap_err().code,
             "stale_dataset"
@@ -738,10 +753,11 @@ mod tests {
     }
 
     #[test]
-    fn historical_poll_reconciles_settled_and_paused_jobs_after_restore() {
+    fn historical_poll_reconciles_settled_and_paused_jobs_after_dataset_change() {
         for expected in ["complete", "incomplete", "paused"] {
             let dir = tempfile::tempdir().unwrap();
-            let mut app = dataset_boundary_app(&dir.path().join("current.sqlite"));
+            let path = dir.path().join("current.sqlite");
+            let mut app = dataset_boundary_app(&path);
             let (mut jobs, provider, response) = fixture_coordinator(&app);
             jobs.begin(&mut app, dataset_boundary_begin("history-a", "dataset-a"))
                 .unwrap();
@@ -761,7 +777,7 @@ mod tests {
                 jobs.poll(&mut app);
             }
             assert_eq!(jobs.status()["status"], expected);
-            restore_empty_dataset(&mut app, "dataset-b");
+            app = switch_fixture_dataset(&path, "dataset-b");
             if expected == "incomplete" {
                 app.create_backfill(dataset_boundary_begin("history-b", "dataset-b"))
                     .unwrap();
@@ -781,15 +797,16 @@ mod tests {
     #[test]
     fn historical_provider_reply_is_drained_before_new_dataset_work() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = dataset_boundary_app(&dir.path().join("drain.sqlite"));
+        let path = dir.path().join("drain.sqlite");
+        let mut app = dataset_boundary_app(&path);
         let (mut jobs, provider, response) = fixture_coordinator(&app);
         jobs.begin(&mut app, dataset_boundary_begin("history-a", "dataset-a"))
             .unwrap();
         jobs.poll(&mut app);
         provider.try_recv().unwrap();
-        restore_empty_dataset(&mut app, "dataset-b");
+        app = switch_fixture_dataset(&path, "dataset-b");
         jobs.poll(&mut app);
-        restore_empty_dataset(&mut app, "dataset-c");
+        app = switch_fixture_dataset(&path, "dataset-c");
         jobs.begin(&mut app, dataset_boundary_begin("history-c", "dataset-c"))
             .unwrap();
         jobs.poll(&mut app);
