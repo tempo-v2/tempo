@@ -254,16 +254,25 @@ impl Tempo {
     ) -> Result<(CheckedGapRepertoire, GapDraft), AppError> {
         let book = self.checked_gap_repertoire(request)?;
         let draft = match request.gap_kind {
-            GapKind::Observed => AuthoredRepertoire::gap_draft,
-            GapKind::Forecast => AuthoredRepertoire::forecast_gap_draft,
-        }(
-            &book.authored,
-            &book.pgn,
-            &request.position,
-            &request.actual_move,
-            book.color,
-            request.response.as_deref(),
-        )
+            GapKind::Observed => book.authored.gap_draft(
+                &book.pgn,
+                &request.position,
+                &request.actual_move,
+                book.color,
+                request.response.as_deref(),
+            ),
+            GapKind::Forecast => {
+                let forecast = self.forecast_gap(request, request.report_id.as_deref())?;
+                book.authored
+                    .coverage_line_from(
+                        &forecast.starting_line.moves,
+                        &request.position,
+                        &request.actual_move,
+                        book.color,
+                    )
+                    .and_then(|line| line.into_gap_draft(&book.pgn, request.response.as_deref()))
+            }
+        }
         .map_err(|error| domain("stale_gap", error))?;
         Ok((book, draft))
     }
@@ -346,7 +355,7 @@ impl Tempo {
         surface: AuthoringSurface,
     ) -> Result<(), AppError> {
         if surface == AuthoringSurface::PhoneBuild {
-            self.phone_forecast_gap(request, None)?;
+            self.phone_forecast_gap(request, request.report_id.as_deref())?;
         }
         Ok(())
     }
@@ -405,7 +414,12 @@ impl Tempo {
         }?;
         let mut line = checked
             .authored
-            .coverage_line(&gap.position, &gap.actual_move, checked.color)
+            .coverage_line_from(
+                &forecast.starting_line.moves,
+                &gap.position,
+                &gap.actual_move,
+                checked.color,
+            )
             .map_err(|error| domain("stale_gap", error))?;
         let anchor_fen = line.fen();
         let first_number = line.move_number();

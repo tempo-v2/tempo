@@ -59,6 +59,7 @@ pub struct GapRequest {
     pub response: Option<String>,
     #[serde(default)]
     pub gap_kind: GapKind,
+    pub report_id: Option<String>,
     pub base_revision: Option<Revision>,
 }
 

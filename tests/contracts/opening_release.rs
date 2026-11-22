@@ -1004,6 +1004,17 @@ fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
     let dataset = "opening-proof".into();
     let mut store = SqliteStore::open(&database).unwrap();
     let book = store.coverage_book(&dataset, id).unwrap().unwrap();
+    let doc = store.repertoire_document(id).unwrap();
+    let empty = store.coverage_start(&dataset, id).unwrap();
+    let initial = store
+        .save_coverage_start(&dataset, id, doc.revision, empty.revision, &["e2e4".into()])
+        .unwrap();
+    assert_eq!(
+        store
+            .save_coverage_start(&dataset, id, doc.revision, empty.revision, &["e2e4".into()])
+            .unwrap(),
+        initial
+    );
     let position = StandardPositionCanonicalizer
         .canonicalize("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
         .unwrap();
@@ -1014,6 +1025,8 @@ fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
             &book.input_key,
             None,
             &CoverageSummary {
+                starting_line: initial.clone(),
+                starting_san: vec!["e4".into()],
                 request_id: "coverage-contract".into(),
                 through_move: 2,
                 target_percent: 90,
@@ -1045,6 +1058,39 @@ fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
         )
         .unwrap();
     assert!(draft["save_token"].is_string(), "{draft}");
+    let cleared = store
+        .save_coverage_start(&dataset, id, doc.revision, initial.revision, &[])
+        .unwrap();
+    let restored = store
+        .save_coverage_start(
+            &dataset,
+            id,
+            doc.revision,
+            cleared.revision,
+            &["e2e4".into()],
+        )
+        .unwrap();
+    assert_ne!(restored.revision, initial.revision);
+    assert!(
+        app.opponent_gaps(0).unwrap()["gaps"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let saved = store.coverage_summary(&dataset, id).unwrap().unwrap();
+    assert!(saved.stale);
+    assert!(
+        store
+            .publish_coverage(
+                &dataset,
+                id,
+                &book.input_key,
+                Some("coverage-contract"),
+                &saved.summary,
+                &[]
+            )
+            .is_err()
+    );
 }
 
 #[test]
