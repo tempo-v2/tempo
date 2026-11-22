@@ -55,7 +55,7 @@ try {
   assert.equal(row.players.black, "Robin");
   assert.equal(new Date(row.players.played_date_ms).toISOString().slice(0, 10), "2026-11-17");
 
-  sql = new DatabaseSync(database, { readOnly: true });
+  sql = new DatabaseSync(database, { readOnly: true, timeout: 5000 });
   function snapshot() {
     const tables = sql.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
     return tables.map(({ name }) => sql.prepare('SELECT * FROM "' + name + '"').all());
@@ -131,6 +131,33 @@ try {
   assert.deepEqual((await evidence(currentScope,"new-document")).data.prepared_uci,["d2d4"]);
   assert.equal((await evidence({...currentScope,review_version:{...currentScope.review_version,
     document_id:italianReview.document_id}},"old-document")).code,"stale_repertoire");
+  // Identity checks must not decode unrelated Study state.
+  const active = await post("study", { command: "next" });
+  assert.ok(active.attempt_id);
+  const write = new DatabaseSync(database, { timeout: 5000 });
+  try {
+    assert.equal(write.prepare("UPDATE attempts SET record='{}' WHERE id=?").run(active.attempt_id).changes, 1);
+    assert.equal(write.prepare(
+      "UPDATE learning SET state='{}' WHERE target_id=(SELECT target_id FROM attempts WHERE id=?)"
+    ).run(active.attempt_id).changes, 1);
+    assert.equal(write.prepare(`
+      INSERT INTO repertoire_run_steps(
+        dataset_id, ordinal, repertoire_id, source_id, target_id, version, mode, lead_in, skipped_warmup
+      )
+      SELECT h.dataset_id, 0, d.repertoire_id, d.source_id, h.target_id, h.version, '"test"', '?', 0
+      FROM content_history h
+      JOIN current_content c ON c.target_id=h.target_id AND c.dataset_id=h.dataset_id
+      JOIN repertoire_documents d ON d.repertoire_id=c.repertoire AND d.dataset_id=c.dataset_id
+      WHERE d.repertoire_id=?
+      LIMIT 1
+    `).run(italian).changes, 1);
+    write.exec("UPDATE store_state SET policy='{}' WHERE singleton=1");
+    assert.equal((await review({ repertoire_id: null })).status, "review");
+    assert.equal((await review({ dataset_id: "stale" })).code, "stale_dataset");
+  } finally {
+    write.close();
+  }
+  console.log("PASS: Games identity survives unreadable Study records and rejects a stale dataset.");
   console.log("PASS: named history, all game boards, exact transposition, distinct destination, learning facts, stale addresses, name invariance and zero database changes across reads.");
 } finally {
   sql?.close();

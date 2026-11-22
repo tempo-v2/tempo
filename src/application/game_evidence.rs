@@ -120,7 +120,7 @@ impl GameBooks {
 
 impl Tempo {
     pub(crate) fn game_dataset(&self) -> Result<DatasetId, AppError> {
-        Ok(self.store.study_state(Default::default())?.dataset)
+        Ok(self.store.dataset_id()?)
     }
 
     pub fn game_history(&mut self) -> Result<Value, AppError> {

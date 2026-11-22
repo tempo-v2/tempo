@@ -7,13 +7,18 @@ use tempo::{AgainCommand, Clock, Components, SubmitCommand, Tempo};
 use tempo_chess::{Catalog, ImportRequest, demo_catalog};
 use tempo_learning::LearningState;
 use tempo_store::{
-    AnswerResult, Commit, ContentState, MemoryStore, PortableGameEvidence, Snapshot, Store,
-    StoreError, StudyScope, StudyState, Write,
+    AnswerResult, Commit, ContentState, DatasetIdentity, MemoryStore, PortableGameEvidence, Snapshot,
+    Store, StoreError, StudyScope, StudyState, Write,
 };
 use tempo_types::{DatasetId, Revision, StudyDay, StudyTime, TargetId};
 
 #[derive(Clone)]
 struct SharedStore(Rc<RefCell<MemoryStore>>);
+impl DatasetIdentity for SharedStore {
+    fn dataset_id(&self) -> Result<DatasetId, StoreError> {
+        self.0.borrow().dataset_id()
+    }
+}
 impl Store for SharedStore {
     fn snapshot(&self) -> Result<Snapshot, StoreError> {
         self.0.borrow().snapshot()
