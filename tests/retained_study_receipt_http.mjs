@@ -48,8 +48,13 @@ async function serve(executable, database, ui, work) {
 function readState(database, submission) {
   const sql = new DatabaseSync(database, { readOnly: true, timeout: 5000 });
   try {
+    const schema = sql.prepare("PRAGMA user_version").get().user_version;
     return {
-      schema: sql.prepare("PRAGMA user_version").get().user_version,
+      schema,
+      days: schema >= 25 ? sql.prepare(
+        "SELECT dataset_id,study_day,opening_spent,tactic_spent,spend_proven FROM study_day_authority"
+      ).all() : [],
+      attempts: sql.prepare("SELECT id,record FROM attempts ORDER BY id").all(),
       receipt: sql.prepare("SELECT * FROM receipts WHERE id=?").get(submission),
       assessmentCount: sql.prepare("SELECT count(*) AS n FROM assessments").get().n,
       learning: sql.prepare("SELECT target_id,state FROM learning ORDER BY target_id").all(),
@@ -102,13 +107,37 @@ for (const priorAccepted of [true, false]) {
         assert.equal(before.receipt, undefined);
       }
       await serve(candidate, database, ui, async post => {
+        if (!priorAccepted) {
+          const sql = new DatabaseSync(database, { timeout: 5000 });
+          try {
+            // The acceptance must commit despite no projection head or state.
+            sql.exec("DELETE FROM study_projection_state");
+            const beforeFailure = readState(database, submission);
+            sql.exec(`CREATE TRIGGER refuse_spend BEFORE UPDATE OF opening_spent ON study_day_authority
+              BEGIN SELECT RAISE(ABORT, 'injected spend failure'); END`);
+            const failure = await post("/api/study", pending);
+            assert.equal(failure.status, "error");
+            assert.deepEqual(readState(database, submission), beforeFailure);
+            sql.exec("DROP TRIGGER refuse_spend");
+          } finally {
+            sql.close();
+          }
+        }
         const completed = await post("/api/study", pending);
         assert.equal(completed.status, "complete");
         assert.equal(completed.attempt_id, JSON.parse(pending).attempt_id);
         if (priorAccepted) assert.deepEqual(completed, accepted);
         const settled = readState(database, submission);
-        assert.equal(settled.schema, 24);
+        assert.equal(settled.schema, 25);
         assert.equal(settled.assessmentCount, before.assessmentCount);
+        const acceptance = JSON.parse(settled.attempts[0].record).acceptance;
+        assert.deepEqual(settled.days.map(day => ({ ...day })), [{
+          dataset_id: JSON.parse(pending).dataset_id,
+          study_day: acceptance.at.day,
+          opening_spent: 1,
+          tactic_spent: 0,
+          spend_proven: 1,
+        }]);
         assert.deepEqual(await post("/api/study", pending), completed);
         assert.deepEqual(readState(database, submission), settled);
         if (priorAccepted) {
