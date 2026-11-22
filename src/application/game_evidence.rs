@@ -75,6 +75,15 @@ impl GameBooks {
         recorded != current
     }
 
+    pub(super) fn has_forecast_start(&self, repertoire: &str, moves: &[String]) -> bool {
+        self.colors.get(repertoire).is_some_and(|color| {
+            self.white
+                .get(repertoire)
+                .or_else(|| self.black.get(repertoire))
+                .is_some_and(|book| book.coverage_frontier(moves, *color).is_ok())
+        })
+    }
+
     pub(super) fn document_for_forecast(
         &self,
         gap: &tempo_chess::OpponentGap,

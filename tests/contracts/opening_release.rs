@@ -1063,6 +1063,16 @@ fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
         })
     };
     let unaccepted = save(&draft);
+    let suspended = content(&mut app, activity_change(id, "forecast-suspend", "suspended"));
+    assert_eq!(suspended["status"], "activity_set", "{suspended}");
+    let suspended_state = app.snapshot().unwrap();
+    assert_eq!(
+        content(&mut app, unaccepted.clone())["code"],
+        "stale_coverage"
+    );
+    assert_eq!(app.snapshot().unwrap(), suspended_state);
+    let resumed = content(&mut app, activity_change(id, "forecast-resume", "active"));
+    assert_eq!(resumed["status"], "activity_set", "{resumed}");
     let before = app.snapshot().unwrap();
     let cleared = store
         .save_coverage_start(&dataset, id, doc.revision, initial.revision, &[])

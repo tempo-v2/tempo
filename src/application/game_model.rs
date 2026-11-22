@@ -143,6 +143,7 @@ impl Tempo {
             .collect();
         let mut ordered = Vec::new();
         let mut forecast_keys = BTreeSet::new();
+        let mut valid_starts = BTreeMap::new();
         let limit = offset.saturating_add(101);
         // Store supplies forecasts in descending probability and observed
         // groups in descending count, both with stable identity ties.
@@ -151,6 +152,15 @@ impl Tempo {
                 break;
             }
             let gap = &forecast.gap;
+            let moves = &forecast.starting_line.moves;
+            if forecast.stale
+                && !moves.is_empty()
+                && !*valid_starts
+                    .entry(&gap.repertoire_id)
+                    .or_insert_with(|| books.has_forecast_start(&gap.repertoire_id, moves))
+            {
+                continue;
+            }
             if let Some(revision) = books.document_for_forecast(gap, forecast.stale) {
                 forecast_keys.insert(gap);
                 ordered.push((gap, revision, Some(forecast)));
