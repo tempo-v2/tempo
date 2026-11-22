@@ -76,10 +76,6 @@ pub(super) fn serve(
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
         gap_analysis: GapAnalysis::new(database),
-        position_evidence: crate::position_evidence::PositionEvidence::new(
-            database,
-            explorer.clone(),
-        ),
         coverage: crate::coverage_scan::CoverageScan::new(database, explorer.clone()),
         gap_explorer: GapExplorer::with_client(explorer),
     };
@@ -154,7 +150,6 @@ struct Games {
     coverage: crate::coverage_scan::CoverageScan,
     gap_analysis: GapAnalysis,
     gap_explorer: GapExplorer,
-    position_evidence: crate::position_evidence::PositionEvidence,
 }
 
 #[derive(serde::Deserialize)]
@@ -586,11 +581,24 @@ fn respond_inner(
                 .with_status_code(status_code(reply.status))
                 .with_header(field("Cache-Control", "no-store")),
         )?;
+    } else if request.method() == &Method::POST
+        && matches!(
+            request.url(),
+            "/api/analysis/evidence" | "/api/analysis/result"
+        )
+    {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Position evidence has been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
     } else if matches!(
         request.url(),
         "/api/games"
-            | "/api/analysis/evidence"
-            | "/api/analysis/result"
             | "/api/games/library"
             | "/api/games/job"
             | "/api/games/import"
@@ -619,16 +627,6 @@ fn respond_inner(
             | "/api/study/card-details"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
-            (&Method::POST, "/api/analysis/evidence") => (
-                202,
-                command::<crate::position_evidence::EvidenceRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|r| games.position_evidence.start(r)),
-            ),
-            (&Method::POST, "/api/analysis/result") => (
-                200,
-                command::<crate::position_evidence::EvidenceRead>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|r| games.position_evidence.read(r)),
-            ),
             (&Method::POST, "/api/games/library") => (
                 200,
                 command::<crate::GameLibraryRead>(&request, MAX_COMMAND_BYTES)
@@ -1058,8 +1056,6 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/detection-result" => "game_detection_result",
         "/api/games/tactics" => "tactics_status",
         "/api/games/tactics/command" => "tactics_command",
-        "/api/analysis/evidence" => "analysis_evidence",
-        "/api/analysis/result" => "analysis_result",
         "/" | "/index.html" => "ui_index",
         path if path.starts_with("/assets/") => "ui_asset",
         _ => "other",

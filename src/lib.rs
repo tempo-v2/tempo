@@ -45,7 +45,6 @@ pub mod gap_analysis;
 pub mod gap_explorer;
 mod gap_recommendation;
 mod maia;
-pub mod position_evidence;
 mod stockfish;
 mod tactical_engine;
 mod tactical_jobs;

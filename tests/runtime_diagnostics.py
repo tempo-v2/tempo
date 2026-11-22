@@ -338,6 +338,57 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(exported["status_code"], 410)
         self.assertNotIn(dataset, json.dumps(events))
 
+    def test_position_evidence_retirement_leaves_replay_and_authoring_available(self):
+        logs = self.root / "position-retirement-logs"
+
+        def post(server, path, payload):
+            return server.request(json.dumps(payload).encode(), path=path)
+
+        with Server(self.database, self.ui, logs) as server:
+            status, _, context, _ = server.request(None, path="/api/context", method="GET")
+            self.assertEqual(status, 200)
+            dataset = json.loads(context)["dataset_id"]
+            for path in ("/api/analysis/evidence", "/api/analysis/result"):
+                status, headers, payload, delivery = post(server, path, {"request_id": "old-reader"})
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                self.assertEqual(headers["X-Tempo-Request-Id"], delivery)
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("evidence.", "sqlite.", "app."))
+                    for e in events
+                ))
+
+            status, _, imported, _ = post(server, "/api/games/import", {
+                "dataset_id": dataset, "command_id": "fixture-game", "learner": "Learner",
+                "pgn": '[White "Learner"]\n[Black "Opponent"]\n[Result "1-0"]\n\n1. e4 e5 1-0',
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(imported)["new_games"], 1)
+            status, _, library, _ = post(server, "/api/games/library", {"dataset_id": dataset})
+            self.assertEqual(status, 200)
+            game, = json.loads(library)["entries"]
+            status, _, replay, _ = post(server, "/api/games/review", {
+                "dataset_id": dataset, "source": game["source"], "game_id": game["game_id"],
+                "learner": game["learner"], "repertoire_id": None,
+            })
+            self.assertEqual(status, 200)
+            replay = json.loads(replay)
+            self.assertEqual(replay["status"], "review")
+            self.assertEqual(len(replay["positions"]), 3)
+            self.assertIsNone(replay["comparison"])
+
+            draft = {"dataset_id": dataset, "name": "Opening", "learner_color": "white", "pgn": "1. d4 d5 2. Bf4 *"}
+            status, _, preview, _ = post(server, "/api/repertoires", {"command": "preview", **draft})
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(preview)["status"], "preview")
+            status, _, saved, _ = post(server, "/api/repertoires", {
+                "command": "save", **draft, "token": json.loads(preview)["token"],
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(saved)["status"], "repertoires")
+
     def test_real_sqlite_wait_has_request_stall_and_recovery_evidence(self):
         logs = self.root / "lock-logs"
         with Server(self.database, self.ui, logs) as server:
