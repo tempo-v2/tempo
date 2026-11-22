@@ -98,39 +98,18 @@ try {
     [{ dataset_id: "stale" }, "stale_dataset"], [{ game_id: "missing" }, "source_unavailable"],
     [{ learner: "missing" }, "invalid_perspective"],
   ]) assert.equal((await review(changes)).code, code);
-  async function evidence(scope, request_id) {
-    let reply = await post("analysis/evidence", {...scope, request_id});
-    const deadline = Date.now() + 5000;
-    while (reply.status === "running" && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve,10));
-      reply = await post("analysis/result", {request_id});
-    }
-    return reply;
-  }
-  const scope = {source:"repertoire", fen:transposition.fen, dataset_id, repertoire_id:italian,
-    review_version:{document_id:italianReview.document_id,revision:italianReview.revision}};
-  const matched = await evidence(scope, "matched");
-  assert.equal(matched.status,"complete");
-  assert.deepEqual(matched.data.prepared_uci,transposition.prepared_uci);
-  assert.equal(matched.data.dataset_id,dataset_id);
-  assert.equal(matched.data.repertoire_id,italian);
-  assert.equal(matched.data.document_id,italianReview.document_id);
-  assert.equal(matched.data.content_revision,italianReview.revision);
-  assert.equal((await evidence({...scope, repertoire_id:other},"another-book")).code,"stale_repertoire");
+  assert.equal((await post("analysis/evidence", {request_id:"matched"})).code, "retired_feature");
+  assert.equal((await post("analysis/result", {request_id:"matched"})).code, "retired_feature");
   assert.deepEqual(snapshot(), before);
   await post("repertoires", { command: "rename", dataset_id, repertoire_id: italian, name: "Renamed" });
   assert.deepEqual((await review()).positions, italianReview.positions);
-  assert.equal((await evidence(scope,"old-revision")).code,"stale_repertoire");
   const edit = {dataset_id,repertoire_id:italian,name:"Renamed",learner_color:"white",pgn:"1. d4 d5 *"};
   const preview = await post("repertoires",{...edit, command:"preview"});
   await post("repertoires",{...edit, command:"save", token:preview.token});
   const changed = await review();
   assert.notEqual(changed.document_id,italianReview.document_id);
-  const currentScope = {...scope,fen:changed.positions[0].fen,
-    review_version:{revision:changed.revision,document_id:changed.document_id}};
-  assert.deepEqual((await evidence(currentScope,"new-document")).data.prepared_uci,["d2d4"]);
-  assert.equal((await evidence({...currentScope,review_version:{...currentScope.review_version,
-    document_id:italianReview.document_id}},"old-document")).code,"stale_repertoire");
+  assert.notEqual(changed.revision, italianReview.revision);
+  assert.deepEqual(changed.positions[0].prepared_uci, ["d2d4"]);
   // Identity checks must not decode unrelated Study state.
   const active = await post("study", { command: "next" });
   assert.ok(active.attempt_id);
