@@ -4,7 +4,6 @@
 //! exposed publicly merely to organize an operation into its own source file.
 mod abandon;
 mod again;
-mod backfill_captures;
 mod content_preview;
 mod coverage_settings;
 pub(crate) use coverage_settings::{CoverageLineSave, PreviousCoverageLineRequest};

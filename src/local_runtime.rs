@@ -100,13 +100,6 @@ pub fn import(path: &Path, puzzles: &Path) -> LocalResult<()> {
     import::run(&mut app, batch)
 }
 
-pub fn backfill_personal_tactics(path: &Path, apply: bool) -> LocalResult<()> {
-    let sources = SqliteStore::open(path)?.content_source_ids()?;
-    let result = open(path)?.backfill_personal_tactics(&sources, apply)?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
-}
-
 pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
     let mut registry = DetectorRegistry::default();
     let engine = match crate::tactical_engine::StockfishEvaluator::discover(database) {

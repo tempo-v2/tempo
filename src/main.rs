@@ -33,12 +33,6 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             };
             local_runtime::backfill_game_capture_origins(Path::new(database), Path::new(transfer), operation)
         }
-        [mode, database] if mode == "backfill-personal-tactics" => {
-            local_runtime::backfill_personal_tactics(Path::new(database), false)
-        }
-        [mode, database, apply] if mode == "backfill-personal-tactics" && apply == "--apply" => {
-            local_runtime::backfill_personal_tactics(Path::new(database), true)
-        }
         [mode, database, args @ ..] if mode == "backfill-study-lead-ins" => {
             let (transfer, apply) = match args {
                 [] => (None, false),
@@ -61,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             local_runtime::serve(Path::new(database), Path::new(ui), port.parse()?)
         }
         _ => Err(
-            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-game-capture-origins DATABASE TRANSFER.json [--apply] | backfill-personal-tactics DATABASE [--apply] | backfill-study-lead-ins DATABASE [TRANSFER.json] [--apply] | split-black-repertoire DATABASE ID [--apply TOKEN] | serve DATABASE UI_DIST PORT"
+            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-game-capture-origins DATABASE TRANSFER.json [--apply] | backfill-study-lead-ins DATABASE [TRANSFER.json] [--apply] | split-black-repertoire DATABASE ID [--apply TOKEN] | serve DATABASE UI_DIST PORT"
                 .into(),
         ),
     }

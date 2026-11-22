@@ -149,12 +149,6 @@ fresh personal captures over the regular review queue. Captures use no daily
 new-tactic slots. Recapturing an already introduced puzzle preserves its
 current review schedule.
 
-For a dataset imported before this behavior was added, run
-`tempo backfill-personal-tactics DATABASE` to check the counts and add
-`--apply` to schedule the verified captures. Back up the dataset before
-applying. The command records one receipt per dataset and leaves actual
-grades to Study. Repeating the command returns the saved receipt.
-
 ## Backup and recovery
 
 Run this from the workspace to make a consistent SQLite backup, including learned material, active work, receipts, and the saved profile. Keep the backup private.

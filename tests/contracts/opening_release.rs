@@ -921,72 +921,34 @@ fn later_tactic_correction_uses_the_issued_move_regardless_of_capture_attributio
 }
 
 #[test]
-fn captures_interrupt_only_the_next_selection_and_cost_no_introductions() {
+fn saving_a_capture_preserves_the_active_attempt_and_spends_no_introduction() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("personal-captures.sqlite");
     let day = Arc::new(AtomicI32::new(20_000));
     let limits = IntroductionLimits {
         repertoire: 0,
-        tactics: 0,
+        tactics: 1,
     };
     let mut app = open(&db, day.clone(), limits, 0);
     let fen = "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1";
-    let legacy = [
-        snippet("Legacy 1", fen, "Kd2"),
-        snippet("Legacy 2", fen, "Kf2"),
-    ]
-    .concat();
-    transfer_tactics(&mut app, &legacy, &[0, 1], "tempo1:capture:legacy-fixture");
-    let before = app.snapshot().unwrap();
-    let dry = app
-        .backfill_personal_tactics(&Default::default(), false)
-        .unwrap();
-    assert_eq!(dry["introduced"], 2);
-    assert_eq!(app.snapshot().unwrap(), before);
-    assert_eq!(
-        app.backfill_personal_tactics(&Default::default(), true)
-            .unwrap()["status"],
-        "applied"
-    );
-    let issued = study(&mut app, json!({"command":"next"}));
-    let captured = snippet("New capture", fen, "e4");
-    transfer_tactics(&mut app, &captured, &[0], "test catalog");
-    let (_, saved) = save_tactics(&mut app, &captured, json!([]), vec![0]);
+    let existing = snippet("First capture", fen, "Kd2");
+    let (_, saved) = save_tactics(&mut app, &existing, json!([]), vec![0]);
     assert_eq!(saved["ready_for_review"], 1);
-    assert_eq!(app.snapshot().unwrap().catalog.items.len(), 3);
+    let issued = study(&mut app, json!({"command":"next"}));
+    assert_eq!(issued["status"], "attempt");
+
+    let capture = snippet("Second capture", fen, "e4");
+    let (_, saved) = save_tactics(&mut app, &capture, json!([]), vec![0]);
+    assert_eq!(saved["ready_for_review"], 1);
     drop(app);
 
-    let mut app = open(&db, day.clone(), limits, 1);
-    app.set_local_tactic_preferences(0, Some(tempo::TacticThemes::starter()));
+    let mut app = open(&db, day.clone(), limits, 0);
     assert_eq!(study(&mut app, json!({"command":"next"})), issued);
-    let skip = activity_command("skip", &issued, "skip-legacy");
-    assert_eq!(study(&mut app, skip)["status"], "abandoned");
-    let next = study(&mut app, json!({"command":"next"}));
-    let target = TargetId::from(next["target_id"].as_str().unwrap());
-    let before_grade = app.snapshot().unwrap();
-    assert_eq!(
-        before_grade.catalog.items[&target].definition.decisions[0]
-            .expected
-            .uci,
-        "e2e4"
-    );
-    assert!(before_grade.assessments.is_empty());
-    let mut answer = activity_command("answer", &next, "solve-capture");
-    answer["answer"] = json!({"uci":"e2e4"});
-    assert_eq!(study(&mut app, answer)["assessment"], "good");
-    app.set_local_tactic_preferences(1, Some(tempo::TacticThemes::starter()));
+    assert!(app.snapshot().unwrap().assessments.is_empty());
     assert_eq!(
         study(&mut app, json!({"command":"study_status"}))["tactics_remaining"],
         1
     );
-    let graded = app.snapshot().unwrap();
-    day.store(20_001, Ordering::Relaxed);
-    assert_eq!(
-        app.backfill_personal_tactics(&Default::default(), true)
-            .unwrap()["status"],
-        "already_applied"
-    );
-    assert_eq!(app.snapshot().unwrap(), graded);
 }
 
 #[test]
