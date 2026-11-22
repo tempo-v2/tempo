@@ -146,8 +146,7 @@ merge into a live dataset.
 ## Read and run one scenario
 
 From the local workspace root, use the module name as the Cargo test filter.
-Each line below is an independently useful command; the UI demo and boundary
-tests require the build first.
+The HTTP boundary tests require the Tempo binary to be built first.
 
 ```sh
 # One concept's same-module example (open its source alongside the output).
@@ -161,18 +160,14 @@ cargo test -p tempo --doc
 cargo test -p tempo --test contracts
 cargo doc -p tempo --no-deps --open
 
-# Real Rust/UI boundary and the transport-backed demonstration.
+# Real Rust/UI boundary over HTTP against disposable SQLite data.
 cargo build -p tempo
 node --test tempo/tests/ui_boundary.mjs
-node tempo/demo/run.mjs
 ```
 
-`cargo run -p tempo -- stdio` accepts one JSON command per line; begin with
-`{"command":"next"}`. [src/main.rs](src/main.rs) owns that adapter, and the UI
-imports no backend or process code. The established `--test contracts` target is
-unchanged and includes failed commits, stale content, grouped queue substitution,
-import/restore, corrective tactics, and replay. The Node boundary suite includes
-a response lost after a real Rust commit.
+The Node boundary suite starts the managed HTTP server on a disposable database,
+validates replies through the Study UI, and checks that retrying a lost reply
+does not duplicate the accepted assessment or receipt.
 
 `tests/contracts.rs` is now a small index. To follow a longer journey, choose
 [study_journeys.rs](tests/contracts/study_journeys.rs),
@@ -188,8 +183,7 @@ content-update journeys. Shared explicit clock/store setup lives in
 ## Current scope
 
 The loopback host uses the real Chess rules, SQLite Store, UTC clock, and
-restart-safe identities. The stdio demonstration still uses its fixed fixture
-policies and in-memory store.
+restart-safe identities.
 Store snapshots currently read the complete dataset. Cross-repository ownership
 lives in `.planning/INTERFACES.md`.
 

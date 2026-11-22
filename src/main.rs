@@ -1,17 +1,10 @@
-use std::{
-    error::Error,
-    io::{self, BufRead, Write},
-    path::Path,
-};
-use tempo::{
-    AppError, Tempo, local_runtime,
-    wire::{StudyCommand, StudyView},
-};
+use std::{error::Error, path::Path};
+use tempo::local_runtime;
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
-        [mode] if mode == "stdio" => stdio(),
+        [mode] if mode == "stdio" => Err("The standalone stdio workflow has been retired.".into()),
         [mode, database] if mode == "init" || mode == "init-practice" => {
             local_runtime::init(Path::new(database))
         }
@@ -55,31 +48,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             local_runtime::serve(Path::new(database), Path::new(ui), port.parse()?)
         }
         _ => Err(
-            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-game-capture-origins DATABASE TRANSFER.json [--apply] | backfill-study-lead-ins DATABASE [TRANSFER.json] [--apply] | split-black-repertoire DATABASE ID [--apply TOKEN] | serve DATABASE UI_DIST PORT"
+            "Usage: tempo init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-game-capture-origins DATABASE TRANSFER.json [--apply] | backfill-study-lead-ins DATABASE [TRANSFER.json] [--apply] | split-black-repertoire DATABASE ID [--apply TOKEN] | serve DATABASE UI_DIST PORT"
                 .into(),
         ),
     }
-}
-
-fn stdio() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut app = Tempo::demo()?;
-    let mut output = io::stdout().lock();
-    for line in io::stdin().lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let view = match serde_json::from_str::<StudyCommand>(&line) {
-            Ok(command) => app
-                .handle(command)
-                .without_move_details()
-                .without_opponent_context()
-                .without_tactic_explanation(),
-            Err(error) => StudyView::from(AppError::new("invalid_command", error.to_string())),
-        };
-        serde_json::to_writer(&mut output, &view)?;
-        writeln!(&mut output)?;
-        output.flush()?;
-    }
-    Ok(())
 }
