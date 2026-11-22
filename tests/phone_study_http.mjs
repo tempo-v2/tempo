@@ -164,6 +164,11 @@ test("phone Study retains its shared commands and denies desktop routes after in
     ["/api/games/gap-analysis", "GET"], ["/api/games/gap-explorer", "POST"],
     ["/api/study", "PUT"], ["/api/study", "GET"], ["/api/study/presence", "GET"],
   ]) assert.equal((await send(host, route, { method, headers: phoneHeaders, payload: {} })).status, 404, route);
+  for (const path of ["/api/games/gap-analysis", "/api/games/gap-analysis/status"]) {
+    const retired = await send(host, path, { method: "POST", headers: phoneHeaders, payload: {} });
+    assert.equal(retired.status, 410);
+    assert.equal(JSON.parse(retired.body).code, "retired_feature");
+  }
   for (const changes of [
     { Host: "another.ts.net:8443" }, { "X-Forwarded-Host": "another.ts.net:8443" },
     { "X-Forwarded-Proto": "http" }, { "Tailscale-User-Login": "other@example.invalid" },

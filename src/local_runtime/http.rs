@@ -10,7 +10,6 @@ use crate::{
     game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
-    gap_analysis::{GapAnalysis, GapAnalysisRead, GapAnalysisRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
@@ -75,7 +74,6 @@ pub(super) fn serve(
         tactics,
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
-        gap_analysis: GapAnalysis::new(database),
         coverage: crate::coverage_scan::CoverageScan::new(database, explorer.clone()),
         gap_explorer: GapExplorer::with_client(explorer),
     };
@@ -148,7 +146,6 @@ struct Games {
     backfill: BackfillCoordinator,
     model: GameModel,
     coverage: crate::coverage_scan::CoverageScan,
-    gap_analysis: GapAnalysis,
     gap_explorer: GapExplorer,
 }
 
@@ -597,6 +594,20 @@ fn respond_inner(
                 .with_status_code(StatusCode::GONE),
         )?;
     } else if matches!(
+        (request.method(), request.url()),
+        (&Method::GET | &Method::POST, "/api/games/gap-analysis")
+            | (&Method::POST, "/api/games/gap-analysis/status")
+    ) {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Standalone gap analysis has been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
+    } else if matches!(
         request.url(),
         "/api/games"
             | "/api/games/library"
@@ -617,8 +628,6 @@ fn respond_inner(
             | "/api/games/gap-line"
             | "/api/games/gap-line/status"
             | "/api/games/review"
-            | "/api/games/gap-analysis"
-            | "/api/games/gap-analysis/status"
             | "/api/games/gap-explorer"
             | "/api/study/relevance"
             | "/api/study/game-context"
@@ -701,21 +710,6 @@ fn respond_inner(
                     app.opponent_gap_page(page.offset, page.forecast_repertoire.as_deref())
                 }),
             ),
-            (&Method::GET, "/api/games/gap-analysis") => (200, Ok(games.gap_analysis.status())),
-            (&Method::POST, "/api/games/gap-analysis") => (
-                202,
-                command::<GapAnalysisRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.gap_analysis.start_on(app, intent, surface)),
-            ),
-            (&Method::POST, "/api/games/gap-analysis/status")
-                if surface == AuthoringSurface::PhoneBuild =>
-            {
-                (
-                    200,
-                    command::<GapAnalysisRead>(&request, MAX_COMMAND_BYTES)
-                        .and_then(|intent| games.gap_analysis.phone_status(intent)),
-                )
-            }
             (&Method::GET, "/api/games/gap-explorer") => (200, Ok(games.gap_explorer.status())),
             (&Method::POST, "/api/games/gap-explorer") => (
                 202,
@@ -1048,8 +1042,6 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/gap-line" => "game_gap_line",
         "/api/games/gap-line/status" => "game_gap_line_status",
         "/api/games/review" => "game_review",
-        "/api/games/gap-analysis" => "game_gap_analysis",
-        "/api/games/gap-analysis/status" => "game_gap_analysis_status",
         "/api/games/gap-explorer" => "game_gap_explorer",
         "/api/games/detectors" => "game_detectors",
         "/api/games/detection" => "game_detection",

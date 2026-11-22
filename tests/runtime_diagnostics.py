@@ -389,6 +389,26 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(saved)["status"], "repertoires")
 
+    def test_standalone_gap_analysis_retirement_does_no_work(self):
+        logs = self.root / "gap-analysis-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            for method, path in (
+                ("GET", "/api/games/gap-analysis"),
+                ("POST", "/api/games/gap-analysis"),
+                ("POST", "/api/games/gap-analysis/status"),
+            ):
+                status, _, payload, delivery = server.request(
+                    None if method == "GET" else b"{}", method=method, path=path
+                )
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("gap_analysis.", "sqlite.", "app."))
+                    for e in events
+                ))
+
     def test_real_sqlite_wait_has_request_stall_and_recovery_evidence(self):
         logs = self.root / "lock-logs"
         with Server(self.database, self.ui, logs) as server:
