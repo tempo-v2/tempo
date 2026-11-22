@@ -1,16 +1,15 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id};
-use crate::game_model::{AuthoringSurface, GapKind, GapRequest, model_input_stamp};
+use crate::game_model::{AuthoringSurface, GapKind, GapRequest};
 use crate::maia::{MODEL_KEY, PROFILE_LABEL, checked_distribution};
 use crate::{AppError, app_error::domain, commands::RepertoireInput};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use tempo_chess::{
-    AuthoredRepertoire, GapDraft, LearnerColor, compile_repertoire, legal_move_labels,
+    AuthoredRepertoire, GapDraft, LearnerColor, legal_move_labels,
 };
 use tempo_store::{
-    CoverageEditBasis, ForecastGap, ModelAuthority, ProjectionStatus, StoreError, model_lines,
-    model_targets,
+    CoverageEditBasis, ForecastGap, ProjectionStatus,
 };
 use tempo_types::{DatasetId, Revision};
 
@@ -28,73 +27,6 @@ impl Tempo {
         dataset: &DatasetId,
     ) -> Result<Option<ProjectionStatus>, AppError> {
         Ok(self.store.game_model_projection_status(dataset)?)
-    }
-
-    /// Verify legacy source associations once against accepted content before cache reprojection.
-    pub fn bootstrap_model_inputs(&mut self) -> Result<(), AppError> {
-        let _diagnostic = crate::diagnostics::Span::new("app.game_model.bootstrap_model_inputs");
-        for _ in 0..4 {
-            let dataset = self.game_dataset()?;
-            let pending = self.store.model_bootstrap_repertoires(&dataset)?;
-            if pending.is_empty() {
-                return Ok(());
-            }
-            let snapshot = self.store.content_state()?;
-            let revision = snapshot.content_revision;
-            if snapshot.dataset != dataset {
-                continue;
-            }
-            for id in pending {
-                let doc = self.store.repertoire_document(&id)?;
-                if doc.dataset != dataset || doc.revision != revision {
-                    break;
-                }
-                let (Some(source_id), ModelAuthority::NeedsBootstrap) =
-                    (doc.source_id, doc.model_authority)
-                else {
-                    continue;
-                };
-                let stamp = doc
-                    .pgn
-                    .as_deref()
-                    .zip(doc.item.as_ref())
-                    .and_then(|(pgn, item)| {
-                        let color = item.definition.learner_color().ok()?;
-                        let compiled =
-                            crate::diagnostics::measure("chess.compile_repertoire", || {
-                                compile_repertoire(pgn, &id, &item.label, color, &source_id)
-                            })
-                            .ok()?;
-                        let targets = model_targets(&snapshot.catalog, &id);
-                        let compiled_targets = model_targets(&compiled, &id);
-                        if model_lines(&compiled, &id) != model_lines(&snapshot.catalog, &id)
-                            || !compiled_targets
-                                .iter()
-                                .map(|(id, (_, definition))| (id, definition))
-                                .eq(targets.iter().map(|(id, (_, definition))| (id, definition)))
-                        {
-                            return None;
-                        }
-                        let authored = AuthoredRepertoire::parse(pgn).ok()?;
-                        Some(model_input_stamp(&authored, color, targets))
-                    });
-                match self.store.finish_model_bootstrap(
-                    &dataset,
-                    revision,
-                    &id,
-                    &source_id,
-                    stamp.as_ref(),
-                ) {
-                    Ok(()) => {}
-                    Err(StoreError::Conflict(_)) => break,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-        Err(AppError::new(
-            "stale_repertoire",
-            "The repertoire changed during model source verification.",
-        ))
     }
 
     pub fn opponent_gaps(&mut self, offset: usize) -> Result<Value, AppError> {

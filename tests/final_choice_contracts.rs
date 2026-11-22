@@ -156,7 +156,6 @@ fn startup_recovers_a_no_grade_choice_written_entirely_under_schema9() {
     let startup = |generation| {
         let day = Arc::new(AtomicI32::new(20_004));
         let mut app = open(&db, day, IntroductionLimits::default(), generation);
-        app.bootstrap_model_inputs().unwrap();
         app.reconcile_legacy_game_requests().unwrap();
         let repair = app.reconcile_choice_encounters().unwrap();
         (app, repair)

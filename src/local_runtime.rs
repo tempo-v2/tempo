@@ -78,7 +78,6 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
     let _diagnostics = crate::diagnostics::init(database);
     let _startup = crate::diagnostics::Span::new("runtime.startup");
     let mut app = open(database)?;
-    app.bootstrap_model_inputs()?;
     app.reconcile_legacy_game_requests()?;
     let encounters = app.reconcile_choice_encounters()?;
     eprintln!(

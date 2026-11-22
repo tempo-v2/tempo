@@ -3,7 +3,7 @@ use super::Tempo;
 use crate::{AppError, app_error::domain};
 use serde::{Deserialize, Serialize};
 use tempo_chess::{AuthoredRepertoire, CoverageStart, LearnerColor};
-use tempo_store::{CoverageLineSetting, ModelAuthority};
+use tempo_store::{CoverageLineSetting};
 use tempo_types::{DatasetId, Revision};
 
 #[derive(Deserialize)]
@@ -108,8 +108,7 @@ impl Tempo {
                 "Choose an active repertoire.",
             ));
         }
-        let (ModelAuthority::Verified, Some(pgn), Some(item)) =
-            (document.model_authority, document.pgn, document.item)
+        let (Some(pgn), Some(item)) = (document.pgn, document.item)
         else {
             return Err(AppError::new(
                 "coverage_unavailable",
