@@ -128,7 +128,7 @@ for (const priorAccepted of [true, false]) {
         assert.equal(completed.attempt_id, JSON.parse(pending).attempt_id);
         if (priorAccepted) assert.deepEqual(completed, accepted);
         const settled = readState(database, submission);
-        assert.equal(settled.schema, 25);
+        assert.equal(settled.schema, 26);
         assert.equal(settled.assessmentCount, before.assessmentCount);
         const acceptance = JSON.parse(settled.attempts[0].record).acceptance;
         assert.deepEqual(settled.days.map(day => ({ ...day })), [{
