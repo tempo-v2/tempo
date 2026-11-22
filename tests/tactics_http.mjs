@@ -76,7 +76,7 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     const database = path.join(dir, 'practice.sqlite');
     const transfer = path.join(dir, 'normalized.json');
     await writeFile(transfer, JSON.stringify({ schema_version: 1, puzzles: [tactic] }));
-    execFileSync(binary, ['init-practice', database]);
+    execFileSync(binary, ['init', database]);
     execFileSync(binary, ['import-tactics', database, transfer]);
     host = await start(database);
     const html = await fetch(host.url);

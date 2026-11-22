@@ -128,7 +128,7 @@ test('diagnostic deliveries preserve a committed Answer through body timeout and
                 provenance: ['Private source'],
             }] }));
             const options = { timeout: 5000, maxBuffer: 512 * 1024 };
-            execFileSync(binary, ['init-practice', database], options);
+            execFileSync(binary, ['init', database], options);
             execFileSync(binary, ['import-tactics', database, transfer], options);
             host = await start(database, logs);
             globalThis.fetch = async (route, init) => {

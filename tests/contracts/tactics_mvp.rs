@@ -14,7 +14,7 @@ fn reopen(path: &Path) -> Tempo {
 
 fn practice(path: &Path) -> Tempo {
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_tempo"))
-        .arg("init-practice")
+        .arg("init")
         .arg(path)
         .output()
         .unwrap();
@@ -245,4 +245,17 @@ fn an_invalid_cli_batch_with_a_valid_record_publishes_nothing() {
         assert!(rejected.stdout.is_empty());
         assert_eq!(app.snapshot().unwrap(), before);
     }
+}
+
+#[test]
+fn retired_init_practice_does_not_create_a_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("retired.sqlite");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tempo"))
+        .arg("init-practice")
+        .arg(&database)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!database.exists());
 }

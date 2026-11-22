@@ -5,9 +5,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
         [mode] if mode == "stdio" => Err("The standalone stdio workflow has been retired.".into()),
-        [mode, database] if mode == "init" || mode == "init-practice" => {
-            local_runtime::init(Path::new(database))
-        }
+        [mode, database] if mode == "init" => local_runtime::init(Path::new(database)),
         [mode, database, repertoire, tactics] if mode == "configure" => {
             local_runtime::configure(Path::new(database), repertoire.parse()?, tactics.parse()?, None)
         }
