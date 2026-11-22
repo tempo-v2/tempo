@@ -6,6 +6,8 @@ mod abandon;
 mod again;
 mod backfill_captures;
 mod content_preview;
+mod coverage_settings;
+pub(crate) use coverage_settings::{CoverageLineSave, PreviousCoverageLineRequest};
 mod current_attempt;
 
 mod daily;

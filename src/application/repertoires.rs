@@ -22,8 +22,9 @@ use tempo_chess::{
 };
 use tempo_learning::{DailyLearning, LearningState};
 use tempo_store::{
-    ContentReceipt, ContentSource, ContentState, RepertoireActivity, RepertoireActivityCommand,
-    RepertoireActivityRead, RepertoireActivityResult, RepertoireReset, Write, model_targets,
+    ContentReceipt, ContentSource, ContentState, CoverageEditBasis, RepertoireActivity,
+    RepertoireActivityCommand, RepertoireActivityRead, RepertoireActivityResult, RepertoireReset,
+    Write, model_targets,
 };
 use tempo_types::{DatasetId, Revision};
 
@@ -60,6 +61,7 @@ impl Tempo {
         id: &str,
         base_revision: Revision,
         surface: AuthoringSurface,
+        forecast: Option<&CoverageEditBasis>,
     ) -> Result<String, AppError> {
         let key = self
             .daily
@@ -90,11 +92,10 @@ impl Tempo {
                 "This response would change existing repertoire positions or learning.",
             ));
         }
-        Ok(match surface {
-            AuthoringSurface::Desktop => document_preview(&key, revision, id, input),
-            AuthoringSurface::PhoneBuild => {
-                scoped_preview(&key, revision, id, input, PHONE_FORECAST)
-            }
+        Ok(match (surface, forecast) {
+            (surface, Some(basis)) => forecast_preview(&key, revision, id, input, surface, basis),
+            (AuthoringSurface::Desktop, None) => document_preview(&key, revision, id, input),
+            (AuthoringSurface::PhoneBuild, None) => return Err(stale_preview()),
         })
     }
 
@@ -105,7 +106,7 @@ impl Tempo {
     ) -> Result<Value, AppError> {
         if surface == AuthoringSurface::PhoneBuild
             && !matches!(&command, RepertoireCommand::List)
-            && !matches!(&command, RepertoireCommand::Save { token, .. } if token.starts_with(PHONE_FORECAST))
+            && !matches!(&command, RepertoireCommand::Save { token, .. } if is_phone_forecast(token))
         {
             return Err(AppError::new(
                 "phone_build_only",
@@ -286,15 +287,17 @@ impl Tempo {
                 Ok(preview(&snapshot, &incoming, &plan, token))
             }
             RepertoireCommand::Save { input, token } => {
-                let from_phone = token.starts_with(PHONE_FORECAST);
-                let (revision_in_token, id) =
-                    if let Some(versioned) = token.strip_prefix(PHONE_FORECAST) {
-                        read_preview(&key, versioned, &(PHONE_FORECAST, &input))?
-                    } else if let Some(versioned) = token.strip_prefix(DOCUMENT_PREVIEW) {
-                        read_preview(&key, versioned, &(DOCUMENT_PREVIEW, &input))?
-                    } else {
-                        read_preview(&key, &token, &input)?
-                    };
+                let from_phone = is_phone_forecast(&token);
+                let forecast = read_forecast_preview(&key, &token, &input)?;
+                let (revision_in_token, id) = if let Some((revision, id, _)) = &forecast {
+                    (*revision, *id)
+                } else if let Some(versioned) = token.strip_prefix(PHONE_FORECAST) {
+                    read_preview(&key, versioned, &(PHONE_FORECAST, &input))?
+                } else if let Some(versioned) = token.strip_prefix(DOCUMENT_PREVIEW) {
+                    read_preview(&key, versioned, &(DOCUMENT_PREVIEW, &input))?
+                } else {
+                    read_preview(&key, &token, &input)?
+                };
                 check_dataset(&snapshot, &input.dataset_id)?;
                 if let Some(saved) = self.store.content_receipt(&token)? {
                     return serde_json::from_str(&saved).map_err(|e| domain("invalid_receipt", e));
@@ -350,6 +353,7 @@ impl Tempo {
                         repertoire_id: id,
                         expected_content_revision: revision_in_token,
                         model_input: &model_input,
+                        forecast: forecast.as_ref().map(|(_, _, basis)| basis),
                     }),
                     Some(receipt),
                 )?;
@@ -460,6 +464,59 @@ impl Tempo {
 // the same content revision. The version is bound into the MAC.
 const DOCUMENT_PREVIEW: &str = "document-v1:";
 const PHONE_FORECAST: &str = "phone-forecast-v1:";
+
+const DESKTOP_FORECAST_V2: &str = "desktop-forecast-v2:";
+const PHONE_FORECAST_V2: &str = "phone-forecast-v2:";
+
+fn is_phone_forecast(token: &str) -> bool {
+    token.starts_with(PHONE_FORECAST) || token.starts_with(PHONE_FORECAST_V2)
+}
+
+fn forecast_preview(
+    key: &[u8; 32],
+    revision: Revision,
+    id: &str,
+    input: &RepertoireInput,
+    surface: AuthoringSurface,
+    basis: &CoverageEditBasis,
+) -> String {
+    let purpose = match surface {
+        AuthoringSurface::Desktop => DESKTOP_FORECAST_V2,
+        AuthoringSurface::PhoneBuild => PHONE_FORECAST_V2,
+    };
+    let signed = preview_id(key, revision, id, &(purpose, input, basis));
+    format!(
+        "{purpose}{}:{}:{signed}",
+        basis.scope_revision, basis.report_id
+    )
+}
+
+fn read_forecast_preview<'a>(
+    key: &[u8; 32],
+    token: &'a str,
+    input: &RepertoireInput,
+) -> Result<Option<(Revision, &'a str, CoverageEditBasis)>, AppError> {
+    let purpose = if token.starts_with(PHONE_FORECAST_V2) {
+        PHONE_FORECAST_V2
+    } else if token.starts_with(DESKTOP_FORECAST_V2) {
+        DESKTOP_FORECAST_V2
+    } else {
+        return Ok(None);
+    };
+    let mut fields = token[purpose.len()..].splitn(3, ':');
+    let scope_revision = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(stale_preview)?;
+    let report_id = fields.next().ok_or_else(stale_preview)?.to_owned();
+    let signed = fields.next().ok_or_else(stale_preview)?;
+    let basis = CoverageEditBasis {
+        report_id,
+        scope_revision,
+    };
+    let (revision, id) = read_preview(key, signed, &(purpose, input, &basis))?;
+    Ok(Some((revision, id, basis)))
+}
 
 fn document_preview(
     key: &[u8; 32],

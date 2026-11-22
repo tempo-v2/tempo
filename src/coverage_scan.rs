@@ -53,15 +53,6 @@ pub(crate) struct ReadCoverage {
     repertoire_id: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CoverageStartingLine {
-    dataset_id: DatasetId,
-    repertoire_id: String,
-    candidate: Option<Vec<String>>,
-    save_at_revision: Option<u64>,
-}
-
 struct Run {
     request: StartCoverage,
     status: &'static str,
@@ -88,87 +79,12 @@ impl CoverageScan {
         }
     }
 
-    pub(crate) fn starting_line(
-        &self,
-        app: &Tempo,
-        request: CoverageStartingLine,
-    ) -> Result<Value, AppError> {
-        if app.game_dataset()? != request.dataset_id {
-            return Err(stale_dataset());
-        }
-        if request
-            .candidate
-            .as_ref()
-            .is_some_and(|moves| moves.len() >= 40)
-            || (request.save_at_revision.is_some() && request.candidate.is_none())
-        {
-            return Err(AppError::new(
-                "invalid_scan",
-                "Choose a saved opening line shorter than 20 moves.",
-            ));
-        }
-        let mut store = if request.save_at_revision.is_some() {
-            SqliteStore::open(&self.database)?
-        } else {
-            SqliteStore::open_read_only(&self.database)?
-        };
-        let document = store.repertoire_document(&request.repertoire_id)?;
-        if document.dataset != request.dataset_id {
-            return Err(stale_dataset());
-        }
-        let (Some(pgn), Some(item)) = (document.pgn, document.item) else {
-            return Err(AppError::new(
-                "coverage_unavailable",
-                "Choose a repertoire with a verified PGN.",
-            ));
-        };
-        if document.suspended {
-            return Err(AppError::new(
-                "coverage_unavailable",
-                "Choose an active repertoire.",
-            ));
-        }
-        let authored =
-            AuthoredRepertoire::parse(&pgn).map_err(|error| domain("invalid_repertoire", error))?;
-        let color = item
-            .definition
-            .learner_color()
-            .map_err(|error| domain("invalid_repertoire", error))?;
-        let mut saved = store.coverage_start(&request.dataset_id, &request.repertoire_id)?;
-        let candidate = request.candidate.as_deref().unwrap_or(&saved.moves);
-        let start = authored.coverage_start(candidate, color);
-        let first = authored
-            .coverage_frontier(candidate, color)
-            .map(|(_, first)| first);
-        if let Some(expected) = request.save_at_revision {
-            if !candidate.is_empty() && !first.as_ref().is_ok_and(|number| *number <= 20) {
-                return Err(AppError::new(
-                    "invalid_scan",
-                    "Choose an authored line with a reply to check by move 20.",
-                ));
-            }
-            saved = store.save_coverage_start(
-                &request.dataset_id,
-                &request.repertoire_id,
-                document.revision,
-                expected,
-                candidate,
-            )?;
-        }
-        Ok(json!({
-            "saved": saved,
-            "line": start.ok(),
-            "minimum_move": first.ok(),
-        }))
-    }
-
     pub(crate) fn read(&self, app: &Tempo, request: ReadCoverage) -> Result<Value, AppError> {
         if app.game_dataset()? != request.dataset_id {
             return Err(stale_dataset());
         }
         let run = self.run.lock().expect("coverage scan");
-        let starting_line = SqliteStore::open_read_only(&self.database)?
-            .coverage_start(&request.dataset_id, &request.repertoire_id)?;
+        let starting_line = app.saved_coverage_line(&request.dataset_id, &request.repertoire_id)?;
         let saved = app.coverage_summary(&request.dataset_id, &request.repertoire_id)?;
         let active = run.as_ref().filter(|run| {
             run.request.dataset_id == request.dataset_id
@@ -248,8 +164,7 @@ impl CoverageScan {
                     "The latest scan changed. Reload its status before starting again.",
                 ));
             }
-            let current = SqliteStore::open_read_only(&self.database)?
-                .coverage_start(&request.dataset_id, &request.repertoire_id)?;
+            let current = app.saved_coverage_line(&request.dataset_id, &request.repertoire_id)?;
             if current != request.starting_line {
                 return Err(AppError::new(
                     "stale_coverage",

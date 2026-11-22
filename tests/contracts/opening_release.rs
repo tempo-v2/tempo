@@ -1047,17 +1047,23 @@ fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
     assert_eq!(gap["games"], 0);
     assert_eq!(gap["gap_kind"], "forecast");
     assert_eq!(gap["forecast"]["probability"], 0.25);
+    let address = json!({
+        "dataset_id": dataset, "repertoire_id":id, "position":gap["position"],
+        "actual_move":gap["actual_move"], "document_revision":gap["document_revision"],
+        "gap_kind":gap["gap_kind"], "response":"g1f3",
+    });
     let draft = app
-        .game_gap_draft(
-            serde_json::from_value(json!({
-                "dataset_id": dataset, "repertoire_id":id, "position":gap["position"],
-                "actual_move":gap["actual_move"], "document_revision":gap["document_revision"],
-                "gap_kind":gap["gap_kind"], "response":"g1f3",
-            }))
-            .unwrap(),
-        )
+        .game_gap_draft(serde_json::from_value(address.clone()).unwrap())
         .unwrap();
     assert!(draft["save_token"].is_string(), "{draft}");
+    let save = |draft: &Value| {
+        json!({
+            "command":"save", "dataset_id":dataset, "repertoire_id":id,
+            "name":"Book", "learner_color":"white", "pgn":draft["draft"]["pgn"], "token":draft["save_token"],
+        })
+    };
+    let unaccepted = save(&draft);
+    let before = app.snapshot().unwrap();
     let cleared = store
         .save_coverage_start(&dataset, id, doc.revision, initial.revision, &[])
         .unwrap();
@@ -1091,6 +1097,35 @@ fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
             )
             .is_err()
     );
+    assert_eq!(content(&mut app, unaccepted)["code"], "stale_coverage");
+    assert_eq!(app.snapshot().unwrap(), before);
+    let mut summary = saved.summary;
+    summary.starting_line = restored.clone();
+    summary.request_id = "fresh-coverage".into();
+    let position = serde_json::from_value(address["position"].clone()).unwrap();
+    store
+        .publish_coverage(
+            &dataset,
+            id,
+            &book.input_key,
+            Some("coverage-contract"),
+            &summary,
+            &[(position, "c7c5".into(), 0.25)],
+        )
+        .unwrap();
+    let draft = app
+        .game_gap_draft(serde_json::from_value(address).unwrap())
+        .unwrap();
+    let accepted = save(&draft);
+    let response = content(&mut app, accepted.clone());
+    assert_eq!(response["status"], "repertoires", "{response}");
+    let updated = store.repertoire_document(id).unwrap();
+    store
+        .save_coverage_start(&dataset, id, updated.revision, restored.revision, &[])
+        .unwrap();
+    let after = app.snapshot().unwrap();
+    assert_eq!(content(&mut app, accepted), response);
+    assert_eq!(app.snapshot().unwrap(), after);
 }
 
 #[test]

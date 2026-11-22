@@ -9,7 +9,8 @@ use tempo_chess::{
     partition_black_openings, plan_repertoire_replacement,
 };
 use tempo_store::{
-    Commit, ContentReceipt, ContentSource, ModelAuthority, SqliteStore, Store, Write, model_targets,
+    Commit, ContentReceipt, ContentSource, ModelAuthority, RepertoirePartition, SqliteStore, Store,
+    Write, model_targets,
 };
 
 /// Preview without writing, or revalidate and commit a previously printed token.
@@ -193,24 +194,28 @@ pub fn split_black_repertoire(path: &Path, id: &str, apply: Option<&str>) -> Loc
                 repertoire_id,
                 expected_content_revision: snapshot.content_revision,
                 model_input: &stamps[index],
+                forecast: None,
             })
             .collect();
         let request = receipt_id(&snapshot.dataset.0, id, &token);
-        let reply = serde_json::to_string(
-            &json!({"summary": summary, "learning_sources": mapping, "applied_at_ms": now.unix_ms}),
-        )?;
-        store.commit_content_batch(
+        let reply = serde_json::to_string(&json!({"summary": summary}))?;
+        store.commit_repertoire_partition(
             Commit {
                 expected_revision: snapshot.revision,
                 expected_dataset: snapshot.dataset,
                 writes,
             },
             documents,
-            Some(ContentReceipt {
+            ContentReceipt {
                 request: &request,
                 reply: &reply,
-            }),
-            Some((id, &ids[1..], &mapping)),
+            },
+            RepertoirePartition {
+                source_repertoire: id,
+                destinations: &ids[1..],
+                source_by_destination: &mapping,
+                applied_at_ms: now.unix_ms,
+            },
         )?;
     }
     println!("{}", serde_json::to_string_pretty(&summary)?);

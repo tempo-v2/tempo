@@ -13,7 +13,8 @@ use tempo_chess::{
     compile_repertoire, legal_move_labels,
 };
 use tempo_store::{
-    ForecastGap, ModelAuthority, ProjectionStatus, StoreError, model_lines, model_targets,
+    CoverageEditBasis, ForecastGap, ModelAuthority, ProjectionStatus, StoreError, model_lines,
+    model_targets,
 };
 use tempo_types::{DatasetId, Revision};
 
@@ -251,8 +252,9 @@ impl Tempo {
     fn checked_gap(
         &self,
         request: &GapRequest,
-    ) -> Result<(CheckedGapRepertoire, GapDraft), AppError> {
+    ) -> Result<(CheckedGapRepertoire, GapDraft, Option<CoverageEditBasis>), AppError> {
         let book = self.checked_gap_repertoire(request)?;
+        let mut basis = None;
         let draft = match request.gap_kind {
             GapKind::Observed => book.authored.gap_draft(
                 &book.pgn,
@@ -263,6 +265,7 @@ impl Tempo {
             ),
             GapKind::Forecast => {
                 let forecast = self.forecast_gap(request, request.report_id.as_deref())?;
+                basis = Some(forecast.edit_basis());
                 book.authored
                     .coverage_line_from(
                         &forecast.starting_line.moves,
@@ -274,7 +277,7 @@ impl Tempo {
             }
         }
         .map_err(|error| domain("stale_gap", error))?;
-        Ok((book, draft))
+        Ok((book, draft, basis))
     }
 
     pub(crate) fn gap_position(
@@ -282,7 +285,7 @@ impl Tempo {
         mut request: GapRequest,
     ) -> Result<(GapDraft, Revision), AppError> {
         request.response = None;
-        let (book, draft) = self.checked_gap(&request)?;
+        let (book, draft, _) = self.checked_gap(&request)?;
         Ok((draft, book.revision))
     }
 
@@ -407,6 +410,16 @@ impl Tempo {
                 "Reopen the gap before drafting a line.",
             ));
         }
+        if gap
+            .report_id
+            .as_ref()
+            .is_some_and(|id| id != &request.report_id)
+        {
+            return Err(AppError::new(
+                "stale_coverage",
+                "Reopen the gap from the latest scan.",
+            ));
+        }
         let report = Some(request.report_id.as_str());
         let forecast = match surface {
             AuthoringSurface::Desktop => self.forecast_gap(&gap, report),
@@ -447,6 +460,7 @@ impl Tempo {
             name: checked.name,
             color: checked.color,
             through_move: forecast.through_move,
+            forecast: forecast.edit_basis(),
         })
     }
 
@@ -455,12 +469,22 @@ impl Tempo {
         input: &RepertoireInput,
         revision: Revision,
         surface: AuthoringSurface,
+        request: &GapLineRequest,
+        basis: &CoverageEditBasis,
     ) -> Result<String, AppError> {
+        let forecast = self.forecast_gap(&request.gap, Some(&request.report_id))?;
+        if forecast.edit_basis() != *basis {
+            return Err(AppError::new(
+                "stale_coverage",
+                "Reopen the gap from the latest scan.",
+            ));
+        }
         self.gap_response_token(
             input,
             input.repertoire_id.as_deref().expect("gap repertoire"),
             revision,
             surface,
+            Some(basis),
         )
     }
 
@@ -484,6 +508,7 @@ impl Tempo {
                 ..
             },
             draft,
+            forecast,
         ) = self.checked_gap(&request)?;
         let save_token = draft
             .pgn
@@ -500,6 +525,7 @@ impl Tempo {
                     &request.repertoire_id,
                     revision,
                     surface,
+                    forecast.as_ref(),
                 )
             })
             .transpose()?;
