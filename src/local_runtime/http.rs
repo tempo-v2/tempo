@@ -25,6 +25,7 @@ use tempo_store::SqliteStore;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn serve(
     app: &mut Tempo,
@@ -884,7 +885,7 @@ fn respond_inner(
             ),
             (&Method::Post, "/api/games/import") => (
                 200,
-                json_command::<GameImport>(&mut request, None)
+                command::<GameImport>(&mut request, MAX_CONTENT_COMMAND_BYTES)
                     .and_then(|intent| app.import_game_pgn(intent))
                     .map(|report| serde_json::json!(report)),
             ),
@@ -1057,51 +1058,31 @@ fn content_command<T: DeserializeOwned>(
     request: &mut Request,
     handle: impl FnOnce(T) -> Value,
 ) -> LocalResult<Value> {
-    Ok(match json_command(request, None) {
+    Ok(match command(request, MAX_CONTENT_COMMAND_BYTES) {
         Ok(intent) => handle(intent),
         Err(error) => serde_json::to_value(ErrorView::for_content(error))?,
     })
 }
 
 fn command<T: DeserializeOwned>(request: &mut Request, max_bytes: usize) -> Result<T, AppError> {
-    json_command(request, Some(max_bytes))
-}
-
-fn json_command<T: DeserializeOwned>(
-    request: &mut Request,
-    max_bytes: Option<usize>,
-) -> Result<T, AppError> {
     let invalid = |message| AppError::new("invalid_command", message);
     let mime = header(request, "Content-Type").and_then(|value| value.split(';').next());
     if mime != Some("application/json") {
         return Err(invalid("Use an application/json command."));
     }
     let mut body_trace = crate::diagnostics::Span::new("http.read_body");
-    let size = request.body_length();
-    let mut bytes = Vec::new();
-    if let Some(max_bytes) = max_bytes {
-        let Some(size) = size.filter(|size| *size <= max_bytes) else {
-            body_trace.set_outcome("invalid_size");
-            return Err(AppError::new(
-                "invalid_command",
-                format!("Send a command body of at most {} KiB.", max_bytes / 1024),
-            ));
-        };
-        bytes.resize(size, 0);
-        request.as_reader().read_exact(&mut bytes).map_err(|_| {
-            body_trace.set_outcome("io_error");
-            invalid("Could not read the command.")
-        })?;
-    } else {
-        request.as_reader().read_to_end(&mut bytes).map_err(|_| {
-            body_trace.set_outcome("io_error");
-            invalid("Could not read the command.")
-        })?;
-        if size.is_some_and(|size| bytes.len() != size) {
-            body_trace.set_outcome("invalid_size");
-            return Err(invalid("Could not read the command."));
-        }
-    }
+    let Some(size) = request.body_length().filter(|size| *size <= max_bytes) else {
+        body_trace.set_outcome("invalid_size");
+        return Err(AppError::new(
+            "invalid_command",
+            format!("Send a command body of at most {} KiB.", max_bytes / 1024),
+        ));
+    };
+    let mut bytes = vec![0; size];
+    request.as_reader().read_exact(&mut bytes).map_err(|_| {
+        body_trace.set_outcome("io_error");
+        invalid("Could not read the command.")
+    })?;
     body_trace.field("bytes", bytes.len());
     drop(body_trace);
     let mut decode_trace = crate::diagnostics::Span::new("http.decode_body");

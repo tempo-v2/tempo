@@ -118,6 +118,15 @@ test("phone Study retains its shared commands and denies desktop routes after in
   assert.equal((await send(host, "/api/games/detectors")).status, 200);
   assert.equal((await send(host, "/api/games")).status, 200);
 
+  // Reject oversized disposable input before decoding its command.
+  const beforeAdmission = databaseRows(database);
+  const oversizedPgn = { command: "save", pgn: " ".repeat(2 * 1024 * 1024) };
+  for (const route of ["/api/repertoires", "/api/tactics", "/api/games/import"]) {
+    const reply = await send(host, route, { method: "POST", payload: oversizedPgn });
+    assert.match(reply.body, /"code":"invalid_command"/);
+    assert.match(reply.body, /2048 KiB/);
+  }
+  assert.deepEqual(databaseRows(database), beforeAdmission);
   const before = databaseRows(database);
   const presence = { tab: "7a791296-6215-4d60-ae7c-58bab00ce975", sequence: 1, state: "active" };
   assert.deepEqual(await send(host, "/api/study/presence", {
