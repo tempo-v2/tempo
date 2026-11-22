@@ -4,8 +4,8 @@ use crate::{Tempo, application::tactic_catalog_facts::pack_memberships};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io, path::Path};
 use tempo_chess::{
-    Catalog, ChangeKind, ContentChange, ContentStatus, GameCapture, TacticLookup, TacticRecord,
-    compile_tactics,
+    Catalog, ChangeKind, ContentChange, ContentStatus, GameCapture, TacticLookup, TacticPolicyFacts,
+    TacticRecord, compile_tactics,
 };
 use tempo_store::{Commit, SqliteStore, Store, Write};
 use tempo_types::{ContentVersion, TargetId};
@@ -71,11 +71,19 @@ impl Batch {
             })
             .unzip();
         let mut catalog = compile_tactics(&records)?;
+        let theme_ids: std::collections::BTreeSet<_> = crate::tactic_themes()
+            .iter()
+            .map(|theme| theme.id.as_str())
+            .collect();
         for (record, (lead_ins, legacy_game_captures)) in records.iter().zip(context) {
             let item = catalog
                 .items
                 .get_mut(&record.target_id())
                 .expect("compiled target");
+            item.tactic_policy_facts = Some(TacticPolicyFacts::from_legacy_metadata(
+                record.provenance.iter().map(String::as_str),
+                |theme| theme_ids.contains(theme),
+            ));
             for lead_in in lead_ins {
                 let verified = tempo_chess::OpponentLeadIn::verified(
                     &lead_in.before_fen,
@@ -295,7 +303,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn batch(directory: &Path, label: &str, membership: Option<(&str, usize)>) -> Batch {
+    fn source_puzzle(
+        source: &str,
+        label: &str,
+        membership: Option<(&str, usize)>,
+    ) -> serde_json::Value {
         let metadata = membership.map(|(theme, position)| {
             format!(
                 "tempo1:catalog-metadata:{}",
@@ -305,18 +317,25 @@ mod tests {
         });
         let mut provenance = vec!["https://example.invalid/source".to_owned()];
         provenance.extend(metadata);
+        json!({
+            "namespace":"catalog-test","source_id":source,
+            "solver_fen":"4k3/8/8/8/8/8/4P3/4K3 w - - 0 1","solution":["e2e4"],
+            "label":label,"provenance":provenance,
+        })
+    }
+
+    fn batch_from_puzzles(directory: &Path, puzzles: Vec<serde_json::Value>) -> Batch {
         let transfer = directory.join("transfer.json");
         std::fs::write(
             &transfer,
-            json!({"schema_version":1,"puzzles":[{
-                "namespace":"catalog-test","source_id":"puzzle",
-                "solver_fen":"4k3/8/8/8/8/8/4P3/4K3 w - - 0 1","solution":["e2e4"],
-                "label":label,"provenance":provenance,
-            }]})
-            .to_string(),
+            json!({"schema_version":1,"puzzles":puzzles}).to_string(),
         )
         .unwrap();
         Batch::open(&transfer).unwrap()
+    }
+
+    fn batch(directory: &Path, label: &str, membership: Option<(&str, usize)>) -> Batch {
+        batch_from_puzzles(directory, vec![source_puzzle("puzzle", label, membership)])
     }
 
     fn daily(directory: &Path, name: &str) -> Tempo {
@@ -421,6 +440,14 @@ mod tests {
         let mut retained = daily(path, "retained.sqlite");
         apply(&mut retained, batch(path, "Retained label", None)).unwrap();
         let before = retained.snapshot().unwrap();
+        assert!(
+            before.catalog.items[target]
+                .tactic_policy_facts
+                .as_ref()
+                .unwrap()
+                .theme_ids()
+                .is_empty()
+        );
         for _ in 0..2 {
             let imported =
                 apply(&mut retained, batch(path, "New label", Some(("fork", 2)))).unwrap();
@@ -430,6 +457,44 @@ mod tests {
             assert_eq!(retained.snapshot().unwrap(), before);
             assert!(retained.next_exercise().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn legacy_tactic_metadata_is_persisted_for_new_aliases_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let mut app = daily(path, "aliases.sqlite");
+        let fresh = batch_from_puzzles(
+            path,
+            vec![
+                source_puzzle("a", "First source", Some(("fork", 2))),
+                source_puzzle("b", "Equivalent source", Some(("pin", 3))),
+            ],
+        );
+        let report = apply(&mut app, fresh).unwrap();
+        let target = report.sources[0].target.clone();
+        assert_eq!(report.sources[1].target, target);
+        assert!(report.sources[1].alias);
+        drop(app);
+
+        let mut app = super::super::open(&path.join("aliases.sqlite")).unwrap();
+        let original = app.snapshot().unwrap();
+        let item = &original.catalog.items[&target];
+        assert_eq!(item.version, ContentVersion(1));
+        assert_eq!(
+            item.tactic_policy_facts.as_ref().unwrap().theme_ids(),
+            &std::collections::BTreeSet::from(["fork".into(), "pin".into()]),
+        );
+        let later = batch_from_puzzles(
+            path,
+            vec![
+                source_puzzle("a", "Relabelled source", Some(("skewer", 4))),
+                source_puzzle("c", "New alias for retained target", Some(("mateIn1", 2))),
+            ],
+        );
+        let report = apply(&mut app, later).unwrap();
+        assert!(report.sources.iter().all(|source| source.target == target));
+        assert_eq!(app.snapshot().unwrap(), original);
     }
 
     #[test]
