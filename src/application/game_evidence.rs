@@ -1,7 +1,6 @@
 //! Normalize game records and coordinate answer-safe comparison and persistence.
 
 use super::{Tempo, content_preview::source_id};
-use crate::adapters::public_games::FetchedGames;
 use crate::game_evidence::{GameImport, GameReport, GameResult, check_id, fingerprint};
 use crate::{AppError, app_error::domain};
 use chrono::{NaiveDate, NaiveDateTime};
@@ -216,88 +215,6 @@ impl Tempo {
             None,
             None,
             None,
-            None,
-        )
-    }
-
-    pub(crate) fn ingest_provider_games(
-        &mut self,
-        dataset: &DatasetId,
-        command_id: &str,
-        fingerprint: &str,
-        learner: &str,
-        fetched: FetchedGames,
-        backfill: Option<&crate::game_backfill::BackfillJob>,
-    ) -> Result<GameReport, AppError> {
-        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.ingest_provider_games");
-        let at = self.components.clock.now().unix_ms;
-        let games = fetched
-            .games
-            .into_iter()
-            .map(|game| {
-                let mut records =
-                    parse_played_games(&game.pgn).map_err(|error| error.to_string())?;
-                if records.len() != 1 {
-                    return Err("Provider record must contain exactly one finished game.".into());
-                }
-                let played = records.pop().unwrap().map_err(|error| error.to_string())?;
-                if game.end_ms > at || game.start_ms.is_some_and(|start| start > game.end_ms) {
-                    return Err("Provider game has an invalid occurrence interval.".into());
-                }
-                let record = GameRecord {
-                    mainline_signature: mainline_signature(&played, &game.white, &game.black),
-                    source: game.provider.into(),
-                    id: game.id,
-                    url: Some(game.url),
-                    white: game.white,
-                    black: game.black,
-                    start_ms: game.start_ms,
-                    end_ms: Some(game.end_ms),
-                    fetched_ms: at,
-                    played_date_ms: None,
-                    pgn: game.pgn,
-                };
-                Ok((record, played))
-            })
-            .collect();
-        self.compare_games(
-            dataset,
-            (command_id, fingerprint),
-            learner,
-            games,
-            GameReport {
-                fetched: fetched.received,
-                errors: fetched.errors,
-                ..GameReport::default()
-            },
-            backfill.is_none().then_some(at),
-            None,
-            None,
-            backfill,
-        )
-    }
-
-    pub(crate) fn ingest_historical_pgns(
-        &mut self,
-        job: &crate::game_backfill::BackfillJob,
-        key: &str,
-        learner: &str,
-        games: Vec<GameRecord>,
-    ) -> Result<GameReport, AppError> {
-        let fetched = games.len();
-        self.compare_games(
-            &job.request.dataset_id,
-            (key, key),
-            learner,
-            games.into_iter().map(parse_stored_game).collect(),
-            GameReport {
-                fetched,
-                ..Default::default()
-            },
-            None,
-            None,
-            None,
-            Some(job),
         )
     }
 
@@ -343,7 +260,7 @@ impl Tempo {
         let backfill = saved
             .backfill_id
             .as_deref()
-            .map(|id| self.read_backfill(&request.dataset_id, Some(id)))
+            .map(|id| self.read_backfill(&request.dataset_id, id))
             .transpose()?
             .flatten();
         if saved.backfill_id.is_some() && backfill.is_none() {
@@ -370,7 +287,6 @@ impl Tempo {
                 fetched: 1,
                 ..Default::default()
             },
-            None,
             Some(&SelectedCorrection {
                 comparison_id: request.comparison_id,
                 ply: request.ply,
@@ -426,7 +342,6 @@ impl Tempo {
                 fetched,
                 ..Default::default()
             },
-            None,
             None,
             None,
             None,
@@ -507,7 +422,6 @@ impl Tempo {
                     fetched: 1,
                     ..Default::default()
                 },
-                None,
                 None,
                 Some(&plies),
                 None,
@@ -621,7 +535,6 @@ impl Tempo {
         learner: &str,
         mut games: Vec<Result<(GameRecord, PlayedGame), String>>,
         mut report: GameReport,
-        refresh_at: Option<u64>,
         selection: Option<&SelectedCorrection>,
         legacy_plies: Option<&BTreeSet<usize>>,
         backfill: Option<&crate::game_backfill::BackfillJob>,
@@ -1013,7 +926,7 @@ impl Tempo {
                     .collect(),
             },
             &comparisons,
-            refresh_at.filter(|_| report.errors.is_empty()),
+            None,
             GameReceipt {
                 id: command_id,
                 fingerprint,

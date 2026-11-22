@@ -164,21 +164,11 @@ Opening imports support standard-start orthodox games. Tactic capture accepts ex
 
 ## Historical Games and Study relevance
 
-Games → Historical backfill takes public provider accounts and a fixed UTC date
-range. It reads bounded provider windows and dated, matching stored PGNs.
-Completed windows survive restart. Retry remaining windows uses the existing
-job and its saved child receipts. Unlisted archives, truncated windows and
-provider failures appear in the window details.
-
-Accounts entered here stay recognized. Leave a provider blank to skip it
-for this import. The first explicit account configuration scopes personal
-game relevance and opponent gaps to the recognized identities.
-
-Only this explicit historic job may add a new Game Again for a qualifying
-unapplied miss from before a repertoire's starting reset. A later accepted
-reset stops the job's remaining learning effects for that repertoire.
-Stored-game reprocessing keeps its original reset rules.
-Distinct raw game and target identities retain their existing acceptance keys.
+Historical Games backfill has ended. Saved games, previously recognized
+player accounts, completed window effects and accepted correction provenance
+remain. Recovery of an original accepted Start or Retry reports its archived
+windows. Pending windows are stopped. Manual PGN import remains available in
+Games, and stored-game reprocessing keeps its original reset rules.
 
 The latest 200 eligible games supply personal position counts. A confirmed
 opponent gap opens the current repertoire at the position after the reply.

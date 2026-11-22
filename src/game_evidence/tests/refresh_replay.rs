@@ -1,11 +1,8 @@
 use super::super::*;
-use crate::{
-    DailyComponents, FixedClock, IntroductionLimits,
-    adapters::public_games::{FetchedGames, Game},
-};
+use crate::{DailyComponents, FixedClock, IntroductionLimits};
 use tempo_chess::Catalog;
 use tempo_learning::{DailyLearning, LearningPolicy};
-use tempo_store::SqliteStore;
+use tempo_store::{Commit, GameReceipt, SqliteStore, Store};
 use tempo_types::{StudyDay, StudyTime};
 
 const NOW: u64 = 20_000 * 86_400_000;
@@ -44,41 +41,37 @@ fn intent(id: &str, dataset: &str) -> GameRefresh {
 fn exact_accepted_refresh_replays_after_restart_without_writing() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("refresh.sqlite");
-    let store = SqliteStore::create(
+    let mut store = SqliteStore::create(
         &path,
         DatasetId::from("dataset-a"),
         Catalog::default(),
         DailyLearning::default().settings(),
     )
     .unwrap();
-    let mut original = app(store);
     let request = intent("accepted", "dataset-a");
-    let saved = original
-        .ingest_provider_games(
-            &request.dataset_id,
-            &request.command_id,
-            &fingerprint("refresh", &request).unwrap(),
-            &request.account,
-            FetchedGames {
-                received: 1,
-                games: vec![Game {
-                    provider: "lichess",
-                    url: "https://lichess.org/fixture".into(),
-                    id: "fixture".into(),
-                    white: "learner".into(),
-                    black: "other".into(),
-                    start_ms: None,
-                    end_ms: NOW - 1000,
-                    pgn: "[White \"learner\"]\n[Black \"other\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0"
-                        .into(),
-                }],
-                ..FetchedGames::default()
+    let saved = GameReport {
+        fetched: 1,
+        errors: vec!["Archived partial provider result.".into()],
+        ..GameReport::default()
+    };
+    let before = store.snapshot().unwrap();
+    store
+        .commit_games(
+            Commit {
+                expected_dataset: before.dataset,
+                expected_revision: before.revision,
+                writes: vec![],
             },
+            &[],
             None,
+            GameReceipt {
+                id: &request.command_id,
+                fingerprint: &fingerprint("refresh", &request).unwrap(),
+                report: &serde_json::to_string(&saved).unwrap(),
+            },
         )
         .unwrap();
-    assert_eq!(saved.new_games, 1);
-    drop(original);
+    drop(store);
 
     let reopened = app(SqliteStore::open(&path).unwrap());
     let before = std::fs::read(&path).unwrap();

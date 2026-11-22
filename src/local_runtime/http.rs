@@ -5,7 +5,7 @@ use self::ingress::{Admission, Head, Header, MAX_REPLY_BYTES, Request, Response,
 use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
-    game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
+    game_backfill::{BackfillRequest, BackfillRetry},
     game_evidence::{GameImport, GameRefresh},
     game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
@@ -56,7 +56,6 @@ pub(super) fn serve(
         }),
     );
     let mut games = Games {
-        backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
     };
     let mut model_marker = None;
@@ -90,10 +89,6 @@ pub(super) fn serve(
             }
             next_model_check = Instant::now() + Duration::from_millis(250);
         }
-        {
-            let _trace = crate::diagnostics::Span::new("loop.backfill_apply");
-            games.backfill.poll(app);
-        }
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
@@ -110,7 +105,6 @@ pub(super) fn serve(
 }
 
 struct Games {
-    backfill: BackfillCoordinator,
     model: GameModel,
 }
 
@@ -545,6 +539,38 @@ fn respond_inner(
                 .with_status_code(status_code(status))
                 .with_header(field("Cache-Control", "no-store")),
         )?;
+    } else if (request.method() == &Method::POST
+        && matches!(
+            request.url(),
+            "/api/games/backfill" | "/api/games/backfill/retry"
+        ))
+        || (request.method() == &Method::GET && request.url() == "/api/games/backfill")
+    {
+        let replay = match (request.method(), request.url()) {
+            (&Method::POST, "/api/games/backfill") => {
+                command::<BackfillRequest>(&request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| intent.replay(app))
+            }
+            (&Method::POST, "/api/games/backfill/retry") => {
+                command::<BackfillRetry>(&request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| intent.replay(app))
+            }
+            _ => Ok((
+                410,
+                serde_json::json!({
+                    "status": "error", "code": "retired_feature", "retryable": false,
+                    "message": "Historical Games backfill status has been retired.",
+                }),
+            )),
+        };
+        let (status, reply) =
+            replay.unwrap_or_else(|error| (400, serde_json::json!(ErrorView::for_content(error))));
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
     } else if matches!(
         request.url(),
         "/api/games"
@@ -552,8 +578,6 @@ fn respond_inner(
             | "/api/games/import"
             | "/api/games/choose"
             | "/api/games/reprocess"
-            | "/api/games/backfill"
-            | "/api/games/backfill/retry"
             | "/api/games/model"
             | "/api/games/coverage/starting-line"
             | "/api/games/coverage/starting-line/save"
@@ -573,17 +597,6 @@ fn respond_inner(
                     .and_then(|r| app.game_library(r)),
             ),
             (&Method::GET, "/api/games") => (200, app.game_history()),
-            (&Method::GET, "/api/games/backfill") => (200, games.backfill.current_status(app)),
-            (&Method::POST, "/api/games/backfill") => (
-                202,
-                command::<BackfillRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.backfill.begin(app, intent)),
-            ),
-            (&Method::POST, "/api/games/backfill/retry") => (
-                202,
-                command::<BackfillRetry>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.backfill.retry(app, intent)),
-            ),
             (&Method::GET, "/api/games/model") => (200, games.model.status(app)),
             (&Method::POST, "/api/games/model") => (
                 202,

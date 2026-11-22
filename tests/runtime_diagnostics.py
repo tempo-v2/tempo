@@ -488,6 +488,62 @@ class RuntimeDiagnostics(unittest.TestCase):
                 for e in log_events(logs)
             ))
 
+    def test_archived_backfill_is_addressed_readback_only(self):
+        logs = self.root / "historical-backfill-retirement-logs"
+        with sqlite3.connect(self.database) as connection:
+            dataset, = connection.execute("SELECT id FROM datasets").fetchone()
+            start = {"dataset_id": dataset, "command_id": "old-job", "lichess": "learner",
+                     "chess_com": None, "from_ms": 86400000, "to_ms": 172800000}
+            window = {"source": "lichess", "learner": "learner", "from_ms": start["from_ms"],
+                      "to_ms": start["to_ms"], "attempt": 2, "status": "pending",
+                      "received": 3, "accepted": 2, "split": False, "notes": []}
+            saved = {"id": "old-job", "request": start, "resets": {"opening": 2}, "windows": [window],
+                     "retries": ["old-retry"]}
+            connection.execute("INSERT INTO game_backfill_jobs VALUES (?, ?, ?)",
+                               (dataset, "old-job", json.dumps(saved)))
+            connection.execute("INSERT INTO game_learner_accounts VALUES (?, ?, ?)",
+                               (dataset, "lichess", "learner"))
+
+        def post(server, suffix, command, expected):
+            status, _, body, delivery = server.request(
+                json.dumps(command).encode(), path="/api/games/backfill" + suffix)
+            self.assertEqual(status, expected, body)
+            wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+            return json.loads(body)
+
+        with Server(self.database, self.ui, logs) as server:
+            status, _, body, delivery = server.request(None, path="/api/games/backfill", method="GET")
+            self.assertEqual(status, 410, body)
+            self.assertEqual(json.loads(body)["code"], "retired_feature")
+            wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+            self.assertFalse(any(e.get("request_id") == delivery and
+                                 e.get("operation", "").startswith(("app.", "sqlite.", "backfill."))
+                                 for e in log_events(logs)))
+            retry = {"dataset_id": dataset, "job_id": "old-job", "command_id": "old-retry"}
+            for suffix, command in (("", {**start, "lichess": " Learner "}), ("/retry", retry)):
+                receipt = post(server, suffix, command, 200)
+                self.assertEqual(receipt, {
+                    "status": "incomplete", "execution": "retired", "command_id": command["command_id"],
+                    "job_id": "old-job", "request": start, "windows": [window],
+                    "pending_windows": 1, "incomplete_windows": 0,
+                })
+                retired = post(server, suffix, {**command, "command_id": "undelivered"}, 410)
+                self.assertEqual(retired["code"], "retired_feature")
+                self.assertEqual(retired["dataset_id"], dataset)
+                self.assertEqual(retired["command_id"], "undelivered")
+                self.assertEqual(retired["job_id"], "old-job" if suffix else "undelivered")
+            self.assertEqual(post(server, "", {**start, "lichess": "other"}, 400)["code"],
+                             "invalid_backfill")
+            self.assertEqual(post(server, "/retry", {**retry, "dataset_id": "other"}, 400)["code"],
+                             "stale_dataset")
+            self.assertFalse(any(e.get("operation", "").startswith(("loop.backfill", "backfill.", "provider."))
+                                 for e in log_events(logs)))
+        with sqlite3.connect(self.database) as connection:
+            jobs = connection.execute("SELECT id, state FROM game_backfill_jobs").fetchall()
+            self.assertEqual(jobs, [("old-job", json.dumps(saved))])
+            self.assertEqual(connection.execute("SELECT source, learner FROM game_learner_accounts").fetchall(),
+                             [("lichess", "learner")])
+
     def test_coverage_scan_and_explorer_retirement_preserves_starting_line_save(self):
         logs = self.root / "coverage-scan-retirement-logs"
         with Server(self.database, self.ui, logs) as server:
