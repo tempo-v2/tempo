@@ -59,6 +59,16 @@ impl tempo_store::StudyContentRead for FailOnceStore {
     }
 }
 
+impl tempo_store::StudyReceiptRead for FailOnceStore {
+    fn study_receipt(
+        &self,
+        dataset: &DatasetId,
+        id: &tempo_types::SubmissionId,
+    ) -> Result<tempo_store::StudyReceiptLookup, StoreError> {
+        self.store.study_receipt(dataset, id)
+    }
+}
+
 impl Store for FailOnceStore {
     fn snapshot(&self) -> Result<Snapshot, StoreError> {
         self.store.snapshot()

@@ -114,6 +114,20 @@ for (const priorAccepted of [true, false]) {
         if (priorAccepted) {
           assert.deepEqual(settled.receipt, before.receipt);
           assert.deepEqual(settled.learning, before.learning);
+
+          const sql = new DatabaseSync(database, { timeout: 5000 });
+          try {
+            sql.exec("UPDATE learning SET state='not-json'");
+            const unreadable = readState(database, submission);
+            assert.deepEqual(await post("/api/study", pending), completed);
+            assert.deepEqual(readState(database, submission), unreadable);
+            const wrongDataset = { ...JSON.parse(pending), dataset_id: "wrong-dataset" };
+            assert.equal((await post("/api/study", JSON.stringify(wrongDataset))).code, "stale_dataset");
+          } finally {
+            for (const row of settled.learning)
+              sql.prepare("UPDATE learning SET state=? WHERE target_id=?").run(row.state, row.target_id);
+            sql.close();
+          }
         } else {
           assert.equal(JSON.parse(settled.receipt.result).Study.receipt_version, 1);
           assert.notDeepEqual(settled.learning, before.learning);

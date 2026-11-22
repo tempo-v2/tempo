@@ -1,7 +1,7 @@
 //! Stop an attempt and save the reply for safe retries.
 use super::{
     Tempo,
-    receipts::{replay, study_result},
+    receipts::{replay_accepted_study, replay_study_in_scope},
 };
 use crate::{
     AbandonCommand, AppError,
@@ -70,12 +70,27 @@ impl Tempo {
             submission: Some(&command.submission_id),
             ..StudyScope::default()
         };
-        let snapshot = self.store.study_state(scope)?;
         let action = if skip { "skip" } else { "abandon" };
         let fingerprint =
             serde_json::to_string(&(action, &command)).map_err(|e| domain("codec_error", e))?;
-        if let Some(result) = replay(&snapshot, &command.submission_id, &fingerprint)? {
-            return study_result(result);
+        if let Some(result) = replay_accepted_study(
+            self.store.as_ref(),
+            &command.dataset_id,
+            &command.submission_id,
+            &fingerprint,
+        )? {
+            return Ok(result);
+        }
+        // Recheck the receipt in the coherent new-work read. Another delivery
+        // may have committed it since the addressed lookup.
+        let snapshot = self.store.study_state(scope)?;
+        if let Some(result) = replay_study_in_scope(
+            &snapshot,
+            &command.dataset_id,
+            &command.submission_id,
+            &fingerprint,
+        )? {
+            return Ok(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
         if old.repertoire_warmup {
