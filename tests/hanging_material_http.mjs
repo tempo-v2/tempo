@@ -12,7 +12,6 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createStudyController } from "../../tempo-ui/study_controller.js";
-import { validateDetection, validateRegistry } from "../../tempo-ui/game_detection.js";
 import { validateTacticalHistory } from "../../tempo-ui/tactical_history.js";
 import { databaseRows } from "./support/game_detection_readback.mjs";
 
@@ -138,11 +137,6 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
       assert.ok(response.status === 200 || response.status === 202, JSON.stringify(value));
       return value;
     }
-    const discovery = validateRegistry(await api("games/detectors"));
-    assert.equal(discovery.status, "available");
-    const detector = discovery.detectors.find(item => item.id === "personal-tactics");
-    assert.ok(detector, JSON.stringify(discovery));
-
     let serial = 0, stored = null, loseAnswer = false, interruptNext = false, lostReply;
     const sent = [];
     function controller() {
@@ -224,22 +218,7 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     for (const key of ["attempt_id", "target_id", "revision", "display_fen"]) assert.deepEqual(resumed[key], active[key], key);
     blind(resumed);
 
-    // The older display-only detector API still validates against its strict
-    // consumer. Previewing the same game does not enqueue it a second time.
     const beforeRead = durableTraining(database);
-    const intent = { schema_version: 1, request_id: "legacy-preview", dataset_id: dataset,
-      source: missed.source, game_id: missed.game_id, learner: missed.learner, detector_id: detector.id };
-    let preview = validateDetection(await api("games/detection", intent), intent, detector);
-    const previewDeadline = Date.now() + 30000;
-    while (preview.status === "running" && Date.now() < previewDeadline) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-      preview = validateDetection(await api("games/detection-result", {
-        schema_version: 1, request_id: intent.request_id, dataset_id: dataset,
-      }), intent, detector);
-    }
-    assert.equal(preview.status, "complete", JSON.stringify(preview));
-    assert.equal(preview.findings.length, 1);
-    assert.ok(preview.findings.every(finding => !Object.hasOwn(finding, "tactical")));
     const retired = validateTacticalHistory(await api("games/tactics", { dataset_id: dataset }), dataset);
     assert.equal(retired.status, "unavailable");
     assert.deepEqual(durableTraining(database), beforeRead);

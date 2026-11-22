@@ -389,6 +389,48 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(saved)["status"], "repertoires")
 
+    def test_manual_detector_retirement_does_no_work_and_preserves_capture(self):
+        logs = self.root / "manual-detector-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            for method, path in (
+                ("GET", "/api/games/detectors"),
+                ("POST", "/api/games/detection"),
+                ("POST", "/api/games/detection-result"),
+            ):
+                status, _, payload, delivery = server.request(
+                    None if method == "GET" else b"{}", method=method, path=path
+                )
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("detection.", "sqlite.", "app."))
+                    for e in events
+                ))
+
+            status, _, context, _ = server.request(None, path="/api/context", method="GET")
+            self.assertEqual(status, 200)
+            capture = {
+                "dataset_id": json.loads(context)["dataset_id"],
+                "pgn": '[SetUp "1"]\n[FEN "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"]\n1.e4 *',
+            }
+            status, _, preview, _ = server.request(
+                json.dumps({"command": "preview", **capture}).encode(), path="/api/tactics"
+            )
+            self.assertEqual(status, 200)
+            preview = json.loads(preview)
+            self.assertEqual(preview["rows"][0]["status"], "valid")
+            save = json.dumps({
+                "command": "save", **capture, "token": preview["token"], "selected": [0],
+            }).encode()
+            status, _, reply, _ = server.request(save, path="/api/tactics")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(reply)["status"], "tactics_saved")
+            status, _, replayed, _ = server.request(save, path="/api/tactics")
+            self.assertEqual(status, 200)
+            self.assertEqual(replayed, reply)
+
     def test_standalone_gap_analysis_retirement_does_no_work(self):
         logs = self.root / "gap-analysis-retirement-logs"
         with Server(self.database, self.ui, logs) as server:

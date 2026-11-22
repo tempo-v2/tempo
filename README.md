@@ -52,13 +52,6 @@ for the session; a distinct new miss restores its priority. Analysis and request
 state survive database restart; portable content/learning export keeps its
 existing scope and does not include game-analysis delivery state.
 
-For a disposable external-detector consumer, build
-`game_detection_contract_host` and pass the temporary database,
-built UI path, loopback port and scenario. The example calls the same
-[public host entry](src/local_runtime.rs) as production. The
-[HTTP proof](tests/game_detection_http.mjs) checks the addressed game, distinct
-outcomes and stable durable state. The companion browser proof lives in Tempo UI.
-
 ## Choose the entry point
 
 | When you need to… | Reach for | Source and nearby example |
@@ -70,7 +63,6 @@ outcomes and stable durable state. The companion browser proof lives in Tempo UI
 | Answer the displayed learner decision | `SubmitCommand` → `Tempo::submit` | [submit_command.rs](src/commands/submit_command.rs) constructs a retryable action; [submit.rs](src/application/submit.rs) shows progress, learning, assessment and receipt saved together. |
 | Stop an attempt | `AbandonCommand` → `Tempo::abandon` | [abandon_command.rs](src/commands/abandon_command.rs) supplies revision/identity without an answer; [abandon.rs](src/application/abandon.rs) clears the active pointer. |
 | Update production repertoire or tactics content | Signed Preview and Save or the validated tactic transfer | [repertoires.rs](src/application/repertoires.rs) and [tactic_capture.rs](src/application/tactic_capture.rs) preserve content and Learning fences. |
-| Read a detector's observations for a stored game | Games detection discovery, start and result routes | [game_detection.rs](src/game_detection.rs) owns bounded ephemeral delivery. Chess checks legal occurrences and reports. |
 | Analyze retained games and prioritize missed captures | Normal runtime's `TacticalJobs`, then `POST /api/games/tactics` for a bounded read | [tactical_jobs.rs](src/tactical_jobs.rs) reuses the detector worker; [tactical_analysis.rs](src/application/tactical_analysis.rs) accepts observation, puzzle and request atomically. |
 | Process fixture-profile games | `Tempo::ingest_games` | [ingest_games.rs](src/application/ingest_games.rs) demonstrates replay-aware ingestion. The count includes processed deviations that were already committed. |
 | Transfer content and learning to an empty dataset | `Tempo::export`, `Tempo::restore` | [export.rs](src/application/export.rs) shows a read-only export; [restore.rs](src/application/restore.rs) restores under a new dataset identity. |

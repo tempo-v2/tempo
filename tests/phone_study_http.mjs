@@ -122,7 +122,9 @@ test("phone Study retains its shared commands and denies desktop routes after in
     sql.close();
   }
 
-  assert.equal((await send(host, "/api/games/detectors")).status, 200);
+  const retiredDetector = await send(host, "/api/games/detectors");
+  assert.equal(retiredDetector.status, 410);
+  assert.equal(JSON.parse(retiredDetector.body).code, "retired_feature");
   assert.equal((await send(host, "/api/games")).status, 200);
 
   // Reject oversized disposable input before decoding its command.

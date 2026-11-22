@@ -7,7 +7,7 @@ use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
     diagnostics::Span,
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
-    game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
+    game_detection::GameDetection,
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
@@ -543,40 +543,21 @@ fn respond_inner(
                 .with_header(field("Cache-Control", "no-store")),
         )?;
     } else if matches!(
-        request.url(),
-        "/api/games/detectors" | "/api/games/detection" | "/api/games/detection-result"
+        (request.method(), request.url()),
+        (&Method::GET, "/api/games/detectors")
+            | (
+                &Method::POST,
+                "/api/games/detection" | "/api/games/detection-result"
+            )
     ) {
-        let reply = match (request.method(), request.url()) {
-            (&Method::GET, "/api/games/detectors") => Ok(games.detection.discovery()),
-            (&Method::POST, "/api/games/detection") => {
-                command::<DetectionRequest>(&request, MAX_COMMAND_BYTES)
-                    .map(|intent| {
-                        let reply = games.detection.start(app, intent);
-                        if reply.started {
-                            games.tactics.cancel_payoffs();
-                        }
-                        reply
-                    })
-            }
-            (&Method::POST, "/api/games/detection-result") => {
-                command::<DetectionRead>(&request, MAX_COMMAND_BYTES)
-                    .map(|intent| games.detection.read(app, intent))
-            }
-            _ => Ok(DetectionReply {
-                started: false,
-                status: 405,
-                body: serde_json::json!({"schema_version": 1, "status": "error", "code": "method_not_allowed"}),
-            }),
-        }.unwrap_or_else(|error| DetectionReply {
-            started: false,
-            status: 400,
-            body: serde_json::json!({"schema_version": 1, "status": "error", "code": error.code}),
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "The manual game detector has been retired.", "retryable": false,
         });
         respond_traced(
             request,
-            body("application/json; charset=utf-8", json_bytes(&reply.body)?)
-                .with_status_code(status_code(reply.status))
-                .with_header(field("Cache-Control", "no-store")),
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
         )?;
     } else if request.method() == &Method::POST
         && matches!(
@@ -1043,9 +1024,6 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/gap-line/status" => "game_gap_line_status",
         "/api/games/review" => "game_review",
         "/api/games/gap-explorer" => "game_gap_explorer",
-        "/api/games/detectors" => "game_detectors",
-        "/api/games/detection" => "game_detection",
-        "/api/games/detection-result" => "game_detection_result",
         "/api/games/tactics" => "tactics_status",
         "/api/games/tactics/command" => "tactics_command",
         "/" | "/index.html" => "ui_index",

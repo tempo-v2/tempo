@@ -1,4 +1,4 @@
-//! Ephemeral, addressed execution of one explicitly requested stored-game scan.
+//! Ephemeral, addressed execution of stored-game analysis.
 use crate::{AppError, Tempo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -94,6 +94,7 @@ pub(crate) struct DetectionRequest {
     pub(crate) detector_id: String,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DetectionRead {
@@ -137,6 +138,7 @@ pub(crate) struct DetectionReply {
     /// status of a replay is also 202.
     pub(crate) started: bool,
     pub(crate) status: u16,
+    #[cfg(test)]
     pub(crate) body: Value,
 }
 
@@ -193,34 +195,40 @@ struct Entry {
     position: Option<tempo_store::TacticalPositionRun>,
     request: DetectionRequest,
     source: Arc<AcceptedDetectionSource>,
+    #[cfg(test)]
     descriptor: DetectorDescriptor,
     status: DetectionStatus,
 }
 
 impl Entry {
     fn reply(&self) -> DetectionReply {
-        let mut body = json!({
-            "schema_version": VERSION,
-            "request_id": self.request.request_id,
-            "dataset_id": self.request.dataset_id,
-            "source": self.request.source,
-            "game_id": self.request.game_id,
-            "detector": descriptor_json(&self.descriptor),
-        });
-        let mut status = serde_json::to_value(&self.status).expect("serializable detection status");
-        // Wire 1 is a display-only preview, consumed by older strict clients.
-        // Typed training evidence is accepted through the application command
-        // and exposed by its separate versioned history read.
-        if let Some(findings) = status.get_mut("findings").and_then(Value::as_array_mut) {
-            for finding in findings {
-                if let Some(fields) = finding.as_object_mut() {
-                    fields.remove("tactical");
+        #[cfg(test)]
+        let body = {
+            let mut body = json!({
+                "schema_version": VERSION,
+                "request_id": self.request.request_id,
+                "dataset_id": self.request.dataset_id,
+                "source": self.request.source,
+                "game_id": self.request.game_id,
+                "detector": descriptor_json(&self.descriptor),
+            });
+            let mut status =
+                serde_json::to_value(&self.status).expect("serializable detection status");
+            // Wire 1 is a display-only preview, consumed by older strict clients.
+            // Typed training evidence is accepted through the application command
+            // and exposed by its separate versioned history read.
+            if let Some(findings) = status.get_mut("findings").and_then(Value::as_array_mut) {
+                for finding in findings {
+                    if let Some(fields) = finding.as_object_mut() {
+                        fields.remove("tactical");
+                    }
                 }
             }
-        }
-        body.as_object_mut()
-            .unwrap()
-            .extend(status.as_object().unwrap().clone());
+            body.as_object_mut()
+                .unwrap()
+                .extend(status.as_object().unwrap().clone());
+            body
+        };
         DetectionReply {
             started: false,
             status: if matches!(self.status, DetectionStatus::Running) {
@@ -228,6 +236,7 @@ impl Entry {
             } else {
                 200
             },
+            #[cfg(test)]
             body,
         }
     }
@@ -330,24 +339,7 @@ impl GameDetection {
         })
     }
 
-    pub(crate) fn discovery(&self) -> DetectionReply {
-        let detectors: Vec<_> = self
-            .registry
-            .0
-            .values()
-            .map(|registered| descriptor_json(&registered.descriptor))
-            .collect();
-        DetectionReply {
-            started: false,
-            status: 200,
-            body: json!({
-                "schema_version": VERSION,
-                "status": if detectors.is_empty() { "unconfigured" } else { "available" },
-                "detectors": detectors,
-            }),
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn start(&mut self, app: &Tempo, request: DetectionRequest) -> DetectionReply {
         self.start_work(app, request, None, &[])
     }
@@ -458,6 +450,7 @@ impl GameDetection {
             position,
             request: request.clone(),
             source: source.clone(),
+            #[cfg(test)]
             descriptor: detector.descriptor.clone(),
             status: DetectionStatus::Running,
         };
@@ -498,6 +491,7 @@ impl GameDetection {
         delivery
     }
 
+    #[cfg(test)]
     pub(crate) fn read(&mut self, app: &Tempo, request: DetectionRead) -> DetectionReply {
         let _diagnostic = crate::diagnostics::Span::new("detection.read");
         let error =
@@ -597,23 +591,25 @@ impl Drop for GameDetection {
 
 fn addressed_error(
     status: u16,
-    code: &str,
-    request_id: &str,
-    dataset_id: &DatasetId,
+    _code: &str,
+    _request_id: &str,
+    _dataset_id: &DatasetId,
 ) -> DetectionReply {
     DetectionReply {
         started: false,
         status,
+        #[cfg(test)]
         body: json!({
             "schema_version": VERSION,
-            "request_id": request_id,
-            "dataset_id": dataset_id,
+            "request_id": _request_id,
+            "dataset_id": _dataset_id,
             "status": "error",
-            "code": code,
+            "code": _code,
         }),
     }
 }
 
+#[cfg(test)]
 fn descriptor_json(descriptor: &DetectorDescriptor) -> Value {
     json!({
         "id": descriptor.id,
