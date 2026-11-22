@@ -14,6 +14,9 @@ impl Tempo {
     ) -> Result<AnswerResult, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.resume.resume_from");
         let record = self.current(snapshot, &snapshot.dataset, id)?;
+        if record.repertoire_warmup {
+            return Err(super::abandon::retired_warmup());
+        }
         Ok(AnswerResult {
             attempt: record.attempt.clone(),
             feedback: None,

@@ -27,7 +27,6 @@ mod next_exercise;
 mod optional_tactics;
 mod queue_source;
 mod receipts;
-mod repertoire_runs;
 mod repertoires;
 mod study_analysis_context;
 mod study_card_details;

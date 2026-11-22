@@ -8,7 +8,7 @@ use crate::{
     app_error::{domain, study_input},
 };
 use tempo_chess::{ChessAnswer, ChessFeedback};
-use tempo_learning::{AssessmentInput, AssessmentSource, DailyLearning, LearningEffect};
+use tempo_learning::{AssessmentInput, AssessmentSource, DailyLearning};
 use tempo_queue::OrderEvent;
 use tempo_store::{
     AcceptanceKind, ActivityAcceptance, ActivityMode, AnswerResult, AssessmentKey,
@@ -80,6 +80,9 @@ impl Tempo {
             return study_result(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
+        if old.repertoire_warmup {
+            return Err(super::abandon::retired_warmup());
+        }
         let (item, prior) = snapshot
             .target(&old.attempt.target)?
             .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
@@ -237,19 +240,6 @@ impl Tempo {
             && snapshot.active_attempt.as_ref() == Some(&result.attempt.id)
         {
             writes.push(Write::Active(None));
-        }
-        if let Some(run) = snapshot
-            .repertoire_run
-            .as_ref()
-            .filter(|run| run.head() == Some(&result.attempt.id))
-        {
-            let ends_run = old.mode == ActivityMode::Test
-                && (result.attempt.terminal == Some(Grade::Again)
-                    || result.learning_effect == Some(LearningEffect::StalePositiveIgnored));
-            if ends_run || (result.attempt.status != AttemptStatus::Active && run.next().is_none())
-            {
-                writes.push(Write::RepertoireRun(None));
-            }
         }
         self.commit_study(&snapshot, writes, scope)?;
         if self.daily.is_none() && result.assessment == Some(Grade::Again) {

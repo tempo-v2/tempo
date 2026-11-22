@@ -7,7 +7,18 @@ use crate::{
     AbandonCommand, AppError,
     app_error::{domain, study_input},
 };
-use tempo_store::{AnswerResult, Receipt, ReceiptResult, StoredAttempt, StudyScope, Write};
+use tempo_store::{
+    AnswerResult, Receipt, ReceiptResult, StoredAttempt, StudyScope, StudyState, Write,
+};
+
+use tempo_types::AttemptId;
+
+pub(super) fn retired_warmup() -> AppError {
+    AppError::new(
+        "retired_activity",
+        "Connected repertoire warm-ups have been retired.",
+    )
+}
 
 impl Tempo {
     /// Stop an attempt without producing a new assessment.
@@ -24,6 +35,35 @@ impl Tempo {
         self.leave(command, true)
     }
 
+    /// Next can retire a previously issued warm-up without grading it.
+    pub(super) fn retire_active_warmup(
+        &mut self,
+        snapshot: &StudyState,
+        id: &AttemptId,
+    ) -> Result<bool, AppError> {
+        let Some(record) = snapshot
+            .attempts
+            .get(id)
+            .filter(|record| record.repertoire_warmup)
+        else {
+            return Ok(false);
+        };
+        let attempt =
+            tempo_study::abandon(&record.attempt, record.attempt.revision).map_err(study_input)?;
+        self.commit_study(
+            snapshot,
+            vec![
+                Write::Progress(StoredAttempt {
+                    attempt,
+                    ..record.clone()
+                }),
+                Write::Active(None),
+            ],
+            StudyScope::default(),
+        )?;
+        Ok(true)
+    }
+
     fn leave(&mut self, command: AbandonCommand, skip: bool) -> Result<AnswerResult, AppError> {
         let scope = StudyScope {
             attempt: Some(&command.attempt_id),
@@ -38,6 +78,9 @@ impl Tempo {
             return study_result(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
+        if old.repertoire_warmup {
+            return Err(retired_warmup());
+        }
         let attempt = crate::diagnostics::measure("study.abandon", || {
             tempo_study::abandon(&old.attempt, command.expected_revision)
         })
@@ -62,19 +105,7 @@ impl Tempo {
         if snapshot.active_attempt.as_ref() == Some(&command.attempt_id) {
             writes.push(Write::Active(None));
         }
-        let in_run = snapshot
-            .repertoire_run
-            .as_ref()
-            .is_some_and(|run| run.head() == Some(&command.attempt_id));
-        let skip_warmup = skip && in_run && old.repertoire_warmup;
-        if in_run {
-            writes.push(if skip_warmup {
-                Write::SkipRepertoireWarmup(command.attempt_id.clone())
-            } else {
-                Write::RepertoireRun(None)
-            });
-        }
-        let at = (skip && !skip_warmup).then(|| self.components.clock.now());
+        let at = skip.then(|| self.components.clock.now());
         self.commit_study(&snapshot, writes, scope)?;
         if let (Some(at), Some(daily)) = (at, &mut self.daily) {
             daily.queue.defer(result.attempt.target.clone(), at.day);

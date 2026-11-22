@@ -16,7 +16,12 @@ impl Tempo {
             catalog: true,
             ..StudyScope::default()
         };
-        let snapshot = self.store.study_state(scope)?;
+        let mut snapshot = self.store.study_state(scope)?;
+        if let Some(id) = &snapshot.active_attempt
+            && self.retire_active_warmup(&snapshot, id)?
+        {
+            snapshot = self.store.study_state(scope)?;
+        }
         if let Some(id) = &snapshot.active_attempt {
             return self.resume_from(&snapshot, id).map(Some);
         }
@@ -24,7 +29,7 @@ impl Tempo {
             let at = self.components.clock.now();
             let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
             let selection = self.daily_selection(&snapshot, at, extra)?;
-            return self.issue_next_daily(&snapshot, at, &selection, false);
+            return self.issue_next_daily(&snapshot, at, &selection);
         }
         let at = self.components.clock.now();
         let context = QueueOrderContext {
