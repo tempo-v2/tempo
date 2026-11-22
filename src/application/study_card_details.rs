@@ -1,8 +1,7 @@
 //! Explain an issued card using presentation-only facts from its saved version.
 use super::{
     Tempo,
-    tactic_catalog_facts::{CaptureOrigin, pack_memberships, saved_pgn_source},
-    tactic_preferences::tactic_themes,
+    tactic_catalog_facts::{CaptureOrigin, saved_pgn_source},
 };
 use crate::AppError;
 use serde::Serialize;
@@ -176,18 +175,11 @@ impl Tempo {
         let personal_capture =
             legacy_capture || CaptureOrigin::read(provenance) == CaptureOrigin::PersonalCapture;
         let archived_capture = provenance.iter().any(|value| saved_pgn_source(value));
-        let imported_pack = pack_memberships(provenance).next().is_some()
-            || provenance
-                .iter()
-                .any(|value| value.starts_with("tempo1:legacy-deck:"));
         let mut sources = Vec::new();
         if tactic && personal_capture {
             sources.push("Personal capture");
         } else if tactic && archived_capture {
             sources.push("Saved PGN selection");
-        }
-        if tactic && imported_pack {
-            sources.push("Imported puzzle pack");
         }
         let attempt = &record.attempt;
         let game = match attribution {
@@ -215,18 +207,7 @@ impl Tempo {
         }
         let explanation = matches!(disclosure, CardDisclosure::Full).then(|| CardExplanation {
             title: title.to_owned(),
-            themes: tactic
-                .then(|| {
-                    pack_memberships(provenance)
-                        .filter_map(|member| {
-                            tactic_themes()
-                                .iter()
-                                .find(|theme| theme.id == member.theme)
-                                .map(|theme| theme.name.as_str())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            themes: BTreeSet::new(),
             capture_method: if legacy_capture {
                 provenance
                     .iter()

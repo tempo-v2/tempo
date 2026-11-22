@@ -1,14 +1,56 @@
 //! Decode the transfer format and report dispositions for one atomic import.
 use super::LocalResult;
-use crate::{Tempo, application::tactic_catalog_facts::pack_memberships};
+use crate::Tempo;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io, path::Path};
 use tempo_chess::{
     Catalog, ChangeKind, ContentChange, ContentStatus, GameCapture, TacticLookup, TacticPolicyFacts,
     TacticRecord, compile_tactics,
 };
+use tempo_queue::{PackDifficulty, PackMembership};
 use tempo_store::{Commit, SqliteStore, Store, Write};
 use tempo_types::{ContentVersion, TargetId};
+
+const LEGACY_PACK: &str = "tempo1:catalog-metadata:";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LegacyPackMember<'a> {
+    motif: &'a str,
+    difficulty: &'a str,
+    deck_id: &'a str,
+    deck_position: usize,
+}
+
+// Preserve the schema-1 offline report's per-pack diagnostics.
+fn pack_memberships(provenance: &[String]) -> impl Iterator<Item = PackMembership<'_>> {
+    provenance.iter().filter_map(|entry| {
+        let member: LegacyPackMember<'_> =
+            serde_json::from_str(entry.strip_prefix(LEGACY_PACK)?).ok()?;
+        let difficulty = match member.difficulty {
+            "easy" => PackDifficulty::Easy,
+            "medium" => PackDifficulty::Medium,
+            "hard" => PackDifficulty::Hard,
+            _ => return None,
+        };
+        if !tempo_chess::known_tactic_theme(member.motif) {
+            return None;
+        }
+        let (pack, ordinal) = member.deck_id.rsplit_once('-')?;
+        let (theme, pack_difficulty) = pack.rsplit_once('-')?;
+        let ordinal = ordinal.parse().ok()?;
+        (theme == member.motif
+            && pack_difficulty == member.difficulty
+            && ordinal > 0
+            && member.deck_position > 0)
+            .then_some(PackMembership {
+                theme,
+                difficulty,
+                ordinal,
+                position: member.deck_position,
+            })
+    })
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

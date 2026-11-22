@@ -1,9 +1,5 @@
 //! Compose today's admissions and durable activity issuance.
-use super::{
-    TacticThemes, Tempo,
-    tactic_catalog_facts::{capture_review_priority, tactic_pack_candidates},
-    tactic_preferences::new_tactic_order,
-};
+use super::{TacticThemes, Tempo, tactic_catalog_facts::capture_review_priority};
 use crate::{
     AppError, DailyComponents,
     app_error::domain,
@@ -45,7 +41,6 @@ impl Default for IntroductionLimits {
 pub(super) struct DailyStudy {
     pub(super) limits: IntroductionLimits,
     pub(super) tactic_themes: Option<TacticThemes>,
-    pub(super) starter_themes: bool,
     pub(super) queue: DailySession,
     pub(super) preview_key: [u8; 32],
     pub(super) more_tactics: usize,
@@ -67,7 +62,6 @@ impl Tempo {
             DailyStudy {
                 limits,
                 tactic_themes: None,
-                starter_themes: false,
                 queue: DailySession::default(),
                 preview_key,
                 more_tactics,
@@ -205,12 +199,17 @@ impl Tempo {
             .collect::<Vec<_>>();
         let hash = blake3::hash(snapshot.dataset.0.as_bytes());
         let seed = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("fixed hash width"));
-        let order = new_tactic_order(
-            tactic_pack_candidates(catalog, learning),
-            at.day,
-            daily.tactic_themes.as_ref(),
-            daily.starter_themes,
-        );
+        let themes = daily.tactic_themes.as_ref().unwrap_or(&TacticThemes::Any);
+        let order = candidates
+            .iter()
+            .filter(|(target, candidate)| {
+                candidate.kind == DailyKind::Tactic
+                    && candidate.first_introduced.is_none()
+                    && themes.admits(catalog.items[*target].tactic_policy_facts.as_ref())
+            })
+            .enumerate()
+            .map(|(ordinal, (target, _))| (target.clone(), ordinal))
+            .collect();
         let required_activity = match snapshot
             .active_attempt
             .as_ref()
@@ -239,7 +238,7 @@ impl Tempo {
                 routes: &routes,
                 admissions,
                 required_activity,
-                new_tactic_order: order.as_ref(),
+                new_tactic_order: Some(&order),
                 capture_priority: &capture_priority,
                 evidence: &evidence,
             })
