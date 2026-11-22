@@ -259,3 +259,28 @@ fn retired_init_practice_does_not_create_a_database() {
     assert!(!output.status.success());
     assert!(!database.exists());
 }
+
+#[test]
+fn retired_one_off_maintenance_does_not_open_a_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("retired.sqlite");
+    for mode in [
+        "backfill-game-capture-origins",
+        "backfill-study-lead-ins",
+        "split-black-repertoire",
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tempo"))
+            .arg(mode)
+            .arg(&database)
+            .args(["fixture", "--apply", "test-token"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{mode}");
+        assert!(output.stdout.is_empty(), "{mode}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("maintenance command has been retired"),
+            "{mode}"
+        );
+        assert!(!database.exists(), "{mode}");
+    }
+}

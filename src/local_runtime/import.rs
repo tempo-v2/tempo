@@ -4,10 +4,9 @@ use crate::Tempo;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io, path::Path};
 use tempo_chess::{
-    Catalog, ChangeKind, ContentChange, ContentStatus, GameCapture, TacticLookup, TacticPolicyFacts,
+    Catalog, ChangeKind, ContentChange, ContentStatus, GameCapture, TacticPolicyFacts,
     TacticRecord, compile_tactics,
 };
-use tempo_store::{Commit, SqliteStore, Store, Write};
 use tempo_types::{ContentVersion, TargetId};
 
 const LEGACY_PACK: &str = "tempo1:catalog-metadata:";
@@ -178,64 +177,6 @@ impl Batch {
     }
 }
 
-/// Explicitly distinguish a read-only preview from saving matched evidence.
-pub enum GameCaptureBackfill {
-    Preview,
-    Apply,
-}
-
-/// Enrich exact retained source matches with separately validated game evidence.
-/// The existing target, version, definition and all Study state are preserved.
-pub fn backfill_game_capture_origins(
-    database: &Path,
-    transfer: &Path,
-    mode: GameCaptureBackfill,
-) -> LocalResult<()> {
-    let apply = matches!(mode, GameCaptureBackfill::Apply);
-    let incoming = Batch::open(transfer)?.catalog;
-    let snapshot = SqliteStore::open_read_only(database)?.content_state()?;
-    let mut catalog = snapshot.catalog;
-    let mut added = 0;
-    for item in catalog
-        .items
-        .values_mut()
-        .filter(|item| item.game_capture.is_none())
-    {
-        let Some(lookup) = TacticLookup::from_item(item) else {
-            continue;
-        };
-        let capture = lookup.source_tokens.iter().find_map(|source| {
-            let candidate = incoming.items.get(&TargetId(source.clone()))?;
-            (candidate.definition == item.definition)
-                .then_some(candidate.game_capture.as_ref())
-                .flatten()
-        });
-        if let Some(capture) = capture {
-            item.game_capture = Some(capture.clone());
-            added += 1;
-        }
-    }
-    if apply && added != 0 {
-        SqliteStore::open(database)?.commit_content(
-            Commit {
-                expected_dataset: snapshot.dataset,
-                expected_revision: snapshot.revision,
-                writes: vec![Write::Catalog(catalog)],
-            },
-            None,
-            None,
-        )?;
-    }
-    println!(
-        "{}",
-        serde_json::json!({
-            "status": if apply { "applied" } else { "dry_run" },
-            "recorded_game_captures": added
-        })
-    );
-    Ok(())
-}
-
 #[derive(Serialize)]
 struct SourceIdentity {
     namespace: String,
@@ -400,67 +341,6 @@ mod tests {
             }),
         );
         app
-    }
-
-    #[test]
-    fn archived_capture_backfill_requires_the_retained_source_and_unchanged_definition() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("game-capture.sqlite");
-        let transfer = directory.path().join("capture-transfer.json");
-        super::super::init(&database).unwrap();
-        let fen = "4k3/8/2n5/8/8/8/4B3/6K1 w - - 0 1";
-        let mut row = json!({
-            "namespace": "tempo1-card", "source_id": "same-capture",
-            "solver_fen": fen, "solution": ["e2b5"], "label": "Legacy fixture",
-            "provenance": ["tempo1:capture:split", "tempo1:source_kind:game"],
-        });
-        let write = |row| {
-            std::fs::write(
-                &transfer,
-                json!({"schema_version": 1, "puzzles": [row]}).to_string(),
-            )
-            .unwrap();
-        };
-        write(row.clone());
-        let mut app = super::super::open(&database).unwrap();
-        apply(&mut app, Batch::open(&transfer).unwrap()).unwrap();
-        let issued = app.next_exercise().unwrap().unwrap().attempt;
-        let before = app.snapshot().unwrap();
-        drop(app);
-
-        row["solution"] = json!(["e2d3"]);
-        row["legacy_game_captures"] = json!([{
-            "capture_id": "verified", "solver_fen": fen, "solution": ["e2d3"]
-        }]);
-        write(row.clone());
-        backfill_game_capture_origins(&database, &transfer, GameCaptureBackfill::Apply).unwrap();
-        let check = || {
-            SqliteStore::open_read_only(&database)
-                .unwrap()
-                .snapshot()
-                .unwrap()
-        };
-        assert_eq!(check(), before);
-
-        row["solution"] = json!(["e2b5"]);
-        row["legacy_game_captures"][0]["solution"] = json!(["e2b5"]);
-        write(row);
-        backfill_game_capture_origins(&database, &transfer, GameCaptureBackfill::Preview).unwrap();
-        assert_eq!(check(), before);
-        backfill_game_capture_origins(&database, &transfer, GameCaptureBackfill::Apply).unwrap();
-        let after = check();
-        assert_eq!(after.active_attempt, before.active_attempt);
-        assert_eq!(after.attempts, before.attempts);
-        assert_eq!(after.learning, before.learning);
-        assert_eq!(after.receipts, before.receipts);
-        assert_eq!(after.content_history, before.content_history);
-        let mut enriched = before.catalog;
-        enriched.items.get_mut(&issued.target).unwrap().game_capture = Some(GameCapture {
-            capture_id: "verified".into(),
-        });
-        assert_eq!(after.catalog, enriched);
-        backfill_game_capture_origins(&database, &transfer, GameCaptureBackfill::Apply).unwrap();
-        assert_eq!(check(), after);
     }
 
     #[test]
