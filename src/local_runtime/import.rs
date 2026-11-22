@@ -7,7 +7,6 @@ use tempo_chess::{
     Catalog, ChangeKind, ContentChange, ContentStatus, GameCapture, TacticLookup, TacticPolicyFacts,
     TacticRecord, compile_tactics,
 };
-use tempo_queue::{PackDifficulty, PackMembership};
 use tempo_store::{Commit, SqliteStore, Store, Write};
 use tempo_types::{ContentVersion, TargetId};
 
@@ -23,6 +22,21 @@ struct LegacyPackMember<'a> {
 }
 
 // Preserve the schema-1 offline report's per-pack diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackDifficulty {
+    Easy,
+    Medium,
+    Hard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackMembership<'a> {
+    theme: &'a str,
+    difficulty: PackDifficulty,
+    ordinal: usize,
+    position: usize,
+}
+
 fn pack_memberships(provenance: &[String]) -> impl Iterator<Item = PackMembership<'_>> {
     provenance.iter().filter_map(|entry| {
         let member: LegacyPackMember<'_> =
@@ -291,9 +305,9 @@ fn apply(app: &mut Tempo, batch: Batch) -> LocalResult<Report> {
                         continue;
                     }
                     let difficulty = match fact.difficulty {
-                        tempo_queue::PackDifficulty::Easy => "easy",
-                        tempo_queue::PackDifficulty::Medium => "medium",
-                        tempo_queue::PackDifficulty::Hard => "hard",
+                        PackDifficulty::Easy => "easy",
+                        PackDifficulty::Medium => "medium",
+                        PackDifficulty::Hard => "hard",
                     };
                     retained_membership_gaps.push(RetainedMembershipGap {
                         target: item.target.clone(),
