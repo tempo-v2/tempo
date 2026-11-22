@@ -1,6 +1,9 @@
 //! File-backed composition for the matched local study release.
 mod http;
 mod import;
+// Production capture must prove completeness before enabling apply turns.
+#[cfg(test)]
+mod study_plan_apply;
 pub(crate) mod tactic_settings;
 
 use crate::{AttemptIds, Clock, DailyComponents, IntroductionLimits, TacticThemes, Tempo};
