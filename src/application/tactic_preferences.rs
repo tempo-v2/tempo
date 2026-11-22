@@ -1,10 +1,9 @@
 //! Project original pack membership into an order for new tactics only.
 use super::{Tempo, tactic_catalog_facts::tactic_pack_candidates};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::LazyLock,
-};
+use std::collections::{BTreeMap, BTreeSet};
+pub(super) use tempo_chess::known_tactic_theme;
+pub use tempo_chess::tactic_themes;
 use tempo_queue::TacticPackCandidate;
 use tempo_store::StudyScope;
 use tempo_types::{StudyDay, TargetId};
@@ -26,30 +25,6 @@ pub enum TacticThemes {
     Selected { theme_ids: BTreeSet<String> },
 }
 
-#[derive(Deserialize, Serialize)]
-pub struct TacticTheme {
-    pub id: String,
-    pub(super) name: String,
-    group: String,
-}
-
-pub fn tactic_themes() -> &'static [TacticTheme] {
-    static THEMES: LazyLock<Vec<TacticTheme>> = LazyLock::new(|| {
-        serde_json::from_str(include_str!("tactic_themes.json")).expect("bundled Tempo theme list")
-    });
-    &THEMES
-}
-
-pub(super) fn known_tactic_theme(id: &str) -> bool {
-    static IDS: LazyLock<BTreeSet<&'static str>> = LazyLock::new(|| {
-        tactic_themes()
-            .iter()
-            .map(|theme| theme.id.as_str())
-            .collect()
-    });
-    IDS.contains(id)
-}
-
 impl TacticThemes {
     pub fn starter() -> Self {
         Self::Selected {
@@ -64,7 +39,7 @@ impl TacticThemes {
                 !theme_ids.is_empty()
                     && theme_ids
                         .iter()
-                        .all(|id| tactic_themes().iter().any(|theme| &theme.id == id))
+                        .all(|id| known_tactic_theme(id))
             }
         }
     }
