@@ -27,6 +27,38 @@ impl tempo_store::AddressedResume for FailOnceStore {
     }
 }
 
+impl tempo_store::StudyContentRead for FailOnceStore {
+    fn study_content_facts(
+        &self,
+        dataset: &DatasetId,
+        target: &TargetId,
+    ) -> Result<Option<tempo_store::StudyContentFacts>, StoreError> {
+        self.store.study_content_facts(dataset, target)
+    }
+
+    fn current_study_definition(
+        &self,
+        dataset: &DatasetId,
+        target: &TargetId,
+        version: tempo_types::ContentVersion,
+        lesson: tempo_store::StudyLessonRead,
+    ) -> Result<Option<tempo_store::CurrentStudyDefinition>, StoreError> {
+        self.store
+            .current_study_definition(dataset, target, version, lesson)
+    }
+
+    fn issued_study_definition(
+        &self,
+        dataset: &DatasetId,
+        target: &TargetId,
+        version: tempo_types::ContentVersion,
+        lesson: tempo_store::StudyLessonRead,
+    ) -> Result<Option<tempo_store::IssuedStudyDefinition>, StoreError> {
+        self.store
+            .issued_study_definition(dataset, target, version, lesson)
+    }
+}
+
 impl Store for FailOnceStore {
     fn snapshot(&self) -> Result<Snapshot, StoreError> {
         self.store.snapshot()

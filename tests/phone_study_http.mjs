@@ -190,13 +190,24 @@ test("phone Study retains its shared commands and denies desktop routes after in
   const { state: learningBeforeResume } = resumeSql.prepare(
     "SELECT state FROM learning WHERE target_id=?"
   ).get(issued.target_id);
+  const { item: issuedItem, version: issuedVersion } = resumeSql.prepare(
+    "SELECT h.item,h.version FROM content_history h JOIN current_content c USING(dataset_id,target_id,version) WHERE h.target_id=?"
+  ).get(issued.target_id);
   let resumed;
   try {
     resumeSql.prepare("UPDATE learning SET state='not-json' WHERE target_id=?").run(issued.target_id);
+    resumeSql.prepare(
+      "UPDATE content_history SET item=json_set(item,'$.verified_tactic',json('{}')) WHERE dataset_id=? AND target_id=? AND version=?"
+    ).run(dataset_id, issued.target_id, issuedVersion);
+
     resumed = await post("/api/study", { command: "resume", attempt_id: issued.attempt_id });
     assert.equal(resumed.status, "ready");
   } finally {
     resumeSql.prepare("UPDATE learning SET state=? WHERE target_id=?").run(learningBeforeResume, issued.target_id);
+    resumeSql.prepare(
+      "UPDATE content_history SET item=? WHERE dataset_id=? AND target_id=? AND version=?"
+    ).run(issuedItem, dataset_id, issued.target_id, issuedVersion);
+
     resumeSql.close();
   }
   assert.equal(resumed.attempt_id, issued.attempt_id);
