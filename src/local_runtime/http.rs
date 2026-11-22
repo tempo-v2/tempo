@@ -1,7 +1,9 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
 mod ingress;
+mod read_context;
 
 use self::ingress::{Admission, Head, Header, MAX_REPLY_BYTES, Request, Response, Server};
+use self::read_context::ContextReader;
 use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
@@ -45,6 +47,7 @@ pub(super) fn serve(
         address,
         desktop: build_files(ui)?,
         phone: PhoneStudy::load(ui)?,
+        context: ContextReader::start(database)?,
     });
     let ingress_surfaces = surfaces.clone();
     let server = Server::start(listener, move |head| ingress_surfaces.admitted(head))?;
@@ -62,7 +65,7 @@ pub(super) fn serve(
     let mut next_model_check = Instant::now();
     loop {
         if let Some(request) = server.try_recv()? {
-            if let Err(error) = respond(app, profile_store, &mut games, request, &surfaces) {
+            if let Err(error) = respond(app, profile_store, &mut games, request) {
                 eprintln!("Tempo HTTP: {error}");
             }
             continue;
@@ -92,7 +95,7 @@ pub(super) fn serve(
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
-        if let Err(error) = respond(app, profile_store, &mut games, request, &surfaces) {
+        if let Err(error) = respond(app, profile_store, &mut games, request) {
             eprintln!("Tempo HTTP: {error}");
             crate::diagnostics::emit(
                 "runtime.error",
@@ -136,6 +139,7 @@ struct HttpSurfaces {
     origin: String,
     desktop: BTreeMap<String, Asset>,
     phone: Option<PhoneStudy>,
+    context: ContextReader,
 }
 
 impl HttpSurfaces {
@@ -162,12 +166,26 @@ impl HttpSurfaces {
             }
             AuthoringSurface::Desktop
         };
+        if head.method() == Method::GET {
+            if head.url() == "/api/context" {
+                return Ok(Admission::Context(self.context.clone()));
+            }
+            let path = asset_path(head.url());
+            if let Some(asset) = self.assets(surface).get(path) {
+                return Ok(Admission::Immediate(body(asset.mime, asset.bytes.clone()).with_header(
+                    field("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'"),
+                )));
+            }
+            if path.starts_with("/assets/") {
+                return Ok(Admission::Immediate(Response::empty(StatusCode::NOT_FOUND)));
+            }
+        }
         let body_bytes = (head.method() == Method::POST).then(|| match head.url() {
             "/api/study/presence" => 1024,
             "/api/repertoires" | "/api/tactics" | "/api/games/import" => MAX_CONTENT_COMMAND_BYTES,
             _ => MAX_COMMAND_BYTES,
         });
-        Ok(Admission {
+        Ok(Admission::Foreground {
             surface,
             body_bytes,
         })
@@ -352,7 +370,6 @@ fn respond(
     profile_store: &SqliteStore,
     games: &mut Games,
     mut request: Request,
-    surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
     if !request.claim() {
         request.busy();
@@ -376,7 +393,7 @@ fn respond(
         },
     );
     trace.field("route", diagnostic_route(request.url()));
-    let result = respond_inner(app, profile_store, games, request, surfaces);
+    let result = respond_inner(app, profile_store, games, request);
     trace.set_outcome(if result.is_ok() {
         "returned"
     } else {
@@ -390,33 +407,8 @@ fn respond_inner(
     profile_store: &SqliteStore,
     games: &mut Games,
     request: Request,
-    surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
     let surface = request.surface();
-    let public = surfaces.assets(surface);
-    if request.method() == &Method::GET && request.url() == "/api/context" {
-        let (status, reply) = match profile_store.context_identity() {
-            Ok((dataset, schema_version)) => (
-                200,
-                serde_json::json!({
-                    "status": "ready",
-                    "dataset_id": dataset,
-                    "schema_version": schema_version,
-                }),
-            ),
-            Err(_) => (
-                503,
-                serde_json::json!({"status": "unavailable", "code": "storage_unavailable"}),
-            ),
-        };
-        respond_traced(
-            request,
-            body("application/json; charset=utf-8", json_bytes(&reply)?)
-                .with_status_code(status_code(status))
-                .with_header(field("Cache-Control", "no-store")),
-        )?;
-        return Ok(());
-    }
     // Older open tabs have strict v5 reply validators. The opt-in changes
     // display only, independent of submission identity and saved receipts.
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
@@ -827,13 +819,7 @@ fn respond_inner(
             body("application/json; charset=utf-8", json_bytes(&reply)?),
         )?;
     } else if request.method() == &Method::GET {
-        if let Some(asset) = public.get(asset_path(request.url())) {
-            respond_traced(request, body(asset.mime, asset.bytes.clone()).with_header(
-                field("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'"),
-            ))?;
-        } else {
-            respond_traced(request, Response::empty(StatusCode::NOT_FOUND))?;
-        }
+        respond_traced(request, Response::empty(StatusCode::NOT_FOUND))?;
     } else {
         respond_traced(request, Response::empty(StatusCode::METHOD_NOT_ALLOWED))?;
     }
