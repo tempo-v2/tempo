@@ -24,7 +24,7 @@ async function serve(executable, database, ui, work) {
       once(lines, "line"),
       once(child, "exit").then(([code]) => { throw new Error(`Tempo exited: ${code}`); }),
     ]);
-    const url = line.removeprefix("Tempo study at ");
+    const url = line.replace(/^Tempo study at /, "");
     assert.match(url, /^http:\/\/127\.0\.0\.1:\d+$/);
     const post = async (route, bytes) => {
       const response = await fetch(url + route, {
