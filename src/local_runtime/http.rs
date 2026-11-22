@@ -5,14 +5,13 @@ use self::ingress::{Admission, Head, Header, MAX_REPLY_BYTES, Request, Response,
 use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
-    diagnostics::{Span, capture_context, with_context},
+    diagnostics::Span,
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
     game_detection::{DetectionRead, DetectionReply, DetectionRequest, GameDetection},
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
     gap_analysis::{GapAnalysis, GapAnalysisRead, GapAnalysisRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
-    personal_tactics_report::{ReportCache, report_generation},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use hyper::{
@@ -71,7 +70,6 @@ pub(super) fn serve(
         tactics.enable_payoffs(engine);
     }
     let mut games = Games {
-        tactics_report: TacticalReportWorker::start(database)?,
         refresh: GameJobs::start()?,
         detection,
         tactics,
@@ -147,105 +145,7 @@ pub(super) fn serve(
     }
 }
 
-struct TacticalReportWork {
-    request: Request,
-    read: crate::personal_tactics_report::ReportRequest,
-    version: String,
-    delivery: Option<String>,
-    enqueued: Instant,
-}
-
-/// Keep archive aggregation out of the serialized foreground Study owner.
-struct TacticalReportWorker(std::sync::mpsc::SyncSender<TacticalReportWork>);
-
-impl TacticalReportWorker {
-    fn start(database: &Path) -> LocalResult<Self> {
-        let store = SqliteStore::open(database)?;
-        let (sender, work) = std::sync::mpsc::sync_channel::<TacticalReportWork>(1);
-        std::thread::Builder::new()
-            .name("tempo-tactics-report".into())
-            .spawn(move || {
-                let mut cache = ReportCache::default();
-                while let Ok(task) = work.recv() {
-                    with_context(task.delivery, || {
-                        let mut trace = Span::new("tactics.report.worker");
-                        trace.field("queue_wait_ms", task.enqueued.elapsed().as_millis() as u64);
-                        let result = cache.read(&store, &task.version, task.read);
-                        trace.set_outcome(if result.is_ok() { "ready" } else { "error" });
-                        if let Err(error) = report_response(task.request, result) {
-                            trace.set_outcome("io_error");
-                            eprintln!("Tempo tactical report: {error}");
-                        }
-                    });
-                }
-            })?;
-        Ok(Self(sender))
-    }
-
-    fn submit(&self, request: Request, version: &str) -> LocalResult<()> {
-        let mut trace = Span::new("tactics.report.admission");
-        let read = match command(&request, MAX_COMMAND_BYTES) {
-            Ok(read) => read,
-            Err(error) => {
-                trace.set_outcome("invalid");
-                return report_response(request, Err(error));
-            }
-        };
-        let task = TacticalReportWork {
-            request,
-            read,
-            version: version.to_owned(),
-            delivery: capture_context(),
-            enqueued: Instant::now(),
-        };
-        match self.0.try_send(task) {
-            Ok(()) => {
-                trace.set_outcome("admitted");
-                Ok(())
-            }
-            Err(
-                std::sync::mpsc::TrySendError::Full(task)
-                | std::sync::mpsc::TrySendError::Disconnected(task),
-            ) => {
-                trace.set_outcome("busy");
-                report_response(
-                    task.request,
-                    Err(AppError::new(
-                        "report_busy",
-                        "The tactics report is busy. Try again.",
-                    )),
-                )
-            }
-        }
-    }
-}
-
-fn report_response(request: Request, result: Result<Value, AppError>) -> LocalResult<()> {
-    let (status, value) = match result {
-        Ok(value) => (200, value),
-        Err(error) if error.code == "report_busy" => (
-            503,
-            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
-        ),
-        Err(error) if error.code == "report_changed" => (
-            409,
-            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
-        ),
-        Err(error) => (
-            400,
-            serde_json::json!({"status":"error","code":error.code,"message":error.message}),
-        ),
-    };
-    respond_traced(
-        request,
-        body("application/json; charset=utf-8", json_bytes(&value)?)
-            .with_status_code(status_code(status)),
-    )?;
-    Ok(())
-}
-
 struct Games {
-    tactics_report: TacticalReportWorker,
     refresh: GameJobs,
     detection: GameDetection,
     tactics: crate::tactical_jobs::TacticalJobs,
@@ -597,49 +497,40 @@ fn respond_inner(
             body("application/json; charset=utf-8", json_bytes(&value)?)
                 .with_status_code(status_code(status)),
         )?;
-    } else if request.method() == &Method::POST && request.url() == "/api/games/tactics/position" {
-        let _trace = Span::new("tactics.report.detail");
-        let result =
-            command::<crate::personal_tactics_report::PositionRequest>(&request, MAX_COMMAND_BYTES)
-                .and_then(|read| {
-                    crate::personal_tactics_report::read_position(
-                        profile_store,
-                        games.tactics.report_version(),
-                        read,
-                    )
-                });
-        report_response(request, result)?;
-    } else if request.method() == &Method::POST && request.url() == "/api/games/tactics/report" {
-        games
-            .tactics_report
-            .submit(request, games.tactics.report_version())?;
+    } else if request.method() == &Method::POST
+        && matches!(
+            request.url(),
+            "/api/games/tactics/report" | "/api/games/tactics/position"
+        )
+    {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "The personal tactics report has been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
     } else if request.url() == "/api/games/tactics" {
         let _trace = Span::new("tactics.status");
         let (status, value) = if request.method() == &Method::POST {
             let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
-            let report_discovery = header(&request, "X-Tempo-Tactics-Report") == Some("2");
-            let report_stamp = header(&request, "X-Tempo-Tactics-Report-Generation") == Some("1");
             match command::<crate::tactical_jobs::TacticalRead>(&request, MAX_COMMAND_BYTES)
                 .and_then(|read| {
-                    let dataset = read.dataset_id.clone();
-                    let mut value = games.tactics.read(app, profile_store, read, wait_reason)?;
-                    if games.tactics.has_personal_report() {
-                        if !report_discovery {
-                            return Ok(serde_json::json!({"schema_version": 1, "dataset_id": dataset,
-                                "status": "unavailable", "message": "Reload Tempo to view personal tactical analysis."}));
-                        }
-                        if value["status"] != "unavailable" {
-                            value["report_schema"] = serde_json::json!(2);
-                            if report_stamp {
-                                let generation =
-                                    profile_store.tactical_report_generation(&dataset)?;
-                                value["report_generation"] = serde_json::json!(report_generation(
-                                    games.tactics.report_version(), generation.evidence,
-                                ));
-                            }
-                        }
+                    if !games.tactics.has_complete_decisions() {
+                        return games.tactics.read(app, profile_store, read, wait_reason);
                     }
-                    Ok(value)
+                    if app.game_dataset()? != read.dataset_id {
+                        return Err(AppError::new(
+                            "stale_dataset",
+                            "Reload the current game archive.",
+                        ));
+                    }
+                    Ok(serde_json::json!({
+                        "schema_version": 1, "dataset_id": read.dataset_id, "status": "unavailable",
+                        "message": "The personal tactics report has been retired.",
+                    }))
                 }) {
                 Ok(value) => (200, value),
                 Err(error) => (
@@ -1167,8 +1058,6 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/detection-result" => "game_detection_result",
         "/api/games/tactics" => "tactics_status",
         "/api/games/tactics/command" => "tactics_command",
-        "/api/games/tactics/position" => "tactics_position",
-        "/api/games/tactics/report" => "tactics_report",
         "/api/analysis/evidence" => "analysis_evidence",
         "/api/analysis/result" => "analysis_result",
         "/" | "/index.html" => "ui_index",

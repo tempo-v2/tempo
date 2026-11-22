@@ -53,6 +53,4 @@ mod tactical_jobs;
 pub mod game_detection;
 pub mod local_runtime;
 
-mod personal_tactics_report;
-
 mod coverage_scan;

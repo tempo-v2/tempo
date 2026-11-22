@@ -287,72 +287,36 @@ class RuntimeDiagnostics(unittest.TestCase):
                         # A second independent request also remains responsive.
                         self.assertEqual(json.loads(server.request()[2]), expected)
 
-    def test_tactics_worker_and_addressed_routes_export_without_a_server(self):
+    def test_report_retirement_preserves_games_context_and_study(self):
         logs = self.root / "tactics-logs"
-
-        def post(server, path, payload):
-            return server.request(json.dumps(payload).encode(), path=path)
-
-        def operation(request_id, name):
-            return wait_event(
-                logs,
-                lambda e: e.get("request_id") == request_id
-                and e.get("event") == "span.end"
-                and e.get("operation") == name,
-            )
-
+        retired_ids = []
         with Server(self.database, self.ui, logs) as server:
-            dataset = json.loads(server.request()[2])["dataset_id"]
-            query = {"dataset_id": dataset}
-            status, headers, payload, report_id = post(server, "/api/games/tactics/report", query)
+            status, _, payload, study_id = server.request()
             self.assertEqual(status, 200)
-            report = json.loads(payload)
-            self.assertEqual(report["dataset_id"], dataset)
-            self.assertEqual(report["games"], [])
-            self.assertEqual(operation(report_id, "http.request")["route"], "tactics_report")
-            self.assertEqual(operation(report_id, "tactics.report.admission")["outcome"], "admitted")
-            worker = operation(report_id, "tactics.report.worker")
-            self.assertEqual(worker["outcome"], "ready")
-            self.assertGreaterEqual(worker["queue_wait_ms"], 0)
-            self.assertEqual(headers["X-Tempo-Request-Id"], report_id)
-            self.assertEqual(headers["X-Tempo-Run-Id"], worker["run_id"])
-            self.assertEqual(operation(report_id, "tactics.report.capture")["outcome"], "archive")
-            self.assertEqual(operation(report_id, "tactics.report.archive_facts")["count"], 0)
-            self.assertEqual(operation(report_id, "tactics.report.decision_facts")["count"], 0)
-            self.assertEqual(operation(report_id, "tactics.report.aggregates")["outcome"], "rebuilt")
+            dataset = json.loads(payload)["dataset_id"]
+            for path in ("/api/games/tactics/report", "/api/games/tactics/position"):
+                status, headers, payload, delivery = server.request(
+                    json.dumps({"dataset_id": dataset, "id": 1}).encode(), path=path,
+                )
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                self.assertEqual(headers["X-Tempo-Request-Id"], delivery)
+                retired_ids.append(delivery)
 
-            status, _, payload, warm_id = post(
-                server, "/api/games/tactics/report", {**query, "report_generation": report["report_generation"]},
-            )
+            status, _, payload, _ = server.request(None, path="/api/context", method="GET")
             self.assertEqual(status, 200)
-            self.assertEqual(json.loads(payload), report)
-            self.assertNotEqual(warm_id, report_id)
-            self.assertEqual(operation(warm_id, "tactics.report.worker")["outcome"], "ready")
-            self.assertEqual(operation(warm_id, "tactics.report.capture")["outcome"], "reused")
-            self.assertEqual(operation(warm_id, "tactics.report.aggregates")["outcome"], "reused")
-            self.assertEqual(operation(warm_id, "tactics.report.page")["count"], 0)
-
-            status, headers, payload, detail_id = post(
-                server, "/api/games/tactics/position",
-                {**query, "id": 1, "report_generation": report["report_generation"]},
-            )
-            self.assertEqual(status, 400)
-            self.assertEqual(json.loads(payload)["code"], "unknown_position")
-            self.assertEqual(headers["X-Tempo-Request-Id"], detail_id)
-            operation(detail_id, "tactics.report.detail")
-            operation(detail_id, "tactics.report.position")
-
-            tab = str(uuid.uuid4())
-            status, headers, _, presence_id = post(
-                server, "/api/study/presence", {"tab": tab, "sequence": 1, "state": "active"},
-            )
-            self.assertEqual(status, 204)
-            self.assertEqual(headers["X-Tempo-Request-Id"], presence_id)
-            operation(presence_id, "study.presence")
-
-            status, _, _, settings_id = post(server, "/api/tactic-settings", {"command": "get"})
+            self.assertEqual(json.loads(payload)["dataset_id"], dataset)
+            status, _, payload, _ = server.request(None, path="/api/games", method="GET")
             self.assertEqual(status, 200)
-            operation(settings_id, "settings.tactics")
+            self.assertEqual(json.loads(payload)["results"], [])
+            self.assert_correlated(logs, study_id)
+            for delivery in retired_ids:
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("tactics.report.", "sqlite.", "app."))
+                    for e in events
+                ))
 
         output = self.root / "offline-export.json"
         subprocess.run(
@@ -367,17 +331,11 @@ class RuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(bundle["samples"])
         events = bundle["diagnostic_logs"]["events"]
         self.assertLessEqual(len(events), bundle["diagnostic_logs"]["bounds"]["events"])
-        exported_worker = next(
-            event for event in events if event.get("request_id") == report_id
-            and event.get("event") == "span.end" and event.get("operation") == "tactics.report.worker"
-        )
-        self.assertEqual(exported_worker["queue_wait_ms"], worker["queue_wait_ms"])
-        exported_response = next(
-            event for event in events if event.get("request_id") == report_id and event["event"] == "http.response"
-        )
-        self.assertEqual(exported_response["run_id"], exported_worker["run_id"])
-        self.assertEqual(exported_response["status_code"], 200)
-        self.assertNotIn(tab, json.dumps(events))
+        for delivery in retired_ids:
+            exported = next(
+                event for event in events if event.get("request_id") == delivery and event["event"] == "http.response"
+            )
+            self.assertEqual(exported["status_code"], 410)
         self.assertNotIn(dataset, json.dumps(events))
 
     def test_real_sqlite_wait_has_request_stall_and_recovery_evidence(self):

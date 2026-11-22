@@ -7,7 +7,7 @@ import { once } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -132,7 +132,7 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
 
     async function api(route, body) {
       const response = await fetch(host.url + "/api/" + route, body === undefined ? {} : {
-        method: "POST", headers: { "Content-Type": "application/json", "X-Tempo-Tactics-Report":"2" }, body: JSON.stringify(body),
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
       const value = await response.json();
       assert.ok(response.status === 200 || response.status === 202, JSON.stringify(value));
@@ -172,89 +172,63 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     assert.equal(active.display_fen, seed.solver_fen);
     const dataset = active.dataset_id;
     let scanResponsiveness = null;
-    const report = async () => validateTacticalHistory(await api("games/tactics", { dataset_id: dataset }), dataset);
+    function evidence() {
+      const tables = new Map(databaseRows(database));
+      const findings = tables.get("tactical_observations")
+        .filter(row => row.dataset_id === dataset && row.current)
+        .map(row => ({ ...row, details: JSON.parse(row.details_json) }));
+      const analyses = tables.get("tactical_analyses").filter(row => row.dataset_id === dataset);
+      const enrollments = new Set(tables.get("tactical_enrollment")
+        .filter(row => row.dataset_id === dataset).map(row => row.id));
+      const positions = tables.get("tactical_positions").filter(row => enrollments.has(row.enrollment_id));
+      const requests = tables.get("tactical_requests").filter(row => row.dataset_id === dataset);
+      return { findings, analyses, positions, requests };
+    }
+
     async function completed(total, pending) {
       const deadline = Date.now() + 100000;
-      let value;
+      let view;
       do {
-        value = await report();
-        assert.notEqual(value.status, "unavailable", JSON.stringify(value));
-        assert.equal(value.statistics.failed_games + value.statistics.timed_out_games + value.statistics.unsupported_games, 0, JSON.stringify(value));
-        if (scanResponsiveness === null && value.status === "running") {
+        view = evidence();
+        assert.ok(view.analyses.every(row => row.status === "complete"), JSON.stringify(view.analyses));
+        if (scanResponsiveness === null && view.positions.some(row => row.status === "pending")) {
           const began = performance.now();
           const progress = await api("study-progress", null);
           scanResponsiveness = performance.now() - began;
           assert.ok(progress && !progress.code, JSON.stringify(progress));
           assert.ok(scanResponsiveness < 1000, `Study blocked behind engine analysis for ${scanResponsiveness}ms`);
         }
-        if (value.statistics.completed_games === total && value.statistics.pending_games === 0
-          && value.statistics.pending_requests === pending && value.status === "ready") return value;
+        if (view.positions.length === total && view.positions.every(row => row.status === "complete")
+          && view.requests.filter(row => !row.fulfilled && !row.cancelled).length === pending) return view;
         await new Promise(resolve => setTimeout(resolve, 150));
       } while (Date.now() < deadline);
-      assert.fail(`Tactical analysis did not settle: ${JSON.stringify(value)}\n${host.diagnostics()}`);
+      assert.fail(`Tactical analysis did not settle: ${JSON.stringify(view)}\n${host.diagnostics()}`);
     }
+    const motifs = row => row.details.assessment.personal?.candidates.map(candidate => candidate.motif) ?? [];
 
     const imported = await api("games/import", { dataset_id: dataset, command_id: "import-five", learner: "Learner", pgn: games });
     assert.equal(imported.new_games, 5, JSON.stringify(imported));
     const history = await completed(5, 1);
-    assert.equal(history.statistics.decisions_scanned, 5);
-    assert.notEqual(scanResponsiveness, null, "must measure Study while analysis is running");
-    const personal = await api("games/tactics/report", {dataset_id:dataset});
-    assert.equal(personal.schema_version, 2);
-    assert.equal(personal.games.length, 5);
-    const missed = personal.games.find(row => row.outcome === "missed_tactic"
-      && row.game.result === "loss" && row.motifs.includes("hanging_material"));
+    assert.equal(history.analyses.reduce((sum, row) => sum + row.decisions_scanned, 0), 5);
+    assert.notEqual(scanResponsiveness, null, "must measure Study while analysis is pending");
+    const missed = history.findings.find(row => motifs(row).includes("hanging_material")
+      && row.details.assessment.personal.puzzle?.line[0].uci === "d4e5");
     assert.ok(missed);
     assert.equal(missed.ply, 0);
-    const position = async id => (await api("games/tactics/position", {dataset_id:dataset,id})).detail;
-    const missedDetail = await position(missed.id);
-    assert.equal(missedDetail.details.assessment.personal.puzzle.line[0].uci, "d4e5");
-    assert.equal(missedDetail.training.status, "queued");
-    assert.ok(personal.games.some(row => row.motifs.includes("mate_in_one")));
-    assert.ok(personal.games.some(row => row.motifs.includes("mate_in_two")));
+    const training = () => evidence().requests.find(row => row.observation_id === missed.id);
+    assert.ok(training());
+    assert.equal(training().fulfilled, 0);
+    assert.ok(history.findings.some(row => motifs(row).includes("mate_in_one")));
+    assert.ok(history.findings.some(row => motifs(row).includes("mate_in_two")));
     const resumed = await api("study", { command: "next" });
     for (const key of ["attempt_id", "target_id", "revision", "display_fen"]) assert.deepEqual(resumed[key], active[key], key);
     blind(resumed);
-
-    // Read the actual built UI using its real typed history transport.
-    if (withBrowser) {
-      const { chromium } = await import(process.env.TEMPO_PLAYWRIGHT ?? "playwright");
-      browser = await chromium.launch({ headless: true,
-        ...(process.env.TEMPO_CHROMIUM ? { executablePath: process.env.TEMPO_CHROMIUM } : {}) });
-      const page = await browser.newPage({ viewport: { width: 1440, height: 1080 } });
-      await page.goto(host.url + "#games");
-      await page.getByText("Game analysis", { exact: true }).click();
-      const panel = page.getByRole("region", { name: "Tactical history" });
-      await panel.getByText("5 games checked", { exact: false }).waitFor();
-      await panel.getByRole("button").filter({ hasText: "Hanging piece" }).filter({ hasText: "loss" }).click();
-      const board = panel.getByRole("group", { name: "Tactical opportunity position" });
-      assert.equal(await board.getAttribute("data-fen"), captureFen);
-      assert.match(await panel.innerText(), /You played h3/);
-      assert.match(await panel.innerText(), /queen e5/);
-      await panel.getByRole("button", {name:"dxe5", exact:true}).first().click();
-      assert.notEqual(await board.getAttribute("data-fen"), captureFen);
-      await panel.getByRole("button", {name:"Reset board", exact:true}).click();
-      assert.equal(await board.getAttribute("data-fen"), captureFen);
-      if (process.env.TEMPO_HTTP_SCREENSHOTS) {
-        const image = join(process.env.TEMPO_HTTP_SCREENSHOTS, "hanging_history.png");
-        await mkdir(dirname(image), { recursive: true });
-        await panel.screenshot({ path: image });
-      }
-      await panel.getByRole("button", { name: "Open source game" }).click();
-      const sourceBoard = page.getByRole("group", { name: "Game review board" });
-      await sourceBoard.waitFor();
-      assert.equal(await sourceBoard.getAttribute("data-fen"), captureFen);
-      const address = new URLSearchParams(new URL(page.url()).hash.slice(7));
-      assert.equal(address.get("game_id"), missed.game.id);
-      assert.equal(address.get("ply"), "0");
-      await page.close();
-    }
 
     // The older display-only detector API still validates against its strict
     // consumer. Previewing the same game does not enqueue it a second time.
     const beforeRead = durableTraining(database);
     const intent = { schema_version: 1, request_id: "legacy-preview", dataset_id: dataset,
-      source: missed.game.source, game_id: missed.game.id, learner: missed.game.learner, detector_id: detector.id };
+      source: missed.source, game_id: missed.game_id, learner: missed.learner, detector_id: detector.id };
     let preview = validateDetection(await api("games/detection", intent), intent, detector);
     const previewDeadline = Date.now() + 30000;
     while (preview.status === "running" && Date.now() < previewDeadline) {
@@ -266,7 +240,8 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     assert.equal(preview.status, "complete", JSON.stringify(preview));
     assert.equal(preview.findings.length, 1);
     assert.ok(preview.findings.every(finding => !Object.hasOwn(finding, "tactical")));
-    await report();
+    const retired = validateTacticalHistory(await api("games/tactics", { dataset_id: dataset }), dataset);
+    assert.equal(retired.status, "unavailable");
     assert.deepEqual(durableTraining(database), beforeRead);
     const duplicated = await api("games/import", { dataset_id: dataset, command_id: "import-again", learner: "Learner", pgn: games });
     assert.equal(duplicated.new_games, 0);
@@ -302,6 +277,9 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     assert.notEqual(urgent.attempt_id, active.attempt_id);
 
     if (withBrowser) {
+      const { chromium } = await import(process.env.TEMPO_PLAYWRIGHT ?? "playwright");
+      browser = await chromium.launch({ headless: true,
+        ...(process.env.TEMPO_CHROMIUM ? { executablePath: process.env.TEMPO_CHROMIUM } : {}) });
       const page = await browser.newPage({ viewport: { width: 1440, height: 1080 } });
       await page.goto(host.url + "#study");
       const board = page.getByRole("group", { name: "Study chessboard" });
@@ -320,7 +298,7 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
       await page.close();
     } else assert.equal((await client.answer("d4e5")).status, "complete");
     await completed(5, 0);
-    assert.equal((await position(missed.id)).training.status, "reviewed");
+    assert.equal(training().fulfilled, 1);
     assert.equal((await client.next()).status, "empty");
 
     // A subsequent game while idle must become the first card, even though the
@@ -328,14 +306,15 @@ test("normal runtime analyzes real games, records comparisons, and makes each mi
     const idleGame = await api("games/import", { dataset_id: dataset, command_id: "black-while-idle", learner: "Learner",
       pgn: pgn("Black missed queen", blackFen, "1... h6 1-0", true) });
     assert.equal(idleGame.new_games, 1);
-    await completed(6, 1);
-    const idleHistory = await api("games/tactics/report", {dataset_id:dataset});
-    const blackMiss = idleHistory.games.find(row => row.outcome === "missed_tactic" && row.game.result === "loss" && row.id !== missed.id);
-    assert.equal((await position(blackMiss.id)).training.status, "queued");
+    const idleHistory = await completed(6, 1);
+    const blackMiss = idleHistory.findings.find(row => row.id !== missed.id && row.details.fen === blackFen
+      && motifs(row).includes("hanging_material"));
+    assert.ok(blackMiss);
+    assert.ok(idleHistory.requests.some(row => row.observation_id === blackMiss.id && !row.fulfilled && !row.cancelled));
     const first = await client.next();
     blind(first);
     assert.equal(first.learner_color, "black");
     assert.equal(first.display_fen, blackFen);
-    t.diagnostic(`Study progress responded in ${scanResponsiveness.toFixed(1)}ms during a real Stockfish scan.`);
-    t.diagnostic(`Verified normal serve, six real-engine games, active-card preservation, durable recovery, next-up and idle-first priority${withBrowser ? ", Games/source boards and actual Study board capture in Chromium" : ""}.`);
+    t.diagnostic(`Study progress responded in ${scanResponsiveness.toFixed(1)}ms while the Stockfish worker had pending positions.`);
+    t.diagnostic(`Verified normal serve, six real-engine games, active-card preservation, durable recovery, next-up and idle-first priority${withBrowser ? ", and actual Study board capture in Chromium" : ""}.`);
   });
