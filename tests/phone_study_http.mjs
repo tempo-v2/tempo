@@ -94,11 +94,13 @@ test("phone Study retains its shared commands and denies desktop routes after in
   const desktop = await post("/api/study-progress", null);
   assert.deepEqual(await post("/api/study-progress", null, phoneHeaders), desktop);
   const sql = new DatabaseSync(database, { timeout: 5000 });
-  const { policy } = sql.prepare("SELECT policy FROM store_state WHERE singleton=1").get();
+  const { dataset_id: contextDataset, policy } = sql.prepare(
+    "SELECT dataset_id, policy FROM store_state WHERE singleton=1"
+  ).get();
   const { user_version } = sql.prepare("PRAGMA user_version").get();
   try {
     sql.prepare("UPDATE store_state SET policy='not-json' WHERE singleton=1").run();
-    const expected = { status: "ready", dataset_id: desktop.dataset_id, schema_version: user_version };
+    const expected = { status: "ready", dataset_id: contextDataset, schema_version: user_version };
     for (const headers of [{}, phoneHeaders]) {
       const context = await send(host, "/api/context", { headers });
       assert.equal(context.status, 200, context.body);
