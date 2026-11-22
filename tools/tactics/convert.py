@@ -16,7 +16,7 @@ PACK_NAMESPACE = "lichess-puzzle"
 CARD_NAMESPACE = "tempo1-card"
 MEMBERSHIP_PREFIX = "tempo1:catalog-metadata:"
 SOURCE_DIFFICULTIES = {"easy", "medium", "hard", "focused", "advanced"}
-THEME_LIST = Path(__file__).resolve().parents[2] / "src/application/tactic_themes.json"
+THEME_LIST = Path(__file__).resolve().parents[3] / "tempo-chess/src/tactic_themes.json"
 
 
 @dataclass

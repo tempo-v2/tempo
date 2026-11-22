@@ -71,10 +71,6 @@ impl Batch {
             })
             .unzip();
         let mut catalog = compile_tactics(&records)?;
-        let theme_ids: std::collections::BTreeSet<_> = crate::tactic_themes()
-            .iter()
-            .map(|theme| theme.id.as_str())
-            .collect();
         for (record, (lead_ins, legacy_game_captures)) in records.iter().zip(context) {
             let item = catalog
                 .items
@@ -82,7 +78,6 @@ impl Batch {
                 .expect("compiled target");
             item.tactic_policy_facts = Some(TacticPolicyFacts::from_legacy_metadata(
                 record.provenance.iter().map(String::as_str),
-                |theme| theme_ids.contains(theme),
             ));
             for lead_in in lead_ins {
                 let verified = tempo_chess::OpponentLeadIn::verified(
