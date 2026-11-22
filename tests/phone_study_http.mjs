@@ -160,6 +160,7 @@ test("phone Study retains its shared commands and denies desktop routes after in
     ["/api/games/detectors", "GET"], ["/api/games/detection", "POST"],
     ["/api/games/detection-result", "POST"], ["/api/games/library", "POST"],
     ["/api/games/review", "POST"], ["/api/games/import", "POST"],
+    ["/api/games/job", "GET"], ["/api/games/refresh", "POST"],
     ["/api/repertoires", "GET"], ["/api/study/analysis-context", "POST"],
     ["/api/games/model", "POST"], ["/api/games/gaps", "GET"],
     ["/api/games/tactics", "POST"], ["/api/games/tactics/command", "POST"],

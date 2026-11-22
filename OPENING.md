@@ -176,8 +176,8 @@ game relevance and opponent gaps to the recognized identities.
 
 Only this explicit historic job may add a new Game Again for a qualifying
 unapplied miss from before a repertoire's starting reset. A later accepted
-reset stops the job's remaining learning effects for that repertoire. Regular
-refresh and stored-game reprocessing keep their original reset rules.
+reset stops the job's remaining learning effects for that repertoire.
+Stored-game reprocessing keeps its original reset rules.
 Distinct raw game and target identities retain their existing acceptance keys.
 
 The latest 200 eligible games supply personal position counts. A confirmed

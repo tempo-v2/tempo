@@ -6,7 +6,7 @@ use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
-    game_evidence::{GameImport, GameJobs, GameRefresh},
+    game_evidence::{GameImport, GameRefresh},
     game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
@@ -56,7 +56,6 @@ pub(super) fn serve(
         }),
     );
     let mut games = Games {
-        refresh: GameJobs::start()?,
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
     };
@@ -92,10 +91,6 @@ pub(super) fn serve(
             next_model_check = Instant::now() + Duration::from_millis(250);
         }
         {
-            let _trace = crate::diagnostics::Span::new("loop.refresh_apply");
-            games.refresh.poll(app);
-        }
-        if !games.refresh.active() {
             let _trace = crate::diagnostics::Span::new("loop.backfill_apply");
             games.backfill.poll(app);
         }
@@ -115,7 +110,6 @@ pub(super) fn serve(
 }
 
 struct Games {
-    refresh: GameJobs,
     backfill: BackfillCoordinator,
     model: GameModel,
 }
@@ -531,13 +525,31 @@ fn respond_inner(
             body("application/json; charset=utf-8", json_bytes(&retired)?)
                 .with_status_code(StatusCode::GONE),
         )?;
+    } else if request.method() == &Method::GET && request.url() == "/api/games/job" {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Remote game refresh status has been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
+    } else if request.method() == &Method::POST && request.url() == "/api/games/refresh" {
+        let (status, reply) = command::<GameRefresh>(&request, MAX_COMMAND_BYTES)
+            .and_then(|intent| intent.replay(app))
+            .unwrap_or_else(|error| (400, serde_json::json!(ErrorView::for_content(error))));
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
     } else if matches!(
         request.url(),
         "/api/games"
             | "/api/games/library"
-            | "/api/games/job"
             | "/api/games/import"
-            | "/api/games/refresh"
             | "/api/games/choose"
             | "/api/games/reprocess"
             | "/api/games/backfill"
@@ -561,7 +573,6 @@ fn respond_inner(
                     .and_then(|r| app.game_library(r)),
             ),
             (&Method::GET, "/api/games") => (200, app.game_history()),
-            (&Method::GET, "/api/games/job") => (200, Ok(games.refresh.poll(app))),
             (&Method::GET, "/api/games/backfill") => (200, games.backfill.current_status(app)),
             (&Method::POST, "/api/games/backfill") => (
                 202,
@@ -697,12 +708,6 @@ fn respond_inner(
                 command::<crate::game_evidence::ReprocessGames>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| app.reprocess_games(intent))
                     .map(|report| serde_json::json!(report)),
-            ),
-            (&Method::POST, "/api/games/refresh") => (
-                202,
-                command::<GameRefresh>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.refresh.refresh(app, intent, !games.backfill.active()))
-                    .map(|reply| serde_json::json!(reply)),
             ),
             _ => (
                 405,
@@ -912,7 +917,6 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/tactic-settings" => "tactic_settings",
         "/api/games" => "games",
         "/api/games/library" => "game_library",
-        "/api/games/job" => "game_refresh_status",
         "/api/games/import" => "game_import",
         "/api/games/refresh" => "game_refresh",
         "/api/games/choose" => "game_choose",

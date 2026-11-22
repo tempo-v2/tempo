@@ -460,6 +460,34 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(replayed, reply)
 
+    def test_remote_refresh_status_does_no_work_and_unaccepted_request_retires(self):
+        logs = self.root / "remote-refresh-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            _, _, context, _ = server.request(None, path="/api/context", method="GET")
+            dataset = json.loads(context)["dataset_id"]
+            status, _, payload, delivery = server.request(None, path="/api/games/job", method="GET")
+            self.assertEqual(status, 410)
+            self.assertEqual(json.loads(payload)["code"], "retired_feature")
+            wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+            self.assertFalse(any(
+                e.get("operation", "").startswith(("refresh.", "provider.", "sqlite.", "app."))
+                for e in log_events(logs) if e.get("request_id") == delivery
+            ))
+
+            command = {"dataset_id": dataset, "command_id": "unaccepted", "source": "lichess",
+                       "account": "learner", "from_ms": 0, "to_ms": 86400000}
+            status, _, payload, delivery = server.request(json.dumps(command).encode(), path="/api/games/refresh")
+            self.assertEqual(status, 410)
+            retired = json.loads(payload)
+            self.assertEqual(retired["code"], "retired_feature")
+            self.assertEqual(retired["dataset_id"], dataset)
+            self.assertEqual(retired["command_id"], "unaccepted")
+            wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+            self.assertFalse(any(
+                e.get("operation", "").startswith(("refresh.", "provider.", "loop.refresh"))
+                for e in log_events(logs)
+            ))
+
     def test_coverage_scan_and_explorer_retirement_preserves_starting_line_save(self):
         logs = self.root / "coverage-scan-retirement-logs"
         with Server(self.database, self.ui, logs) as server:
