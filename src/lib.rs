@@ -46,10 +46,7 @@ pub mod gap_explorer;
 mod gap_recommendation;
 mod maia;
 mod stockfish;
-mod tactical_engine;
-mod tactical_jobs;
 
-pub mod game_detection;
 pub mod local_runtime;
 
 mod coverage_scan;

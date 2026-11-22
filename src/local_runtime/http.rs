@@ -5,9 +5,7 @@ use self::ingress::{Admission, Head, Header, MAX_REPLY_BYTES, Request, Response,
 use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
-    diagnostics::Span,
     game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
-    game_detection::GameDetection,
     game_evidence::{GameImport, GameJobs, GameRefresh},
     game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
     gap_explorer::{GapExplorer, GapExplorerRequest},
@@ -40,8 +38,6 @@ pub(super) fn serve(
     database: &Path,
     ui: &Path,
     port: u16,
-    detection: GameDetection,
-    engine: Option<crate::tactical_engine::PayoffEngine>,
 ) -> LocalResult<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
     let address = listener.local_addr()?.to_string();
@@ -61,17 +57,8 @@ pub(super) fn serve(
         }),
     );
     let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
-    let detector = detection
-        .complete_decision_detector()
-        .unwrap_or("hanging-material");
-    let mut tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
-    if let Some(engine) = engine {
-        tactics.enable_payoffs(engine);
-    }
     let mut games = Games {
         refresh: GameJobs::start()?,
-        detection,
-        tactics,
         backfill: BackfillCoordinator::start(app)?,
         model: GameModel::new(database)?,
         coverage: crate::coverage_scan::CoverageScan::new(database, explorer.clone()),
@@ -112,14 +99,6 @@ pub(super) fn serve(
             let _trace = crate::diagnostics::Span::new("loop.refresh_apply");
             games.refresh.poll(app);
         }
-        {
-            let _trace = crate::diagnostics::Span::new("loop.detection_apply");
-            games.detection.poll(app);
-        }
-        {
-            let _trace = crate::diagnostics::Span::new("loop.tactics_apply");
-            games.tactics.poll(app, profile_store, &mut games.detection);
-        }
         if !games.refresh.active() {
             let _trace = crate::diagnostics::Span::new("loop.backfill_apply");
             games.backfill.poll(app);
@@ -141,8 +120,6 @@ pub(super) fn serve(
 
 struct Games {
     refresh: GameJobs,
-    detection: GameDetection,
-    tactics: crate::tactical_jobs::TacticalJobs,
     backfill: BackfillCoordinator,
     model: GameModel,
     coverage: crate::coverage_scan::CoverageScan,
@@ -463,84 +440,25 @@ fn respond_inner(
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     let opponent_context = header(&request, "X-Tempo-Study-Opponent-Moves") == Some("1");
     let tactic_explanation = header(&request, "X-Tempo-Study-Tactic-Explanation") == Some("1");
-    if request.method() == &Method::POST && request.url() == "/api/study/presence" {
-        let _trace = Span::new("study.presence");
-        let result = command(&request, 1024)
-            .and_then(|report| games.tactics.study_presence(report, &mut games.detection));
-        let status = if result.is_ok() { 204 } else { 400 };
-        respond_traced(request, Response::empty(status_code(status)))?;
-    } else if request.method() == &Method::POST && request.url() == "/api/games/tactics/command" {
-        let _trace = Span::new("tactics.command");
-        let result = command::<crate::tactical_jobs::TacticalCommand>(&request, MAX_COMMAND_BYTES)
-            .and_then(|intent| {
-                games
-                    .tactics
-                    .command(profile_store, &mut games.detection, intent)
-            });
-        let (status, value) = match result {
-            Ok(value) => (200, value),
-            Err(error) => (
-                400,
-                serde_json::json!({"code":error.code,"message":error.message}),
-            ),
-        };
-        respond_traced(
-            request,
-            body("application/json; charset=utf-8", json_bytes(&value)?)
-                .with_status_code(status_code(status)),
-        )?;
-    } else if request.method() == &Method::POST
+    if request.method() == &Method::POST
         && matches!(
             request.url(),
-            "/api/games/tactics/report" | "/api/games/tactics/position"
+            "/api/study/presence"
+                | "/api/games/tactics"
+                | "/api/games/tactics/command"
+                | "/api/games/tactics/report"
+                | "/api/games/tactics/position"
         )
     {
         let retired = serde_json::json!({
             "status": "error", "code": "retired_feature",
-            "message": "The personal tactics report has been retired.", "retryable": false,
+            "message": "Automatic tactical analysis and Study presence have been retired.",
+            "retryable": false,
         });
         respond_traced(
             request,
             body("application/json; charset=utf-8", json_bytes(&retired)?)
                 .with_status_code(StatusCode::GONE),
-        )?;
-    } else if request.url() == "/api/games/tactics" {
-        let _trace = Span::new("tactics.status");
-        let (status, value) = if request.method() == &Method::POST {
-            let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
-            match command::<crate::tactical_jobs::TacticalRead>(&request, MAX_COMMAND_BYTES)
-                .and_then(|read| {
-                    if !games.tactics.has_complete_decisions() {
-                        return games.tactics.read(app, profile_store, read, wait_reason);
-                    }
-                    if app.game_dataset()? != read.dataset_id {
-                        return Err(AppError::new(
-                            "stale_dataset",
-                            "Reload the current game archive.",
-                        ));
-                    }
-                    Ok(serde_json::json!({
-                        "schema_version": 1, "dataset_id": read.dataset_id, "status": "unavailable",
-                        "message": "The personal tactics report has been retired.",
-                    }))
-                }) {
-                Ok(value) => (200, value),
-                Err(error) => (
-                    400,
-                    serde_json::json!({"schema_version":1,"status":"error","code":error.code,"message":error.message}),
-                ),
-            }
-        } else {
-            (
-                405,
-                serde_json::json!({"schema_version":1,"status":"error","code":"method_not_allowed"}),
-            )
-        };
-        respond_traced(
-            request,
-            body("application/json; charset=utf-8", json_bytes(&value)?)
-                .with_status_code(status_code(status))
-                .with_header(field("Cache-Control", "no-store")),
         )?;
     } else if matches!(
         (request.method(), request.url()),
@@ -859,12 +777,7 @@ fn respond_inner(
         )?;
     } else if request.method() == &Method::POST && request.url() == "/api/study" {
         let reply = command::<StudyCommand>(&request, MAX_COMMAND_BYTES)
-            .map(|intent| {
-                if !matches!(intent, StudyCommand::StudyStatus) {
-                    games.tactics.study_activity(&mut games.detection);
-                }
-                app.handle(intent)
-            })
+            .map(|intent| app.handle(intent))
             .unwrap_or_else(Into::into);
         let reply = if move_details {
             reply
@@ -999,7 +912,6 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/study/review-mark" => "study_review_mark",
         "/api/study/card-details" => "study_card_details",
         "/api/study/saved-reviews" => "study_saved_reviews",
-        "/api/study/presence" => "study_presence",
         "/api/repertoires" => "repertoires",
         "/api/tactics" => "tactics",
         "/api/tactics-collection" => "tactics_collection",
@@ -1024,8 +936,6 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/gap-line/status" => "game_gap_line_status",
         "/api/games/review" => "game_review",
         "/api/games/gap-explorer" => "game_gap_explorer",
-        "/api/games/tactics" => "tactics_status",
-        "/api/games/tactics/command" => "tactics_command",
         "/" | "/index.html" => "ui_index",
         path if path.starts_with("/assets/") => "ui_asset",
         _ => "other",

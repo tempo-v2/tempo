@@ -389,6 +389,35 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(saved)["status"], "repertoires")
 
+    def test_tactical_jobs_and_presence_retirement_do_no_work(self):
+        logs = self.root / "tactical-jobs-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            _, _, context, _ = server.request(None, path="/api/context", method="GET")
+            dataset = json.loads(context)["dataset_id"]
+            for path, command in (
+                ("/api/study/presence", {"tab": "7a791296-6215-4d60-ae7c-58bab00ce975", "sequence": 1, "state": "active"}),
+                ("/api/games/tactics", {"dataset_id": dataset}),
+                ("/api/games/tactics/command", {"action": "resume", "dataset_id": dataset}),
+                ("/api/games/tactics/command", {"action": "retry", "dataset_id": dataset}),
+            ):
+                status, _, payload, delivery = server.request(json.dumps(command).encode(), path=path)
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("tactics.", "detection.", "study.presence", "sqlite.", "app."))
+                    for e in events
+                ))
+
+            status, _, study, _ = server.request(json.dumps({"command": "next"}).encode())
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(study)["dataset_id"], dataset)
+            self.assertFalse(any(
+                e.get("operation") in ("loop.detection_apply", "loop.tactics_apply")
+                for e in log_events(logs)
+            ))
+
     def test_manual_detector_retirement_does_no_work_and_preserves_capture(self):
         logs = self.root / "manual-detector-retirement-logs"
         with Server(self.database, self.ui, logs) as server:

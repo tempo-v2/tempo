@@ -3,10 +3,7 @@ use crate::{AppError, app_error::domain};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::sync::{
-    Mutex, MutexGuard,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::sync::Mutex;
 use std::{
     collections::BTreeSet,
     path::Path,
@@ -14,40 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 static ENGINE_SLOT: Mutex<()> = Mutex::new(());
-static BACKGROUND_OWNS_SLOT: AtomicBool = AtomicBool::new(false);
-static FOREGROUND: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) fn foreground_waiting() -> bool {
-    FOREGROUND.load(Ordering::SeqCst) != 0
-}
-
-pub(crate) struct BackgroundSlot {
-    _slot: MutexGuard<'static, ()>,
-}
-impl Drop for BackgroundSlot {
-    fn drop(&mut self) {
-        BACKGROUND_OWNS_SLOT.store(false, Ordering::SeqCst);
-    }
-}
-pub(crate) fn background_slot() -> Option<BackgroundSlot> {
-    let slot = ENGINE_SLOT.try_lock().ok()?;
-    BACKGROUND_OWNS_SLOT.store(true, Ordering::SeqCst);
-    Some(BackgroundSlot { _slot: slot })
-}
-
-struct Foreground;
-impl Foreground {
-    fn request() -> Self {
-        FOREGROUND.fetch_add(1, Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for Foreground {
-    fn drop(&mut self) {
-        FOREGROUND.fetch_sub(1, Ordering::SeqCst);
-    }
-}
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct EngineCandidate {
@@ -65,23 +28,6 @@ pub(crate) struct EngineResult {
     pub(crate) comparison: Option<Vec<EngineCandidate>>,
 }
 
-pub(crate) fn stockfish(
-    directory: &Path,
-    fen: &str,
-    legal_moves: &[String],
-    shortlist: &[&str],
-    candidate_count: usize,
-) -> Result<EngineResult, AppError> {
-    stockfish_until(
-        directory,
-        fen,
-        legal_moves,
-        shortlist,
-        candidate_count,
-        None,
-    )
-}
-
 pub(crate) fn stockfish_until(
     directory: &Path,
     fen: &str,
@@ -96,9 +42,6 @@ pub(crate) fn stockfish_until(
         })
     };
     let _diagnostic = crate::diagnostics::Span::new("engine.evaluate");
-    let _request = Foreground::request();
-    // A line starts as soon as the first response is staged. The editor may
-    // still be evaluating that starting board on the shared engine.
     let slot_wait = if deadline.is_some() { 10 } else { 2 };
     let slot_deadline = Instant::now() + remaining(Duration::from_secs(slot_wait));
     let _slot = loop {
@@ -113,14 +56,10 @@ pub(crate) fn stockfish_until(
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
         if Instant::now() >= slot_deadline {
-            return Err(if BACKGROUND_OWNS_SLOT.load(Ordering::SeqCst) {
-                AppError::new(
-                    "background_engine_busy",
-                    "Background analysis is still releasing Stockfish.",
-                )
-            } else {
-                AppError::new("engine_busy", "Stockfish is working on another request.")
-            });
+            return Err(AppError::new(
+                "engine_busy",
+                "Stockfish is working on another request.",
+            ));
         }
         std::thread::sleep(Duration::from_millis(20));
     };

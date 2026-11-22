@@ -11,7 +11,6 @@ mod current_attempt;
 mod daily;
 mod export;
 mod game_backfill;
-mod game_detection;
 mod game_evidence;
 mod game_library;
 pub use game_library::GameLibraryRead;
@@ -39,7 +38,6 @@ pub use study_progress::{ProgressStamp, StudyProgress};
 mod tactic_capture;
 pub(crate) mod tactic_catalog_facts;
 mod tactic_preferences;
-pub(crate) mod tactical_analysis;
 mod tactics_collection;
 pub use tactics_collection::{TacticsRead, TacticsReadReply};
 

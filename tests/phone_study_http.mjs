@@ -148,12 +148,11 @@ test("phone Study retains its shared commands and denies desktop routes after in
   assert.deepEqual(databaseRows(database), beforeAdmission);
   const before = databaseRows(database);
   const presence = { tab: "7a791296-6215-4d60-ae7c-58bab00ce975", sequence: 1, state: "active" };
-  assert.deepEqual(await send(host, "/api/study/presence", {
+  const retiredPresence = await send(host, "/api/study/presence", {
     method: "POST", headers: phoneHeaders, payload: presence,
-  }), { status: 204, body: "" });
-  assert.equal((await send(host, "/api/study/presence", {
-    method: "POST", headers: phoneHeaders, payload: { ...presence, sequence: 0 },
-  })).status, 400);
+  });
+  assert.equal(retiredPresence.status, 410);
+  assert.equal(JSON.parse(retiredPresence.body).code, "retired_feature");
   assert.equal((await send(host, "/api/study/presence", {
     method: "POST", headers: { ...phoneHeaders, Origin: "https://another.ts.net:8443" }, payload: presence,
   })).status, 403);
@@ -163,6 +162,7 @@ test("phone Study retains its shared commands and denies desktop routes after in
     ["/api/games/review", "POST"], ["/api/games/import", "POST"],
     ["/api/repertoires", "GET"], ["/api/study/analysis-context", "POST"],
     ["/api/games/model", "POST"], ["/api/games/gaps", "GET"],
+    ["/api/games/tactics", "POST"], ["/api/games/tactics/command", "POST"],
     ["/api/games/gap-analysis", "GET"], ["/api/games/gap-explorer", "POST"],
     ["/api/study", "PUT"], ["/api/study", "GET"], ["/api/study/presence", "GET"],
   ]) assert.equal((await send(host, route, { method, headers: phoneHeaders, payload: {} })).status, 404, route);
