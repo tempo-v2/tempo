@@ -181,7 +181,13 @@ impl Tempo {
             };
             let policy = self.components.learning.as_ref();
             let transition = crate::diagnostics::measure("learning.assess_test", || {
-                policy.assess_test(prior, &input, old.attempt.content_version, old.issued_at)
+                if old.issued_work.is_some() {
+                    policy.assess_prepared_test(
+                        prior, &input, old.attempt.content_version, old.issued_at,
+                    )
+                } else {
+                    policy.assess_test(prior, &input, old.attempt.content_version, old.issued_at)
+                }
             })
             .map_err(|e| domain("learning_error", e))?;
             effect = Some(transition.effect);
@@ -205,16 +211,22 @@ impl Tempo {
                     && record.input.grade == Grade::Again
             })
         {
+            // The assessed Again record is immutable and addressed by this
+            // attempt. Its revision binds the correction across restart,
+            // rollover, and generation cleanup.
             if record.transition.state.correction.is_some() {
-                let state = crate::diagnostics::measure("learning.repair", || {
-                    DailyLearning::repair(
-                        prior,
-                        old.attempt.content_version,
-                        record.transition.state.miss_revision,
-                        self.components.clock.now(),
+                let revision = record.transition.state.miss_revision;
+                let state = if old.issued_work.is_some() {
+                    DailyLearning::complete_human_correction(
+                        prior, record.content_version, revision,
                     )
-                })
-                .map_err(|error| domain("learning_error", error))?;
+                } else {
+                    crate::diagnostics::measure("learning.repair", || {
+                        DailyLearning::repair(
+                            prior, record.content_version, revision, self.components.clock.now(),
+                        )
+                    }).map_err(|error| domain("learning_error", error))?
+                };
                 if state != *prior {
                     writes.push(Write::Learning {
                         target: old.attempt.target.clone(),
