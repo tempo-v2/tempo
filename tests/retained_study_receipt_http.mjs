@@ -164,3 +164,78 @@ for (const priorAccepted of [true, false]) {
       });
     });
 }
+
+test("issued Skip defers only its exact obligation without a plan or summary", { timeout: 20000 },
+  async t => {
+    const candidate = binary("TEMPO_BINARY");
+    const root = await mkdtemp(join(tmpdir(), "tempo-exact-skip-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const database = join(root, "study.sqlite");
+    const ui = join(root, "ui");
+    await mkdir(join(ui, "assets"), { recursive: true });
+    await writeFile(join(ui, "index.html"), "<title>Exact Skip fixture</title>");
+    execFileSync(candidate, ["init", database]);
+    const submission_id = "prepared-skip";
+    let pending;
+    let issuedWork;
+    await serve(candidate, database, ui, async post => {
+      const { dataset_id } = await post("/api/repertoires", JSON.stringify({ command: "list" }));
+      const input = { dataset_id, name: "Skip fixture", learner_color: "white", pgn: "1. e4 *" };
+      const preview = await post("/api/repertoires", JSON.stringify({ ...input, command: "preview" }));
+      await post("/api/repertoires", JSON.stringify({ ...input, command: "save", token: preview.token }));
+      const issued = await post("/api/study", JSON.stringify({ command: "next" }));
+      pending = JSON.stringify({
+        command: "skip", dataset_id, attempt_id: issued.attempt_id,
+        expected_revision: issued.revision, submission_id,
+      });
+    });
+
+    // T21 will issue the token through prepared Next. Seed that persisted
+    // identity explicitly here to exercise the real Skip consumer before T21.
+    const sql = new DatabaseSync(database, { timeout: 5000 });
+    try {
+      const { attempt_id } = JSON.parse(pending);
+      const row = sql.prepare("SELECT record FROM attempts WHERE id=?").get(attempt_id);
+      const record = JSON.parse(row.record);
+      issuedWork = {
+        day: record.issued_at.day,
+        obligation: {
+          target: record.attempt.target,
+          version: record.attempt.content_version,
+          kind: "teach",
+          revision: record.issued_miss_revision,
+        },
+      };
+      sql.prepare("UPDATE attempts SET record=? WHERE id=?").run(
+        JSON.stringify({ ...record, issued_work: issuedWork }), attempt_id,
+      );
+      sql.exec("DELETE FROM study_projection_state");
+      sql.exec(`CREATE TRIGGER refuse_deferral BEFORE INSERT ON study_deferrals
+        BEGIN SELECT RAISE(ABORT, 'injected deferral failure'); END`);
+      await serve(candidate, database, ui, async post => {
+        const before = readState(database, submission_id);
+        assert.equal((await post("/api/study", pending)).status, "error");
+        assert.deepEqual(readState(database, submission_id), before);
+        sql.exec("DROP TRIGGER refuse_deferral");
+        const accepted = await post("/api/study", pending);
+        assert.notEqual(accepted.status, "error");
+        const settled = readState(database, submission_id);
+        assert.deepEqual(settled.learning, before.learning);
+        assert.equal(settled.assessmentCount, before.assessmentCount);
+        const row = sql.prepare(`SELECT target_id,work_kind,ordinal,hex(version) AS version,
+          hex(obligation_revision) AS revision FROM study_deferrals`).get();
+        const integerKey = n => BigInt(n).toString(16).toUpperCase().padStart(16, "0");
+        assert.deepEqual({ ...row }, {
+          target_id: issuedWork.obligation.target,
+          work_kind: "teach",
+          ordinal: 1,
+          version: integerKey(issuedWork.obligation.version),
+          revision: integerKey(issuedWork.obligation.revision),
+        });
+        assert.deepEqual(await post("/api/study", pending), accepted);
+        assert.deepEqual(readState(database, submission_id), settled);
+      });
+    } finally {
+      sql.close();
+    }
+  });

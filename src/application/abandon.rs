@@ -8,7 +8,7 @@ use crate::{
     app_error::{domain, study_input},
 };
 use tempo_store::{
-    AnswerResult, Receipt, ReceiptResult, StoredAttempt, StudyScope, StudyState, Write,
+    AnswerResult, Commit, Receipt, ReceiptResult, StoredAttempt, StudyScope, StudyState, Write,
 };
 
 use tempo_types::AttemptId;
@@ -121,9 +121,23 @@ impl Tempo {
             writes.push(Write::Active(None));
         }
         let at = skip.then(|| self.components.clock.now());
-        self.commit_study(&snapshot, writes, scope)?;
-        if let (Some(at), Some(daily)) = (at, &mut self.daily) {
-            daily.queue.defer(result.attempt.target.clone(), at.day);
+        if let Some(at) = at.filter(|_| old.issued_work.is_some()) {
+            self.store.commit_issued_skip(
+                Commit {
+                    expected_dataset: snapshot.dataset.clone(),
+                    expected_revision: snapshot.revision,
+                    writes,
+                },
+                scope,
+                at.day,
+            )?;
+        } else {
+            self.commit_study(&snapshot, writes, scope)?;
+            // This is the unchanged legacy path for attempts issued before an
+            // exact token is available. The prepared Next cutover removes it.
+            if let (Some(at), Some(daily)) = (at, &mut self.daily) {
+                daily.queue.defer(result.attempt.target.clone(), at.day);
+            }
         }
         Ok(result)
     }
