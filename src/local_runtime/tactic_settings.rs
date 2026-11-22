@@ -123,9 +123,11 @@ mod tests {
         let mut store = SqliteStore::open(&path).unwrap();
         let initial = handle(&mut app, &store, Command::Get).unwrap();
         let dataset: DatasetId = serde_json::from_value(initial["dataset_id"].clone()).unwrap();
-        let limit = Profile::default().introductions.tactics;
+        let profile: Profile =
+            serde_json::from_str(&store.local_profile().unwrap().unwrap()).unwrap();
+        let limit = profile.introductions.tactics;
         let before = store
-            .observe_study_day(&dataset, StudyDay(100))
+            .observe_study_calendar_day(&dataset, &profile.study_timezone, StudyDay(100))
             .unwrap()
             .unwrap();
 
@@ -191,7 +193,7 @@ mod tests {
         .unwrap();
         let mut app = super::super::open(&path).unwrap();
         let before = store
-            .observe_study_day(&dataset, StudyDay(100))
+            .observe_study_calendar_day(&dataset, &profile.study_timezone, StudyDay(100))
             .unwrap()
             .unwrap();
         let original = handle(&mut app, &store, Command::Get).unwrap();

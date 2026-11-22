@@ -20,6 +20,8 @@ mod handle;
 mod import_pgn;
 mod next_exercise;
 mod optional_tactics;
+#[cfg(test)]
+mod plan_builder;
 mod receipts;
 mod repertoires;
 mod study_analysis_context;
