@@ -1,6 +1,7 @@
 //! Apply the saved theme preference to typed new-tactic admission facts.
 
 use super::Tempo;
+use crate::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 pub use tempo_chess::tactic_themes;
@@ -51,6 +52,21 @@ impl TacticThemes {
 }
 
 impl Tempo {
+    pub(crate) fn local_study_profile(&self) -> Result<Option<String>, AppError> {
+        Ok(self.store.local_profile()?)
+    }
+
+    pub(crate) fn save_local_study_profile(
+        &mut self,
+        dataset: &tempo_types::DatasetId,
+        expected: &str,
+        replacement: &str,
+        effect: tempo_store::StudyProfilePlanEffect,
+    ) -> Result<(), tempo_store::StoreError> {
+        self.store
+            .update_study_profile_for_plan(dataset, expected, replacement, effect)
+    }
+
     pub(crate) fn apply_local_study_settings(
         &mut self,
         limits: crate::IntroductionLimits,

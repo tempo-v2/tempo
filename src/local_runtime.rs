@@ -85,7 +85,7 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
         encounters.examined, encounters.repaired, encounters.unresolved
     );
     drop(_startup);
-    http::serve(&mut app, &SqliteStore::open(database)?, database, ui, port)
+    http::serve(&mut app, &SqliteStore::open_read_only(database)?, database, ui, port)
 }
 
 fn stored_profile(store: &SqliteStore) -> LocalResult<String> {

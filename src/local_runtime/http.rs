@@ -35,7 +35,7 @@ const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn serve(
     app: &mut Tempo,
-    profile_store: &SqliteStore,
+    model_reader: &SqliteStore,
     database: &Path,
     ui: &Path,
     port: u16,
@@ -65,7 +65,7 @@ pub(super) fn serve(
     let mut next_model_check = Instant::now();
     loop {
         if let Some(request) = server.try_recv()? {
-            if let Err(error) = respond(app, profile_store, &mut games, request) {
+            if let Err(error) = respond(app, &mut games, request) {
                 eprintln!("Tempo HTTP: {error}");
             }
             continue;
@@ -73,7 +73,7 @@ pub(super) fn serve(
         if Instant::now() >= next_model_check {
             let mut trace = crate::diagnostics::Span::new("loop.model_schedule");
             let scheduled = (|| -> LocalResult<()> {
-                let marker = profile_store.game_comparison_marker()?;
+                let marker = model_reader.game_comparison_marker()?;
                 if model_marker.as_ref() != Some(&marker) {
                     games.model.project_cached(marker.0.clone())?;
                     model_marker = Some(marker);
@@ -95,7 +95,7 @@ pub(super) fn serve(
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
-        if let Err(error) = respond(app, profile_store, &mut games, request) {
+        if let Err(error) = respond(app, &mut games, request) {
             eprintln!("Tempo HTTP: {error}");
             crate::diagnostics::emit(
                 "runtime.error",
@@ -367,7 +367,6 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
 
 fn respond(
     app: &mut Tempo,
-    profile_store: &SqliteStore,
     games: &mut Games,
     mut request: Request,
 ) -> LocalResult<()> {
@@ -393,7 +392,7 @@ fn respond(
         },
     );
     trace.field("route", diagnostic_route(request.url()));
-    let result = respond_inner(app, profile_store, games, request);
+    let result = respond_inner(app, games, request);
     trace.set_outcome(if result.is_ok() {
         "returned"
     } else {
@@ -404,7 +403,6 @@ fn respond(
 
 fn respond_inner(
     app: &mut Tempo,
-    profile_store: &SqliteStore,
     games: &mut Games,
     request: Request,
 ) -> LocalResult<()> {
@@ -737,7 +735,7 @@ fn respond_inner(
         )?;
     } else if request.method() == &Method::POST && request.url() == "/api/tactic-settings" {
         let reply = command(&request, MAX_COMMAND_BYTES)
-            .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
+            .and_then(|intent| tactic_settings::handle(app, intent))
             .unwrap_or_else(|error| serde_json::json!(ErrorView::for_content(error)));
         respond_traced(
             request,
