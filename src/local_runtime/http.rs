@@ -360,7 +360,9 @@ impl PhoneStudy {
 
     fn exposes(&self, request: &Request) -> bool {
         match request.method() {
-            Method::Get => self.assets.contains_key(asset_path(request)),
+            Method::Get => {
+                request.url() == "/api/context" || self.assets.contains_key(asset_path(request))
+            }
             Method::Post => matches!(
                 request.url(),
                 "/api/study"
@@ -504,6 +506,29 @@ fn respond_inner(
         Ok(admitted) => admitted,
         Err(status) => return Ok(respond_traced(request, Response::empty(status))?),
     };
+    if request.method() == &Method::Get && request.url() == "/api/context" {
+        let (status, reply) = match profile_store.context_identity() {
+            Ok((dataset, schema_version)) => (
+                200,
+                serde_json::json!({
+                    "status": "ready",
+                    "dataset_id": dataset,
+                    "schema_version": schema_version,
+                }),
+            ),
+            Err(_) => (
+                503,
+                serde_json::json!({"status": "unavailable", "code": "storage_unavailable"}),
+            ),
+        };
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", serde_json::to_vec(&reply)?)
+                .with_status_code(StatusCode(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
+        return Ok(());
+    }
     // Older open tabs have strict v5 reply validators. The opt-in changes
     // display only, independent of submission identity and saved receipts.
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
@@ -1109,6 +1134,7 @@ fn body(mime: &str, bytes: Vec<u8>) -> Response<std::io::Cursor<Vec<u8>>> {
 /// Diagnostics only use known route templates; URLs and query strings are never recorded.
 fn diagnostic_route(url: &str) -> &'static str {
     match url.split('?').next().unwrap_or_default() {
+        "/api/context" => "context",
         "/api/study" => "study",
         "/api/study-progress" => "study_progress",
         "/api/study/relevance" => "study_relevance",
