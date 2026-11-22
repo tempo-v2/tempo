@@ -61,16 +61,18 @@ impl Tempo {
         more_tactics: usize,
     ) -> Result<Self, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.daily.daily");
-        let mut app = Self::assemble(store, components, None)?;
-        app.daily = Some(DailyStudy {
-            limits,
-            tactic_themes: None,
-            starter_themes: false,
-            queue: DailySession::default(),
-            preview_key,
-            more_tactics,
-        });
-        Ok(app)
+        Self::assemble(
+            store,
+            components,
+            DailyStudy {
+                limits,
+                tactic_themes: None,
+                starter_themes: false,
+                queue: DailySession::default(),
+                preview_key,
+                more_tactics,
+            },
+        )
     }
 
     pub(super) fn daily_selection(

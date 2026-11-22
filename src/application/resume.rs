@@ -39,11 +39,10 @@ impl Tempo {
 
 #[cfg(test)]
 mod tests {
-    use crate::Tempo;
 
     #[test]
     fn resume_reads_progress_without_changing_the_store() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let issued = app.next_exercise().unwrap().unwrap();
         let before = app.snapshot().unwrap();
         assert_eq!(

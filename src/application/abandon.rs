@@ -116,11 +116,11 @@ impl Tempo {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AbandonCommand, Tempo};
+    use crate::AbandonCommand;
 
     #[test]
     fn abandoning_clears_the_active_pointer_and_allows_a_fresh_attempt() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let issued = app.next_exercise().unwrap().unwrap();
         app.abandon(AbandonCommand {
             dataset_id: issued.attempt.dataset,

@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicI32, Ordering},
     },
 };
-use tempo::{Clock, DailyComponents, CounterIds, IntroductionLimits, Tempo};
+use tempo::{Clock, CounterIds, DailyComponents, IntroductionLimits, Tempo};
 use tempo_chess::{Catalog, LegalSequenceGrader};
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::{SqliteStore, Store};
@@ -45,7 +45,6 @@ fn open(path: &Path, day: Day, limits: IntroductionLimits, generation: u8) -> Te
         grader: Box::new(LegalSequenceGrader),
         ids: Box::new(CounterIds(u64::from(generation) * 1_000)),
         learning: Box::new(learning),
-        ..DailyComponents::fixtures()
     };
     Tempo::daily(Box::new(store), components, limits, [42; 32], 10).unwrap()
 }

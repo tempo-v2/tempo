@@ -634,7 +634,7 @@ mod tests {
                 unix_ms: 20_000 * DAY,
             })),
             learning: Box::new(DailyLearning::default()),
-            ..DailyComponents::fixtures()
+            ..crate::components::test_components()
         };
         let store = SqliteStore::create(
             path,
@@ -823,7 +823,7 @@ mod tests {
                         unix_ms: now,
                     })),
                     learning: Box::new(DailyLearning::default()),
-                    ..DailyComponents::fixtures()
+                    ..crate::components::test_components()
                 },
                 IntroductionLimits::default(),
                 [42; 32],
@@ -952,7 +952,7 @@ mod tests {
                 })),
                 grader: Box::new(LegalSequenceGrader),
                 learning: Box::new(learning),
-                ..DailyComponents::fixtures()
+                ..crate::components::test_components()
             },
             IntroductionLimits::default(),
             [42; 32],

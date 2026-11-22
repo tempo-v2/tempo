@@ -3,8 +3,7 @@
 //! # Where to start
 //! - [`Tempo`]: public application operations (`src/application/`).
 //! - [`commands`]: caller-owned intent and retry identities.
-//! - [`Components`] and [`ports`]: choose replaceable policy/adapter implementations.
-//! - [`adapters`]: executable fixture implementations of those ports.
+//! - [`DailyComponents`] and [`ports`]: choose replaceable policy/adapter implementations.
 //! - [`views`] and [`wire`]: the versioned UI boundary, with no answer keys.
 //! - [`PortableSnapshot`]: export/restore data, separate from the store snapshot.
 //!
@@ -16,14 +15,13 @@ mod application;
 pub mod commands;
 pub mod components;
 mod diagnostics;
-pub mod game;
 pub mod game_range;
 pub mod portable_snapshot;
 pub mod ports;
 pub mod views;
 pub mod wire;
 
-pub use adapters::{CounterIds, FixedClock, FixtureGames, JsonSnapshotCodec, UnavailableGames};
+pub use adapters::{CounterIds, FixedClock, JsonSnapshotCodec};
 pub use app_error::AppError;
 pub use application::{
     GameLibraryRead, GameReviewLine, GameReviewRead, IntroductionLimits, ProgressStamp,
@@ -31,12 +29,11 @@ pub use application::{
     tactic_themes,
 };
 pub use application::{SaveStudyReview, SavedStudyReviewCommand};
-pub use commands::{AbandonCommand, AgainCommand, SubmitCommand};
-pub use components::{Components, DailyComponents};
-pub use game::Game;
+pub use commands::{AbandonCommand, SubmitCommand};
+pub use components::DailyComponents;
 pub use game_range::GameRange;
 pub use portable_snapshot::PortableSnapshot;
-pub use ports::{AttemptIds, ChessGrader, Clock, GameProvider, SnapshotCodec};
+pub use ports::{AttemptIds, ChessGrader, Clock, SnapshotCodec};
 
 pub mod game_evidence;
 

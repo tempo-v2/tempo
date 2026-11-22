@@ -2,7 +2,7 @@
 use tempo_chess::{ChessAnswer, ChessDefinition, ChessFeedback, ChessPrompt, ChessState};
 use tempo_study::Grader;
 
-/// The grader trait object stored in [`crate::Components`].
+/// The grader trait object stored in [`crate::DailyComponents`].
 ///
 /// Use this alias when injecting a chess grader: it spells out the associated
 /// types once. The implementation still decides correctness; Tempo only carries

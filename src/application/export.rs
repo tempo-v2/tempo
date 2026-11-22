@@ -11,7 +11,7 @@ impl Tempo {
         let _diagnostic = crate::diagnostics::Span::new("app.export.export");
         let (snapshot, game_evidence) = self.store.portable_state()?;
         codec.encode(&PortableSnapshot {
-            schema_version: if self.daily.is_some() { 5 } else { 1 },
+            schema_version: 5,
             game_evidence,
             catalog: snapshot.catalog,
             learning: snapshot.learning,
@@ -22,11 +22,11 @@ impl Tempo {
 
 #[cfg(test)]
 mod tests {
-    use crate::{JsonSnapshotCodec, SnapshotCodec, Tempo};
+    use crate::{JsonSnapshotCodec, SnapshotCodec};
 
     #[test]
     fn export_is_a_read_and_leaves_an_active_attempt_untouched() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         app.next_exercise().unwrap();
         let before = app.snapshot().unwrap();
         let portable = JsonSnapshotCodec

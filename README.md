@@ -64,12 +64,11 @@ outcomes and stable durable state. The companion browser proof lives in Tempo UI
 | When you need to… | Reach for | Source and nearby example |
 | --- | --- | --- |
 | Assemble production Daily Study | `DailyComponents` and `Tempo::daily` | [daily.rs](src/application/daily.rs) uses Learning availability, DailySession and Study issuance. |
-| Assemble the standalone fixture | `Components` and `Tempo::new` | [components.rs](src/components.rs) supplies fixture queue, parser and comparator ports. |
+| Assemble Daily Study | `DailyComponents` and `Tempo::daily` | [components.rs](src/components.rs) declares the runtime ports. |
 | Begin study, or continue the active attempt | `Tempo::next_exercise` | [next_exercise.rs](src/application/next_exercise.rs) demonstrates that another Next resumes without issuing a competing attempt. |
 | Reload persisted progress | `Tempo::resume` | [resume.rs](src/application/resume.rs) demonstrates a read with no new assessment or write. |
 | Answer the displayed learner decision | `SubmitCommand` → `Tempo::submit` | [submit_command.rs](src/commands/submit_command.rs) constructs a retryable action; [submit.rs](src/application/submit.rs) shows progress, learning, assessment and receipt saved together. |
 | Stop an attempt | `AbandonCommand` → `Tempo::abandon` | [abandon_command.rs](src/commands/abandon_command.rs) supplies revision/identity without an answer; [abandon.rs](src/application/abandon.rs) clears the active pointer. |
-| Report a standard-profile external miss | `AgainCommand` → `Tempo::again` | [again_command.rs](src/commands/again_command.rs) rejects analysis against the wrong definition; [again.rs](src/application/again.rs) updates learning without fabricating a human attempt. |
 | Update production repertoire or tactics content | Signed Preview and Save or the validated tactic transfer | [repertoires.rs](src/application/repertoires.rs) and [tactic_capture.rs](src/application/tactic_capture.rs) preserve content and Learning fences. |
 | Read a detector's observations for a stored game | Games detection discovery, start and result routes | [game_detection.rs](src/game_detection.rs) owns bounded ephemeral delivery. Chess checks legal occurrences and reports. |
 | Analyze retained games and prioritize missed captures | Normal runtime's `TacticalJobs`, then `POST /api/games/tactics` for a bounded read | [tactical_jobs.rs](src/tactical_jobs.rs) reuses the detector worker; [tactical_analysis.rs](src/application/tactical_analysis.rs) accepts observation, puzzle and request atomically. |
@@ -78,7 +77,7 @@ outcomes and stable durable state. The companion browser proof lives in Tempo UI
 | Dispatch one decoded UI intent | `wire::StudyCommand` → `Tempo::handle` | [study_command.rs](src/commands/study_command.rs) decodes the versioned envelope; [handle.rs](src/application/handle.rs) returns typed replies even on application failure. |
 
 The existing root imports remain available, for example `tempo::SubmitCommand`
-and `tempo::Components`. Grouped modules add navigable paths without requiring
+and `tempo::DailyComponents`. Grouped modules add navigable paths without requiring
 callers to adopt them. `tempo::wire::{StudyCommand, StudyView}` remains the public
 transport boundary. Your `src/views/` files remain the homes of those view concepts.
 
@@ -87,9 +86,7 @@ transport boundary. Your `src/views/` files remain the homes of those view conce
 | Value | Produced by | Consumed by | What to notice |
 | --- | --- | --- | --- |
 | `SubmitCommand` / `AbandonCommand` | UI controller or another caller | Application operation | Copy the latest **attempt revision**, allocate one submission ID per user action, reuse the whole command for retries. |
-| `AgainCommand` | Standard-profile external feedback adapter | Application operation | Include the content version actually compared, provider namespace and stable event identity. |
-| [`Game`](src/game.rs) | `GameProvider` | `Tempo::ingest_games` | Stable provider/game IDs make rescans replayable; the PGN is still raw input for the comparator. |
-| [`GameRange`](src/game_range.rs) | Refresh caller | `GameProvider::fetch` | Inclusive observation-time endpoints; the provider validates their order. |
+| [`GameRange`](src/game_range.rs) | Refresh caller | `GameJobs` | Inclusive observation-time endpoints; the provider validates their order. |
 | [`PortableSnapshot`](src/portable_snapshot.rs) | Export or a codec | Codec or restore | Content, learning and policy only. It omits source dataset ID, attempts, active pointer and receipts. |
 | [`AppError`](src/app_error.rs) | Application error mapping | Caller or error view | Stable code plus message and retryability; the caller need not parse a domain error string. |
 | [`AttemptView`](src/views/attempt_view.rs) | Application result mapping | UI | Prompt, feedback, identities and lifetime assessment; no answer key or scheduler state. |
@@ -110,7 +107,6 @@ of the application; dependency ownership stays in the composition root.
 | [`Clock`](src/ports/clock.rs) | Supply real application time or a controlled timeline | [`FixedClock`](src/adapters/fixed_clock.rs); the port's test injects a clock and checks the issued timestamp. |
 | [`AttemptIds`](src/ports/attempt_ids.rs) | Supply identities unique across durable restarts | [`CounterIds`](src/adapters/counter_ids.rs); the port's test reserves one ID and proves resume does not allocate another. |
 | [`ChessGrader`](src/ports/chess_grader.rs) | Bind a replacement grader to the concrete chess associated types | `ExactSequenceGrader`; the alias's test starts a two-decision exercise through a trait object. |
-| [`GameProvider`](src/ports/game_provider.rs) | Fetch games in a job outside ordinary study | [`FixtureGames`](src/adapters/fixture_games.rs) and [`UnavailableGames`](src/adapters/unavailable_games.rs); examples cover filtering, ingestion and independent failure. |
 | [`SnapshotCodec`](src/ports/snapshot_codec.rs) | Change the portable representation | [`JsonSnapshotCodec`](src/adapters/json_snapshot_codec.rs); the port's example plugs in a tagged encoding without changing Tempo. |
 
 Domain policy ports stay in their owning crates: Queue decides eligibility and
@@ -134,10 +130,6 @@ These paths use combined repertoire coverage and `DailyLearning::assess_game`,
 which owns the model update, corrective obligation and human Test cadence.
 Store commits the results and command receipt together.
 
-`GameProvider` and `Tempo::ingest_games` serve the fixture profile through a
-supplied comparator. `Tempo::again` serves the standard external-feedback
-profile, where each deviation commits independently.
-
 Content import updates the current dataset and preserves learning unless the
 definition actually changes. Portable restore requires an empty destination,
 compatible settings/memory and a fresh dataset identity. It is not an undo or a
@@ -151,7 +143,7 @@ The HTTP boundary tests require the Tempo binary to be built first.
 ```sh
 # One concept's same-module example (open its source alongside the output).
 cargo test -p tempo --lib commands::submit_command::tests
-cargo test -p tempo --lib ports::game_provider::tests
+cargo test -p tempo --lib ports::attempt_ids::tests
 cargo test -p tempo --lib views::study_view::tests
 
 # All nearby examples, the compiling usage example, and retained contract journeys.
@@ -169,16 +161,11 @@ The Node boundary suite starts the managed HTTP server on a disposable database,
 validates replies through the Study UI, and checks that retrying a lost reply
 does not duplicate the accepted assessment or receipt.
 
-`tests/contracts.rs` is now a small index. To follow a longer journey, choose
-[study_journeys.rs](tests/contracts/study_journeys.rs),
-[submission_recovery.rs](tests/contracts/submission_recovery.rs),
-[external_feedback.rs](tests/contracts/external_feedback.rs),
-[content_updates.rs](tests/contracts/content_updates.rs),
-[portable_restore.rs](tests/contracts/portable_restore.rs), or
-[queue_substitution.rs](tests/contracts/queue_substitution.rs).
-For example, `cargo test -p tempo --test contracts content_updates` runs only the
-content-update journeys. Shared explicit clock/store setup lives in
-[support.rs](tests/contracts/support.rs).
+Use [study_journeys.rs](tests/contracts/study_journeys.rs) for normal Study,
+[submission_recovery.rs](tests/contracts/submission_recovery.rs) for exact retry,
+or [opening_release.rs](tests/contracts/opening_release.rs) for signed repertoire
+updates. For example, `cargo test -p tempo --test contracts submission_recovery`
+runs only the retry scenarios.
 
 ## Current scope
 

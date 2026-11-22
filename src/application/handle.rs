@@ -5,8 +5,7 @@ use crate::{
     app_error::domain,
     commands::StudyCommand,
     views::attempt_view::CorrectionView,
-    views::{EmptyView, LessonView, StudyView},
-    wire::STUDY_WIRE_VERSION,
+    views::{LessonView, StudyView},
 };
 use tempo_chess::{ContentKind, explain_issued_tactic, move_san, project_position};
 use tempo_store::{ActivityMode, AnswerResult, StudyScope};
@@ -64,9 +63,6 @@ impl Tempo {
 
     fn study_status(&self) -> Result<StudyView, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.handle.study_status");
-        if self.daily.is_none() {
-            return Err(AppError::new("unsupported", "Use the local study release."));
-        }
         let snapshot = self.store.study_state(StudyScope {
             catalog: true,
             ..StudyScope::default()
@@ -85,38 +81,20 @@ impl Tempo {
         {
             return self.project(self.resume_from(&active, id)?);
         }
-        if self.daily.is_some() {
-            let snapshot = self.store.study_state(StudyScope {
-                catalog: true,
-                ..StudyScope::default()
-            })?;
-            if let Some(id) = &snapshot.active_attempt {
-                return self.project(self.resume_from(&snapshot, id)?);
-            }
-            let at = self.components.clock.now();
-            let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
-            let selection = self.daily_selection(&snapshot, at, extra)?;
-            if let Some(issued) = self.issue_next_daily(&snapshot, at, &selection)? {
-                return self.project(issued);
-            }
-            return Ok(self.daily_summary(snapshot.dataset, selection));
+        let snapshot = self.store.study_state(StudyScope {
+            catalog: true,
+            ..StudyScope::default()
+        })?;
+        if let Some(id) = &snapshot.active_attempt {
+            return self.project(self.resume_from(&snapshot, id)?);
         }
-        match self.next_exercise()? {
-            Some(value) => self.project(value),
-            None => Ok(StudyView::Empty(EmptyView {
-                schema_version: STUDY_WIRE_VERSION,
-                status: "empty".into(),
-                dataset_id: active.dataset,
-                done: true,
-                corrective_recalls_remaining: None,
-                outstanding: 0,
-                repertoire_remaining: 0,
-                tactics_remaining: 0,
-                can_practice_tactics: false,
-                can_learn_more_tactics: false,
-                learn_more_count: 0,
-            })),
+        let at = self.components.clock.now();
+        let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;
+        let selection = self.daily_selection(&snapshot, at, extra)?;
+        if let Some(issued) = self.issue_next_daily(&snapshot, at, &selection)? {
+            return self.project(issued);
         }
+        Ok(self.daily_summary(snapshot.dataset, selection))
     }
 
     pub(super) fn project(&self, result: AnswerResult) -> Result<StudyView, AppError> {
@@ -207,14 +185,11 @@ impl Tempo {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        Tempo,
-        wire::{StudyCommand, StudyView},
-    };
+    use crate::wire::{StudyCommand, StudyView};
 
     #[test]
     fn a_command_failure_becomes_a_serializable_error_view() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let view = app.handle(StudyCommand::Resume {
             attempt_id: "unknown".into(),
         });

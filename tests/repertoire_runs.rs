@@ -86,7 +86,6 @@ impl Fixture {
             grader: Box::new(LegalSequenceGrader),
             ids: Box::new(CounterIds(ids)),
             learning: Box::new(DailyLearning::default()),
-            ..DailyComponents::fixtures()
         };
         Tempo::daily(
             Box::new(store),

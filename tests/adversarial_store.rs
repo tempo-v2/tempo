@@ -28,7 +28,7 @@ fn app(path: &Path) -> Tempo {
             })),
             grader: Box::new(LegalSequenceGrader),
             learning: Box::new(learning),
-            ..DailyComponents::fixtures()
+            ids: Box::new(tempo::CounterIds::default()),
         },
         IntroductionLimits::default(),
         [42; 32],

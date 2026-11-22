@@ -27,11 +27,10 @@ pub struct SubmitCommand {
 #[cfg(test)]
 mod tests {
     use super::SubmitCommand;
-    use crate::Tempo;
 
     #[test]
     fn copy_the_displayed_revision_and_reuse_the_whole_command_after_a_lost_reply() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let issued = app.next_exercise().unwrap().unwrap();
         let command = SubmitCommand {
             dataset_id: issued.attempt.dataset,

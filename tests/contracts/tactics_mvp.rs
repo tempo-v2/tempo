@@ -1,17 +1,15 @@
 //! Durable tactic import and issued-version board replay.
 use serde_json::Value;
-use tempo::{AbandonCommand, Components, SubmitCommand, Tempo, wire::StudyCommand};
-use tempo_chess::{LegalSequenceGrader, TacticRecord, apply_setup_move, compile_tactics};
-use tempo_store::SqliteStore;
+use tempo::{AbandonCommand, SubmitCommand, Tempo, wire::StudyCommand};
+use tempo_chess::{TacticRecord, apply_setup_move, compile_tactics};
+use tempo_learning::DailyLearning;
+use tempo_store::{Commit, SqliteStore, Store, Write};
 use tempo_types::Grade;
 
 use std::path::Path;
 
 fn reopen(path: &Path) -> Tempo {
-    let mut components = Components::fixtures();
-    components.grader = Box::new(LegalSequenceGrader);
-    components.learning = Box::new(tempo_learning::DailyLearning::default());
-    Tempo::new(Box::new(SqliteStore::open(path).unwrap()), components).unwrap()
+    super::support::open(Box::new(SqliteStore::open(path).unwrap()), 10, 100)
 }
 
 fn practice(path: &Path) -> Tempo {
@@ -43,6 +41,36 @@ fn white_mate_in_two() -> TacticRecord {
 fn import(app: &mut Tempo, row: &TacticRecord) {
     let catalog = compile_tactics(std::slice::from_ref(row)).unwrap();
     app.apply_catalog(&app.snapshot().unwrap().dataset, &catalog)
+        .unwrap();
+}
+
+// Seed a superseding version through the SQLite test fixture. Normal manual
+// capture keeps an existing answer version immutable.
+fn supersede_answer(path: &Path, tactic: &TacticRecord) {
+    let mut store = SqliteStore::open(path).unwrap();
+    let state = store.snapshot().unwrap();
+    let target = tactic.target_id();
+    let mut catalog = state.catalog;
+    let item = catalog.items.get_mut(&target).unwrap();
+    item.definition = compile_tactics(std::slice::from_ref(tactic))
+        .unwrap()
+        .items
+        .remove(&target)
+        .unwrap()
+        .definition;
+    item.version.0 += 1;
+    store
+        .commit(Commit {
+            expected_dataset: state.dataset,
+            expected_revision: state.revision,
+            writes: vec![
+                Write::Catalog(catalog),
+                Write::Learning {
+                    target: target.clone(),
+                    state: DailyLearning::changed_answer(&state.learning[&target]),
+                },
+            ],
+        })
         .unwrap();
 }
 
@@ -106,7 +134,7 @@ fn actual_tactic_replays_issued_board_after_restart_and_a_semantic_edit() {
     // A legal alternative changes the issued definition. The old final board
     // must still be reconstructible exclusively from its archived version.
     tactic.solution = vec!["a6b7".into()];
-    import(&mut app, &tactic);
+    supersede_answer(&path, &tactic);
     drop(app);
 
     let mut restarted = reopen(&path);
@@ -127,7 +155,8 @@ fn actual_tactic_replays_issued_board_after_restart_and_a_semantic_edit() {
 #[test]
 fn a_legal_miss_keeps_the_board_and_only_the_original_again_through_abandon() {
     let dir = tempfile::tempdir().unwrap();
-    let mut app = practice(&dir.path().join("practice.sqlite"));
+    let path = dir.path().join("practice.sqlite");
+    let mut app = practice(&path);
     import(&mut app, &white_mate_in_two());
     let issued = app.next_exercise().unwrap().unwrap().attempt;
     let resume = StudyCommand::Resume {
@@ -171,7 +200,7 @@ fn a_legal_miss_keeps_the_board_and_only_the_original_again_through_abandon() {
 
     let mut edited = white_mate_in_two();
     edited.solution = vec!["a6b7".into()];
-    import(&mut app, &edited);
+    supersede_answer(&path, &edited);
     let before_replay = app.snapshot().unwrap();
     assert_eq!(reply(&mut app, missed_move), miss);
     assert_eq!(app.snapshot().unwrap(), before_replay);

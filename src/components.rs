@@ -1,53 +1,8 @@
-//! Choose policy and adapter implementations at the application boundary.
-use crate::{AttemptIds, ChessGrader, Clock, CounterIds, FixedClock};
-use tempo_chess::{ContentParser, ExactSequenceGrader, GameComparator};
-use tempo_learning::{FixedIntervalScheduler, LearningPolicy, StandardLearning};
-use tempo_queue::{QueuePolicy, StableQueue};
-use tempo_types::{StudyDay, StudyTime};
+//! Ports for the Daily Study application.
+use crate::{AttemptIds, ChessGrader, Clock};
+use tempo_learning::LearningPolicy;
 
-/// Ports for the standalone fixture workflow assembled by [`crate::Tempo::new`].
-///
-/// Start with [`Self::fixtures`] for a runnable demonstration, then replace a
-/// single field with another implementation of the same port. The store is a
-/// separate constructor argument because it owns persistence. A game provider is
-/// also separate: provider I/O happens before `Tempo::ingest_games`.
-pub struct Components {
-    /// Eligibility and ordering; produces targets, never attempts.
-    pub queue: Box<dyn QueuePolicy>,
-    /// Interprets accepted assessments and owns scheduling settings.
-    pub learning: Box<dyn LearningPolicy>,
-    /// Decides correctness and next prompt for chess exercises.
-    pub grader: Box<ChessGrader>,
-    /// Converts a standard-profile import request into typed catalog content.
-    pub parser: Box<dyn ContentParser>,
-    /// Pure comparison of fetched game text against catalog content.
-    pub comparator: Box<dyn GameComparator>,
-    /// Supplies acceptance and issuance times as explicit values.
-    pub clock: Box<dyn Clock>,
-    /// Allocates identities for new human attempts.
-    pub ids: Box<dyn AttemptIds>,
-}
-impl Components {
-    /// The complete runnable set of fixture policies/adapters, ready for substitution.
-    pub fn fixtures() -> Self {
-        Self {
-            queue: Box::new(StableQueue),
-            learning: Box::new(StandardLearning {
-                scheduler: FixedIntervalScheduler::default(),
-            }),
-            grader: Box::new(ExactSequenceGrader),
-            parser: Box::new(tempo_chess::demo_parser()),
-            comparator: Box::new(tempo_chess::demo_comparator()),
-            clock: Box::new(FixedClock(StudyTime {
-                day: StudyDay(0),
-                unix_ms: 10,
-            })),
-            ids: Box::new(CounterIds::default()),
-        }
-    }
-}
-
-/// Ports consumed by Daily Study and the signed content and game commands.
+/// Ports consumed by Daily Study and signed content and Games operations.
 pub struct DailyComponents {
     pub learning: Box<dyn LearningPolicy>,
     pub grader: Box<ChessGrader>,
@@ -55,59 +10,74 @@ pub struct DailyComponents {
     pub ids: Box<dyn AttemptIds>,
 }
 
-impl DailyComponents {
-    /// Deterministic baseline ports for disposable integration tests.
-    pub fn fixtures() -> Self {
-        Components::fixtures().split().0
-    }
-}
-
-pub(crate) struct FixtureOperations {
-    pub(crate) queue: Box<dyn QueuePolicy>,
-    pub(crate) parser: Box<dyn ContentParser>,
-    pub(crate) comparator: Box<dyn GameComparator>,
-}
-
-impl Components {
-    pub(crate) fn split(self) -> (DailyComponents, FixtureOperations) {
-        (
-            DailyComponents {
-                learning: self.learning,
-                grader: self.grader,
-                clock: self.clock,
-                ids: self.ids,
-            },
-            FixtureOperations {
-                queue: self.queue,
-                parser: self.parser,
-                comparator: self.comparator,
-            },
-        )
+#[cfg(test)]
+pub(crate) fn test_components() -> DailyComponents {
+    DailyComponents {
+        learning: Box::new(tempo_learning::DailyLearning::default()),
+        grader: Box::new(tempo_chess::LegalSequenceGrader),
+        clock: Box::new(crate::FixedClock(tempo_types::StudyTime {
+            day: tempo_types::StudyDay(10),
+            unix_ms: 864_000_000,
+        })),
+        ids: Box::new(crate::CounterIds::default()),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Components;
-    use crate::Tempo;
-    use tempo_queue::ReverseQueue;
-    use tempo_store::MemoryStore;
-    use tempo_types::TargetId;
+pub(crate) fn test_store(
+    directory: &tempfile::TempDir,
+    dataset: &str,
+    catalog: tempo_chess::Catalog,
+    components: &DailyComponents,
+) -> tempo_store::SqliteStore {
+    tempo_store::SqliteStore::create(
+        directory.path().join("study.sqlite"),
+        dataset.into(),
+        catalog,
+        components.learning.settings(),
+    )
+    .unwrap()
+}
 
-    #[test]
-    fn selecting_a_different_queue_policy_changes_the_first_exercise() {
-        let mut components = Components::fixtures();
-        components.queue = Box::new(ReverseQueue);
-        let store = MemoryStore::new(
-            "policy-demo".into(),
-            tempo_chess::demo_catalog(),
-            components.learning.settings(),
-        )
+#[cfg(test)]
+pub(crate) fn test_study() -> (crate::Tempo, tempfile::TempDir) {
+    use tempo_learning::{DailyLearning, LearningState};
+    use tempo_store::{Commit, Store, Write};
+    use tempo_types::{StudyDay, StudyTime};
+
+    let components = test_components();
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = test_store(
+        &directory,
+        "unit-study",
+        tempo_chess::demo_catalog(),
+        &components,
+    );
+    let state = store.snapshot().unwrap();
+    store
+        .commit(Commit {
+            expected_dataset: state.dataset,
+            expected_revision: state.revision,
+            writes: vec![Write::Learning {
+                target: "r1:p1".into(),
+                state: DailyLearning::teach(
+                    &LearningState::default(),
+                    StudyTime {
+                        day: StudyDay(9),
+                        unix_ms: 777_600_000,
+                    },
+                )
+                .unwrap(),
+            }],
+        })
         .unwrap();
-        let mut app = Tempo::new(Box::new(store), components).unwrap();
-        assert_eq!(
-            app.next_exercise().unwrap().unwrap().attempt.target,
-            TargetId::from("t1")
-        );
-    }
+    let app = crate::Tempo::daily(
+        Box::new(store),
+        components,
+        crate::IntroductionLimits::default(),
+        [42; 32],
+        10,
+    )
+    .unwrap();
+    (app, directory)
 }

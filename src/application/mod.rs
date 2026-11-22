@@ -3,7 +3,6 @@
 //! These child modules can access Tempo's private fields. No field needs to be
 //! exposed publicly merely to organize an operation into its own source file.
 mod abandon;
-mod again;
 mod content_preview;
 mod coverage_settings;
 pub(crate) use coverage_settings::{CoverageLineSave, PreviousCoverageLineRequest};
@@ -21,10 +20,8 @@ mod game_review;
 pub use game_review::{GameReviewLine, GameReviewRead};
 mod handle;
 mod import_pgn;
-mod ingest_games;
 mod next_exercise;
 mod optional_tactics;
-mod queue_source;
 mod receipts;
 mod repertoires;
 mod study_analysis_context;
@@ -51,48 +48,23 @@ mod teach;
 pub use daily::IntroductionLimits;
 pub use tactic_preferences::{TacticThemes, tactic_themes};
 
-use crate::{
-    AppError, Components, DailyComponents, app_error::domain, components::FixtureOperations,
-};
-use tempo_queue::OrderEvent;
-use tempo_store::{Commit, MemoryStore, Snapshot, Store, StudyScope, StudyState, Write};
-use tempo_types::TargetId;
+use crate::{AppError, DailyComponents, app_error::domain};
+use tempo_store::{Commit, Snapshot, Store, StudyScope, StudyState, Write};
 
-/// Coordinate domain decisions and commit the resulting operation atomically.
+/// Coordinate the daily Study application and commit accepted operations atomically.
 ///
-/// Construct one with a store and [`Components`], or use [`Self::demo`] for the
-/// wired fixture. Call methods with intent values; the queue selects content,
-/// Study advances attempts, the grader decides correctness, Learning interprets
-/// assessments, and Store accepts the assembled transaction.
-///
-/// ```
-/// use tempo::Tempo;
-/// let mut app = Tempo::demo()?;
-/// let issued = app.next_exercise()?.expect("demo has an eligible exercise");
-/// let resumed = app.resume(&issued.attempt.id)?;
-/// assert_eq!(resumed.attempt, issued.attempt);
-/// # Ok::<(), tempo::AppError>(())
-/// ```
+/// Use [`Self::daily`] to assemble the application with its Store and runtime ports.
 pub struct Tempo {
     store: Box<dyn Store>,
     components: DailyComponents,
-    fixture: Option<FixtureOperations>,
-    remaining_block: Vec<TargetId>,
-    order_history: Vec<OrderEvent>,
     daily: Option<daily::DailyStudy>,
     game_books: Option<std::sync::Arc<game_evidence::GameBooks>>,
 }
 impl Tempo {
-    /// Assemble the application after checking stored policy and learning compatibility.
-    pub fn new(store: Box<dyn Store>, components: Components) -> Result<Self, AppError> {
-        let (common, fixture) = components.split();
-        Self::assemble(store, common, Some(fixture))
-    }
-
     fn assemble(
         store: Box<dyn Store>,
         components: DailyComponents,
-        fixture: Option<FixtureOperations>,
+        daily: daily::DailyStudy,
     ) -> Result<Self, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.mod.assemble");
         let snapshot = store.study_state(StudyScope {
@@ -115,22 +87,9 @@ impl Tempo {
         Ok(Self {
             store,
             components,
-            fixture,
-            remaining_block: vec![],
-            order_history: vec![],
-            daily: None,
+            daily: Some(daily),
             game_books: None,
         })
-    }
-    /// Create the reproducible in-memory repertoire/tactic demonstration.
-    pub fn demo() -> Result<Self, AppError> {
-        let components = Components::fixtures();
-        let store = MemoryStore::new(
-            "demo-dataset".into(),
-            tempo_chess::demo_catalog(),
-            components.learning.settings(),
-        )?;
-        Self::new(Box::new(store), components)
     }
     /// Read a consistent store snapshot for application inspection or adapters.
     /// This internal-data shape is not the UI view contract.

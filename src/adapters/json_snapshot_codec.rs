@@ -19,11 +19,11 @@ impl SnapshotCodec for JsonSnapshotCodec {
 #[cfg(test)]
 mod tests {
     use super::JsonSnapshotCodec;
-    use crate::{SnapshotCodec, Tempo};
+    use crate::SnapshotCodec;
 
     #[test]
     fn the_json_adapter_round_trips_export_data_and_reports_malformed_input() {
-        let app = Tempo::demo().unwrap();
+        let (app, _directory) = crate::components::test_study();
         let encoded = app.export(&JsonSnapshotCodec).unwrap();
         let portable = JsonSnapshotCodec.decode(&encoded).unwrap();
         assert_eq!(portable.catalog, app.snapshot().unwrap().catalog);

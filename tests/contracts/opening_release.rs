@@ -8,7 +8,7 @@ use std::{
     },
 };
 use tempo::{Clock, CounterIds, DailyComponents, IntroductionLimits, Tempo, wire::StudyCommand};
-use tempo_chess::{Catalog, ImportRequest, LearnerColor, LegalSequenceGrader, compile_repertoire};
+use tempo_chess::{Catalog, LearnerColor, LegalSequenceGrader, compile_repertoire};
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::{SqliteStore, Store};
 use tempo_types::{StudyDay, StudyTime, TargetId};
@@ -48,7 +48,6 @@ fn open(path: &Path, day: Day, limits: IntroductionLimits, generation: u8) -> Te
         grader: Box::new(LegalSequenceGrader),
         ids: Box::new(CounterIds(u64::from(generation) * 1_000)),
         learning: Box::new(learning),
-        ..DailyComponents::fixtures()
     };
     Tempo::daily(Box::new(store), components, limits, [42; 32], 10).unwrap()
 }
@@ -252,25 +251,8 @@ fn daily_generic_import_rejects_repertoires_and_mixed_catalogs_atomically() {
     assert_eq!(study(&mut app, ack)["status"], "complete");
 
     let before = app.snapshot().unwrap();
-    let request = ImportRequest {
-        pgn: "1. d4 *".into(),
-        source: "fixture".into(),
-        repertoire: Some(id.into()),
-        learner_color: Some(LearnerColor::White),
-    };
-    assert_eq!(
-        app.import_pgn(&before.dataset, &request).unwrap_err().code,
-        "unsupported"
-    );
-
-    let replacement = compile_repertoire(
-        &request.pgn,
-        id,
-        "Book",
-        LearnerColor::White,
-        &request.source,
-    )
-    .unwrap();
+    let replacement =
+        compile_repertoire("1. d4 *", id, "Book", LearnerColor::White, "fixture").unwrap();
     let tactics = tempo_chess::compile_tactics(&[tempo_chess::TacticRecord {
         namespace: "fixture".into(),
         source_id: "daily-tactic".into(),
@@ -1028,7 +1010,10 @@ fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
         })
     };
     let unaccepted = save(&draft);
-    let suspended = content(&mut app, activity_change(id, "forecast-suspend", "suspended"));
+    let suspended = content(
+        &mut app,
+        activity_change(id, "forecast-suspend", "suspended"),
+    );
     assert_eq!(suspended["status"], "activity_set", "{suspended}");
     let suspended_state = app.snapshot().unwrap();
     assert_eq!(

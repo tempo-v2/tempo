@@ -10,7 +10,7 @@ impl Tempo {
     /// Decode and validate a portable snapshot, then atomically restore it.
     ///
     /// The destination must be empty, settings must match, and the fresh dataset
-    /// identity must pass Store's checks. For edits within a dataset use `import_pgn`.
+    /// identity must pass Store's checks. Edits within a dataset use the addressed content commands.
     pub fn restore(
         &mut self,
         fresh_dataset: DatasetId,
@@ -58,9 +58,7 @@ impl Tempo {
                 || state.game_teaching_relevance
                 || state.restored_game_obligation.is_some()
             {
-                if self.daily.is_none()
-                    || !matches!(item.definition.kind, ContentKind::Repertoire { .. })
-                {
+                if !matches!(item.definition.kind, ContentKind::Repertoire { .. }) {
                     return Err(AppError::new(
                         "invalid_learning",
                         "Legacy game obligations require a Daily Study repertoire target.",
@@ -94,31 +92,36 @@ impl Tempo {
                 PortableChoiceFormat::Legacy
             },
         )?;
-        self.remaining_block.clear();
-        self.order_history.clear();
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Components, JsonSnapshotCodec, Tempo};
+    use crate::{JsonSnapshotCodec, Tempo};
     use tempo_chess::Catalog;
-    use tempo_store::MemoryStore;
     use tempo_types::DatasetId;
 
     #[test]
     fn restore_uses_an_empty_destination_and_a_new_dataset_identity() {
-        let source = Tempo::demo().unwrap();
+        let (source, _source_directory) = crate::components::test_study();
         let data = source.export(&JsonSnapshotCodec).unwrap();
-        let components = Components::fixtures();
-        let empty = MemoryStore::new(
-            "destination-before-restore".into(),
+        let components = crate::components::test_components();
+        let directory = tempfile::tempdir().unwrap();
+        let empty = crate::components::test_store(
+            &directory,
+            "destination-before-restore",
             Catalog::default(),
-            components.learning.settings(),
+            &components,
+        );
+        let mut destination = Tempo::daily(
+            Box::new(empty),
+            components,
+            Default::default(),
+            [42; 32],
+            10,
         )
         .unwrap();
-        let mut destination = Tempo::new(Box::new(empty), components).unwrap();
         destination
             .restore("restored".into(), &data, &JsonSnapshotCodec)
             .unwrap();

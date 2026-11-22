@@ -23,11 +23,11 @@ pub struct PortableSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::{JsonSnapshotCodec, SnapshotCodec, Tempo};
+    use crate::{JsonSnapshotCodec, SnapshotCodec};
 
     #[test]
     fn portability_carries_content_and_learning_without_live_attempt_identity() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         app.next_exercise().unwrap();
         let text = app.export(&JsonSnapshotCodec).unwrap();
         let portable = JsonSnapshotCodec.decode(&text).unwrap();

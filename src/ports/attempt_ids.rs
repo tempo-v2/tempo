@@ -13,8 +13,7 @@ pub trait AttemptIds {
 #[cfg(test)]
 mod tests {
     use super::AttemptIds;
-    use crate::{Components, Tempo};
-    use tempo_store::MemoryStore;
+    use crate::Tempo;
     use tempo_types::AttemptId;
 
     struct ReservedIds(Vec<AttemptId>);
@@ -26,15 +25,23 @@ mod tests {
 
     #[test]
     fn a_custom_id_source_supplies_new_attempts_but_resume_does_not_allocate() {
-        let mut components = Components::fixtures();
+        let mut components = crate::components::test_components();
         components.ids = Box::new(ReservedIds(vec!["reserved-attempt".into()]));
-        let store = MemoryStore::new(
-            "ids-demo".into(),
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::components::test_store(
+            &directory,
+            "ids-demo",
             tempo_chess::demo_catalog(),
-            components.learning.settings(),
+            &components,
+        );
+        let mut app = Tempo::daily(
+            Box::new(store),
+            components,
+            Default::default(),
+            [42; 32],
+            10,
         )
         .unwrap();
-        let mut app = Tempo::new(Box::new(store), components).unwrap();
         let issued = app.next_exercise().unwrap().unwrap();
         assert_eq!(issued.attempt.id, AttemptId::from("reserved-attempt"));
         // Only one ID was available. A second Next resumes without asking for one.

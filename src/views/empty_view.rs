@@ -28,22 +28,19 @@ pub struct EmptyView {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Components, Tempo,
+        Tempo,
         wire::{StudyCommand, StudyView},
     };
     use tempo_chess::Catalog;
-    use tempo_store::MemoryStore;
 
     #[test]
     fn asking_an_empty_dataset_returns_an_empty_view_without_fabricating_an_attempt() {
-        let components = Components::fixtures();
-        let store = MemoryStore::new(
-            "empty".into(),
-            Catalog::default(),
-            components.learning.settings(),
-        )
-        .unwrap();
-        let mut app = Tempo::new(Box::new(store), components).unwrap();
+        let components = crate::components::test_components();
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            crate::components::test_store(&directory, "empty", Catalog::default(), &components);
+        let mut app =
+            Tempo::daily(Box::new(store), components, Default::default(), [42; 32], 0).unwrap();
         let StudyView::Empty(view) = app.handle(StudyCommand::Next) else {
             panic!("no content means no eligible exercise");
         };
