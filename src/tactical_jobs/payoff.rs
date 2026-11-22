@@ -1,24 +1,19 @@
 //! Upgrade retained generated definitions while the normal analysis window is open.
 use crate::tactical_engine::PayoffEngine;
 use crate::{
-    AppError, application::tactical_analysis::continuation_roots,
+    AppError,
+    application::tactical_analysis::{Continuations, TacticalDetails, continuation_roots},
     game_detection::DetectionCompletion,
 };
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    thread::JoinHandle,
-};
-use tempo_chess::{
-    ContentItem, DetectionControl, DetectionStop, EvaluationFailure, short_generated_decision,
-};
-use tempo_store::{SqliteStore, TacticPayoffPublication};
+use tempo_chess::{ContentItem, DetectionControl, DetectionStop, EvaluationFailure};
+use tempo_store::SqliteStore;
 use tempo_types::DatasetId;
-use tempo_types::{ContentVersion, TargetId};
 
 struct Cancel(Arc<AtomicBool>);
 impl DetectionControl for Cancel {
@@ -32,7 +27,6 @@ impl DetectionControl for Cancel {
 }
 
 struct Pending {
-    id: i64,
     dataset: DatasetId,
     item: ContentItem,
     cancel: Arc<AtomicBool>,
@@ -41,19 +35,27 @@ struct Pending {
 
 struct NewPuzzleSearch {
     cancel: Arc<AtomicBool>,
-    worker: JoinHandle<BTreeMap<usize, Vec<String>>>,
+    worker: JoinHandle<Continuations>,
+}
+
+struct PendingRecognition {
+    dataset: DatasetId,
+    id: i64,
+    evidence: String,
+    cancel: Arc<AtomicBool>,
+    worker: JoinHandle<Option<tempo_chess::TacticRecognition>>,
 }
 
 pub(super) struct Payoffs {
     engine: PayoffEngine,
     dataset: Option<DatasetId>,
-    before: i64,
+    after: String,
     next: Instant,
-    // A complete search that proves no extension needs no more engine time
-    // for this version. A target held by an earlier request is revisited.
-    checked: BTreeSet<(TargetId, ContentVersion)>,
     pending: Option<Pending>,
     new_puzzle: Option<NewPuzzleSearch>,
+    recognition: Option<PendingRecognition>,
+    recognition_before: i64,
+    recognition_next: Instant,
 }
 
 impl Payoffs {
@@ -61,11 +63,13 @@ impl Payoffs {
         Self {
             engine,
             dataset: None,
-            before: i64::MAX,
+            after: String::new(),
             next: Instant::now(),
-            checked: BTreeSet::new(),
             pending: None,
             new_puzzle: None,
+            recognition: None,
+            recognition_before: i64::MAX,
+            recognition_next: Instant::now(),
         }
     }
     pub(super) fn start_new_puzzle(&mut self, result: &DetectionCompletion) {
@@ -85,7 +89,7 @@ impl Payoffs {
                         engine
                             .variation(&fen, &answer, &control)
                             .ok()
-                            .map(|line| (index, line))
+                            .map(|line| ((index, answer.uci), line))
                     })
                     .collect()
             }),
@@ -94,7 +98,7 @@ impl Payoffs {
 
     // The completed detection stays available even if this optional search
     // stops, times out, or fails. Pending denotes only continuation work.
-    pub(super) fn new_puzzle_lines(&mut self) -> Option<BTreeMap<usize, Vec<String>>> {
+    pub(super) fn new_puzzle_lines(&mut self) -> Option<Continuations> {
         if self
             .new_puzzle
             .as_ref()
@@ -114,6 +118,9 @@ impl Payoffs {
         if let Some(job) = &self.new_puzzle {
             job.cancel.store(true, Ordering::Relaxed);
         }
+        if let Some(job) = &self.recognition {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(job) = &self.pending {
             job.cancel.store(true, Ordering::Relaxed)
         }
@@ -122,13 +129,30 @@ impl Payoffs {
         &mut self,
         store: &SqliteStore,
         dataset: &DatasetId,
+        report_version: &str,
     ) -> Result<bool, AppError> {
         debug_assert!(self.new_puzzle.is_none());
         if self.dataset.as_ref() != Some(dataset) {
             self.cancel();
-            self.checked.clear();
-            self.before = i64::MAX;
+            self.after.clear();
+            self.recognition_before = i64::MAX;
+            self.recognition_next = Instant::now();
             self.dataset = Some(dataset.clone());
+        }
+        if self
+            .recognition
+            .as_ref()
+            .is_some_and(|job| !job.worker.is_finished())
+        {
+            return Ok(true);
+        }
+        if let Some(job) = self.recognition.take() {
+            if let Ok(Some(result)) = job.worker.join()
+                && &job.dataset == dataset
+            {
+                store.publish_tactic_recognition(dataset, job.id, &job.evidence, &result)?;
+            }
+            return Ok(false);
         }
         if self
             .pending
@@ -143,28 +167,10 @@ impl Payoffs {
                 .join()
                 .map_err(|_| AppError::new("analysis_failed", "Puzzle analysis worker stopped."))?;
             if &job.dataset == dataset {
-                match result {
-                    Ok(pv) => {
-                        let candidate = tempo_chess::extend_generated_tactic(&job.item, &pv)
-                            .map_err(|e| AppError::new("invalid_tactic", e.to_string()))?;
-                        let done = match candidate {
-                            Some(extension) => {
-                                matches!(
-                                    store.publish_tactic_payoff(dataset, job.id, &extension)?,
-                                    TacticPayoffPublication::Published
-                                        | TacticPayoffPublication::ConflictingDefinition
-                                )
-                            }
-                            None => true,
-                        };
-                        if done {
-                            self.checked.insert((job.item.target, job.item.version));
-                        }
-                    }
-                    Err(EvaluationFailure::Stopped(_)) => {
-                        self.before = job.id + 1;
-                    }
-                    Err(_) => {} // retry on the next pass
+                if let Ok(pv) = result {
+                    let verdict = tempo_chess::requalify_game_tactic(&job.item, &pv)
+                        .map_err(|e| AppError::new("invalid_tactic", e.to_string()))?;
+                    store.publish_game_tactic_qualification(dataset, &job.item, verdict)?;
                 }
             }
             // Release this dispatch turn to game detection before starting
@@ -172,30 +178,24 @@ impl Payoffs {
             return Ok(false);
         }
         if Instant::now() < self.next {
-            return Ok(false);
+            return self.start_recognition(store, dataset, report_version);
         }
-        let page = store.game_tactic_candidates(dataset, self.before)?;
+        let page = store.pending_game_tactic_qualifications(dataset, &self.after)?;
         if page.is_empty() {
-            self.before = i64::MAX;
+            self.after.clear();
             self.next = Instant::now() + Duration::from_secs(60);
-            return Ok(false);
+            return self.start_recognition(store, dataset, report_version);
         }
-        for (id, item) in page {
-            self.before = id;
-            let Some(decision) = short_generated_decision(&item) else {
-                continue;
-            };
-            if self.checked.contains(&(item.target.clone(), item.version))
-                || store.tactic_payoff_held(dataset, &item)?
-            {
+        for item in page {
+            self.after.clone_from(&item.target.0);
+            if store.game_tactic_qualification_held(dataset, &item)? {
                 continue;
             }
-            let decision = decision.clone();
+            let decision = item.definition.decisions[0].clone();
             let engine = self.engine.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             let control = Cancel(cancel.clone());
             self.pending = Some(Pending {
-                id,
                 dataset: dataset.clone(),
                 item,
                 cancel,
@@ -207,6 +207,48 @@ impl Payoffs {
         }
         Ok(self.pending.is_some())
     }
+    fn start_recognition(
+        &mut self,
+        store: &SqliteStore,
+        dataset: &DatasetId,
+        report_version: &str,
+    ) -> Result<bool, AppError> {
+        if Instant::now() < self.recognition_next {
+            return Ok(false);
+        }
+        let page =
+            store.pending_tactic_recognition(dataset, report_version, self.recognition_before)?;
+        let Some((id, evidence)) = page.into_iter().next() else {
+            self.recognition_before = i64::MAX;
+            self.recognition_next = Instant::now() + Duration::from_secs(60);
+            return Ok(false);
+        };
+        self.recognition_before = id;
+        let detail: TacticalDetails = serde_json::from_str(&evidence)
+            .map_err(|e| AppError::new("invalid_tactical_history", e.to_string()))?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let control = Cancel(cancel.clone());
+        let engine = self.engine.clone();
+        self.recognition = Some(PendingRecognition {
+            dataset: dataset.clone(),
+            id,
+            evidence,
+            cancel,
+            worker: std::thread::spawn(move || {
+                let mut lines = std::collections::BTreeMap::new();
+                for root in tempo_chess::recognition_roots(&detail.assessment) {
+                    let answer = tempo_chess::ChessAnswer::from(root.as_str());
+                    if let Ok(line) = engine.variation(&detail.fen, &answer, &control) {
+                        lines.insert(root, line);
+                    }
+                }
+                tempo_chess::recognize_game_tactics(&detail.assessment, &detail.fen, |root| {
+                    lines.get(&root.uci).map(Vec::as_slice)
+                })
+            }),
+        });
+        Ok(true)
+    }
 }
 
 impl Drop for Payoffs {
@@ -214,6 +256,9 @@ impl Drop for Payoffs {
         self.cancel();
         if let Some(job) = self.new_puzzle.take() {
             let _ = job.worker.join();
+        }
+        if let Some(recognition) = self.recognition.take() {
+            let _ = recognition.worker.join();
         }
         if let Some(pending) = self.pending.take() {
             let _ = pending.worker.join();

@@ -62,7 +62,7 @@ pub(crate) enum TacticalCommand {
 struct ReadyPosition {
     task: TacticalPositionTask,
     result: DetectionCompletion,
-    continuations: BTreeMap<usize, Vec<String>>,
+    continuations: crate::application::tactical_analysis::Continuations,
 }
 
 pub(crate) struct TacticalJobs {
@@ -262,7 +262,7 @@ impl TacticalJobs {
         // durable detection deadline starts only after the retained worker
         // has returned the slot.
         if let Some(payoffs) = &mut self.payoffs
-            && payoffs.advance_retained(store, &dataset)?
+            && payoffs.advance_retained(store, &dataset, &self.version)?
         {
             return Ok(());
         }

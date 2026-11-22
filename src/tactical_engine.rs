@@ -530,7 +530,7 @@ impl PayoffEngine {
                     return Err(EvaluationFailure::Failed);
                 }
                 let stdout = child.0.stdout.take().ok_or(EvaluationFailure::Failed)?;
-                return serde_json::from_reader(stdout.take(1024))
+                return serde_json::from_reader(stdout.take(8192))
                     .map_err(|_| EvaluationFailure::Failed);
             }
             if Instant::now() >= deadline {

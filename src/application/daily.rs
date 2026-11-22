@@ -149,6 +149,11 @@ impl Tempo {
                 }
                 if super::repertoires::is_suspended(item, &snapshot.suspended_repertoires)
                     || snapshot.excluded_tactics.contains(&item.target)
+                    || (snapshot.withheld_game_tactics.contains(&item.target)
+                        && !state
+                            .correction
+                            .as_ref()
+                            .is_some_and(|c| c.answer_version == item.version))
                 {
                     return None;
                 }

@@ -30,6 +30,8 @@ pub(crate) struct TacticalDetails {
     pub(crate) side_to_move: tempo_chess::LearnerColor,
     pub(crate) assessment: TacticalAssessment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recognition: Option<tempo_chess::TacticRecognition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) opponent_lead_in: Option<tempo_chess::OpponentLeadIn>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) skipped_analyses: Vec<String>,
@@ -77,31 +79,60 @@ impl<'a> DetectionPuzzle<'a> {
     }
 }
 
+// Searches are scoped to a recorded position and an engine-accepted
+// candidate root. Explored positions never become extra game observations.
+pub(crate) type Continuations = BTreeMap<(usize, String), Vec<String>>;
+
 pub(crate) fn continuation_roots(
     completion: &DetectionCompletion,
 ) -> Vec<(usize, String, tempo_chess::ChessAnswer)> {
     let DetectionStatus::Complete { findings, .. } = &completion.status else {
         return Vec::new();
     };
-    findings
-        .iter()
-        .enumerate()
-        .filter_map(|(index, finding)| {
-            let proposal =
-                DetectionPuzzle::from_assessment(finding.moment.tactical.as_ref()?).ok()??;
-            let (fen, answer) = match proposal {
-                DetectionPuzzle::Personal(puzzle)
-                    if puzzle.kind == tempo_chess::PersonalPuzzleKind::OnlyMove
-                        && puzzle.line.len() == 1 =>
-                {
-                    (puzzle.fen.as_str(), &puzzle.line[0])
-                }
-                DetectionPuzzle::Capture(fen, answer) => (fen, answer),
-                _ => return None,
-            };
-            Some((index, fen.to_owned(), answer.clone()))
-        })
-        .collect()
+    let mut roots = Vec::new();
+    for (index, finding) in findings.iter().enumerate() {
+        let Some(assessment) = finding.moment.tactical.as_ref() else {
+            continue;
+        };
+        let mut selected = tempo_chess::recognition_roots(assessment);
+        if let Some(puzzle) = assessment.personal.as_ref().and_then(|p| p.puzzle.as_ref())
+            && puzzle.kind == tempo_chess::PersonalPuzzleKind::OnlyMove
+        {
+            selected.insert(puzzle.line[0].uci.clone());
+        } else if let Some(puzzle) = &assessment.puzzle {
+            selected.insert(puzzle.answer.uci.clone());
+        }
+        roots.extend(selected.into_iter().map(|root| {
+            (
+                index,
+                finding.moment.fen.clone(),
+                tempo_chess::ChessAnswer::from(root.as_str()),
+            )
+        }));
+    }
+    roots
+}
+
+fn qualify_proposal(
+    proposal: DetectionPuzzle<'_>,
+    provenance: &[String],
+    continuations: &Continuations,
+    index: usize,
+) -> Result<Option<tempo_chess::GeneratedTacticalPuzzle>, tempo_chess::ChessError> {
+    let (prepared, root) = match proposal {
+        DetectionPuzzle::Personal(puzzle) => (
+            prepare_personal_puzzle(puzzle, provenance)?,
+            &puzzle.line[0],
+        ),
+        DetectionPuzzle::Capture(fen, root) => {
+            (prepare_tactical_puzzle(fen, root, provenance)?, root)
+        }
+    };
+    prepared.qualify(
+        continuations
+            .get(&(index, root.uci.clone()))
+            .map(Vec::as_slice),
+    )
 }
 
 impl Tempo {
@@ -179,7 +210,7 @@ impl Tempo {
         &mut self,
         game: &TacticalGame,
         completion: &DetectionCompletion,
-        continuations: &BTreeMap<usize, Vec<String>>,
+        continuations: &Continuations,
     ) -> Result<TacticalAcceptance, AppError> {
         let mut trace = crate::diagnostics::Span::new("tactics.acceptance");
         let basis = self.validate_tactical_source(game, completion)?;
@@ -256,13 +287,24 @@ impl Tempo {
                         }
                     };
                     let proposal = DetectionPuzzle::from_assessment(assessment)?;
-                    let train = if let Some(proposal) = proposal {
-                        let binding = self.store.tactical_training_binding(
+                    let binding = if proposal.is_some() {
+                        self.store.tactical_training_binding(
                             dataset,
                             game,
                             GAME_TACTICS_REPORT,
                             address,
-                        )?;
+                        )?
+                    } else {
+                        None
+                    };
+                    let prepared = proposal
+                        .map(|proposal| {
+                            qualify_proposal(proposal, &provenance, continuations, index)
+                        })
+                        .transpose()
+                        .map_err(|error| domain("invalid_tactical_puzzle", error))?
+                        .flatten();
+                    let train = if let Some(prepared) = prepared {
                         let mut plan_trace =
                             crate::diagnostics::Span::new("tactics.acceptance.plan");
                         plan_trace.field(
@@ -273,47 +315,33 @@ impl Tempo {
                                 "new_binding"
                             },
                         );
-                        let prepared = match proposal {
-                            DetectionPuzzle::Personal(puzzle) => {
-                                prepare_personal_puzzle(puzzle, &provenance)
-                            }
-                            DetectionPuzzle::Capture(fen, answer) => {
-                                prepare_tactical_puzzle(fen, answer, &provenance)
-                            }
-                        };
-                        let prepared = prepared.map(|puzzle| match continuations.get(&index) {
-                            Some(line) => puzzle.with_payoff(line),
-                            None => puzzle,
-                        });
-                        let plan = match prepared {
-                            Ok(puzzle) => {
-                                let matched = self
-                                    .store
-                                    .tactical_content_matches(dataset, &puzzle.lookup())?;
-                                let mut catalog = Catalog {
-                                    items: matched
-                                        .into_iter()
-                                        .map(|item| (item.target.clone(), item))
-                                        .collect(),
-                                    lines: Vec::new(),
-                                };
-                                catalog.items.extend(targets.iter().filter_map(
-                                    |(target, change)| {
-                                        change.content.clone().map(|item| (target.clone(), item))
-                                    },
-                                ));
-                                puzzle.plan(&catalog).map(|mut plan| {
-                                    let item = plan
-                                        .content
-                                        .catalog
-                                        .items
-                                        .remove(&plan.target)
-                                        .expect("planned tactic");
-                                    let changed = catalog.items.get(&item.target) != Some(&item);
-                                    (item, changed)
-                                })
-                            }
-                            Err(error) => Err(error),
+                        let plan = {
+                            let puzzle = prepared;
+                            let matched = self
+                                .store
+                                .tactical_content_matches(dataset, &puzzle.lookup())?;
+                            let mut catalog = Catalog {
+                                items: matched
+                                    .into_iter()
+                                    .map(|item| (item.target.clone(), item))
+                                    .collect(),
+                                lines: Vec::new(),
+                            };
+                            catalog
+                                .items
+                                .extend(targets.iter().filter_map(|(target, change)| {
+                                    change.content.clone().map(|item| (target.clone(), item))
+                                }));
+                            puzzle.plan(&catalog).map(|mut plan| {
+                                let item = plan
+                                    .content
+                                    .catalog
+                                    .items
+                                    .remove(&plan.target)
+                                    .expect("planned tactic");
+                                let changed = catalog.items.get(&item.target) != Some(&item);
+                                (item, changed)
+                            })
                         };
                         if let Some(binding) = binding {
                             // Legacy receipts can include the detached proposal.
@@ -350,7 +378,7 @@ impl Tempo {
                             Some(puzzle)
                         }
                     } else {
-                        None
+                        binding
                     };
                     let details = TacticalDetails {
                         schema_version: 1,
@@ -358,6 +386,15 @@ impl Tempo {
                         position: moment.position.0.clone(),
                         side_to_move: moment.side_to_move,
                         assessment: assessment.clone(),
+                        recognition: tempo_chess::recognize_game_tactics(
+                            assessment,
+                            &moment.fen,
+                            |root| {
+                                continuations
+                                    .get(&(index, root.uci.clone()))
+                                    .map(Vec::as_slice)
+                            },
+                        ),
                         opponent_lead_in: moment.opponent_lead_in.clone(),
                         skipped_analyses: finding
                             .skipped
