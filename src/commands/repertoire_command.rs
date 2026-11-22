@@ -54,6 +54,7 @@ pub enum RepertoireCommand {
         command_id: String,
         activity: tempo_store::RepertoireActivity,
     },
+    /// Read-only recovery of a Reset accepted by an older release.
     ResetProgress {
         dataset_id: DatasetId,
         repertoire_id: String,

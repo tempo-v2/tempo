@@ -22,9 +22,9 @@ use tempo_chess::{
 };
 use tempo_learning::{DailyLearning, LearningState};
 use tempo_store::{
-    ContentReceipt, ContentSource, ContentState, CoverageEditBasis, RepertoireActivity,
-    RepertoireActivityCommand, RepertoireActivityRead, RepertoireActivityResult, RepertoireReset,
-    Write, model_targets,
+    ContentReceipt, ContentSource, ContentState, CoverageEditBasis, PriorRepertoireReset,
+    RepertoireActivity, RepertoireActivityCommand, RepertoireActivityRead,
+    RepertoireActivityResult, Write, model_targets,
 };
 use tempo_types::{DatasetId, Revision};
 
@@ -145,7 +145,7 @@ impl Tempo {
             command_id,
         } = &command
         {
-            return self.reset_repertoire(dataset_id, repertoire_id, command_id);
+            return self.replay_repertoire_reset(dataset_id, repertoire_id, command_id);
         }
         if let RepertoireCommand::SetActivity {
             dataset_id,
@@ -417,8 +417,8 @@ impl Tempo {
         }))
     }
 
-    fn reset_repertoire(
-        &mut self,
+    fn replay_repertoire_reset(
+        &self,
         dataset: &DatasetId,
         repertoire: &str,
         command_id: &str,
@@ -429,24 +429,21 @@ impl Tempo {
                 "A reset command identity is required.",
             ));
         }
-        let at = self.components.clock.now();
-        match self.store.reset_repertoire(
-            dataset,
-            repertoire,
-            command_id,
-            at.unix_ms,
-            &LearningState::default(),
-        )? {
-            RepertoireReset::Applied(targets) => {
-                let daily = self.daily.as_mut().expect("daily release");
-                for target in &targets {
-                    daily.queue.clear_deferral(target);
-                }
+        match self
+            .store
+            .accepted_repertoire_reset(dataset, repertoire, command_id)?
+        {
+            PriorRepertoireReset::Replayed => {}
+            PriorRepertoireReset::NotAccepted => {
+                return Err(AppError::new(
+                    "retired_feature",
+                    "Resetting repertoire progress has been retired.",
+                ));
             }
-            RepertoireReset::Replayed => {}
-            RepertoireReset::UnknownRepertoire => return Err(unknown_repertoire()),
-            RepertoireReset::StaleDataset => return Err(super::content_preview::stale_dataset()),
-            RepertoireReset::CommandConflict => {
+            PriorRepertoireReset::StaleDataset => {
+                return Err(super::content_preview::stale_dataset());
+            }
+            PriorRepertoireReset::CommandConflict => {
                 return Err(AppError::new(
                     "command_conflict",
                     "This reset command was already used for another repertoire.",

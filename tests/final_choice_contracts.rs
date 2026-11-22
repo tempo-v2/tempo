@@ -247,7 +247,7 @@ fn choice_attribution_survives_reopen_and_reimport() {
 }
 
 #[test]
-fn old_choice_stays_closed_without_version_upgrade_or_reset_regrading() {
+fn old_choice_stays_closed_without_version_upgrade_or_retired_reset_regrading() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("versioned-choice.sqlite");
     let day = Arc::new(AtomicI32::new(20_004));
@@ -317,12 +317,13 @@ fn old_choice_stays_closed_without_version_upgrade_or_reset_regrading() {
     assert_eq!(store.game_failures(&dataset).unwrap().len(), 1);
     preview_and_save(&mut app, "1. e4 e5 2. d3 *", &name, Some(&rep));
     assert!(app.snapshot().unwrap().catalog.items[&target].active());
+    let before = app.snapshot().unwrap();
     let reset = content(
         &mut app,
         json!({"command":"reset_progress","dataset_id":dataset,"repertoire_id":rep,"command_id":"reset-after-choice"}),
     );
-    assert_eq!(reset["status"], "progress_reset");
-    let reset_learning = app.snapshot().unwrap().learning;
+    assert_eq!(reset["code"], "retired_feature");
+    assert_eq!(app.snapshot().unwrap(), before);
     let after = date_only_import(
         &mut app,
         "post-reset-reimport",
@@ -330,7 +331,7 @@ fn old_choice_stays_closed_without_version_upgrade_or_reset_regrading() {
         "1. e4 e5 2. Nc3",
     );
     assert!(after["results"][0].get("choices").is_none());
-    assert_eq!(app.snapshot().unwrap().learning, reset_learning);
+    assert_eq!(app.snapshot().unwrap().learning, before.learning);
     let failures = store.game_failures(&dataset).unwrap();
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].version, old_version);
@@ -339,6 +340,6 @@ fn old_choice_stays_closed_without_version_upgrade_or_reset_regrading() {
         0
     );
     eprintln!(
-        "guard passed: selected version1 remains historic through new answer version2, retirement/reactivation and reset; no fresh Game Again, no reopened choice"
+        "guard passed: selected version1 remains historic through new answer version2, retirement/reactivation and a retired reset request; no fresh Game Again, no reopened choice"
     );
 }

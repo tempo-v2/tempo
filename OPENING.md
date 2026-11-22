@@ -21,12 +21,6 @@ their history. Restoring a retired position compares its answer against the
 latest retained version. A changed answer preserves its first introduction and
 requires re-teaching without another introduction slot.
 
-Choose **Reset progress** on a saved repertoire to erase its Study history and
-review schedule. Confirm the repertoire by name. Its positions become new and
-Study teaches them under the usual daily allowance. The PGN, other repertoires,
-tactics and imported games are kept. Games played before the reset remain in
-Games history and do not affect the new Study schedule.
-
 Daily Study accepts repertoire PGN through the signed Preview and Save commands.
 The generic daily catalog method accepts active tactics only. The separate
 standard profile retains additive imports, which keep omitted content present.
