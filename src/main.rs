@@ -49,11 +49,19 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             };
             local_runtime::backfill_study_lead_ins(Path::new(database), transfer, apply)
         }
+        [mode, database, id, args @ ..] if mode == "split-black-repertoire" => {
+            let apply = match args {
+                [] => None,
+                [action, token] if action == "--apply" => Some(token.as_str()),
+                _ => return Err("Usage: tempo split-black-repertoire DATABASE ID [--apply TOKEN]".into()),
+            };
+            local_runtime::split_black_repertoire(Path::new(database), id, apply)
+        }
         [mode, database, ui, port] if mode == "serve" => {
             local_runtime::serve(Path::new(database), Path::new(ui), port.parse()?)
         }
         _ => Err(
-            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-game-capture-origins DATABASE TRANSFER.json [--apply] | backfill-personal-tactics DATABASE [--apply] | backfill-study-lead-ins DATABASE [TRANSFER.json] [--apply] | serve DATABASE UI_DIST PORT"
+            "Usage: tempo stdio | init DATABASE | configure DATABASE NEW_OPENINGS NEW_TACTICS [MORE_TACTICS] | import-tactics DATABASE NORMALIZED.json | backfill-game-capture-origins DATABASE TRANSFER.json [--apply] | backfill-personal-tactics DATABASE [--apply] | backfill-study-lead-ins DATABASE [TRANSFER.json] [--apply] | split-black-repertoire DATABASE ID [--apply TOKEN] | serve DATABASE UI_DIST PORT"
                 .into(),
         ),
     }

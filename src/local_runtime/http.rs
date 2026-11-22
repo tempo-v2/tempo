@@ -373,6 +373,8 @@ impl PhoneStudy {
                     | "/api/repertoires"
                     | "/api/games/coverage"
                     | "/api/games/coverage/status"
+                    | "/api/games/coverage/starting-line"
+                    | "/api/games/coverage/starting-line/save"
                     | "/api/games/gaps"
                     | "/api/games/gap-draft"
                     | "/api/games/gap-line"
@@ -660,6 +662,8 @@ fn respond_inner(
             | "/api/games/model"
             | "/api/games/coverage"
             | "/api/games/coverage/status"
+            | "/api/games/coverage/starting-line"
+            | "/api/games/coverage/starting-line/save"
             | "/api/games/gaps"
             | "/api/games/gap-draft"
             | "/api/games/gap-line"
@@ -721,6 +725,28 @@ fn respond_inner(
                 200,
                 command::<crate::coverage_scan::ReadCoverage>(&mut request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.coverage.read(app, intent)),
+            ),
+            (&Method::Post, "/api/games/coverage/starting-line") => (
+                200,
+                command::<crate::application::PreviousCoverageLineRequest>(
+                    &mut request,
+                    MAX_COMMAND_BYTES,
+                )
+                .and_then(|intent| match intent {
+                    crate::application::PreviousCoverageLineRequest::Read(read) => {
+                        app.coverage_line_options(read)
+                    }
+                    crate::application::PreviousCoverageLineRequest::Save(save) => {
+                        app.save_coverage_line(save)
+                    }
+                })
+                .map(|reply| serde_json::json!(reply)),
+            ),
+            (&Method::Post, "/api/games/coverage/starting-line/save") => (
+                200,
+                command::<crate::application::CoverageLineSave>(&mut request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| app.save_coverage_line(intent))
+                    .map(|reply| serde_json::json!(reply)),
             ),
             (&Method::Get, "/api/games/gaps") => (200, app.opponent_gaps(0)),
             (&Method::Post, "/api/games/gaps") => (
@@ -1113,6 +1139,8 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/backfill/retry" => "game_backfill_retry",
         "/api/games/model" => "game_model",
         "/api/games/coverage" => "repertoire_coverage_start",
+        "/api/games/coverage/starting-line/save" => "save_repertoire_coverage_starting_line",
+        "/api/games/coverage/starting-line" => "repertoire_coverage_starting_line",
         "/api/games/coverage/status" => "repertoire_coverage_status",
         "/api/games/gaps" => "game_gaps",
         "/api/games/gap-draft" => "game_gap_draft",

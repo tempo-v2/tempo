@@ -16,10 +16,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempo_chess::{
-    AuthoredRepertoire, ContentKind, LearnerColor, LearnerResponse, PositionCanonicalizer,
-    PositionKey, START_FEN, StandardPositionCanonicalizer, legal_successors,
+    AuthoredRepertoire, LearnerColor, LearnerResponse, PositionKey, legal_successors,
 };
-use tempo_store::{CoverageSummary, SqliteStore, Store};
+use tempo_store::{CoverageLineSetting, CoverageSummary, SqliteStore, Store};
 use tempo_types::DatasetId;
 
 mod gap_line;
@@ -43,6 +42,8 @@ pub(crate) struct StartCoverage {
     repertoire_id: String,
     through_move: u8,
     target_percent: u8,
+    #[serde(default)]
+    starting_line: CoverageLineSetting,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +84,7 @@ impl CoverageScan {
             return Err(stale_dataset());
         }
         let run = self.run.lock().expect("coverage scan");
+        let starting_line = app.saved_coverage_line(&request.dataset_id, &request.repertoire_id)?;
         let saved = app.coverage_summary(&request.dataset_id, &request.repertoire_id)?;
         let active = run.as_ref().filter(|run| {
             run.request.dataset_id == request.dataset_id
@@ -91,6 +93,7 @@ impl CoverageScan {
         let busy = run.as_ref().is_some_and(|run| run.status == "running");
         Ok(json!({
             "dataset_id": request.dataset_id, "repertoire_id": request.repertoire_id,
+            "starting_line": starting_line,
             "status": active.map_or(if saved.is_some() { "complete" } else { "idle" }, |run| run.status),
             "busy": busy,
             "request_id": active.map(|run| &run.request.request_id),
@@ -143,6 +146,7 @@ impl CoverageScan {
             {
                 if saved.target_percent != request.target_percent
                     || saved.through_move != request.through_move
+                    || saved.starting_line != request.starting_line
                 {
                     return Err(AppError::new(
                         "invalid_scan",
@@ -158,6 +162,13 @@ impl CoverageScan {
                 return Err(AppError::new(
                     "stale_coverage",
                     "The latest scan changed. Reload its status before starting again.",
+                ));
+            }
+            let current = app.saved_coverage_line(&request.dataset_id, &request.repertoire_id)?;
+            if current != request.starting_line {
+                return Err(AppError::new(
+                    "stale_coverage",
+                    "The starting line changed. Reload the scan.",
                 ));
             }
             *active = Some(Run {
@@ -225,11 +236,7 @@ fn scan(
         .targets
         .values()
         .next()
-        .and_then(|(_, item)| {
-            matches!(item.kind, ContentKind::Repertoire { .. })
-                .then(|| item.learner_color().ok())
-                .flatten()
-        })
+        .and_then(|(_, item)| item.learner_color().ok())
         .ok_or_else(|| {
             AppError::new(
                 "coverage_unavailable",
@@ -243,11 +250,17 @@ fn scan(
         ));
     }
     let mut sources = Sources::new(started + RUN_LIMIT, &store, explorer, cache, database);
-    let estimate = estimate(&authored, color, request.through_move, |position, moves| {
-        let result = sources.distribution(position, moves);
-        progress(sources.positions);
-        result
-    })?;
+    let estimate = estimate(
+        &authored,
+        color,
+        &request.starting_line.moves,
+        request.through_move,
+        |position, moves| {
+            let result = sources.distribution(position, moves);
+            progress(sources.positions);
+            result
+        },
+    )?;
     if estimate.unresolved >= 1.0 - EPSILON {
         return Err(AppError::new(
             "coverage_unavailable",
@@ -255,6 +268,11 @@ fn scan(
         ));
     }
     let summary = CoverageSummary {
+        starting_san: authored
+            .coverage_start(&request.starting_line.moves, color)
+            .map_err(|error| domain("invalid_scan", error))?
+            .san,
+        starting_line: request.starting_line.clone(),
         request_id: request.request_id.clone(),
         through_move: request.through_move,
         target_percent: request.target_percent,
@@ -469,34 +487,25 @@ impl Estimate {
 fn estimate(
     book: &AuthoredRepertoire,
     color: LearnerColor,
+    prefix: &[String],
     through_move: u8,
     mut evidence: impl FnMut(&PositionKey, &[String]) -> Distribution,
 ) -> Result<Estimate, AppError> {
     let mut result = Estimate::default();
-    let root = StandardPositionCanonicalizer
-        .canonicalize(START_FEN)
-        .map_err(|error| domain("invalid_repertoire", error))?;
-    let white = color == LearnerColor::White;
-    let start = if white {
-        match book
-            .learner_response(&root, color)
-            .map_err(|error| domain("invalid_repertoire", error))?
-        {
-            LearnerResponse::Prepared(next) => next.clone(),
-            _ => {
-                return Err(AppError::new(
-                    "invalid_repertoire",
-                    "The verified repertoire lacks its starting move.",
-                ));
-            }
-        }
-    } else {
-        root
-    };
+    let (start, first) = book
+        .coverage_frontier(prefix, color)
+        .map_err(|error| domain("invalid_scan", error))?;
+    let through = u16::from(through_move);
+    if !prefix.is_empty() && through < first {
+        return Err(AppError::new(
+            "invalid_scan",
+            format!("Choose a depth of at least move {first} for this starting line."),
+        ));
+    }
     let mut frontier = BTreeMap::from([(start, 1.0_f64)]);
     let mut probabilities = BTreeMap::new();
     let mut responses = BTreeMap::new();
-    for _ in 0..(through_move - u8::from(white)) {
+    for _ in first..=through {
         let mut current: Vec<_> = std::mem::take(&mut frontier).into_iter().collect();
         current.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (position, mass) in current {
@@ -562,7 +571,7 @@ mod tests {
     ) -> Estimate {
         let book = AuthoredRepertoire::parse(pgn).unwrap();
         let mut by_position = evidence.iter();
-        estimate(&book, color, depth, |_, _| {
+        estimate(&book, color, &[], depth, |_, _| {
             by_position
                 .next()
                 .unwrap_or(&&[][..])
@@ -571,6 +580,41 @@ mod tests {
                 .collect()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn black_conditioned_scan_samples_only_the_given_position_through_absolute_move_two() {
+        let book = AuthoredRepertoire::parse("1.e4 c6 2.d4 d5 *\n\n1.d4 d5 2.c4 c6 *").unwrap();
+        let color = LearnerColor::Black;
+        let line = vec!["e2e4".into(), "c7c6".into()];
+        let given = book.coverage_start(&line, color).unwrap().position;
+        let run = |d4| {
+            let mut lookups = 0;
+            let estimate = estimate(&book, color, &line, 2, |position, _| {
+                assert_eq!(position, &given);
+                lookups += 1;
+                BTreeMap::from([("d2d4".into(), d4), ("g1f3".into(), 0.25)])
+            })
+            .unwrap();
+            assert_eq!(lookups, 1);
+            estimate
+        };
+        let first = run(0.6);
+        approx(first.covered, 0.6);
+        approx(first.unresolved, 0.15);
+        assert_eq!(
+            first.suggestions(90),
+            vec![(given.clone(), "g1f3".into(), 0.25)]
+        );
+        approx(run(0.4).covered, 0.4);
+        let before_black_reply = &line[..1];
+        assert!(estimate(&book, color, before_black_reply, 1, |_, _| unreachable!()).is_err());
+        let after_forced_reply = estimate(&book, color, before_black_reply, 2, |position, _| {
+            assert_eq!(position, &given);
+            BTreeMap::from([("d2d4".into(), 1.0)])
+        })
+        .unwrap();
+        approx(after_forced_reply.covered, 1.0);
     }
 
     #[test]

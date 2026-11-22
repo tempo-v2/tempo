@@ -23,7 +23,7 @@ use tempo_chess::{
     AuthoredRepertoire, CoverageLine, LearnerColor, PositionKey, SavedRepertoireResponse,
     nearby_repertoire_positions,
 };
-use tempo_store::SqliteStore;
+use tempo_store::{CoverageEditBasis, SqliteStore};
 use tempo_types::Revision;
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -52,6 +52,7 @@ pub(crate) struct GapLineInput {
     pub name: String,
     pub color: LearnerColor,
     pub through_move: u8,
+    pub forecast: CoverageEditBasis,
 }
 
 #[derive(Default)]
@@ -65,6 +66,7 @@ struct LineRun {
     request: GapLineRequest,
     surface: AuthoringSurface,
     through_move: u8,
+    forecast: CoverageEditBasis,
     reached: Option<u16>,
     result: Option<Result<Arc<Preview>, AppError>>,
 }
@@ -129,6 +131,7 @@ impl CoverageScan {
             request: request.clone(),
             surface,
             through_move: input.through_move,
+            forecast: input.forecast.clone(),
             reached: None,
             result: None,
         });
@@ -168,6 +171,8 @@ impl CoverageScan {
             .gap
             .base_revision
             .expect("validated line revision");
+        let request = run.request.clone();
+        let forecast = run.forecast.clone();
         let through_move = run.through_move;
         let reached = run.reached;
         let result = run.result.clone();
@@ -184,7 +189,8 @@ impl CoverageScan {
             reply["steps"] = json!(preview.steps);
             reply["stop"] = json!(preview.reason);
             if preview.steps.iter().filter(|step| step.learner).count() > 1 {
-                reply["save_command"] = signed_save(app, &preview.save, revision, surface)?;
+                reply["save_command"] =
+                    signed_save(app, &preview.save, revision, surface, &request, &forecast)?;
             }
         }
         Ok(reply)
@@ -196,8 +202,10 @@ fn signed_save(
     input: &RepertoireInput,
     revision: Revision,
     surface: AuthoringSurface,
+    request: &GapLineRequest,
+    forecast: &CoverageEditBasis,
 ) -> Result<Value, AppError> {
-    let token = app.sign_gap_line(input, revision, surface)?;
+    let token = app.sign_gap_line(input, revision, surface, request, forecast)?;
     let mut save = json!(input);
     save["command"] = json!("save");
     save["token"] = json!(token);

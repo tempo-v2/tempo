@@ -40,6 +40,12 @@ impl From<StoreError> for AppError {
             StoreError::Conflict(_) => "store_conflict",
             StoreError::Invalid(_) => "store_invalid",
             StoreError::Unsupported(_) => "unsupported_capability",
+            StoreError::StaleCoverage => {
+                return AppError::new(
+                    "stale_coverage",
+                    "The coverage forecast changed. Reopen the gap before saving.",
+                );
+            }
         };
         crate::diagnostics::emit(
             "application.error",
