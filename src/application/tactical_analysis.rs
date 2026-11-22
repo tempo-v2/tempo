@@ -118,7 +118,7 @@ fn qualify_proposal(
     provenance: &[String],
     continuations: &Continuations,
     index: usize,
-) -> Result<Option<tempo_chess::GeneratedTacticalPuzzle>, tempo_chess::ChessError> {
+) -> Result<Option<tempo_chess::QualifiedTacticalPuzzle>, tempo_chess::ChessError> {
     let (prepared, root) = match proposal {
         DetectionPuzzle::Personal(puzzle) => (
             prepare_personal_puzzle(puzzle, provenance)?,
@@ -332,29 +332,32 @@ impl Tempo {
                                 .extend(targets.iter().filter_map(|(target, change)| {
                                     change.content.clone().map(|item| (target.clone(), item))
                                 }));
-                            puzzle.plan(&catalog).map(|mut plan| {
-                                let item = plan
-                                    .content
-                                    .catalog
-                                    .items
-                                    .remove(&plan.target)
-                                    .expect("planned tactic");
-                                let changed = catalog.items.get(&item.target) != Some(&item);
-                                (item, changed)
+                            puzzle.plan(&catalog).map(|plan| {
+                                plan.map(|mut plan| {
+                                    let item = plan
+                                        .content
+                                        .catalog
+                                        .items
+                                        .remove(&plan.target)
+                                        .expect("planned tactic");
+                                    let changed = catalog.items.get(&item.target) != Some(&item);
+                                    (item, changed)
+                                })
                             })
                         };
                         if let Some(binding) = binding {
                             // Legacy receipts can include the detached proposal.
                             // Its resolution changes no retained content or Learning.
                             plan.ok()
+                                .flatten()
                                 .map(|(item, _)| TacticalPuzzleRef {
                                     target: item.target,
                                     version: item.version,
                                 })
                                 .or(Some(binding))
-                        } else {
-                            let (item, changed) =
-                                plan.map_err(|error| domain("invalid_tactical_puzzle", error))?;
+                        } else if let Some((item, changed)) =
+                            plan.map_err(|error| domain("invalid_tactical_puzzle", error))?
+                        {
                             let staged = targets.entry(item.target.clone()).or_default();
                             if staged.introduction.is_none() {
                                 let prior = self
@@ -376,6 +379,8 @@ impl Tempo {
                                 staged.content = Some(item);
                             }
                             Some(puzzle)
+                        } else {
+                            None
                         }
                     } else {
                         binding
