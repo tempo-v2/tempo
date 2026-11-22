@@ -43,7 +43,6 @@ pub(super) struct DailyStudy {
     pub(super) tactic_themes: Option<TacticThemes>,
     pub(super) queue: DailySession,
     pub(super) preview_key: [u8; 32],
-    pub(super) more_tactics: usize,
 }
 
 impl Tempo {
@@ -53,7 +52,7 @@ impl Tempo {
         components: DailyComponents,
         limits: IntroductionLimits,
         preview_key: [u8; 32],
-        more_tactics: usize,
+        _legacy_more_tactics: usize,
     ) -> Result<Self, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.daily.daily");
         Self::assemble(
@@ -64,7 +63,6 @@ impl Tempo {
                 tactic_themes: None,
                 queue: DailySession::default(),
                 preview_key,
-                more_tactics,
             },
         )
     }
@@ -264,7 +262,6 @@ impl Tempo {
         selection: DailySelection,
     ) -> StudyView {
         let _diagnostic = crate::diagnostics::Span::new("app.daily.daily_summary");
-        let more = self.daily.as_ref().expect("daily release").more_tactics;
         let done = selection.outstanding == 0;
         StudyView::Empty(EmptyView {
             schema_version: STUDY_WIRE_VERSION,
@@ -276,9 +273,9 @@ impl Tempo {
             outstanding: selection.outstanding,
             repertoire_remaining: selection.repertoire_remaining,
             tactics_remaining: selection.tactics_remaining,
-            can_practice_tactics: done && selection.practice.is_some(),
-            can_learn_more_tactics: done && selection.unseen_tactics && more > 0,
-            learn_more_count: more,
+            can_practice_tactics: false,
+            can_learn_more_tactics: false,
+            learn_more_count: 0,
         })
     }
 

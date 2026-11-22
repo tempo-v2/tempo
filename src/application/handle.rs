@@ -28,11 +28,11 @@ impl Tempo {
         let result: Result<StudyView, AppError> = match command {
             StudyCommand::Next => self.next_view(),
             StudyCommand::StudyStatus => self.study_status(),
-            StudyCommand::PracticeTactics => self.practice_tactics(),
+            StudyCommand::PracticeTactics => Err(super::optional_tactics::retired_optional_tactics()),
             StudyCommand::LearnMoreTactics {
                 dataset_id,
                 submission_id,
-            } => self.learn_more_tactics(dataset_id, submission_id),
+            } => self.replay_retired_allowance(dataset_id, submission_id),
             StudyCommand::ResumeSkipped => {
                 if let Some(daily) = &mut self.daily {
                     daily.queue.resume_skipped();

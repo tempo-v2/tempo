@@ -153,7 +153,7 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     const before = persisted(database);
     const page = await post('tactics-collection', { command: 'list', search: 'Lichess CC0' });
     assert.equal(page.dataset_id, issued.dataset_id);
-    assert.deepEqual(page.rows, [{ target: issued.target_id, label: tactic.label, introduced: false, due: false }]);
+    assert.deepEqual(page.rows, [{ target: issued.target_id, label: tactic.label, introduced: false, due: false, removed_from_study: false }]);
     const detail = { command: 'detail', dataset_id: page.dataset_id, target: issued.target_id, show_solution: true };
     const blocked = await post('tactics-collection', detail);
     assert.equal(blocked.solution_blocked, true);
@@ -228,18 +228,19 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     assert.deepEqual(sent.slice(continuation), [{ command: 'next' }, { command: 'next' }]);
     assert.equal(reloaded.status, 'empty');
     assert.equal(reloaded.done, true);
-    assert.equal(reloaded.can_practice_tactics, true);
-    const schedulingRows = () => databaseRows(database).filter(([name]) =>
-        name === 'learning' || name === 'daily_tactics_allowances');
-    const beforePractice = schedulingRows();
-    const practice = await client.practiceTactics();
-    assert.equal(practice.activity, 'practice');
-    assert.notEqual(practice.attempt_id, issued.attempt_id);
-    assert.equal(practice.display_fen, issued.display_fen);
-    await client.answer('a6c8');
-    assert.equal((await client.answer('e1e8')).assessment, 'good');
+    assert.equal(reloaded.can_practice_tactics, false);
+    assert.equal(reloaded.can_learn_more_tactics, false);
+    const beforeRetired = databaseRows(database);
+    for (const command of [
+        { command: 'practice_tactics' },
+        { command: 'learn_more_tactics', dataset_id: issued.dataset_id, submission_id: 'new-extra' },
+    ]) {
+        const retired = await post('study', command);
+        assert.equal(retired.code, 'retired_activity');
+        assert.equal(retired.retryable, false);
+    }
     assert.deepEqual(persisted(database).grades, ['again']);
-    assert.deepEqual(schedulingRows(), beforePractice);
+    assert.deepEqual(databaseRows(database), beforeRetired);
     assert.equal((await client.next()).status, 'empty');
 });
 
@@ -335,7 +336,23 @@ test('large PGN commands reach repertoire, tactic, and Games consumers', { timeo
     assert.match(truncatedReply, /Could not read the command/);
 
     const { dataset_id } = await post('repertoires', { command: 'list' });
-    const padding = '[Site "' + 'a'.repeat(2 * 1024 * 1024) + '"]\n';
+    const oversized = connect(Number(address.port), address.hostname);
+    oversized.setTimeout(5_000, () => oversized.destroy(new Error('Timed out waiting for size rejection')));
+    oversized.end([
+        'POST /api/repertoires HTTP/1.1',
+        'Host: ' + address.host,
+        'Content-Type: application/json',
+        'Content-Length: ' + (2 * 1024 * 1024 + 1),
+        'Connection: close',
+        '',
+        '',
+    ].join('\r\n'));
+    let oversizedReply = '';
+    for await (const chunk of oversized) oversizedReply += chunk;
+    assert.match(oversizedReply, /^HTTP\/1\.1 413 /);
+    assert.match(oversizedReply, /at most 2048 KiB/);
+
+    const padding = '[Site "' + 'a'.repeat(1900 * 1024) + '"]\n';
     const input = { dataset_id, name: 'Large', learner_color: 'white', pgn: padding + '1.e4 e5 *' };
     const preview = await post('repertoires', { command: 'preview', ...input });
     assert.equal(preview.status, 'preview', JSON.stringify(preview));

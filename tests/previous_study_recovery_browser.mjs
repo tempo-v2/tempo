@@ -68,20 +68,15 @@ function count(snapshot, table) {
   return snapshot.find(([name]) => name === table)[1].length;
 }
 
-function assertReplayPreservedRows(after, before) {
-  const oldTables = new Set(before.map(([name]) => name));
-  for (const [name, rows] of after.filter(([name]) => !oldTables.has(name))) {
-    assert.ok([
-      "repertoire_suspensions",
-      "game_participation_revisions",
-      "repertoire_coverage",
-      "repertoire_coverage_gaps",
-      "repertoire_run_steps",
-      "study_exclusions",
-    ].includes(name));
-    assert.deepEqual(rows, []);
-  }
-  assert.deepEqual(after.filter(([name]) => oldTables.has(name)), before);
+function assertUpgradePreservedAcceptedWork(after, before) {
+  const retained = new Set([
+    "attempts", "assessments", "learning", "receipts",
+    "content_history", "content_receipts", "daily_tactics_allowances",
+  ]);
+  assert.deepEqual(
+    after.filter(([name]) => retained.has(name)),
+    before.filter(([name]) => retained.has(name)),
+  );
 }
 
 async function missTactic(page) {
@@ -103,6 +98,7 @@ try {
 
   for (const kind of ["answer", "learn_more_tactics"]) {
     for (const acceptedBeforeUpgrade of [true, false]) {
+      const retiredAllowance = kind === "learn_more_tactics" && !acceptedBeforeUpgrade;
       const database = join(directory, `${kind}-${acceptedBeforeUpgrade}.sqlite`);
       execFileSync(previous, ["init-practice", database]);
       execFileSync(previous, ["import-tactics", database, transfer]);
@@ -151,6 +147,8 @@ try {
       await page.unroute(studyApi);
       await stop();
       assert.equal(await start(binary, database, ui, new URL(origin).port), origin);
+      const afterUpgrade = databaseRows(database);
+      assertUpgradePreservedAcceptedWork(afterUpgrade, afterOld);
       const commandsAfterUpgrade = [];
       if (kind === "learn_more_tactics") {
         // The accepted allowance normally continues with a separate Next.
@@ -173,7 +171,11 @@ try {
       assert.equal(response.status(), 200);
       assert.equal(response.request().postData(), immutableBytes, "candidate replay must send exact old bytes");
       const result = await response.json();
-      assert.equal(result.status, kind === "answer" ? "ready" : "empty", JSON.stringify(result));
+      assert.equal(
+        result.status,
+        retiredAllowance ? "error" : (kind === "answer" ? "ready" : "empty"),
+        JSON.stringify(result),
+      );
       if (kind === "answer") {
         const { tactic_explanation, ...feedback } = result.feedback;
         assert.deepEqual(tactic_explanation, {kind: "mating_line"});
@@ -185,24 +187,32 @@ try {
         }
       } else if (priorReply) {
         assert.deepEqual(result, priorReply);
+      } else {
+        assert.equal(result.code, "retired_activity");
+        assert.equal(result.retryable, false);
       }
-      if (kind === "learn_more_tactics") {
+      if (kind === "learn_more_tactics" && acceptedBeforeUpgrade) {
         await page.getByRole("button", { name: "Retry next exercise" }).waitFor();
       } else {
         await page.waitForFunction(key => JSON.parse(sessionStorage.getItem(key)).pending === null, recoveryKey);
       }
 
       const after = databaseRows(database);
-      assert.equal(count(after, "receipts"), count(prior, "receipts") + 1);
+      assert.equal(count(after, "receipts"), count(prior, "receipts") + Number(!retiredAllowance));
       if (kind === "answer") {
         assert.equal(result.assessment, "again");
         assert.equal(count(after, "assessments"), count(prior, "assessments") + 1);
       } else {
         assert.equal(count(after, "assessments"), count(prior, "assessments"));
-        assert.equal(count(after, "daily_tactics_allowances"), count(prior, "daily_tactics_allowances") + 1);
+        assert.equal(
+          count(after, "daily_tactics_allowances"),
+          count(prior, "daily_tactics_allowances") + Number(acceptedBeforeUpgrade),
+        );
       }
-      if (acceptedBeforeUpgrade) assertReplayPreservedRows(after, afterOld);
-      if (kind === "learn_more_tactics") {
+      if (acceptedBeforeUpgrade || retiredAllowance) assert.deepEqual(after, afterUpgrade);
+      if (retiredAllowance) {
+        assert.deepEqual(commandsAfterUpgrade, ["learn_more_tactics"]);
+      } else if (kind === "learn_more_tactics") {
         const next = page.waitForResponse(response =>
           response.url().endsWith("/api/study") && response.request().postDataJSON().command === "next");
         await page.getByRole("button", { name: "Retry next exercise" }).click();
@@ -212,7 +222,9 @@ try {
       }
       await page.close();
       await stop();
-      console.log(`Replayed prior installed ${kind} (${acceptedBeforeUpgrade ? "accepted, reply lost" : "unaccepted"}) exactly once.`);
+      console.log(retiredAllowance
+        ? "Retired the unaccepted prior allowance without a durable effect."
+        : `Replayed prior installed ${kind} (${acceptedBeforeUpgrade ? "accepted, reply lost" : "unaccepted"}) exactly once.`);
     }
   }
 
@@ -267,6 +279,8 @@ try {
     await page.unroute(repertoireApi);
     await stop();
     assert.equal(await start(binary, database, ui, new URL(origin).port), origin);
+    const afterUpgrade = databaseRows(database);
+    assertUpgradePreservedAcceptedWork(afterUpgrade, afterOld);
     const candidate = page.waitForResponse(response =>
       response.url().endsWith("/api/repertoires") && response.request().postDataJSON().command === "save");
     await page.reload();
@@ -284,7 +298,7 @@ try {
     const after = databaseRows(database);
     assert.equal(count(after, "content_receipts"), 1);
     assert.equal(count(after, "repertoire_documents"), 1);
-    if (acceptedBeforeUpgrade) assertReplayPreservedRows(after, afterOld);
+    if (acceptedBeforeUpgrade) assert.deepEqual(after, afterUpgrade);
     await page.close();
     await stop();
     console.log(`Replayed prior installed repertoire save (${acceptedBeforeUpgrade ? "accepted, reply lost" : "unaccepted"}) exactly once.`);

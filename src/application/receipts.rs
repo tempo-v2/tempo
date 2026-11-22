@@ -13,6 +13,17 @@ pub(super) fn replay_accepted_study(
     id: &SubmissionId,
     command: &str,
 ) -> Result<Option<AnswerResult>, AppError> {
+    replay_accepted_receipt(store, dataset, id, command)?
+        .map(study_result)
+        .transpose()
+}
+
+pub(super) fn replay_accepted_receipt(
+    store: &(impl StudyReceiptRead + ?Sized),
+    dataset: &DatasetId,
+    id: &SubmissionId,
+    command: &str,
+) -> Result<Option<ReceiptResult>, AppError> {
     validate_id(id)?;
     match store.study_receipt(dataset, id)? {
         StudyReceiptLookup::WrongDataset => Err(AppError::new(
@@ -22,7 +33,7 @@ pub(super) fn replay_accepted_study(
         StudyReceiptLookup::Missing => Ok(None),
         StudyReceiptLookup::Found(receipt) => {
             check_command(&receipt, command)?;
-            study_result(receipt.result).map(Some)
+            Ok(Some(receipt.result))
         }
     }
 }
