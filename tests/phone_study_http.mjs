@@ -65,7 +65,12 @@ function send(host, route, { method = "GET", headers = {}, payload } = {}) {
     });
     req.on("error", reject);
     req.on("timeout", () => req.destroy(new Error("HTTP fixture timed out")));
-    req.end(bytes);
+    if (headers.Expect === "100-continue") {
+      req.once("continue", () => req.end(bytes));
+      req.flushHeaders();
+    } else {
+      req.end(bytes);
+    }
   });
 }
 
@@ -92,11 +97,13 @@ test("phone Study retains its shared commands and denies desktop routes after in
   assert.deepEqual(await send(host, "/"), { status: 200, body: "Desktop fixture" });
   assert.deepEqual(await send(host, "/", { headers: phoneHeaders }), { status: 200, body: "Phone fixture" });
   const desktop = await post("/api/study-progress", null);
+  assert.equal(typeof desktop.stamp?.dataset_id, "string", JSON.stringify(desktop));
   assert.deepEqual(await post("/api/study-progress", null, phoneHeaders), desktop);
   const sql = new DatabaseSync(database, { timeout: 5000 });
   const { dataset_id: contextDataset, policy } = sql.prepare(
     "SELECT dataset_id, policy FROM store_state WHERE singleton=1"
   ).get();
+  assert.equal(desktop.stamp.dataset_id, contextDataset);
   const { user_version } = sql.prepare("PRAGMA user_version").get();
   try {
     sql.prepare("UPDATE store_state SET policy='not-json' WHERE singleton=1").run();
@@ -122,9 +129,19 @@ test("phone Study retains its shared commands and denies desktop routes after in
   const beforeAdmission = databaseRows(database);
   const oversizedPgn = { command: "save", pgn: " ".repeat(2 * 1024 * 1024) };
   for (const route of ["/api/repertoires", "/api/tactics", "/api/games/import"]) {
-    const reply = await send(host, route, { method: "POST", payload: oversizedPgn });
-    assert.match(reply.body, /"code":"invalid_command"/);
-    assert.match(reply.body, /2048 KiB/);
+    const reply = await send(host, route, {
+      method: "POST",
+      payload: oversizedPgn,
+      headers: {
+        Expect: "100-continue",
+        "Content-Length": Buffer.byteLength(JSON.stringify(oversizedPgn)),
+      },
+    });
+    assert.equal(reply.status, 413, reply.body);
+    const error = JSON.parse(reply.body);
+    assert.equal(error.code, "invalid_command");
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /2048 KiB/);
   }
   assert.deepEqual(databaseRows(database), beforeAdmission);
   const before = databaseRows(database);

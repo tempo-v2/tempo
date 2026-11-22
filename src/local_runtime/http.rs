@@ -1,4 +1,7 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
+mod ingress;
+
+use self::ingress::{Admission, Head, Header, MAX_REPLY_BYTES, Request, Response, Server};
 use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
@@ -12,17 +15,23 @@ use crate::{
     personal_tactics_report::{ReportCache, report_generation},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
+use hyper::{
+    Method, StatusCode,
+    body::Bytes,
+    header::{HeaderName, HeaderValue},
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
-    net::Ipv4Addr,
+    io::{Read, Write},
+    net::{Ipv4Addr, TcpListener},
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tempo_store::SqliteStore;
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
@@ -36,14 +45,16 @@ pub(super) fn serve(
     detection: GameDetection,
     engine: Option<crate::tactical_engine::PayoffEngine>,
 ) -> LocalResult<()> {
-    let server = Server::http((Ipv4Addr::LOCALHOST, port))?;
-    let address = server.server_addr().to_string();
-    let surfaces = HttpSurfaces {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    let address = listener.local_addr()?.to_string();
+    let surfaces = Arc::new(HttpSurfaces {
         origin: format!("http://{address}"),
         address,
         desktop: build_files(ui)?,
         phone: PhoneStudy::load(ui)?,
-    };
+    });
+    let ingress_surfaces = surfaces.clone();
+    let server = Server::start(listener, move |head| ingress_surfaces.admitted(head))?;
     println!("Tempo study at {}", surfaces.origin);
     crate::diagnostics::emit(
         "runtime.listening",
@@ -171,9 +182,9 @@ impl TacticalReportWorker {
         Ok(Self(sender))
     }
 
-    fn submit(&self, mut request: Request, version: &str) -> LocalResult<()> {
+    fn submit(&self, request: Request, version: &str) -> LocalResult<()> {
         let mut trace = Span::new("tactics.report.admission");
-        let read = match command(&mut request, MAX_COMMAND_BYTES) {
+        let read = match command(&request, MAX_COMMAND_BYTES) {
             Ok(read) => read,
             Err(error) => {
                 trace.set_outcome("invalid");
@@ -227,11 +238,8 @@ fn report_response(request: Request, result: Result<Value, AppError>) -> LocalRe
     };
     respond_traced(
         request,
-        body(
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&value)?,
-        )
-        .with_status_code(StatusCode(status)),
+        body("application/json; charset=utf-8", json_bytes(&value)?)
+            .with_status_code(status_code(status)),
     )?;
     Ok(())
 }
@@ -280,32 +288,47 @@ struct HttpSurfaces {
 }
 
 impl HttpSurfaces {
-    fn admitted(
-        &self,
-        request: &Request,
-    ) -> Result<(&BTreeMap<String, Asset>, AuthoringSurface), StatusCode> {
-        // Tailscale Serve rewrites the forwarding headers and always marks proxied
-        // requests. Classify those before checking the caller-controlled Host,
-        // including when phone access is disabled.
-        if header(request, "X-Forwarded-Host").is_some()
-            || header(request, "X-Forwarded-Proto").is_some()
+    fn admitted(&self, head: &Head) -> Result<Admission, StatusCode> {
+        // Check the forwarded surface first, even when phone access is disabled.
+        let surface = if head.headers().contains_key("X-Forwarded-Host")
+            || head.headers().contains_key("X-Forwarded-Proto")
         {
             let phone = self
                 .phone
                 .as_ref()
-                .filter(|phone| phone.authorizes(request))
-                .ok_or(StatusCode(403))?;
-            if !phone.exposes(request) {
-                return Err(StatusCode(404));
+                .filter(|phone| phone.authorizes(head))
+                .ok_or(StatusCode::FORBIDDEN)?;
+            if !phone.exposes(head) {
+                return Err(StatusCode::NOT_FOUND);
             }
-            return Ok((&phone.assets, AuthoringSurface::PhoneBuild));
+            AuthoringSurface::PhoneBuild
+        } else {
+            if head.header("Host") != Some(self.address.as_str())
+                || (head.headers().contains_key("Origin")
+                    && head.header("Origin") != Some(self.origin.as_str()))
+            {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            AuthoringSurface::Desktop
+        };
+        let body_bytes = (head.method() == Method::POST).then(|| match head.url() {
+            "/api/study/presence" => 1024,
+            "/api/repertoires" | "/api/tactics" | "/api/games/import" => MAX_CONTENT_COMMAND_BYTES,
+            _ => MAX_COMMAND_BYTES,
+        });
+        Ok(Admission {
+            surface,
+            body_bytes,
+        })
+    }
+
+    fn assets(&self, surface: AuthoringSurface) -> &BTreeMap<String, Asset> {
+        match surface {
+            AuthoringSurface::Desktop => &self.desktop,
+            AuthoringSurface::PhoneBuild => {
+                &self.phone.as_ref().expect("admitted phone surface").assets
+            }
         }
-        if header(request, "Host") != Some(self.address.as_str())
-            || header(request, "Origin").is_some_and(|origin| origin != self.origin)
-        {
-            return Err(StatusCode(403));
-        }
-        Ok((&self.desktop, AuthoringSurface::Desktop))
     }
 }
 
@@ -341,30 +364,29 @@ impl PhoneStudy {
         }))
     }
 
-    fn authorizes(&self, request: &Request) -> bool {
+    fn authorizes(&self, request: &Head) -> bool {
         let matches = |name, expected: &str| {
-            let mut values = request
-                .headers()
-                .iter()
-                .filter(|field| field.field.equiv(name))
-                .map(|field| field.value.as_str());
-            values.next() == Some(expected) && values.next().is_none()
+            let values = request.headers().get_all(name);
+            let mut values = values.iter();
+            values.next().and_then(|value| value.to_str().ok()) == Some(expected)
+                && values.next().is_none()
         };
         matches("Host", &self.authority)
             && matches("X-Forwarded-Host", &self.authority)
             && matches("X-Forwarded-Proto", "https")
             && matches("Tailscale-User-Login", &self.login)
-            && header(request, "Tailscale-Funnel-Request").is_none()
+            && !request.headers().contains_key("Tailscale-Funnel-Request")
             && (matches("Origin", &self.origin)
-                || (request.method() == &Method::Get && header(request, "Origin").is_none()))
+                || (request.method() == &Method::GET && !request.headers().contains_key("Origin")))
     }
 
-    fn exposes(&self, request: &Request) -> bool {
+    fn exposes(&self, request: &Head) -> bool {
         match request.method() {
-            Method::Get => {
-                request.url() == "/api/context" || self.assets.contains_key(asset_path(request))
+            &Method::GET => {
+                request.url() == "/api/context"
+                    || self.assets.contains_key(asset_path(request.url()))
             }
-            Method::Post => matches!(
+            &Method::POST => matches!(
                 request.url(),
                 "/api/study"
                     | "/api/study/presence"
@@ -403,13 +425,24 @@ fn valid_phone_authority(authority: &str) -> bool {
             .is_ok_and(|port| port > 0 && port != 443)
 }
 
-fn asset_path(request: &Request) -> &str {
-    request.url().split('?').next().unwrap_or_default()
+fn asset_path(url: &str) -> &str {
+    url.split('?').next().unwrap_or_default()
 }
 
 struct Asset {
     mime: &'static str,
-    bytes: Vec<u8>,
+    bytes: Bytes,
+}
+
+fn read_asset(path: &Path) -> LocalResult<Bytes> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((MAX_REPLY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_REPLY_BYTES {
+        return Err("Tempo UI asset exceeds the response budget".into());
+    }
+    Ok(bytes.into())
 }
 
 fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
@@ -422,7 +455,7 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
         "/".to_owned(),
         Asset {
             mime: "text/html; charset=utf-8",
-            bytes: fs::read(index)?,
+            bytes: read_asset(&index)?,
         },
     )]);
     for path in fs::read_dir(directory)? {
@@ -456,7 +489,7 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
             format!("/assets/{name}"),
             Asset {
                 mime,
-                bytes: fs::read(path.path())?,
+                bytes: read_asset(&path.path())?,
             },
         );
     }
@@ -467,22 +500,27 @@ fn respond(
     app: &mut Tempo,
     profile_store: &SqliteStore,
     games: &mut Games,
-    request: Request,
+    mut request: Request,
     surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
-    let context = crate::diagnostics::RequestContext::new(header(&request, "X-Tempo-Request-Id"));
+    if !request.claim() {
+        request.busy();
+        return Ok(());
+    }
+    let context = crate::diagnostics::RequestContext::new(Some(request.delivery_id()));
     let mut trace = crate::diagnostics::Span::new("http.request");
     trace.field("request_id", context.id());
+    trace.field("queue_wait_ms", request.queue_wait().as_millis() as u64);
     trace.field(
         "method",
         match request.method() {
-            Method::Get => "GET",
-            Method::Post => "POST",
-            Method::Head => "HEAD",
-            Method::Put => "PUT",
-            Method::Delete => "DELETE",
-            Method::Options => "OPTIONS",
-            Method::Patch => "PATCH",
+            &Method::GET => "GET",
+            &Method::POST => "POST",
+            &Method::HEAD => "HEAD",
+            &Method::PUT => "PUT",
+            &Method::DELETE => "DELETE",
+            &Method::OPTIONS => "OPTIONS",
+            &Method::PATCH => "PATCH",
             _ => "OTHER",
         },
     );
@@ -500,14 +538,12 @@ fn respond_inner(
     app: &mut Tempo,
     profile_store: &SqliteStore,
     games: &mut Games,
-    mut request: Request,
+    request: Request,
     surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
-    let (public, surface) = match surfaces.admitted(&request) {
-        Ok(admitted) => admitted,
-        Err(status) => return Ok(respond_traced(request, Response::empty(status))?),
-    };
-    if request.method() == &Method::Get && request.url() == "/api/context" {
+    let surface = request.surface();
+    let public = surfaces.assets(surface);
+    if request.method() == &Method::GET && request.url() == "/api/context" {
         let (status, reply) = match profile_store.context_identity() {
             Ok((dataset, schema_version)) => (
                 200,
@@ -524,8 +560,8 @@ fn respond_inner(
         };
         respond_traced(
             request,
-            body("application/json; charset=utf-8", serde_json::to_vec(&reply)?)
-                .with_status_code(StatusCode(status))
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
                 .with_header(field("Cache-Control", "no-store")),
         )?;
         return Ok(());
@@ -535,21 +571,20 @@ fn respond_inner(
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     let opponent_context = header(&request, "X-Tempo-Study-Opponent-Moves") == Some("1");
     let tactic_explanation = header(&request, "X-Tempo-Study-Tactic-Explanation") == Some("1");
-    if request.method() == &Method::Post && request.url() == "/api/study/presence" {
+    if request.method() == &Method::POST && request.url() == "/api/study/presence" {
         let _trace = Span::new("study.presence");
-        let result = command(&mut request, 1024)
+        let result = command(&request, 1024)
             .and_then(|report| games.tactics.study_presence(report, &mut games.detection));
         let status = if result.is_ok() { 204 } else { 400 };
-        respond_traced(request, Response::empty(StatusCode(status)))?;
-    } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/command" {
+        respond_traced(request, Response::empty(status_code(status)))?;
+    } else if request.method() == &Method::POST && request.url() == "/api/games/tactics/command" {
         let _trace = Span::new("tactics.command");
-        let result =
-            command::<crate::tactical_jobs::TacticalCommand>(&mut request, MAX_COMMAND_BYTES)
-                .and_then(|intent| {
-                    games
-                        .tactics
-                        .command(profile_store, &mut games.detection, intent)
-                });
+        let result = command::<crate::tactical_jobs::TacticalCommand>(&request, MAX_COMMAND_BYTES)
+            .and_then(|intent| {
+                games
+                    .tactics
+                    .command(profile_store, &mut games.detection, intent)
+            });
         let (status, value) = match result {
             Ok(value) => (200, value),
             Err(error) => (
@@ -559,37 +594,32 @@ fn respond_inner(
         };
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&value)?,
-            )
-            .with_status_code(StatusCode(status)),
+            body("application/json; charset=utf-8", json_bytes(&value)?)
+                .with_status_code(status_code(status)),
         )?;
-    } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/position" {
+    } else if request.method() == &Method::POST && request.url() == "/api/games/tactics/position" {
         let _trace = Span::new("tactics.report.detail");
-        let result = command::<crate::personal_tactics_report::PositionRequest>(
-            &mut request,
-            MAX_COMMAND_BYTES,
-        )
-        .and_then(|read| {
-            crate::personal_tactics_report::read_position(
-                profile_store,
-                games.tactics.report_version(),
-                read,
-            )
-        });
+        let result =
+            command::<crate::personal_tactics_report::PositionRequest>(&request, MAX_COMMAND_BYTES)
+                .and_then(|read| {
+                    crate::personal_tactics_report::read_position(
+                        profile_store,
+                        games.tactics.report_version(),
+                        read,
+                    )
+                });
         report_response(request, result)?;
-    } else if request.method() == &Method::Post && request.url() == "/api/games/tactics/report" {
+    } else if request.method() == &Method::POST && request.url() == "/api/games/tactics/report" {
         games
             .tactics_report
             .submit(request, games.tactics.report_version())?;
     } else if request.url() == "/api/games/tactics" {
         let _trace = Span::new("tactics.status");
-        let (status, value) = if request.method() == &Method::Post {
+        let (status, value) = if request.method() == &Method::POST {
             let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
             let report_discovery = header(&request, "X-Tempo-Tactics-Report") == Some("2");
             let report_stamp = header(&request, "X-Tempo-Tactics-Report-Generation") == Some("1");
-            match command::<crate::tactical_jobs::TacticalRead>(&mut request, MAX_COMMAND_BYTES)
+            match command::<crate::tactical_jobs::TacticalRead>(&request, MAX_COMMAND_BYTES)
                 .and_then(|read| {
                     let dataset = read.dataset_id.clone();
                     let mut value = games.tactics.read(app, profile_store, read, wait_reason)?;
@@ -625,21 +655,18 @@ fn respond_inner(
         };
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&value)?,
-            )
-            .with_status_code(StatusCode(status))
-            .with_header(field("Cache-Control", "no-store")),
+            body("application/json; charset=utf-8", json_bytes(&value)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
         )?;
     } else if matches!(
         request.url(),
         "/api/games/detectors" | "/api/games/detection" | "/api/games/detection-result"
     ) {
         let reply = match (request.method(), request.url()) {
-            (&Method::Get, "/api/games/detectors") => Ok(games.detection.discovery()),
-            (&Method::Post, "/api/games/detection") => {
-                command::<DetectionRequest>(&mut request, MAX_COMMAND_BYTES)
+            (&Method::GET, "/api/games/detectors") => Ok(games.detection.discovery()),
+            (&Method::POST, "/api/games/detection") => {
+                command::<DetectionRequest>(&request, MAX_COMMAND_BYTES)
                     .map(|intent| {
                         let reply = games.detection.start(app, intent);
                         if reply.started {
@@ -648,8 +675,8 @@ fn respond_inner(
                         reply
                     })
             }
-            (&Method::Post, "/api/games/detection-result") => {
-                command::<DetectionRead>(&mut request, MAX_COMMAND_BYTES)
+            (&Method::POST, "/api/games/detection-result") => {
+                command::<DetectionRead>(&request, MAX_COMMAND_BYTES)
                     .map(|intent| games.detection.read(app, intent))
             }
             _ => Ok(DetectionReply {
@@ -664,12 +691,9 @@ fn respond_inner(
         });
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&reply.body)?,
-            )
-            .with_status_code(StatusCode(reply.status))
-            .with_header(field("Cache-Control", "no-store")),
+            body("application/json; charset=utf-8", json_bytes(&reply.body)?)
+                .with_status_code(status_code(reply.status))
+                .with_header(field("Cache-Control", "no-store")),
         )?;
     } else if matches!(
         request.url(),
@@ -704,57 +728,54 @@ fn respond_inner(
             | "/api/study/card-details"
     ) {
         let (status, reply) = match (request.method(), request.url()) {
-            (&Method::Post, "/api/analysis/evidence") => (
+            (&Method::POST, "/api/analysis/evidence") => (
                 202,
-                command::<crate::position_evidence::EvidenceRequest>(
-                    &mut request,
-                    MAX_COMMAND_BYTES,
-                )
-                .and_then(|r| games.position_evidence.start(r)),
+                command::<crate::position_evidence::EvidenceRequest>(&request, MAX_COMMAND_BYTES)
+                    .and_then(|r| games.position_evidence.start(r)),
             ),
-            (&Method::Post, "/api/analysis/result") => (
+            (&Method::POST, "/api/analysis/result") => (
                 200,
-                command::<crate::position_evidence::EvidenceRead>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::position_evidence::EvidenceRead>(&request, MAX_COMMAND_BYTES)
                     .and_then(|r| games.position_evidence.read(r)),
             ),
-            (&Method::Post, "/api/games/library") => (
+            (&Method::POST, "/api/games/library") => (
                 200,
-                command::<crate::GameLibraryRead>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::GameLibraryRead>(&request, MAX_COMMAND_BYTES)
                     .and_then(|r| app.game_library(r)),
             ),
-            (&Method::Get, "/api/games") => (200, app.game_history()),
-            (&Method::Get, "/api/games/job") => (200, Ok(games.refresh.poll(app))),
-            (&Method::Get, "/api/games/backfill") => (200, games.backfill.current_status(app)),
-            (&Method::Post, "/api/games/backfill") => (
+            (&Method::GET, "/api/games") => (200, app.game_history()),
+            (&Method::GET, "/api/games/job") => (200, Ok(games.refresh.poll(app))),
+            (&Method::GET, "/api/games/backfill") => (200, games.backfill.current_status(app)),
+            (&Method::POST, "/api/games/backfill") => (
                 202,
-                command::<BackfillRequest>(&mut request, MAX_COMMAND_BYTES)
+                command::<BackfillRequest>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.backfill.begin(app, intent)),
             ),
-            (&Method::Post, "/api/games/backfill/retry") => (
+            (&Method::POST, "/api/games/backfill/retry") => (
                 202,
-                command::<BackfillRetry>(&mut request, MAX_COMMAND_BYTES)
+                command::<BackfillRetry>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.backfill.retry(app, intent)),
             ),
-            (&Method::Get, "/api/games/model") => (200, games.model.status(app)),
-            (&Method::Post, "/api/games/model") => (
+            (&Method::GET, "/api/games/model") => (200, games.model.status(app)),
+            (&Method::POST, "/api/games/model") => (
                 202,
-                command::<ModelRequest>(&mut request, MAX_COMMAND_BYTES)
+                command::<ModelRequest>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.model.start(app, intent)),
             ),
-            (&Method::Post, "/api/games/coverage") => (
+            (&Method::POST, "/api/games/coverage") => (
                 202,
-                command::<crate::coverage_scan::StartCoverage>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::coverage_scan::StartCoverage>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.coverage.start(app, intent)),
             ),
-            (&Method::Post, "/api/games/coverage/status") => (
+            (&Method::POST, "/api/games/coverage/status") => (
                 200,
-                command::<crate::coverage_scan::ReadCoverage>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::coverage_scan::ReadCoverage>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.coverage.read(app, intent)),
             ),
-            (&Method::Post, "/api/games/coverage/starting-line") => (
+            (&Method::POST, "/api/games/coverage/starting-line") => (
                 200,
                 command::<crate::application::PreviousCoverageLineRequest>(
-                    &mut request,
+                    &request,
                     MAX_COMMAND_BYTES,
                 )
                 .and_then(|intent| match intent {
@@ -767,16 +788,16 @@ fn respond_inner(
                 })
                 .map(|reply| serde_json::json!(reply)),
             ),
-            (&Method::Post, "/api/games/coverage/starting-line/save") => (
+            (&Method::POST, "/api/games/coverage/starting-line/save") => (
                 200,
-                command::<crate::application::CoverageLineSave>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::application::CoverageLineSave>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| app.save_coverage_line(intent))
                     .map(|reply| serde_json::json!(reply)),
             ),
-            (&Method::Get, "/api/games/gaps") => (200, app.opponent_gaps(0)),
-            (&Method::Post, "/api/games/gaps") => (
+            (&Method::GET, "/api/games/gaps") => (200, app.opponent_gaps(0)),
+            (&Method::POST, "/api/games/gaps") => (
                 200,
-                command::<GapPage>(&mut request, MAX_COMMAND_BYTES).and_then(|page| {
+                command::<GapPage>(&request, MAX_COMMAND_BYTES).and_then(|page| {
                     if surface == AuthoringSurface::PhoneBuild
                         && page
                             .forecast_repertoire
@@ -791,56 +812,56 @@ fn respond_inner(
                     app.opponent_gap_page(page.offset, page.forecast_repertoire.as_deref())
                 }),
             ),
-            (&Method::Get, "/api/games/gap-analysis") => (200, Ok(games.gap_analysis.status())),
-            (&Method::Post, "/api/games/gap-analysis") => (
+            (&Method::GET, "/api/games/gap-analysis") => (200, Ok(games.gap_analysis.status())),
+            (&Method::POST, "/api/games/gap-analysis") => (
                 202,
-                command::<GapAnalysisRequest>(&mut request, MAX_COMMAND_BYTES)
+                command::<GapAnalysisRequest>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.gap_analysis.start_on(app, intent, surface)),
             ),
-            (&Method::Post, "/api/games/gap-analysis/status")
+            (&Method::POST, "/api/games/gap-analysis/status")
                 if surface == AuthoringSurface::PhoneBuild =>
             {
                 (
                     200,
-                    command::<GapAnalysisRead>(&mut request, MAX_COMMAND_BYTES)
+                    command::<GapAnalysisRead>(&request, MAX_COMMAND_BYTES)
                         .and_then(|intent| games.gap_analysis.phone_status(intent)),
                 )
             }
-            (&Method::Get, "/api/games/gap-explorer") => (200, Ok(games.gap_explorer.status())),
-            (&Method::Post, "/api/games/gap-explorer") => (
+            (&Method::GET, "/api/games/gap-explorer") => (200, Ok(games.gap_explorer.status())),
+            (&Method::POST, "/api/games/gap-explorer") => (
                 202,
-                command::<GapExplorerRequest>(&mut request, MAX_COMMAND_BYTES)
+                command::<GapExplorerRequest>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.gap_explorer.start(app, intent)),
             ),
-            (&Method::Post, "/api/games/review") => (
+            (&Method::POST, "/api/games/review") => (
                 200,
-                command::<crate::GameReviewRead>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::GameReviewRead>(&request, MAX_COMMAND_BYTES)
                     .and_then(|request| app.game_review(request)),
             ),
-            (&Method::Post, "/api/games/gap-line") => (
+            (&Method::POST, "/api/games/gap-line") => (
                 202,
-                command::<crate::coverage_scan::GapLineRequest>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::coverage_scan::GapLineRequest>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.coverage.start_line(app, intent, surface)),
             ),
-            (&Method::Post, "/api/games/gap-line/status") => (
+            (&Method::POST, "/api/games/gap-line/status") => (
                 200,
-                command::<crate::coverage_scan::GapLineRead>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::coverage_scan::GapLineRead>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.coverage.read_line(app, intent, surface)),
             ),
-            (&Method::Post, "/api/games/gap-draft") => (
+            (&Method::POST, "/api/games/gap-draft") => (
                 200,
-                command::<GapRequest>(&mut request, MAX_COMMAND_BYTES)
+                command::<GapRequest>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| app.game_gap_draft_on(intent, surface)),
             ),
-            (&Method::Post, "/api/study/relevance") => (
+            (&Method::POST, "/api/study/relevance") => (
                 200,
-                command::<StudyAttemptRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                command::<StudyAttemptRead>(&request, MAX_COMMAND_BYTES).and_then(|intent| {
                     app.study_relevance_reason(&intent.dataset_id, &intent.attempt_id)
                 }),
             ),
-            (&Method::Post, "/api/study/analysis-context") => (
+            (&Method::POST, "/api/study/analysis-context") => (
                 200,
-                command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                command::<StudyAnalysisRead>(&request, MAX_COMMAND_BYTES).and_then(|intent| {
                     app.study_analysis_context(
                         &intent.dataset_id,
                         &intent.attempt_id,
@@ -849,9 +870,9 @@ fn respond_inner(
                     )
                 }),
             ),
-            (&Method::Post, "/api/study/analysis-line") => (
+            (&Method::POST, "/api/study/analysis-line") => (
                 200,
-                command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                command::<StudyAnalysisRead>(&request, MAX_COMMAND_BYTES).and_then(|intent| {
                     app.study_analysis_line(
                         &intent.dataset_id,
                         &intent.attempt_id,
@@ -861,9 +882,9 @@ fn respond_inner(
                     .map(|line| serde_json::json!(line))
                 }),
             ),
-            (&Method::Post, "/api/study/card-details") => (
+            (&Method::POST, "/api/study/card-details") => (
                 200,
-                command::<StudyAnalysisRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                command::<StudyAnalysisRead>(&request, MAX_COMMAND_BYTES).and_then(|intent| {
                     app.study_card_details(
                         &intent.dataset_id,
                         &intent.attempt_id,
@@ -872,9 +893,9 @@ fn respond_inner(
                     )
                 }),
             ),
-            (&Method::Post, "/api/study/game-context") => (
+            (&Method::POST, "/api/study/game-context") => (
                 200,
-                command::<StudyAttemptRead>(&mut request, MAX_COMMAND_BYTES).and_then(|intent| {
+                command::<StudyAttemptRead>(&request, MAX_COMMAND_BYTES).and_then(|intent| {
                     let mut reply =
                         app.study_game_context(&intent.dataset_id, &intent.attempt_id)?;
                     if !move_details && let Some(context) = reply["context"].as_object_mut() {
@@ -883,30 +904,27 @@ fn respond_inner(
                     Ok(reply)
                 }),
             ),
-            (&Method::Post, "/api/games/import") => (
+            (&Method::POST, "/api/games/import") => (
                 200,
-                command::<GameImport>(&mut request, MAX_CONTENT_COMMAND_BYTES)
+                command::<GameImport>(&request, MAX_CONTENT_COMMAND_BYTES)
                     .and_then(|intent| app.import_game_pgn(intent))
                     .map(|report| serde_json::json!(report)),
             ),
-            (&Method::Post, "/api/games/choose") => (
+            (&Method::POST, "/api/games/choose") => (
                 200,
-                command::<crate::game_evidence::ChooseGameCorrection>(
-                    &mut request,
-                    MAX_COMMAND_BYTES,
-                )
-                .and_then(|intent| app.choose_game_correction(intent))
-                .map(|report| serde_json::json!(report)),
+                command::<crate::game_evidence::ChooseGameCorrection>(&request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| app.choose_game_correction(intent))
+                    .map(|report| serde_json::json!(report)),
             ),
-            (&Method::Post, "/api/games/reprocess") => (
+            (&Method::POST, "/api/games/reprocess") => (
                 200,
-                command::<crate::game_evidence::ReprocessGames>(&mut request, MAX_COMMAND_BYTES)
+                command::<crate::game_evidence::ReprocessGames>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| app.reprocess_games(intent))
                     .map(|report| serde_json::json!(report)),
             ),
-            (&Method::Post, "/api/games/refresh") => (
+            (&Method::POST, "/api/games/refresh") => (
                 202,
-                command::<GameRefresh>(&mut request, MAX_COMMAND_BYTES)
+                command::<GameRefresh>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| games.refresh.refresh(app, intent, !games.backfill.active()))
                     .map(|reply| serde_json::json!(reply)),
             ),
@@ -927,71 +945,56 @@ fn respond_inner(
         };
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&reply)?,
-            )
-            .with_status_code(StatusCode(status))
-            .with_header(field("Cache-Control", "no-store")),
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
         )?;
-    } else if request.method() == &Method::Post && request.url() == "/api/tactic-settings" {
-        let reply = command(&mut request, MAX_COMMAND_BYTES)
+    } else if request.method() == &Method::POST && request.url() == "/api/tactic-settings" {
+        let reply = command(&request, MAX_COMMAND_BYTES)
             .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
             .unwrap_or_else(|error| serde_json::json!(ErrorView::for_content(error)));
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&reply)?,
-            ),
+            body("application/json; charset=utf-8", json_bytes(&reply)?),
         )?;
-    } else if request.method() == &Method::Post && request.url() == "/api/tactics-collection" {
-        let reply = command::<crate::TacticsRead>(&mut request, MAX_COMMAND_BYTES)
+    } else if request.method() == &Method::POST && request.url() == "/api/tactics-collection" {
+        let reply = command::<crate::TacticsRead>(&request, MAX_COMMAND_BYTES)
             .and_then(|intent| app.read_tactics(intent))
             .map(|content| serde_json::json!(content))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&reply)?,
-            ),
+            body("application/json; charset=utf-8", json_bytes(&reply)?),
         )?;
-    } else if request.method() == &Method::Post
+    } else if request.method() == &Method::POST
         && matches!(
             request.url(),
             "/api/study/review-mark" | "/api/study/saved-reviews"
         )
     {
         let reply = match request.url() {
-            "/api/study/review-mark" => command::<SaveStudyReview>(&mut request, MAX_COMMAND_BYTES)
+            "/api/study/review-mark" => command::<SaveStudyReview>(&request, MAX_COMMAND_BYTES)
                 .and_then(|intent| app.save_study_review(intent)),
-            _ => command::<SavedStudyReviewCommand>(&mut request, MAX_COMMAND_BYTES)
+            _ => command::<SavedStudyReviewCommand>(&request, MAX_COMMAND_BYTES)
                 .and_then(|intent| app.saved_study_reviews(intent)),
         }
         .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&reply)?,
-            )
-            .with_header(field("Cache-Control", "no-store")),
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_header(field("Cache-Control", "no-store")),
         )?;
-    } else if request.method() == &Method::Post && request.url() == "/api/study-progress" {
-        let reply = command::<Option<crate::ProgressStamp>>(&mut request, MAX_COMMAND_BYTES)
+    } else if request.method() == &Method::POST && request.url() == "/api/study-progress" {
+        let reply = command::<Option<crate::ProgressStamp>>(&request, MAX_COMMAND_BYTES)
             .and_then(|known| app.study_progress(known.as_ref()))
             .map(|progress| serde_json::json!(progress))
             .unwrap_or_else(|error| serde_json::json!(StudyView::from(error)));
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&reply)?,
-            ),
+            body("application/json; charset=utf-8", json_bytes(&reply)?),
         )?;
-    } else if request.method() == &Method::Post && request.url() == "/api/study" {
-        let reply = command::<StudyCommand>(&mut request, MAX_COMMAND_BYTES)
+    } else if request.method() == &Method::POST && request.url() == "/api/study" {
+        let reply = command::<StudyCommand>(&request, MAX_COMMAND_BYTES)
             .map(|intent| {
                 if !matches!(intent, StudyCommand::StudyStatus) {
                     games.tactics.study_activity(&mut games.detection);
@@ -1016,46 +1019,40 @@ fn respond_inner(
         };
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&reply)?,
-            ),
+            body("application/json; charset=utf-8", json_bytes(&reply)?),
         )?;
-    } else if request.method() == &Method::Post
+    } else if request.method() == &Method::POST
         && matches!(request.url(), "/api/repertoires" | "/api/tactics")
     {
         let reply = if request.url() == "/api/repertoires" {
-            content_command(&mut request, |intent: RepertoireCommand| {
+            content_command(&request, |intent: RepertoireCommand| {
                 app.handle_repertoire_on(intent, surface)
             })?
         } else {
-            content_command(&mut request, |intent: TacticCaptureCommand| {
+            content_command(&request, |intent: TacticCaptureCommand| {
                 app.handle_tactic_capture(intent)
             })?
         };
         respond_traced(
             request,
-            body(
-                "application/json; charset=utf-8",
-                serde_json::to_vec(&reply)?,
-            ),
+            body("application/json; charset=utf-8", json_bytes(&reply)?),
         )?;
-    } else if request.method() == &Method::Get {
-        if let Some(asset) = public.get(asset_path(&request)) {
+    } else if request.method() == &Method::GET {
+        if let Some(asset) = public.get(asset_path(request.url())) {
             respond_traced(request, body(asset.mime, asset.bytes.clone()).with_header(
                 field("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'"),
             ))?;
         } else {
-            respond_traced(request, Response::empty(StatusCode(404)))?;
+            respond_traced(request, Response::empty(StatusCode::NOT_FOUND))?;
         }
     } else {
-        respond_traced(request, Response::empty(StatusCode(405)))?;
+        respond_traced(request, Response::empty(StatusCode::METHOD_NOT_ALLOWED))?;
     }
     Ok(())
 }
 
 fn content_command<T: DeserializeOwned>(
-    request: &mut Request,
+    request: &Request,
     handle: impl FnOnce(T) -> Value,
 ) -> LocalResult<Value> {
     Ok(match command(request, MAX_CONTENT_COMMAND_BYTES) {
@@ -1064,29 +1061,17 @@ fn content_command<T: DeserializeOwned>(
     })
 }
 
-fn command<T: DeserializeOwned>(request: &mut Request, max_bytes: usize) -> Result<T, AppError> {
+fn command<T: DeserializeOwned>(request: &Request, max_bytes: usize) -> Result<T, AppError> {
     let invalid = |message| AppError::new("invalid_command", message);
     let mime = header(request, "Content-Type").and_then(|value| value.split(';').next());
-    if mime != Some("application/json") {
-        return Err(invalid("Use an application/json command."));
-    }
-    let mut body_trace = crate::diagnostics::Span::new("http.read_body");
-    let Some(size) = request.body_length().filter(|size| *size <= max_bytes) else {
-        body_trace.set_outcome("invalid_size");
-        return Err(AppError::new(
-            "invalid_command",
-            format!("Send a command body of at most {} KiB.", max_bytes / 1024),
+    if mime != Some("application/json") || request.body().len() > max_bytes {
+        return Err(invalid(
+            "Use an application/json command within the request limit.",
         ));
-    };
-    let mut bytes = vec![0; size];
-    request.as_reader().read_exact(&mut bytes).map_err(|_| {
-        body_trace.set_outcome("io_error");
-        invalid("Could not read the command.")
-    })?;
-    body_trace.field("bytes", bytes.len());
-    drop(body_trace);
+    }
     let mut decode_trace = crate::diagnostics::Span::new("http.decode_body");
-    let result = serde_json::from_slice(&bytes).map_err(|_| invalid("The command is invalid."));
+    let result =
+        serde_json::from_slice(request.body()).map_err(|_| invalid("The command is invalid."));
     if result.is_err() {
         decode_trace.set_outcome("invalid_json");
     }
@@ -1094,18 +1079,43 @@ fn command<T: DeserializeOwned>(request: &mut Request, max_bytes: usize) -> Resu
 }
 
 fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
-    request
-        .headers()
-        .iter()
-        .find(|field| field.field.equiv(name))
-        .map(|field| field.value.as_str())
+    request.header(name)
 }
 
 fn field(name: &str, value: &str) -> Header {
-    Header::from_bytes(name, value).expect("static HTTP header")
+    (
+        HeaderName::from_bytes(name.as_bytes()).expect("HTTP header name"),
+        HeaderValue::from_str(value).expect("HTTP header value"),
+    )
 }
 
-fn body(mime: &str, bytes: Vec<u8>) -> Response<std::io::Cursor<Vec<u8>>> {
+fn status_code(status: u16) -> StatusCode {
+    StatusCode::from_u16(status).expect("valid HTTP status")
+}
+
+fn json_bytes(value: &impl serde::Serialize) -> serde_json::Result<Vec<u8>> {
+    struct BoundedResponse(Vec<u8>);
+    impl Write for BoundedResponse {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_REPLY_BYTES - self.0.len() {
+                return Err(std::io::Error::other(
+                    "Tempo response exceeds the byte budget",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = BoundedResponse(Vec::new());
+    serde_json::to_writer(&mut output, value)?;
+    Ok(output.0)
+}
+
+fn body(mime: &str, bytes: impl Into<Bytes>) -> Response {
     Response::from_data(bytes)
         .with_header(field("Content-Type", mime))
         .with_header(field("Cache-Control", "no-store"))
@@ -1167,25 +1177,15 @@ fn diagnostic_route(url: &str) -> &'static str {
     }
 }
 
-/// A completed write records transport delivery only, never command acceptance.
-fn respond_traced<R: std::io::Read>(
-    request: Request,
-    mut response: Response<R>,
-) -> std::io::Result<()> {
+/// Queue the detached response; this does not establish network delivery.
+fn respond_traced(request: Request, response: Response) -> std::io::Result<()> {
     let mut trace = crate::diagnostics::Span::new("http.write_response");
-    let status = response.status_code().0;
+    let status = response.status_code().as_u16();
     trace.field("status_code", status);
-    if let Some(id) = crate::diagnostics::current_request_id() {
-        response.add_header(field("X-Tempo-Request-Id", &id));
-    }
-    if let Some(id) = crate::diagnostics::run_id() {
-        response.add_header(field("X-Tempo-Run-Id", &id));
-    }
-    let result = request.respond(response);
-    let outcome = if result.is_ok() {
-        "written"
+    let outcome = if request.send(response) {
+        "queued_for_delivery"
     } else {
-        "io_error"
+        "disconnected"
     };
     trace.set_outcome(outcome);
     crate::diagnostics::emit(
@@ -1194,7 +1194,7 @@ fn respond_traced<R: std::io::Read>(
             "operation":"http.write_response", "status_code":status, "outcome":outcome
         }),
     );
-    result
+    Ok(())
 }
 
 #[cfg(test)]

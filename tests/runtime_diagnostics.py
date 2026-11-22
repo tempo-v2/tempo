@@ -28,7 +28,8 @@ from urllib.parse import urlsplit
 import uuid
 
 
-WORKSPACE = Path(__file__).resolve().parents[2]
+TEMPO_SOURCE = Path(__file__).resolve().parents[1]
+WORKSPACE = TEMPO_SOURCE.parent
 TARGET = Path(os.environ.get("CARGO_TARGET_DIR", WORKSPACE / "target"))
 BINARY = Path(os.environ.get("TEMPO_BIN", TARGET / "debug" / "tempo")).resolve()
 STATUS_BODY = b'{"command":"study_status"}'
@@ -131,7 +132,7 @@ class Server:
             connection.request(method, path, body=body, headers=fields)
             response = connection.getresponse()
             payload = response.read()
-            return response.status, dict(response.getheaders()), payload, fields["X-Tempo-Request-Id"]
+            return response.status, response.headers, payload, fields["X-Tempo-Request-Id"]
         finally:
             connection.close()
 
@@ -355,7 +356,7 @@ class RuntimeDiagnostics(unittest.TestCase):
 
         output = self.root / "offline-export.json"
         subprocess.run(
-            [sys.executable, str(WORKSPACE / "tempo" / "tools" / "diagnose.py"),
+            [sys.executable, str(TEMPO_SOURCE / "tools" / "diagnose.py"),
              "--duration", "1", "--interval", "1", "--log-dir", str(logs), "--output", str(output)],
             check=True,
             capture_output=True,
@@ -384,8 +385,8 @@ class RuntimeDiagnostics(unittest.TestCase):
         with Server(self.database, self.ui, logs) as server:
             baseline = json.loads(server.request()[2])
             request_id = str(uuid.uuid4())
-            # tiny_http buffers short bodies before dispatch. A larger, semantically
-            # identical JSON body exposes the real read_body boundary without hooks.
+            # Wait for the ingress to receive this request while withholding the
+            # rest of its legal body so the application has not claimed it.
             body = STATUS_BODY + b" " * 2048
             connection = server.connection(timeout=8)
             lock = sqlite3.connect(self.database, timeout=2)
@@ -399,18 +400,18 @@ class RuntimeDiagnostics(unittest.TestCase):
                 wait_event(
                     logs,
                     lambda e: e.get("request_id") == request_id
-                    and e.get("event") == "span.start"
+                    and e.get("event") == "http.body_started"
                     and e.get("operation") == "http.read_body",
                 )
-                # The application is now inside this exact HTTP handler; its loop
-                # cannot race us by entering model scheduling before the read.
+                # Hold a real SQLite lock before allowing the request into the
+                # application, then measure and correlate the storage wait.
                 lock.execute("BEGIN EXCLUSIVE")
                 started = time.monotonic()
                 connection.send(body[1:])
 
                 def receive():
                     response = connection.getresponse()
-                    return response.status, dict(response.getheaders()), json.loads(response.read())
+                    return response.status, response.headers, json.loads(response.read())
 
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     pending = executor.submit(receive)
