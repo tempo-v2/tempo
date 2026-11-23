@@ -267,7 +267,7 @@ impl TacticalJobs {
             return Ok(());
         }
         let descriptor = self.descriptor.as_ref().expect("configured detector");
-        if self.has_personal_report() && self.enrolled_archive.as_ref() != Some(&dataset) {
+        if self.has_complete_decisions() && self.enrolled_archive.as_ref() != Some(&dataset) {
             store.enroll_verified_archive(&dataset)?;
             self.enrolled_archive = Some(dataset.clone());
         }
@@ -339,12 +339,8 @@ impl TacticalJobs {
         Ok(())
     }
 
-    pub(crate) fn has_personal_report(&self) -> bool {
+    pub(crate) fn has_complete_decisions(&self) -> bool {
         self.has_complete_decisions
-    }
-
-    pub(crate) fn report_version(&self) -> &str {
-        &self.version
     }
 
     pub(crate) fn command(

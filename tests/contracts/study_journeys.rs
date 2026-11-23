@@ -1,15 +1,14 @@
-//! Repertoire, multi-decision tactics, correction, repetition, and abandonment.
-use super::support::{answer, one, seed_due, start};
+//! Repertoire, multi-decision tactics, correction, and abandonment.
+use super::support::{answer, one, start};
 use tempo::wire::{StudyCommand, StudyView};
 use tempo::{AbandonCommand, SubmitCommand};
-use tempo_learning::{LearningEffect, LearningState};
+use tempo_learning::LearningState;
 use tempo_study::AttemptStatus;
-use tempo_types::{Grade, MissRevision, StudyDay, TargetId};
+use tempo_types::{Grade, StudyDay, TargetId};
 
 #[test]
 fn repertoire_due_journey_crosses_wire_queue_grader_learning_and_store() {
     let mut h = one("r1:p1");
-    seed_due(&mut h, &["r1:p1"]);
     let StudyView::Attempt(view) = h.app.handle(StudyCommand::Next) else {
         panic!("expected attempt view")
     };
@@ -33,14 +32,10 @@ fn repertoire_due_journey_crosses_wire_queue_grader_learning_and_store() {
     assert_eq!(done.assessment, Some(Grade::Good));
     let saved = h.app.snapshot().unwrap();
     assert_eq!(saved.assessments.len(), 1);
-    assert_eq!(
-        saved.learning[&TargetId::from("r1:p1")].due,
-        Some(StudyDay(13))
-    );
-    assert_eq!(
-        saved.learning[&TargetId::from("r1:p1")].last_credit_day,
-        Some(StudyDay(10))
-    );
+    let learning = &saved.learning[&TargetId::from("r1:p1")];
+    assert_eq!(learning.last_graded_day, Some(StudyDay(10)));
+    assert_eq!(learning.scheduled_reviews, 1);
+    assert!(learning.scheduler_memory.is_some());
     assert!(matches!(
         h.app.handle(StudyCommand::Next),
         StudyView::Empty(_)
@@ -68,7 +63,7 @@ fn two_decision_tactic_has_one_grade_and_autoplay_has_none() {
 }
 
 #[test]
-fn first_miss_is_committed_correction_stays_failed_and_new_repeat_preserves_tomorrow() {
+fn first_miss_is_committed_and_correction_stays_failed_without_a_second_grade() {
     let mut h = one("t1");
     let issued = start(&mut h);
     let missed = answer(&mut h, &issued, "miss", "e2e3");
@@ -76,7 +71,10 @@ fn first_miss_is_committed_correction_stays_failed_and_new_repeat_preserves_tomo
     assert_eq!(missed.attempt.status, AttemptStatus::Active);
     let persisted = h.app.snapshot().unwrap();
     assert_eq!(persisted.assessments.len(), 1);
-    assert!(persisted.learning[&TargetId::from("t1")].repeat_pending);
+    assert_eq!(
+        persisted.learning[&TargetId::from("t1")].scheduled_reviews,
+        1
+    );
     assert_eq!(
         h.app.resume(&issued.attempt.id).unwrap().attempt.terminal,
         Some(Grade::Again)
@@ -86,17 +84,10 @@ fn first_miss_is_committed_correction_stays_failed_and_new_repeat_preserves_tomo
     assert_eq!(finished.attempt.terminal, Some(Grade::Again));
     assert_eq!(finished.assessment, None);
     assert_eq!(h.app.snapshot().unwrap().assessments.len(), 1);
-    let fresh = start(&mut h);
-    assert_ne!(fresh.attempt.id, issued.attempt.id);
-    let step = answer(&mut h, &fresh, "repeat-1", "e2e4");
-    let done = answer(&mut h, &step, "repeat-2", "g1f3");
-    assert_eq!(done.learning_effect, Some(LearningEffect::RepeatCleared));
-    let state = &h.app.snapshot().unwrap().learning[&TargetId::from("t1")];
-    assert_eq!(state.due, Some(StudyDay(11)));
-    assert!(!state.repeat_pending);
-    assert_eq!(state.miss_revision, MissRevision(1));
-    assert_eq!(state.scheduled_reviews, 1);
-    assert!(h.app.next_exercise().unwrap().is_none());
+    assert_eq!(
+        h.app.snapshot().unwrap().learning[&TargetId::from("t1")],
+        persisted.learning[&TargetId::from("t1")],
+    );
 }
 
 #[test]

@@ -14,7 +14,7 @@ pub trait SnapshotCodec {
 #[cfg(test)]
 mod tests {
     use super::SnapshotCodec;
-    use crate::{AppError, JsonSnapshotCodec, PortableSnapshot, Tempo};
+    use crate::{AppError, JsonSnapshotCodec, PortableSnapshot};
 
     // A small alternate representation illustrates replacing the codec, not Tempo.
     struct TaggedJson;
@@ -35,7 +35,7 @@ mod tests {
 
     #[test]
     fn application_export_accepts_an_alternate_codec_through_the_same_port() {
-        let app = Tempo::demo().unwrap();
+        let (app, _directory) = crate::components::test_study();
         let codec: &dyn SnapshotCodec = &TaggedJson;
         let data = app.export(codec).unwrap();
         assert!(data.starts_with("tempo-export\n"));

@@ -18,8 +18,7 @@ pub trait Clock {
 #[cfg(test)]
 mod tests {
     use super::Clock;
-    use crate::{Components, Tempo};
-    use tempo_store::MemoryStore;
+    use crate::Tempo;
     use tempo_types::{StudyDay, StudyTime};
 
     struct ScenarioClock;
@@ -34,15 +33,23 @@ mod tests {
 
     #[test]
     fn an_injected_clock_supplies_the_time_saved_with_an_issued_attempt() {
-        let mut components = Components::fixtures();
+        let mut components = crate::components::test_components();
         components.clock = Box::new(ScenarioClock);
-        let store = MemoryStore::new(
-            "clock-demo".into(),
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::components::test_store(
+            &directory,
+            "clock-demo",
             tempo_chess::demo_catalog(),
-            components.learning.settings(),
+            &components,
+        );
+        let mut app = Tempo::daily(
+            Box::new(store),
+            components,
+            Default::default(),
+            [42; 32],
+            10,
         )
         .unwrap();
-        let mut app = Tempo::new(Box::new(store), components).unwrap();
         let issued = app.next_exercise().unwrap().unwrap();
         let snapshot = app.snapshot().unwrap();
         assert_eq!(

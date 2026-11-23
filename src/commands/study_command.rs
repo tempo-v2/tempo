@@ -35,12 +35,12 @@ pub enum StudyCommand {
 #[cfg(test)]
 mod tests {
     use super::StudyCommand;
-    use crate::{Tempo, views::StudyView};
+    use crate::views::StudyView;
 
     #[test]
     fn a_transport_decodes_an_intent_before_dispatching_it() {
         let command: StudyCommand = serde_json::from_str(r#"{"command":"next"}"#).unwrap();
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         assert!(matches!(app.handle(command), StudyView::Attempt(_)));
         // A transport cannot dispatch an operation outside the supported intents.
         assert!(

@@ -87,8 +87,22 @@ fn disposable() -> (tempfile::TempDir, Tempo) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("tactics.sqlite");
     local_runtime::init(&path).unwrap();
-    local_runtime::configure(&path, 0, 0, None).unwrap();
     let mut app = local_runtime::open(&path).unwrap();
+    let store = tempo_store::SqliteStore::open(&path).unwrap();
+    use local_runtime::tactic_settings::{Command, handle};
+    let settings = handle(&mut app, &store, Command::Get).unwrap();
+    handle(
+        &mut app,
+        &store,
+        Command::Save {
+            dataset_id: serde_json::from_value(settings["dataset_id"].clone()).unwrap(),
+            expected_revision: settings["revision"].as_str().unwrap().into(),
+            new_tactics_per_day: 0,
+            new_openings_per_day: Some(0),
+            selection: crate::TacticThemes::Any,
+        },
+    )
+    .unwrap();
     app.components.clock = Box::new(FixedClock(app.components.clock.now()));
     (directory, app)
 }
@@ -1408,25 +1422,12 @@ fn personal_findings_flow_through_games_and_study_and_reuse_the_previous_request
     .unwrap();
     assert_eq!(detector.complete_decision_detector(), Some("z-archive"));
     let mut jobs = TacticalJobs::new(&detector, &["a-earlier", "z-archive"]);
-    assert!(jobs.has_personal_report());
+    assert!(jobs.has_complete_decisions());
     scan(&directory, &mut app, &mut detector, &mut jobs, 2);
     let requests = store.pending_tactical_requests(&dataset).unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].id, previous.id);
     assert_eq!(requests[0].target, previous.target);
-    let query = json!({"dataset_id": dataset, "filters": {"clock":{"seconds":60,"increment":0},
-        "speed":"bullet","learner_rating":1450,"motif":"hanging_material"}});
-    let report = crate::personal_tactics_report::read(
-        &store,
-        jobs.report_version(),
-        serde_json::from_value(query).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(report["filtered_games"], 2);
-    assert_eq!(report["clocks"].as_array().unwrap().len(), 1);
-    assert_eq!(report["loss_comparison"]["with_miss"]["losses"], 1);
-    assert_eq!(report["loss_comparison"]["without_miss"]["wins"], 1);
-    assert_eq!(report["games"].as_array().unwrap().len(), 2);
     let active = app.next_exercise().unwrap().unwrap();
     assert_eq!(active.attempt.target, previous.target);
     let saved = answer(&mut app, &active, "a1a7", "personal-answer");
@@ -1515,11 +1516,6 @@ fn a_revised_tactic_preserves_the_issued_attempt_without_introducing_new_learnin
         app.next_exercise().unwrap().unwrap().attempt,
         issued.attempt
     );
-    let report_request = || serde_json::from_value(json!({"dataset_id":dataset})).unwrap();
-    let before_skip =
-        crate::personal_tactics_report::read(&store, jobs.report_version(), report_request())
-            .unwrap();
-    assert_eq!(before_skip["detail"]["training"]["status"], "superseded");
     app.skip(crate::AbandonCommand {
         dataset_id: dataset.clone(),
         attempt_id: issued.attempt.id,
@@ -1527,10 +1523,6 @@ fn a_revised_tactic_preserves_the_issued_attempt_without_introducing_new_learnin
         submission_id: "skip-superseded".into(),
     })
     .unwrap();
-    let after_skip =
-        crate::personal_tactics_report::read(&store, jobs.report_version(), report_request())
-            .unwrap();
-    assert!(after_skip["detail"]["training"].is_null());
     assert!(
         store
             .pending_tactical_requests(&dataset)
@@ -1901,249 +1893,6 @@ fn a_tactical_request_does_not_record_whether_it_introduced_prior_learning() {
 }
 
 #[test]
-fn report_cache_bounds_warm_page_and_detail_work_as_the_archive_grows() {
-    use crate::personal_tactics_report::{ReportCache, WorkCounts, read_position};
-
-    for games in [36, 100] {
-        let (directory, mut app) = disposable();
-        let store =
-            tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
-        let dataset = app.game_dataset().unwrap();
-        let mut registry = DetectorRegistry::default();
-        registry
-            .register(tempo_chess::PersonalTacticsDetector(Evaluator {
-                revision: "report-cache",
-                outcome: "good",
-            }))
-            .unwrap();
-        let mut detector = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
-        let mut jobs = TacticalJobs::new(&detector, &["personal-tactics"]);
-        for start in (0..games).step_by(30) {
-            let end = (start + 30).min(games);
-            let pgn = (start..end)
-                .map(|number| {
-                    let (fen, clock) = if number == 0 {
-                        ("7k/n7/8/8/8/8/7P/R5K1 w - - 0 1", "120+1")
-                    } else {
-                        (HANGING, if number == 1 { "120+1" } else { "60" })
-                    };
-                    format!(
-                        "[White \"Learner\"]\n[Black \"Opponent{number}\"]\n[TimeControl \"{clock}\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n[Result \"0-1\"]\n\n1. Kg2 0-1"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            assert_eq!(
-                app.import_game_pgn(GameImport {
-                    dataset_id: dataset.clone(),
-                    command_id: format!("report-cache-{start}"),
-                    learner: "Learner".into(),
-                    repertoire_id: None,
-                    pgn,
-                })
-                .unwrap()
-                .new_games as usize,
-                end - start
-            );
-            scan(&directory, &mut app, &mut detector, &mut jobs, end as u64);
-        }
-        let version = jobs.report_version();
-        let mut cache = ReportCache::default();
-        let request = |fields: Value| {
-            let mut input = json!({"dataset_id": dataset});
-            input
-                .as_object_mut()
-                .unwrap()
-                .extend(fields.as_object().unwrap().clone());
-            serde_json::from_value(input).unwrap()
-        };
-        let first = cache.read(&store, version, request(json!({}))).unwrap();
-        assert_eq!(first["filtered_games"], games);
-        assert_eq!(first["loss_comparison"]["with_miss"]["losses"], games);
-        let first_work = WorkCounts {
-            pgns: games,
-            decisions: games,
-            aggregates: 1,
-            similarity: 0,
-            page_rows: 30,
-        };
-        assert_eq!(cache.work, first_work);
-        let stamp = &first["report_generation"];
-        let older_query = json!({"before": first["next_before"], "report_generation": stamp});
-        let older = cache.read(&store, version, request(older_query)).unwrap();
-        let older_len = (games - 30).min(30);
-        assert_eq!(older["games"].as_array().unwrap().len(), older_len);
-        assert_eq!(older["report_generation"], *stamp);
-        assert_eq!(older["loss_comparison"], first["loss_comparison"]);
-        assert_eq!(
-            cache.work,
-            WorkCounts {
-                page_rows: 30 + older_len,
-                ..first_work
-            }
-        );
-
-        let id = &older["games"][0]["id"];
-        let detail = read_position(
-            &store,
-            version,
-            serde_json::from_value(json!({"dataset_id":dataset,"id":id,"report_generation":stamp}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(detail["detail"], older["detail"]);
-        let before_filter = cache.work;
-        let sparse_query = json!({"filters":{"clock":{"seconds":120,"increment":1}}});
-        let sparse = cache
-            .read(&store, version, request(sparse_query.clone()))
-            .unwrap();
-        assert_eq!(sparse["filtered_games"], 2);
-        assert_eq!(sparse["games"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            cache.work,
-            WorkCounts {
-                aggregates: before_filter.aggregates + 1,
-                page_rows: before_filter.page_rows + 2,
-                ..before_filter
-            }
-        );
-
-        let anchor = &sparse["games"][0]["id"];
-        let other = &sparse["games"][1]["id"];
-        let similar = |anchor: &Value| {
-            json!({
-                "filters":sparse_query["filters"], "anchor":anchor, "report_generation":stamp
-            })
-        };
-        let peers = cache
-            .read(&store, version, request(similar(anchor)))
-            .unwrap();
-        assert_eq!(peers["games"].as_array().unwrap().len(), 1);
-        assert_eq!(peers["games"][0]["id"], *other);
-        assert_eq!(peers["loss_comparison"], sparse["loss_comparison"]);
-        let reversed = cache
-            .read(&store, version, request(similar(other)))
-            .unwrap();
-        assert_eq!(reversed["games"][0]["id"], *anchor);
-        let before_repeat = cache.work;
-        assert_eq!(
-            cache
-                .read(&store, version, request(similar(anchor)))
-                .unwrap(),
-            peers
-        );
-        assert_eq!(
-            cache.work,
-            WorkCounts {
-                page_rows: before_repeat.page_rows + 1,
-                ..before_repeat
-            }
-        );
-
-        let rebuilt = ReportCache::default()
-            .read(&store, version, request(json!({})))
-            .unwrap();
-        assert_eq!(rebuilt, first);
-    }
-}
-
-#[test]
-fn a_deeper_rescan_advances_report_freshness_without_reparsing_the_archive() {
-    use crate::personal_tactics_report::{ReportCache, WorkCounts, read_position};
-    struct DeeperEvaluator(Evaluator);
-    impl TacticalEvaluator for DeeperEvaluator {
-        fn descriptor(&self) -> EvaluationProvenance {
-            self.0.descriptor()
-        }
-        fn evaluate(
-            &self,
-            request: &TacticalEvaluationRequest,
-            control: &dyn DetectionControl,
-        ) -> Result<RootEvaluation, EvaluationFailure> {
-            if control.deeper_search() {
-                self.0.evaluate(request, control)
-            } else {
-                Err(EvaluationFailure::Incomplete)
-            }
-        }
-    }
-
-    let (directory, mut app) = disposable();
-    let store = tempo_store::SqliteStore::open(directory.path().join("tactics.sqlite")).unwrap();
-    let dataset = app.game_dataset().unwrap();
-    import(&mut app, "Deeper", "1. Rxa7");
-    let mut registry = DetectorRegistry::default();
-    registry
-        .register(tempo_chess::PersonalTacticsDetector(DeeperEvaluator(
-            Evaluator {
-                revision: "depth-stable",
-                outcome: "good",
-            },
-        )))
-        .unwrap();
-    let mut detector = GameDetection::new(registry, AnalysisOptions::default()).unwrap();
-    let mut jobs = TacticalJobs::new(&detector, &["personal-tactics"]);
-    jobs.force_idle_for_test();
-    let deadline = Instant::now() + Duration::from_secs(6);
-    loop {
-        detector.poll(&mut app);
-        jobs.poll(&mut app, &store, &mut detector);
-        let status = read(&mut app, &jobs, &store);
-        if status["statistics"]["retryable_positions"] == 1 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "expected a retryable position: {status}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let mut cache = ReportCache::default();
-    let unpinned = || serde_json::from_value(json!({"dataset_id":dataset})).unwrap();
-    let before = cache
-        .read(&store, jobs.report_version(), unpinned())
-        .unwrap();
-    let generation = store.tactical_report_generation(&dataset).unwrap();
-    assert_eq!(before["loss_comparison"]["analyzed"], 0);
-    assert_eq!(before["games"].as_array().unwrap().len(), 1);
-    assert_eq!(before["games"][0]["outcome"], "uncertain");
-
-    store
-        .retry_position_analysis(&dataset, jobs.report_version())
-        .unwrap();
-    scan(&directory, &mut app, &mut detector, &mut jobs, 1);
-    let new_generation = store.tactical_report_generation(&dataset).unwrap();
-    assert_eq!(new_generation.archive, generation.archive);
-    assert!(new_generation.evidence > generation.evidence);
-    let version = jobs.report_version();
-    let id = &before["games"][0]["id"];
-    let stale =
-        json!({"dataset_id":dataset,"id":id,"report_generation":before["report_generation"]});
-    assert_eq!(
-        read_position(&store, version, serde_json::from_value(stale).unwrap())
-            .unwrap_err()
-            .code,
-        "report_changed"
-    );
-    let after = cache.read(&store, version, unpinned()).unwrap();
-    assert_eq!(after["games"].as_array().unwrap().len(), 1);
-    assert_eq!(after["games"][0]["id"], *id);
-    assert_eq!(after["games"][0]["outcome"], "played_tactic");
-    assert_eq!(after["loss_comparison"]["analyzed"], 1);
-    assert_ne!(before["report_generation"], after["report_generation"]);
-    assert_eq!(
-        cache.work,
-        WorkCounts {
-            pgns: 1,
-            decisions: 2,
-            aggregates: 2,
-            similarity: 0,
-            page_rows: 2,
-        }
-    );
-}
-
-#[test]
 #[ignore = "requires the configured tactical Python and Stockfish"]
 fn generated_checking_fork_is_extended_before_its_first_request_is_issued() {
     assert_generated_checking_fork(false);
@@ -2259,17 +2008,6 @@ fn pictured_game_lesson_ends_at_the_rook_and_measures_the_actual_turn() {
         pgn: format!("[White \"Learner\"]\n[Black \"Opponent\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n[Result \"0-1\"]\n\n1. Bxc5 0-1"),
     }).unwrap();
     scan(&dir, &mut app, &mut detector, &mut jobs, 1);
-    let report = crate::personal_tactics_report::read(
-        &store,
-        jobs.report_version(),
-        serde_json::from_value(json!({"dataset_id":dataset})).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(report["simple_tactics"]["missed"], 1);
-    assert_eq!(
-        report["detail"]["details"]["recognition"]["motifs"],
-        json!(["hanging_material"])
-    );
     let first = app.next_exercise().unwrap().unwrap();
     let issued = store.stored_attempt(&first.attempt.id).unwrap().unwrap();
     assert_eq!(

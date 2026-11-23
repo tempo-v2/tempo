@@ -1,9 +1,5 @@
 //! Compose today's admissions and durable activity issuance.
-use super::{
-    TacticThemes, Tempo,
-    tactic_catalog_facts::{capture_review_priority, tactic_pack_candidates},
-    tactic_preferences::new_tactic_order,
-};
+use super::{TacticThemes, Tempo, tactic_catalog_facts::capture_review_priority};
 use crate::{
     AppError, DailyComponents,
     app_error::domain,
@@ -20,8 +16,8 @@ use tempo_queue::{
     ImmediateRecall, Line, RelevanceReason, TargetRelevance,
 };
 use tempo_store::{
-    ActivityMode, AnswerResult, Commit, RepertoireRun, Store, StoredAttempt, StudyOrderingWrite,
-    StudyScope, StudyState, Write,
+    ActivityMode, AnswerResult, Commit, Store, StoredAttempt, StudyOrderingWrite, StudyScope,
+    StudyState, Write,
 };
 use tempo_study::{Exercise, start_selected_exercise};
 use tempo_types::{DatasetId, StudyTime};
@@ -45,10 +41,8 @@ impl Default for IntroductionLimits {
 pub(super) struct DailyStudy {
     pub(super) limits: IntroductionLimits,
     pub(super) tactic_themes: Option<TacticThemes>,
-    pub(super) starter_themes: bool,
     pub(super) queue: DailySession,
     pub(super) preview_key: [u8; 32],
-    pub(super) more_tactics: usize,
 }
 
 impl Tempo {
@@ -58,19 +52,19 @@ impl Tempo {
         components: DailyComponents,
         limits: IntroductionLimits,
         preview_key: [u8; 32],
-        more_tactics: usize,
+        _legacy_more_tactics: usize,
     ) -> Result<Self, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.daily.daily");
-        let mut app = Self::assemble(store, components, None)?;
-        app.daily = Some(DailyStudy {
-            limits,
-            tactic_themes: None,
-            starter_themes: false,
-            queue: DailySession::default(),
-            preview_key,
-            more_tactics,
-        });
-        Ok(app)
+        Self::assemble(
+            store,
+            components,
+            DailyStudy {
+                limits,
+                tactic_themes: None,
+                queue: DailySession::default(),
+                preview_key,
+            },
+        )
     }
 
     pub(super) fn daily_selection(
@@ -203,12 +197,17 @@ impl Tempo {
             .collect::<Vec<_>>();
         let hash = blake3::hash(snapshot.dataset.0.as_bytes());
         let seed = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("fixed hash width"));
-        let order = new_tactic_order(
-            tactic_pack_candidates(catalog, learning),
-            at.day,
-            daily.tactic_themes.as_ref(),
-            daily.starter_themes,
-        );
+        let themes = daily.tactic_themes.as_ref().unwrap_or(&TacticThemes::Any);
+        let order = candidates
+            .iter()
+            .filter(|(target, candidate)| {
+                candidate.kind == DailyKind::Tactic
+                    && candidate.first_introduced.is_none()
+                    && themes.admits(catalog.items[*target].tactic_policy_facts.as_ref())
+            })
+            .enumerate()
+            .map(|(ordinal, (target, _))| (target.clone(), ordinal))
+            .collect();
         let required_activity = match snapshot
             .active_attempt
             .as_ref()
@@ -237,7 +236,7 @@ impl Tempo {
                 routes: &routes,
                 admissions,
                 required_activity,
-                new_tactic_order: order.as_ref(),
+                new_tactic_order: Some(&order),
                 capture_priority: &capture_priority,
                 evidence: &evidence,
             })
@@ -263,7 +262,6 @@ impl Tempo {
         selection: DailySelection,
     ) -> StudyView {
         let _diagnostic = crate::diagnostics::Span::new("app.daily.daily_summary");
-        let more = self.daily.as_ref().expect("daily release").more_tactics;
         let done = selection.outstanding == 0;
         StudyView::Empty(EmptyView {
             schema_version: STUDY_WIRE_VERSION,
@@ -275,10 +273,23 @@ impl Tempo {
             outstanding: selection.outstanding,
             repertoire_remaining: selection.repertoire_remaining,
             tactics_remaining: selection.tactics_remaining,
-            can_practice_tactics: done && selection.practice.is_some(),
-            can_learn_more_tactics: done && selection.unseen_tactics && more > 0,
-            learn_more_count: more,
+            can_practice_tactics: false,
+            can_learn_more_tactics: false,
+            learn_more_count: 0,
         })
+    }
+
+    pub(super) fn issue_next_daily(
+        &mut self,
+        snapshot: &StudyState,
+        at: StudyTime,
+        selection: &DailySelection,
+    ) -> Result<Option<AnswerResult>, AppError> {
+        selection
+            .next
+            .clone()
+            .map(|choice| self.issue_daily(snapshot, at, choice))
+            .transpose()
     }
 
     pub(super) fn issue_daily(
@@ -286,16 +297,6 @@ impl Tempo {
         snapshot: &StudyState,
         at: StudyTime,
         choice: DailyChoice,
-    ) -> Result<AnswerResult, AppError> {
-        self.issue_daily_with_run(snapshot, at, choice, None)
-    }
-
-    pub(super) fn issue_daily_with_run(
-        &mut self,
-        snapshot: &StudyState,
-        at: StudyTime,
-        choice: DailyChoice,
-        mut run: Option<RepertoireRun>,
     ) -> Result<AnswerResult, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.daily.issue_daily");
         let (item, learning) = snapshot
@@ -305,7 +306,8 @@ impl Tempo {
             DailyActivity::Teach => ActivityMode::Teach,
             DailyActivity::Repair => ActivityMode::Repair,
             DailyActivity::Test => ActivityMode::Test,
-            DailyActivity::Practice | DailyActivity::RepertoireWarmup => ActivityMode::Practice,
+            DailyActivity::Practice => ActivityMode::Practice,
+            DailyActivity::RepertoireWarmup => return Err(super::abandon::retired_warmup()),
         };
         let exercise = Exercise {
             target: item.target.clone(),
@@ -321,11 +323,6 @@ impl Tempo {
             )
         })
         .map_err(|error| domain("invalid_content", error))?;
-        let repertoire_warmup = choice.activity == DailyActivity::RepertoireWarmup;
-        let run_lead_in = run
-            .as_ref()
-            .filter(|run| !(run.skipped_warmup && run.head() == run.steps[0].issued.as_ref()))
-            .and_then(|run| run.next()?.lead_in.clone());
         let mut record = StoredAttempt {
             attempt: attempt.clone(),
             issued_at: at,
@@ -363,7 +360,7 @@ impl Tempo {
                 _ => None,
             },
             opponent_lead_in: None,
-            repertoire_warmup,
+            repertoire_warmup: false,
             acceptance: None,
             revealed_decision: None,
         };
@@ -372,27 +369,16 @@ impl Tempo {
         } else if mode == ActivityMode::Repair {
             self.repair_lead_in(&record, item)
         } else {
-            run_lead_in.or_else(|| item.verified_opponent_lead_in())
+            item.verified_opponent_lead_in()
         };
         let scope = StudyScope {
             target: Some(&item.target),
             ..StudyScope::default()
         };
-        let mut writes = vec![
+        let writes = vec![
             Write::Issue(record),
             Write::Active(Some(attempt.id.clone())),
         ];
-        if let Some(run) = &mut run {
-            let step = run
-                .steps
-                .iter_mut()
-                .find(|step| step.issued.is_none())
-                .ok_or_else(|| AppError::new("stale_activity", "Repertoire run has finished."))?;
-            step.issued = Some(attempt.id.clone());
-        }
-        if run.is_some() || snapshot.repertoire_run.is_some() {
-            writes.push(Write::RepertoireRun(run));
-        }
         let ordering = match choice.ordering {
             DailyOrderingEffect::Preserve => StudyOrderingWrite::Preserve,
             DailyOrderingEffect::OweRegularReview => StudyOrderingWrite::OweRegularReview,

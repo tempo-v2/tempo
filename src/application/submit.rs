@@ -1,15 +1,14 @@
 //! Grade one answer and commit progress, learning, assessment and replay receipt together.
 use super::{
     Tempo,
-    receipts::{replay, study_result},
+    receipts::{replay_accepted_study, replay_study_in_scope},
 };
 use crate::{
     AbandonCommand, AppError, SubmitCommand,
     app_error::{domain, study_input},
 };
 use tempo_chess::{ChessAnswer, ChessFeedback};
-use tempo_learning::{AssessmentInput, AssessmentSource, DailyLearning, LearningEffect};
-use tempo_queue::OrderEvent;
+use tempo_learning::{AssessmentInput, AssessmentSource, DailyLearning};
 use tempo_store::{
     AcceptanceKind, ActivityAcceptance, ActivityMode, AnswerResult, AssessmentKey,
     AssessmentRecord, Receipt, ReceiptResult, RevealedDecision, StoredAttempt, StudyScope, Write,
@@ -75,11 +74,29 @@ impl Tempo {
             submission: Some(&command.submission_id),
             ..StudyScope::default()
         };
+        if let Some(result) = replay_accepted_study(
+            self.store.as_ref(),
+            &command.dataset_id,
+            &command.submission_id,
+            &fingerprint,
+        )? {
+            return Ok(result);
+        }
+        // Recheck the receipt in the coherent new-work read. Another delivery
+        // may have committed it since the addressed lookup.
         let snapshot = self.store.study_state(scope)?;
-        if let Some(result) = replay(&snapshot, &command.submission_id, &fingerprint)? {
-            return study_result(result);
+        if let Some(result) = replay_study_in_scope(
+            &snapshot,
+            &command.dataset_id,
+            &command.submission_id,
+            &fingerprint,
+        )? {
+            return Ok(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
+        if old.repertoire_warmup {
+            return Err(super::abandon::retired_warmup());
+        }
         let (item, prior) = snapshot
             .target(&old.attempt.target)?
             .ok_or_else(|| AppError::new("stale_content", "target is unavailable"))?;
@@ -120,25 +137,21 @@ impl Tempo {
         }
         .map_err(study_input)?;
         let accepted_at = progress.assessment.map(|_| self.components.clock.now());
-        let acceptance = if self.daily.is_some() {
-            accepted_at
-                .zip(progress.assessment)
-                .map(|(at, grade)| {
-                    let decision_index = old.attempt.state.decision_index;
-                    let kind = match (grade, &response) {
-                        (Grade::Good, _) => AcceptanceKind::Recall,
-                        (Grade::Again, Response::Move(answer)) => AcceptanceKind::WrongMove {
-                            uci: answer.uci.clone(),
-                            decision_index,
-                        },
-                        (Grade::Again, _) => AcceptanceKind::Revealed { decision_index },
-                    };
-                    ActivityAcceptance { at, kind }
-                })
-                .or_else(|| old.acceptance.clone())
-        } else {
-            old.acceptance.clone()
-        };
+        let acceptance = accepted_at
+            .zip(progress.assessment)
+            .map(|(at, grade)| {
+                let decision_index = old.attempt.state.decision_index;
+                let kind = match (grade, &response) {
+                    (Grade::Good, _) => AcceptanceKind::Recall,
+                    (Grade::Again, Response::Move(answer)) => AcceptanceKind::WrongMove {
+                        uci: answer.uci.clone(),
+                        decision_index,
+                    },
+                    (Grade::Again, _) => AcceptanceKind::Revealed { decision_index },
+                };
+                ActivityAcceptance { at, kind }
+            })
+            .or_else(|| old.acceptance.clone());
         // Incorrect feedback authorizes the issued response at this cursor.
         // Concession also yields that transition before its inline reply is suppressed.
         let revealed_decision = (!progress.feedback.correct)
@@ -167,19 +180,9 @@ impl Tempo {
                 },
             };
             let policy = self.components.learning.as_ref();
-            let transition = if self.daily.is_some() {
-                crate::diagnostics::measure("learning.assess_test", || {
-                    DailyLearning::assess_test(
-                        policy,
-                        prior,
-                        &input,
-                        old.attempt.content_version,
-                        old.issued_at,
-                    )
-                })
-            } else {
-                policy.apply(prior, &input)
-            }
+            let transition = crate::diagnostics::measure("learning.assess_test", || {
+                policy.assess_test(prior, &input, old.attempt.content_version, old.issued_at)
+            })
             .map_err(|e| domain("learning_error", e))?;
             effect = Some(transition.effect);
             writes.push(Write::Learning {
@@ -238,42 +241,19 @@ impl Tempo {
         {
             writes.push(Write::Active(None));
         }
-        if let Some(run) = snapshot
-            .repertoire_run
-            .as_ref()
-            .filter(|run| run.head() == Some(&result.attempt.id))
-        {
-            let ends_run = old.mode == ActivityMode::Test
-                && (result.attempt.terminal == Some(Grade::Again)
-                    || result.learning_effect == Some(LearningEffect::StalePositiveIgnored));
-            if ends_run || (result.attempt.status != AttemptStatus::Active && run.next().is_none())
-            {
-                writes.push(Write::RepertoireRun(None));
-            }
-        }
         self.commit_study(&snapshot, writes, scope)?;
-        if self.daily.is_none() && result.assessment == Some(Grade::Again) {
-            self.order_history.push(OrderEvent::Missed {
-                target: result.attempt.target.clone(),
-            });
-        }
-        if self.daily.is_none() && result.attempt.status == AttemptStatus::Complete {
-            self.order_history.push(OrderEvent::Completed {
-                target: result.attempt.target.clone(),
-            });
-        }
         Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{SubmitCommand, Tempo};
+    use crate::SubmitCommand;
     use tempo_types::Grade;
 
     #[test]
     fn an_accepted_miss_saves_progress_learning_assessment_and_receipt_together() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let issued = app.next_exercise().unwrap().unwrap();
         let result = app
             .submit(SubmitCommand {
@@ -287,7 +267,7 @@ mod tests {
         let saved = app.snapshot().unwrap();
         assert_eq!(result.assessment, Some(Grade::Again));
         assert_eq!(saved.attempts[&result.attempt.id].attempt, result.attempt);
-        assert!(saved.learning[&result.attempt.target].repeat_pending);
+        assert_eq!(saved.learning[&result.attempt.target].scheduled_reviews, 1);
         assert_eq!(saved.assessments.len(), 1);
         assert_eq!(saved.receipts.len(), 1);
     }

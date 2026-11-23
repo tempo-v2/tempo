@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn a_model_host_only_reports_run_status_for_the_current_dataset() {
-        use crate::{DailyComponents, IntroductionLimits};
+        use crate::IntroductionLimits;
         use tempo_chess::Catalog;
         use tempo_learning::{DailyLearning, LearningPolicy};
 
@@ -659,7 +659,7 @@ mod tests {
                 learning.settings(),
             )
             .unwrap();
-            let mut components = DailyComponents::fixtures();
+            let mut components = crate::components::test_components();
             components.learning = Box::new(learning);
             Tempo::daily(
                 Box::new(store),
@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn cache_only_projection_publishes_partial_and_terminal_reach_without_python() {
-        use crate::{DailyComponents, IntroductionLimits};
+        use crate::IntroductionLimits;
         use tempo_chess::Catalog;
         use tempo_learning::{DailyLearning, LearningPolicy};
 
@@ -754,7 +754,7 @@ mod tests {
             learning.settings(),
         )
         .unwrap();
-        let mut components = DailyComponents::fixtures();
+        let mut components = crate::components::test_components();
         components.learning = Box::new(learning);
         let mut app = Tempo::daily(
             Box::new(store),

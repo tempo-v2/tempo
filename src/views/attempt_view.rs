@@ -104,16 +104,13 @@ pub(crate) struct CorrectionView {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        Tempo,
-        wire::{StudyCommand, StudyView},
-    };
+    use crate::wire::{StudyCommand, StudyView};
 
     #[test]
     fn only_the_miss_discloses_the_chess_projected_correction_label() {
         use crate::SubmitCommand;
 
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let StudyView::Attempt(issued) = app.handle(StudyCommand::Next) else {
             panic!("ready exercise");
         };
@@ -134,7 +131,7 @@ mod tests {
 
     #[test]
     fn the_ui_gets_prompt_and_identity_but_no_private_answer_or_learning_state() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let StudyView::Attempt(view) = app.handle(StudyCommand::Next) else {
             panic!("the demo has a ready attempt");
         };

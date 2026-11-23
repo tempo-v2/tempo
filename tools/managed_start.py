@@ -51,7 +51,23 @@ def backup(source, destination):
             raise ValueError(f"Tempo backup failed integrity checks: {destination}")
 
 
-def study_status(port, dataset, ui):
+def context_status(port, dataset, schema):
+    url = f"http://127.0.0.1:{port}/api/context"
+    with urllib.request.urlopen(url, timeout=1) as reply:
+        status = json.load(reply)
+    if (status.get("status") != "ready"
+            or status.get("dataset_id") != dataset
+            or status.get("schema_version") != schema):
+        raise ValueError("Tempo did not report the expected dataset and schema readiness")
+
+
+def desktop_assets(port, ui):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/assets/app.js", timeout=1) as reply:
+        if reply.read() != (ui / "assets/app.js").read_bytes():
+            raise ValueError("Tempo did not serve the expected UI")
+
+
+def study_smoke(port, dataset):
     url = f"http://127.0.0.1:{port}"
     request = urllib.request.Request(
         url + "/api/study", data=b'{"command":"study_status"}',
@@ -61,9 +77,6 @@ def study_status(port, dataset, ui):
         status = json.load(reply)
     if status.get("dataset_id") != dataset or status.get("status") != "empty":
         raise ValueError("Tempo did not report Study status for the registered dataset")
-    with urllib.request.urlopen(url + "/assets/app.js", timeout=1) as reply:
-        if reply.read() != (ui / "assets/app.js").read_bytes():
-            raise ValueError("Tempo did not serve the expected UI")
 
 
 def phone_environment(job):
@@ -109,9 +122,13 @@ def rehearse(binary, ui, database, dataset, scratch, phone):
             if not banner.startswith(prefix):
                 raise ValueError("The candidate did not start on the disposable database")
             port = int(banner[len(prefix):])
-            study_status(port, dataset, ui)
+            _, schema = database_status(copy)
+            context_status(port, dataset, schema)
+            desktop_assets(port, ui)
+            study_smoke(port, dataset)
             if phone:
                 phone_status(port, dataset, ui, phone)
+            return schema
         finally:
             if server.poll() is None:
                 server.terminate()
@@ -175,12 +192,18 @@ def stop_managed(port):
     raise ValueError(f"Managed Tempo did not release port {port}")
 
 
-def start_managed(config, port, dataset):
+def verify_running_binary(pid, binary):
+    images = lsof("-a", "-p", str(pid), "-d", "txt", "-Fn")
+    expected = binary.resolve()
+    if not any(line.startswith("n") and Path(line[1:]).resolve() == expected
+               for line in images):
+        raise ValueError("Tempo listener did not load the expected binary")
+
+
+def start_managed(config, port, dataset, schema, *, previous_release=False):
     resources = plist_resources(config)
-    (_, _, ui, _), _ = resources
+    (binary, _, ui, _), _ = resources
     job = plistlib.loads(config.read_bytes())
-    registered = job.get("EnvironmentVariables", {})
-    phone = {key: registered[key] for key in PHONE_VARIABLES if key in registered}
     launch("bootstrap", DOMAIN, str(config))
     if not job.get("RunAtLoad"):
         launch("kickstart", SERVICE)
@@ -188,9 +211,10 @@ def start_managed(config, port, dataset):
         pid = managed_pid()
         if pid and listeners(port) == {pid}:
             try:
-                study_status(port, dataset, ui)
-                if phone:
-                    phone_status(port, dataset, ui, phone)
+                if not previous_release:
+                    context_status(port, dataset, schema)
+                desktop_assets(port, ui)
+                verify_running_binary(pid, binary)
                 if registration(config, resources):
                     return
             except (ConnectionError, TimeoutError, URLError):
@@ -241,8 +265,11 @@ def restart(config, keep_development=False):
         shutil.copytree(UI / "dist", stage / "ui")
         checksum = artifact_hash(stage / "tempo", stage / "ui")
         changed = checksum != artifact_hash(old_binary, old_ui)
+        candidate_schema = schema
         if changed or environment_changed:
-            rehearse(stage / "tempo", stage / "ui", database, dataset, scratch, phone)
+            candidate_schema = rehearse(
+                stage / "tempo", stage / "ui", database, dataset, scratch, phone
+            )
         if changed:
             checkpoint = release / "checkpoints" / f"workspace-{checksum[:20]}"
             if checkpoint.exists():
@@ -274,7 +301,7 @@ def restart(config, keep_development=False):
                 backup(database, recovery / "study.sqlite")
                 print(f"Saved Tempo backup in {recovery}", flush=True)
                 write_plist(config, plistlib.dumps(job))
-            start_managed(config, port, dataset)
+            start_managed(config, port, dataset, candidate_schema)
         except (OSError, ValueError, subprocess.CalledProcessError, sqlite3.Error, KeyboardInterrupt):
             # The live database may already have accepted writes. Never restore a backup here.
             try:
@@ -282,7 +309,7 @@ def restart(config, keep_development=False):
                     if loaded_resources():
                         stop_managed(port)
                     write_plist(config, original)
-                    start_managed(config, port, dataset)
+                    start_managed(config, port, dataset, schema, previous_release=True)
             except (OSError, ValueError, subprocess.CalledProcessError, sqlite3.Error) as recovery_error:
                 print(f"Could not restart the previous Tempo service: {recovery_error}", file=sys.stderr)
             raise

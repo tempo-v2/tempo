@@ -136,12 +136,12 @@ impl StudyView {
 #[cfg(test)]
 mod tests {
     use super::StudyView;
-    use crate::{SubmitCommand, Tempo, wire::StudyCommand};
+    use crate::{SubmitCommand, wire::StudyCommand};
     use tempo_types::Grade;
 
     #[test]
     fn a_resumed_correction_still_displays_the_attempts_original_again_grade() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let issued = app.next_exercise().unwrap().unwrap();
         app.submit(SubmitCommand {
             dataset_id: issued.attempt.dataset,

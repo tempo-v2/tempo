@@ -23,12 +23,11 @@ pub struct AbandonCommand {
 #[cfg(test)]
 mod tests {
     use super::AbandonCommand;
-    use crate::Tempo;
     use tempo_study::AttemptStatus;
 
     #[test]
     fn a_stop_intent_carries_concurrency_identity_but_no_answer_or_grade() {
-        let mut app = Tempo::demo().unwrap();
+        let (mut app, _directory) = crate::components::test_study();
         let issued = app.next_exercise().unwrap().unwrap();
         let command = AbandonCommand {
             dataset_id: issued.attempt.dataset,

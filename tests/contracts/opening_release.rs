@@ -8,7 +8,7 @@ use std::{
     },
 };
 use tempo::{Clock, CounterIds, DailyComponents, IntroductionLimits, Tempo, wire::StudyCommand};
-use tempo_chess::{Catalog, ImportRequest, LearnerColor, LegalSequenceGrader, compile_repertoire};
+use tempo_chess::{Catalog, LearnerColor, LegalSequenceGrader, compile_repertoire};
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::{SqliteStore, Store};
 use tempo_types::{StudyDay, StudyTime, TargetId};
@@ -48,7 +48,6 @@ fn open(path: &Path, day: Day, limits: IntroductionLimits, generation: u8) -> Te
         grader: Box::new(LegalSequenceGrader),
         ids: Box::new(CounterIds(u64::from(generation) * 1_000)),
         learning: Box::new(learning),
-        ..DailyComponents::fixtures()
     };
     Tempo::daily(Box::new(store), components, limits, [42; 32], 10).unwrap()
 }
@@ -252,25 +251,8 @@ fn daily_generic_import_rejects_repertoires_and_mixed_catalogs_atomically() {
     assert_eq!(study(&mut app, ack)["status"], "complete");
 
     let before = app.snapshot().unwrap();
-    let request = ImportRequest {
-        pgn: "1. d4 *".into(),
-        source: "fixture".into(),
-        repertoire: Some(id.into()),
-        learner_color: Some(LearnerColor::White),
-    };
-    assert_eq!(
-        app.import_pgn(&before.dataset, &request).unwrap_err().code,
-        "unsupported"
-    );
-
-    let replacement = compile_repertoire(
-        &request.pgn,
-        id,
-        "Book",
-        LearnerColor::White,
-        &request.source,
-    )
-    .unwrap();
+    let replacement =
+        compile_repertoire("1. d4 *", id, "Book", LearnerColor::White, "fixture").unwrap();
     let tactics = tempo_chess::compile_tactics(&[tempo_chess::TacticRecord {
         namespace: "fixture".into(),
         source_id: "daily-tactic".into(),
@@ -425,7 +407,7 @@ fn snippet(label: &str, fen: &str, moves: &str) -> String {
 }
 
 #[test]
-fn mixed_study_independent_quotas_due_order_and_optional_actions() {
+fn mixed_study_independent_quotas_and_due_order() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("mixed.sqlite");
     let today = Arc::new(AtomicI32::new(20_000));
@@ -494,43 +476,17 @@ fn mixed_study_independent_quotas_due_order_and_optional_actions() {
     assert_eq!(done["done"], true, "{done}");
     assert_eq!(done["repertoire_remaining"], 0);
     assert_eq!(done["tactics_remaining"], 0);
-    assert_eq!(done["can_practice_tactics"], true);
-    assert_eq!(done["can_learn_more_tactics"], true);
-    let admitted = app.snapshot().unwrap();
-    assert_eq!(admitted.assessments.len(), 20);
-    let practice = study(&mut app, json!({"command":"practice_tactics"}));
-    assert_eq!(practice["activity"], "practice");
-    let target: TargetId = practice["target_id"].as_str().unwrap().into();
-    assert!(admitted.learning[&target].introduced);
-    assert_eq!(grade(&mut app, &practice, "practice")["assessment"], "good");
-    let after_practice = app.snapshot().unwrap();
-    assert_eq!(after_practice.learning, admitted.learning);
-    assert_eq!(after_practice.assessments, admitted.assessments);
-    let learn_more =
-        json!({"command":"learn_more_tactics","dataset_id":"opening-proof","submission_id":"more"});
-    let extended = study(&mut app, learn_more.clone());
-    assert_eq!(extended["done"], false);
-    assert_eq!(extended["tactics_remaining"], 10);
-    assert_eq!(extended["outstanding"], 5);
-    drop(app);
-
-    let mut app = open(&db, today.clone(), limits, 1);
-    assert_eq!(study(&mut app, learn_more), extended);
-    for index in 0..5 {
-        let card = study(&mut app, json!({"command":"next"}));
-        assert_eq!(card["activity"], "test");
-        let target: TargetId = card["target_id"].as_str().unwrap().into();
-        assert!(!admitted.learning[&target].introduced);
-        assert_eq!(
-            grade(&mut app, &card, &format!("optional-{index}"))["assessment"],
-            "good"
-        );
-    }
-    let done = study(&mut app, json!({"command":"next"}));
-    assert_eq!(done["done"], true);
-    assert_eq!(done["tactics_remaining"], 5);
+    assert_eq!(done["can_practice_tactics"], false);
     assert_eq!(done["can_learn_more_tactics"], false);
     let all_introduced = app.snapshot().unwrap();
+    assert_eq!(all_introduced.assessments.len(), 20);
+    let existing_id = json!({
+        "command":"learn_more_tactics",
+        "dataset_id":"opening-proof",
+        "submission_id":"learn-first-miss",
+    });
+    assert_eq!(study(&mut app, existing_id)["code"], "submission_conflict");
+    assert_eq!(app.snapshot().unwrap(), all_introduced);
 
     today.store(20_014, Ordering::Relaxed);
     let mut due = all_introduced
@@ -538,7 +494,7 @@ fn mixed_study_independent_quotas_due_order_and_optional_actions() {
         .iter()
         .filter_map(|(id, state)| state.introduced.then_some(id.clone()))
         .collect::<Vec<_>>();
-    assert_eq!(due.len(), 35);
+    assert_eq!(due.len(), 30);
     let hash = blake3::hash(b"opening-proof");
     let seed = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
     due.sort_by_cached_key(|id| {
@@ -564,7 +520,7 @@ fn mixed_study_independent_quotas_due_order_and_optional_actions() {
     let status = study(&mut app, json!({"command":"study_status"}));
     assert_eq!(status["tactics_remaining"], 20);
     assert_eq!(status["repertoire_remaining"], 10);
-    assert_eq!(app.snapshot().unwrap().assessments.len(), 60);
+    assert_eq!(app.snapshot().unwrap().assessments.len(), 50);
     for index in 0..40 {
         preview_and_save(&mut app, BOOK, &format!("Timing sample {index}"), None);
     }
@@ -730,6 +686,9 @@ fn a_wire_four_allowance_receipt_replays_after_rollover_without_a_write() {
     let mut expected = saved;
     expected["schema_version"] = json!(5);
     assert_eq!(study(&mut app, extend.clone()), expected);
+    let mut wrong_dataset = extend.clone();
+    wrong_dataset["dataset_id"] = json!("different-dataset");
+    assert_eq!(study(&mut app, wrong_dataset)["code"], "stale_dataset");
     assert_eq!(study(&mut app, extend), expected);
     assert_eq!(app.snapshot().unwrap(), before);
     let store = SqliteStore::open(&db).unwrap();
@@ -748,7 +707,7 @@ fn a_wire_four_allowance_receipt_replays_after_rollover_without_a_write() {
 }
 
 #[test]
-fn practice_failure_and_cross_midnight_allowance_replay_preserve_learning() {
+fn retired_optional_commands_leave_learning_and_allowance_unchanged() {
     use tempo_store::Store;
 
     let directory = tempfile::tempdir().unwrap();
@@ -779,64 +738,42 @@ fn practice_failure_and_cross_midnight_allowance_replay_preserve_learning() {
     let done = study(&mut app, json!({"command":"study_status"}));
     assert_eq!(done["done"], true);
     assert_eq!(done["tactics_remaining"], 0);
-    let before_practice = app.snapshot().unwrap();
-    let practice = study(&mut app, json!({"command":"practice_tactics"}));
-    assert_eq!(practice["target_id"], scheduled["target_id"]);
-    let give_up = activity_command("give_up", &practice, "practice-reveal");
-    let failed = study(&mut app, give_up.clone());
-    assert_eq!(failed["assessment"], "again");
-    assert_eq!(study(&mut app, give_up), failed);
-    let mut correct = activity_command("answer", &failed, "practice-correction");
-    correct["answer"] = json!({"uci":"e2e4"});
-    let completed = study(&mut app, correct);
-    assert_eq!(completed["status"], "complete");
-    assert_eq!(completed["assessment"], "again");
-    let after_practice = app.snapshot().unwrap();
-    assert_eq!(after_practice.learning, before_practice.learning);
-    assert_eq!(after_practice.assessments, before_practice.assessments);
-    assert_eq!(study(&mut app, json!({"command":"study_status"})), done);
-
+    let before = app.snapshot().unwrap();
+    let practice = json!({"command":"practice_tactics"});
     let extend = json!({
         "command":"learn_more_tactics",
         "dataset_id":"opening-proof",
-        "submission_id":"accepted-before-midnight"
+        "submission_id":"retired-before-midnight"
     });
-    let extended = study(&mut app, extend.clone());
-    assert_eq!(extended["tactics_remaining"], 10);
-    assert_eq!(extended["outstanding"], 1);
+    for command in [practice.clone(), extend.clone()] {
+        let retired = study(&mut app, command);
+        assert_eq!(retired["code"], "retired_activity");
+        assert_eq!(retired["retryable"], false);
+    }
+    assert_eq!(app.snapshot().unwrap(), before);
+    assert_eq!(study(&mut app, json!({"command":"study_status"})), done);
+
     let progress = app.study_progress(None).unwrap().unwrap();
     assert_eq!(progress.tactics_introduced, 1);
-    assert_eq!(progress.tactics_limit, 11);
-    assert_eq!(progress.extra_tactics, 10);
+    assert_eq!(progress.tactics_limit, 1);
+    assert_eq!(progress.extra_tactics, 0);
     assert!(app.study_progress(Some(&progress.stamp)).unwrap().is_none());
     drop(app);
+
     day.store(20_001, Ordering::Relaxed);
     let mut app = open(&db, day, limits, 1);
-    let before_replay = app.snapshot().unwrap();
+    assert_eq!(study(&mut app, practice)["code"], "retired_activity");
+    assert_eq!(study(&mut app, extend)["code"], "retired_activity");
+    assert_eq!(app.snapshot().unwrap(), before);
     let today = app.study_progress(Some(&progress.stamp)).unwrap().unwrap();
     assert_eq!(today.stamp.day, StudyDay(20_001));
     assert_eq!(today.tactics_introduced, 0);
     assert_eq!(today.tactics_limit, 1);
     assert_eq!(today.extra_tactics, 0);
-    assert_eq!(study(&mut app, extend), extended);
-    assert_eq!(app.snapshot().unwrap(), before_replay);
     let store = SqliteStore::open(&db).unwrap();
-    assert_eq!(
-        store
-            .tactics_extra(&before_replay.dataset, StudyDay(20_000))
-            .unwrap(),
-        10
-    );
-    assert_eq!(
-        store
-            .tactics_extra(&before_replay.dataset, StudyDay(20_001))
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        study(&mut app, json!({"command":"study_status"}))["tactics_remaining"],
-        1
-    );
+    for day in [StudyDay(20_000), StudyDay(20_001)] {
+        assert_eq!(store.tactics_extra(&before.dataset, day).unwrap(), 0);
+    }
 }
 
 #[test]
@@ -921,72 +858,34 @@ fn later_tactic_correction_uses_the_issued_move_regardless_of_capture_attributio
 }
 
 #[test]
-fn captures_interrupt_only_the_next_selection_and_cost_no_introductions() {
+fn saving_a_capture_preserves_the_active_attempt_and_spends_no_introduction() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("personal-captures.sqlite");
     let day = Arc::new(AtomicI32::new(20_000));
     let limits = IntroductionLimits {
         repertoire: 0,
-        tactics: 0,
+        tactics: 1,
     };
     let mut app = open(&db, day.clone(), limits, 0);
     let fen = "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1";
-    let legacy = [
-        snippet("Legacy 1", fen, "Kd2"),
-        snippet("Legacy 2", fen, "Kf2"),
-    ]
-    .concat();
-    transfer_tactics(&mut app, &legacy, &[0, 1], "tempo1:capture:legacy-fixture");
-    let before = app.snapshot().unwrap();
-    let dry = app
-        .backfill_personal_tactics(&Default::default(), false)
-        .unwrap();
-    assert_eq!(dry["introduced"], 2);
-    assert_eq!(app.snapshot().unwrap(), before);
-    assert_eq!(
-        app.backfill_personal_tactics(&Default::default(), true)
-            .unwrap()["status"],
-        "applied"
-    );
-    let issued = study(&mut app, json!({"command":"next"}));
-    let captured = snippet("New capture", fen, "e4");
-    transfer_tactics(&mut app, &captured, &[0], "test catalog");
-    let (_, saved) = save_tactics(&mut app, &captured, json!([]), vec![0]);
+    let existing = snippet("First capture", fen, "Kd2");
+    let (_, saved) = save_tactics(&mut app, &existing, json!([]), vec![0]);
     assert_eq!(saved["ready_for_review"], 1);
-    assert_eq!(app.snapshot().unwrap().catalog.items.len(), 3);
+    let issued = study(&mut app, json!({"command":"next"}));
+    assert_eq!(issued["status"], "ready");
+
+    let capture = snippet("Second capture", fen, "e4");
+    let (_, saved) = save_tactics(&mut app, &capture, json!([]), vec![0]);
+    assert_eq!(saved["ready_for_review"], 1);
     drop(app);
 
     let mut app = open(&db, day.clone(), limits, 1);
-    app.set_local_tactic_preferences(0, Some(tempo::TacticThemes::starter()));
     assert_eq!(study(&mut app, json!({"command":"next"})), issued);
-    let skip = activity_command("skip", &issued, "skip-legacy");
-    assert_eq!(study(&mut app, skip)["status"], "abandoned");
-    let next = study(&mut app, json!({"command":"next"}));
-    let target = TargetId::from(next["target_id"].as_str().unwrap());
-    let before_grade = app.snapshot().unwrap();
-    assert_eq!(
-        before_grade.catalog.items[&target].definition.decisions[0]
-            .expected
-            .uci,
-        "e2e4"
-    );
-    assert!(before_grade.assessments.is_empty());
-    let mut answer = activity_command("answer", &next, "solve-capture");
-    answer["answer"] = json!({"uci":"e2e4"});
-    assert_eq!(study(&mut app, answer)["assessment"], "good");
-    app.set_local_tactic_preferences(1, Some(tempo::TacticThemes::starter()));
+    assert!(app.snapshot().unwrap().assessments.is_empty());
     assert_eq!(
         study(&mut app, json!({"command":"study_status"}))["tactics_remaining"],
         1
     );
-    let graded = app.snapshot().unwrap();
-    day.store(20_001, Ordering::Relaxed);
-    assert_eq!(
-        app.backfill_personal_tactics(&Default::default(), true)
-            .unwrap()["status"],
-        "already_applied"
-    );
-    assert_eq!(app.snapshot().unwrap(), graded);
 }
 
 #[test]
@@ -1066,7 +965,10 @@ fn public_gap_list_reads_forecast_only_rows_and_opens_the_signed_editor() {
         })
     };
     let unaccepted = save(&draft);
-    let suspended = content(&mut app, activity_change(id, "forecast-suspend", "suspended"));
+    let suspended = content(
+        &mut app,
+        activity_change(id, "forecast-suspend", "suspended"),
+    );
     assert_eq!(suspended["status"], "activity_set", "{suspended}");
     let suspended_state = app.snapshot().unwrap();
     assert_eq!(

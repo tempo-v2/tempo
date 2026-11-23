@@ -28,7 +28,8 @@ from urllib.parse import urlsplit
 import uuid
 
 
-WORKSPACE = Path(__file__).resolve().parents[2]
+TEMPO_SOURCE = Path(__file__).resolve().parents[1]
+WORKSPACE = TEMPO_SOURCE.parent
 TARGET = Path(os.environ.get("CARGO_TARGET_DIR", WORKSPACE / "target"))
 BINARY = Path(os.environ.get("TEMPO_BIN", TARGET / "debug" / "tempo")).resolve()
 STATUS_BODY = b'{"command":"study_status"}'
@@ -131,7 +132,7 @@ class Server:
             connection.request(method, path, body=body, headers=fields)
             response = connection.getresponse()
             payload = response.read()
-            return response.status, dict(response.getheaders()), payload, fields["X-Tempo-Request-Id"]
+            return response.status, response.headers, payload, fields["X-Tempo-Request-Id"]
         finally:
             connection.close()
 
@@ -286,76 +287,40 @@ class RuntimeDiagnostics(unittest.TestCase):
                         # A second independent request also remains responsive.
                         self.assertEqual(json.loads(server.request()[2]), expected)
 
-    def test_tactics_worker_and_addressed_routes_export_without_a_server(self):
+    def test_report_retirement_preserves_games_context_and_study(self):
         logs = self.root / "tactics-logs"
-
-        def post(server, path, payload):
-            return server.request(json.dumps(payload).encode(), path=path)
-
-        def operation(request_id, name):
-            return wait_event(
-                logs,
-                lambda e: e.get("request_id") == request_id
-                and e.get("event") == "span.end"
-                and e.get("operation") == name,
-            )
-
+        retired_ids = []
         with Server(self.database, self.ui, logs) as server:
-            dataset = json.loads(server.request()[2])["dataset_id"]
-            query = {"dataset_id": dataset}
-            status, headers, payload, report_id = post(server, "/api/games/tactics/report", query)
+            status, _, payload, study_id = server.request()
             self.assertEqual(status, 200)
-            report = json.loads(payload)
-            self.assertEqual(report["dataset_id"], dataset)
-            self.assertEqual(report["games"], [])
-            self.assertEqual(operation(report_id, "http.request")["route"], "tactics_report")
-            self.assertEqual(operation(report_id, "tactics.report.admission")["outcome"], "admitted")
-            worker = operation(report_id, "tactics.report.worker")
-            self.assertEqual(worker["outcome"], "ready")
-            self.assertGreaterEqual(worker["queue_wait_ms"], 0)
-            self.assertEqual(headers["X-Tempo-Request-Id"], report_id)
-            self.assertEqual(headers["X-Tempo-Run-Id"], worker["run_id"])
-            self.assertEqual(operation(report_id, "tactics.report.capture")["outcome"], "archive")
-            self.assertEqual(operation(report_id, "tactics.report.archive_facts")["count"], 0)
-            self.assertEqual(operation(report_id, "tactics.report.decision_facts")["count"], 0)
-            self.assertEqual(operation(report_id, "tactics.report.aggregates")["outcome"], "rebuilt")
+            dataset = json.loads(payload)["dataset_id"]
+            for path in ("/api/games/tactics/report", "/api/games/tactics/position"):
+                status, headers, payload, delivery = server.request(
+                    json.dumps({"dataset_id": dataset, "id": 1}).encode(), path=path,
+                )
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                self.assertEqual(headers["X-Tempo-Request-Id"], delivery)
+                retired_ids.append(delivery)
 
-            status, _, payload, warm_id = post(
-                server, "/api/games/tactics/report", {**query, "report_generation": report["report_generation"]},
-            )
+            status, _, payload, _ = server.request(None, path="/api/context", method="GET")
             self.assertEqual(status, 200)
-            self.assertEqual(json.loads(payload), report)
-            self.assertNotEqual(warm_id, report_id)
-            self.assertEqual(operation(warm_id, "tactics.report.worker")["outcome"], "ready")
-            self.assertEqual(operation(warm_id, "tactics.report.capture")["outcome"], "reused")
-            self.assertEqual(operation(warm_id, "tactics.report.aggregates")["outcome"], "reused")
-            self.assertEqual(operation(warm_id, "tactics.report.page")["count"], 0)
-
-            status, headers, payload, detail_id = post(
-                server, "/api/games/tactics/position",
-                {**query, "id": 1, "report_generation": report["report_generation"]},
-            )
-            self.assertEqual(status, 400)
-            self.assertEqual(json.loads(payload)["code"], "unknown_position")
-            self.assertEqual(headers["X-Tempo-Request-Id"], detail_id)
-            operation(detail_id, "tactics.report.detail")
-            operation(detail_id, "tactics.report.position")
-
-            tab = str(uuid.uuid4())
-            status, headers, _, presence_id = post(
-                server, "/api/study/presence", {"tab": tab, "sequence": 1, "state": "active"},
-            )
-            self.assertEqual(status, 204)
-            self.assertEqual(headers["X-Tempo-Request-Id"], presence_id)
-            operation(presence_id, "study.presence")
-
-            status, _, _, settings_id = post(server, "/api/tactic-settings", {"command": "get"})
+            self.assertEqual(json.loads(payload)["dataset_id"], dataset)
+            status, _, payload, _ = server.request(None, path="/api/games", method="GET")
             self.assertEqual(status, 200)
-            operation(settings_id, "settings.tactics")
+            self.assertEqual(json.loads(payload)["results"], [])
+            self.assert_correlated(logs, study_id)
+            for delivery in retired_ids:
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("tactics.report.", "sqlite.", "app."))
+                    for e in events
+                ))
 
         output = self.root / "offline-export.json"
         subprocess.run(
-            [sys.executable, str(WORKSPACE / "tempo" / "tools" / "diagnose.py"),
+            [sys.executable, str(TEMPO_SOURCE / "tools" / "diagnose.py"),
              "--duration", "1", "--interval", "1", "--log-dir", str(logs), "--output", str(output)],
             check=True,
             capture_output=True,
@@ -366,26 +331,133 @@ class RuntimeDiagnostics(unittest.TestCase):
         self.assertTrue(bundle["samples"])
         events = bundle["diagnostic_logs"]["events"]
         self.assertLessEqual(len(events), bundle["diagnostic_logs"]["bounds"]["events"])
-        exported_worker = next(
-            event for event in events if event.get("request_id") == report_id
-            and event.get("event") == "span.end" and event.get("operation") == "tactics.report.worker"
-        )
-        self.assertEqual(exported_worker["queue_wait_ms"], worker["queue_wait_ms"])
-        exported_response = next(
-            event for event in events if event.get("request_id") == report_id and event["event"] == "http.response"
-        )
-        self.assertEqual(exported_response["run_id"], exported_worker["run_id"])
-        self.assertEqual(exported_response["status_code"], 200)
-        self.assertNotIn(tab, json.dumps(events))
+        for delivery in retired_ids:
+            exported = next(
+                event for event in events if event.get("request_id") == delivery and event["event"] == "http.response"
+            )
+            self.assertEqual(exported["status_code"], 410)
         self.assertNotIn(dataset, json.dumps(events))
+
+    def test_position_evidence_retirement_leaves_replay_and_authoring_available(self):
+        logs = self.root / "position-retirement-logs"
+
+        def post(server, path, payload):
+            return server.request(json.dumps(payload).encode(), path=path)
+
+        with Server(self.database, self.ui, logs) as server:
+            status, _, context, _ = server.request(None, path="/api/context", method="GET")
+            self.assertEqual(status, 200)
+            dataset = json.loads(context)["dataset_id"]
+            for path in ("/api/analysis/evidence", "/api/analysis/result"):
+                status, headers, payload, delivery = post(server, path, {"request_id": "old-reader"})
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                self.assertEqual(headers["X-Tempo-Request-Id"], delivery)
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("evidence.", "sqlite.", "app."))
+                    for e in events
+                ))
+
+            status, _, imported, _ = post(server, "/api/games/import", {
+                "dataset_id": dataset, "command_id": "fixture-game", "learner": "Learner",
+                "pgn": '[White "Learner"]\n[Black "Opponent"]\n[Result "1-0"]\n\n1. e4 e5 1-0',
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(imported)["new_games"], 1)
+            status, _, library, _ = post(server, "/api/games/library", {"dataset_id": dataset})
+            self.assertEqual(status, 200)
+            game, = json.loads(library)["entries"]
+            status, _, replay, _ = post(server, "/api/games/review", {
+                "dataset_id": dataset, "source": game["source"], "game_id": game["game_id"],
+                "learner": game["learner"], "repertoire_id": None,
+            })
+            self.assertEqual(status, 200)
+            replay = json.loads(replay)
+            self.assertEqual(replay["status"], "review")
+            self.assertEqual(len(replay["positions"]), 3)
+            self.assertIsNone(replay["comparison"])
+
+            draft = {"dataset_id": dataset, "name": "Opening", "learner_color": "white", "pgn": "1. d4 d5 2. Bf4 *"}
+            status, _, preview, _ = post(server, "/api/repertoires", {"command": "preview", **draft})
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(preview)["status"], "preview")
+            status, _, saved, _ = post(server, "/api/repertoires", {
+                "command": "save", **draft, "token": json.loads(preview)["token"],
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(saved)["status"], "repertoires")
+
+    def test_manual_detector_retirement_does_no_work_and_preserves_capture(self):
+        logs = self.root / "manual-detector-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            for method, path in (
+                ("GET", "/api/games/detectors"),
+                ("POST", "/api/games/detection"),
+                ("POST", "/api/games/detection-result"),
+            ):
+                status, _, payload, delivery = server.request(
+                    None if method == "GET" else b"{}", method=method, path=path
+                )
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("detection.", "sqlite.", "app."))
+                    for e in events
+                ))
+
+            status, _, context, _ = server.request(None, path="/api/context", method="GET")
+            self.assertEqual(status, 200)
+            capture = {
+                "dataset_id": json.loads(context)["dataset_id"],
+                "pgn": '[SetUp "1"]\n[FEN "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"]\n1.e4 *',
+            }
+            status, _, preview, _ = server.request(
+                json.dumps({"command": "preview", **capture}).encode(), path="/api/tactics"
+            )
+            self.assertEqual(status, 200)
+            preview = json.loads(preview)
+            self.assertEqual(preview["rows"][0]["status"], "valid")
+            save = json.dumps({
+                "command": "save", **capture, "token": preview["token"], "selected": [0],
+            }).encode()
+            status, _, reply, _ = server.request(save, path="/api/tactics")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(reply)["status"], "tactics_saved")
+            status, _, replayed, _ = server.request(save, path="/api/tactics")
+            self.assertEqual(status, 200)
+            self.assertEqual(replayed, reply)
+
+    def test_standalone_gap_analysis_retirement_does_no_work(self):
+        logs = self.root / "gap-analysis-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            for method, path in (
+                ("GET", "/api/games/gap-analysis"),
+                ("POST", "/api/games/gap-analysis"),
+                ("POST", "/api/games/gap-analysis/status"),
+            ):
+                status, _, payload, delivery = server.request(
+                    None if method == "GET" else b"{}", method=method, path=path
+                )
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("gap_analysis.", "sqlite.", "app."))
+                    for e in events
+                ))
 
     def test_real_sqlite_wait_has_request_stall_and_recovery_evidence(self):
         logs = self.root / "lock-logs"
         with Server(self.database, self.ui, logs) as server:
             baseline = json.loads(server.request()[2])
             request_id = str(uuid.uuid4())
-            # tiny_http buffers short bodies before dispatch. A larger, semantically
-            # identical JSON body exposes the real read_body boundary without hooks.
+            # Wait for the ingress to receive this request while withholding the
+            # rest of its legal body so the application has not claimed it.
             body = STATUS_BODY + b" " * 2048
             connection = server.connection(timeout=8)
             lock = sqlite3.connect(self.database, timeout=2)
@@ -399,18 +471,18 @@ class RuntimeDiagnostics(unittest.TestCase):
                 wait_event(
                     logs,
                     lambda e: e.get("request_id") == request_id
-                    and e.get("event") == "span.start"
+                    and e.get("event") == "http.body_started"
                     and e.get("operation") == "http.read_body",
                 )
-                # The application is now inside this exact HTTP handler; its loop
-                # cannot race us by entering model scheduling before the read.
+                # Hold a real SQLite lock before allowing the request into the
+                # application, then measure and correlate the storage wait.
                 lock.execute("BEGIN EXCLUSIVE")
                 started = time.monotonic()
                 connection.send(body[1:])
 
                 def receive():
                     response = connection.getresponse()
-                    return response.status, dict(response.getheaders()), json.loads(response.read())
+                    return response.status, response.headers, json.loads(response.read())
 
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     pending = executor.submit(receive)

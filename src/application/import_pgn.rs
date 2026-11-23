@@ -1,40 +1,13 @@
 //! Parse content and commit its semantic change plan with affected learning state.
 use super::Tempo;
 use crate::{AppError, app_error::domain};
-use tempo_chess::{Catalog, ChangeKind, ContentPlan, ImportRequest};
+use tempo_chess::{Catalog, ChangeKind, ContentPlan};
 use tempo_learning::LearningState;
 use tempo_store::{ContentState, Write};
 use tempo_types::DatasetId;
 
 impl Tempo {
-    /// Additively import content through the standard profile's selected parser.
-    ///
-    /// Omitted content and metadata-only learning are retained. New or
-    /// semantically changed targets start with default learning. Daily Study
-    /// accepts repertoire PGN through signed Preview and Save instead.
-    pub fn import_pgn(
-        &mut self,
-        dataset: &DatasetId,
-        request: &ImportRequest,
-    ) -> Result<Vec<tempo_chess::ContentChange>, AppError> {
-        let _diagnostic = crate::diagnostics::Span::new("app.import_pgn.import_pgn");
-        let fixture = self.fixture.as_ref().ok_or_else(|| {
-            AppError::new(
-                "unsupported",
-                "Use Repertoires to preview and save repertoire PGN.",
-            )
-        })?;
-        let snapshot = self.import_snapshot(dataset)?;
-        let parsed = fixture
-            .parser
-            .parse(request)
-            .map_err(|e| domain("content_parse_error", e))?;
-        Ok(self.apply_catalog_to(&snapshot, &parsed)?.changes)
-    }
-
-    /// Apply validated content atomically. The standard profile uses additive
-    /// import. Daily Study accepts only active tactics with no repertoire routes
-    /// and uses the capture planner to preserve existing definitions and learning.
+    /// Apply validated tactics while preserving existing definitions and learning.
     pub fn apply_catalog(
         &mut self,
         dataset: &DatasetId,
@@ -94,13 +67,9 @@ impl Tempo {
         snapshot: &ContentState,
         catalog: &Catalog,
     ) -> Result<ContentPlan, AppError> {
-        let plan = if self.daily.is_some() {
-            tempo_chess::plan_tactic_capture(&snapshot.catalog, catalog).map(|plan| plan.content)
-        } else {
-            tempo_chess::plan_import(&snapshot.catalog, catalog)
-        }
-        .map_err(|e| domain("content_change_error", e))?;
-        self.publish_import(snapshot, plan)
+        let plan = tempo_chess::plan_tactic_capture(&snapshot.catalog, catalog)
+            .map_err(|error| domain("content_change_error", error))?;
+        self.publish_import(snapshot, plan.content)
     }
 
     fn publish_import(
@@ -132,35 +101,6 @@ impl Tempo {
             }
         }
         self.commit(&snapshot.dataset, snapshot.revision, writes)?;
-        self.remaining_block.clear();
         Ok(plan)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::Tempo;
-    use tempo_chess::{ImportRequest, REPERTOIRE_PGN};
-
-    #[test]
-    fn importing_unchanged_repertoire_preserves_the_active_attempt() {
-        let mut app = Tempo::demo().unwrap();
-        let issued = app.next_exercise().unwrap().unwrap();
-        let before = app.snapshot().unwrap();
-        app.import_pgn(
-            &before.dataset,
-            &ImportRequest {
-                pgn: REPERTOIRE_PGN.into(),
-                source: "example-import".into(),
-                repertoire: None,
-                learner_color: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            app.resume(&issued.attempt.id).unwrap().attempt,
-            issued.attempt
-        );
-        assert_eq!(app.snapshot().unwrap().learning, before.learning);
     }
 }

@@ -44,7 +44,7 @@ fn failed_commit_leaves_progress_grade_learning_and_receipt_unchanged_then_retry
     let issued = start(&mut h);
     let before = h.app.snapshot().unwrap();
     let submit = command(&issued, "retry-after-failure", "e2e3");
-    h.store.borrow_mut().fail_next_commit();
+    h.fail_next_commit.set(true);
     let failure = h.app.submit(submit.clone()).unwrap_err();
     assert_eq!(failure.code, "store_unavailable");
     assert!(failure.retryable);

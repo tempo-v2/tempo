@@ -3,9 +3,7 @@ use super::{Tempo, content_preview::source_id};
 use crate::coverage_scan::{GapLineInput, GapLineRequest};
 use crate::game_model::{AuthoringSurface, GapKind, GapRequest, model_input_stamp};
 use crate::maia::{MODEL_KEY, PROFILE_LABEL, checked_distribution};
-use crate::{
-    AppError, app_error::domain, commands::RepertoireInput, gap_analysis::GapAnalysisInput,
-};
+use crate::{AppError, app_error::domain, commands::RepertoireInput};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use tempo_chess::{
@@ -24,11 +22,6 @@ struct CheckedGapRepertoire {
     name: String,
     color: LearnerColor,
     pgn: String,
-}
-
-struct GapAnalysisContext {
-    catalog: BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>,
-    names: BTreeMap<String, String>,
 }
 
 impl Tempo {
@@ -299,29 +292,12 @@ impl Tempo {
         Ok((draft, book.revision))
     }
 
-    pub(crate) fn gap_analysis_input(
-        &self,
-        request: GapRequest,
-    ) -> Result<GapAnalysisInput, AppError> {
-        let dataset = request.dataset_id.clone();
-        let repertoire_id = request.repertoire_id.clone();
-        let (draft, revision) = self.gap_position(request)?;
-        let context = self.gap_analysis_context(&dataset, &repertoire_id, revision)?;
-        Ok(GapAnalysisInput {
-            draft,
-            catalog: context.catalog,
-            repertoire_id,
-            repertoire_names: context.names,
-            revision,
-        })
-    }
-
     fn gap_analysis_context(
         &self,
         dataset: &DatasetId,
         repertoire_id: &str,
         revision: Revision,
-    ) -> Result<GapAnalysisContext, AppError> {
+    ) -> Result<BTreeMap<PositionKey, Vec<SavedRepertoireResponse>>, AppError> {
         let snapshot = self.store.content_state()?;
         let current_revision = snapshot.content_revision;
         if &snapshot.dataset != dataset || current_revision != revision {
@@ -334,7 +310,6 @@ impl Tempo {
             return Err(super::repertoires::suspended_repertoire());
         }
         let mut catalog = BTreeMap::<PositionKey, Vec<SavedRepertoireResponse>>::new();
-        let mut repertoire_names = BTreeMap::new();
         for item in snapshot.catalog.items.values().filter(|item| item.active()) {
             if let ContentKind::Repertoire {
                 position,
@@ -344,9 +319,6 @@ impl Tempo {
                 if snapshot.suspended_repertoires.contains(repertoire) {
                     continue;
                 }
-                repertoire_names
-                    .entry(repertoire.clone())
-                    .or_insert_with(|| item.label.clone());
                 catalog
                     .entry(position.clone())
                     .or_default()
@@ -356,10 +328,7 @@ impl Tempo {
                     });
             }
         }
-        Ok(GapAnalysisContext {
-            catalog,
-            names: repertoire_names,
-        })
+        Ok(catalog)
     }
 
     pub(crate) fn authorize_gap_surface(
@@ -455,9 +424,8 @@ impl Tempo {
         let first_san = line
             .play(&checked.authored, &first)
             .map_err(|error| domain("invalid_gap_line", error))?;
-        let catalog = self
-            .gap_analysis_context(&gap.dataset_id, &gap.repertoire_id, checked.revision)?
-            .catalog;
+        let catalog =
+            self.gap_analysis_context(&gap.dataset_id, &gap.repertoire_id, checked.revision)?;
         Ok(GapLineInput {
             line,
             anchor_fen,

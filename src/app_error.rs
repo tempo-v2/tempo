@@ -80,8 +80,22 @@ mod tests {
     use tempo_store::StoreError;
 
     #[test]
-    fn game_history_on_study_fixture_reports_a_nonretryable_capability_error() {
-        let mut app = crate::Tempo::demo().unwrap();
+    fn game_history_without_store_support_reports_a_nonretryable_capability_error() {
+        let components = crate::components::test_components();
+        let store = tempo_store::MemoryStore::new(
+            "test".into(),
+            tempo_chess::Catalog::default(),
+            components.learning.settings(),
+        )
+        .unwrap();
+        let mut app = crate::Tempo::daily(
+            Box::new(store),
+            components,
+            Default::default(),
+            [42; 32],
+            10,
+        )
+        .unwrap();
         let before = app.snapshot().unwrap();
         let error = app.game_history().unwrap_err();
         assert_eq!(error.code, "unsupported_capability");

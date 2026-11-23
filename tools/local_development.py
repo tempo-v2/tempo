@@ -8,7 +8,6 @@ import sys
 
 WORKSPACE = Path.cwd().resolve()
 UI = WORKSPACE / "tempo-ui"
-sys.path.insert(0, str(UI / "tools"))
 
 from development_guard import Installation, check_ui, contains, database_files, identity
 from stop_local_server import find_server, stop_server

@@ -1,7 +1,7 @@
 //! Accept guided reproduction as instruction, with no graded Study submission.
 use super::{
     Tempo,
-    receipts::{replay, study_result},
+    receipts::{replay_accepted_study, replay_study_in_scope},
 };
 use crate::{
     AppError, SubmitCommand,
@@ -23,11 +23,26 @@ impl Tempo {
             submission: Some(&command.submission_id),
             ..StudyScope::default()
         };
-        let snapshot = self.store.study_state(scope)?;
         let fingerprint = serde_json::to_string(&("acknowledge", &command))
             .map_err(|error| domain("codec_error", error))?;
-        if let Some(result) = replay(&snapshot, &command.submission_id, &fingerprint)? {
-            return study_result(result);
+        if let Some(result) = replay_accepted_study(
+            self.store.as_ref(),
+            &command.dataset_id,
+            &command.submission_id,
+            &fingerprint,
+        )? {
+            return Ok(result);
+        }
+        // Recheck the receipt in the coherent new-work read. Another delivery
+        // may have committed it since the addressed lookup.
+        let snapshot = self.store.study_state(scope)?;
+        if let Some(result) = replay_study_in_scope(
+            &snapshot,
+            &command.dataset_id,
+            &command.submission_id,
+            &fingerprint,
+        )? {
+            return Ok(result);
         }
         let old = self.current(&snapshot, &command.dataset_id, &command.attempt_id)?;
         if !matches!(old.mode, ActivityMode::Teach | ActivityMode::Repair) {

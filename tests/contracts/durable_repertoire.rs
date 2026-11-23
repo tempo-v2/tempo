@@ -1,9 +1,10 @@
 //! Drive real PGN import and SQLite replay across two application processes.
 
-use super::support::command;
+use super::support::{command, daily_components, open};
+use serde_json::{Value, json};
 use std::{env, fs, path::Path, process::Command};
-use tempo::{Components, CounterIds, SubmitCommand, Tempo};
-use tempo_chess::{Catalog, ImportRequest, LearnerColor, RepertoirePgnParser};
+use tempo::{SubmitCommand, wire::StudyCommand};
+use tempo_chess::Catalog;
 use tempo_store::{ReceiptResult, Snapshot, SqliteStore, Store};
 use tempo_study::AttemptStatus;
 use tempo_types::{DatasetId, Grade};
@@ -38,42 +39,45 @@ fn import_study_restart_and_replay() {
 }
 
 fn run_stage(database: &Path) {
-    let mut components = Components::fixtures();
-    components.parser = Box::new(RepertoirePgnParser::new("open-games", "Open Games"));
     match env::var(STAGE_ENV).as_deref() {
-        Ok("import-and-answer") => import_and_answer(database, components),
-        Ok("resume-and-replay") => resume_and_replay(database, components),
+        Ok("import-and-answer") => import_and_answer(database),
+        Ok("resume-and-replay") => resume_and_replay(database),
         stage => panic!("unexpected child stage {stage:?}"),
     }
 }
 
-fn import_and_answer(database: &Path, components: Components) {
+fn import_and_answer(database: &Path) {
     let dataset = DatasetId::from("durable-repertoire");
     let store = SqliteStore::create(
         database,
         dataset.clone(),
         Catalog::default(),
-        components.learning.settings(),
+        daily_components(10, 0).learning.settings(),
     )
     .unwrap();
-    let mut app = Tempo::new(Box::new(store), components).unwrap();
-    let request = ImportRequest {
-        pgn: "[Event \"Durable repertoire\"]\n\n1.e4 e5 2.Nf3 *".into(),
-        source: "repertoire contract test".into(),
-        repertoire: Some("open-games".into()),
-        learner_color: Some(LearnerColor::White),
-    };
-    assert_eq!(app.import_pgn(&dataset, &request).unwrap().len(), 2);
-    let added = app.snapshot().unwrap().catalog.items;
-    app.import_pgn(
-        &dataset,
-        &ImportRequest {
-            pgn: "1. e4 *".into(),
-            ..request
-        },
-    )
-    .unwrap();
-    assert_eq!(app.snapshot().unwrap().catalog.items, added);
+    let mut app = open(Box::new(store), 10, 0);
+    let mut request = json!({
+        "command": "preview", "dataset_id": dataset,
+        "pgn": "1. e4 e5 2. Nf3 *", "name": "Open Games", "learner_color": "white"
+    });
+    let preview = app.handle_repertoire(serde_json::from_value(request.clone()).unwrap());
+    assert_eq!(preview["status"], "preview");
+    request["command"] = json!("save");
+    request["token"] = preview["token"].clone();
+    let saved = app.handle_repertoire(serde_json::from_value(request).unwrap());
+    assert_eq!(saved["status"], "repertoires");
+    assert_eq!(saved["repertoires"][0]["positions"], 2);
+    let issued: Value = serde_json::to_value(app.handle(StudyCommand::Next)).unwrap();
+    assert_eq!(issued["activity"], "teach");
+    let acknowledge = json!({
+        "command": "acknowledge", "dataset_id": issued["dataset_id"],
+        "attempt_id": issued["attempt_id"], "expected_revision": issued["revision"],
+        "submission_id": "initial-teach", "answer": { "uci": "e2e4" }
+    });
+    let taught = app.handle(serde_json::from_value(acknowledge).unwrap());
+    assert_eq!(serde_json::to_value(taught).unwrap()["status"], "complete");
+    drop(app);
+    let mut app = open(Box::new(SqliteStore::open(database).unwrap()), 11, 100);
     let issued = app.next_exercise().unwrap().unwrap();
     let submission = command(&issued, "lost-answer", "d2d4");
     fs::write(
@@ -84,10 +88,10 @@ fn import_and_answer(database: &Path, components: Components) {
     // Lose the reply after the commit, as a transport could.
     let _ = app.submit(submission).unwrap();
     let saved = app.snapshot().unwrap();
-    assert!(saved.learning[&issued.attempt.target].repeat_pending);
+    assert_eq!(saved.learning[&issued.attempt.target].scheduled_reviews, 1);
     assert_eq!(saved.assessments.len(), 1);
     assert_eq!(saved.assessments[0].input.grade, Grade::Again);
-    assert_eq!(saved.receipts.len(), 1);
+    assert_eq!(saved.receipts.len(), 2);
     fs::write(
         database.with_extension("snapshot.json"),
         serde_json::to_vec(&saved).unwrap(),
@@ -95,7 +99,7 @@ fn import_and_answer(database: &Path, components: Components) {
     .unwrap();
 }
 
-fn resume_and_replay(database: &Path, mut components: Components) {
+fn resume_and_replay(database: &Path) {
     let store = SqliteStore::open(database).unwrap();
     let saved: Snapshot =
         serde_json::from_slice(&fs::read(database.with_extension("snapshot.json")).unwrap())
@@ -104,9 +108,7 @@ fn resume_and_replay(database: &Path, mut components: Components) {
         serde_json::from_slice(&fs::read(database.with_extension("command.json")).unwrap())
             .unwrap();
     assert_eq!(store.snapshot().unwrap(), saved);
-    // This isolated test process starts its counter above all IDs it has issued.
-    components.ids = Box::new(CounterIds(saved.revision.0));
-    let mut app = Tempo::new(Box::new(store), components).unwrap();
+    let mut app = open(Box::new(store), 11, 200);
     let resumed = app.next_exercise().unwrap().unwrap();
     assert_eq!(
         resumed.attempt,

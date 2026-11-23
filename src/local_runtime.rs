@@ -1,12 +1,7 @@
 //! File-backed composition for the matched local study release.
 mod http;
 mod import;
-pub use import::{GameCaptureBackfill, backfill_game_capture_origins};
-mod split_black_repertoire;
-pub use split_black_repertoire::split_black_repertoire;
-mod study_lead_ins;
-pub use study_lead_ins::backfill_study_lead_ins;
-mod tactic_settings;
+pub(crate) mod tactic_settings;
 
 use crate::game_detection::{AnalysisOptions, DetectorRegistry, GameDetection};
 use crate::{AttemptIds, Clock, DailyComponents, IntroductionLimits, TacticThemes, Tempo};
@@ -71,40 +66,10 @@ pub fn init(path: &Path) -> LocalResult<()> {
     Ok(())
 }
 
-pub fn configure(
-    path: &Path,
-    repertoire: usize,
-    tactics: usize,
-    more: Option<usize>,
-) -> LocalResult<()> {
-    let store = SqliteStore::open(path)?;
-    let previous = stored_profile(&store)?;
-    let mut profile: Profile = serde_json::from_str(&previous)?;
-    profile.introductions = IntroductionLimits {
-        repertoire,
-        tactics,
-    };
-    if let Some(more) = more {
-        profile.more_tactics = more;
-    }
-    store.update_local_profile(&previous, &serde_json::to_string(&profile)?)?;
-    println!(
-        "Saved daily introduction limits of {repertoire} opening positions and {tactics} tactics. Restart Tempo to apply them."
-    );
-    Ok(())
-}
-
 pub fn import(path: &Path, puzzles: &Path) -> LocalResult<()> {
     let batch = import::Batch::open(puzzles)?;
     let mut app = open(path)?;
     import::run(&mut app, batch)
-}
-
-pub fn backfill_personal_tactics(path: &Path, apply: bool) -> LocalResult<()> {
-    let sources = SqliteStore::open(path)?.content_source_ids()?;
-    let result = open(path)?.backfill_personal_tactics(&sources, apply)?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
 }
 
 pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {

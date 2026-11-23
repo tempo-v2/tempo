@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { databaseRows } from "./support/game_detection_readback.mjs";
 
 const binary = resolve(process.env.TEMPO_BINARY || "target/debug/tempo");
@@ -64,7 +65,12 @@ function send(host, route, { method = "GET", headers = {}, payload } = {}) {
     });
     req.on("error", reject);
     req.on("timeout", () => req.destroy(new Error("HTTP fixture timed out")));
-    req.end(bytes);
+    if (headers.Expect === "100-continue") {
+      req.once("continue", () => req.end(bytes));
+      req.flushHeaders();
+    } else {
+      req.end(bytes);
+    }
   });
 }
 
@@ -91,10 +97,55 @@ test("phone Study retains its shared commands and denies desktop routes after in
   assert.deepEqual(await send(host, "/"), { status: 200, body: "Desktop fixture" });
   assert.deepEqual(await send(host, "/", { headers: phoneHeaders }), { status: 200, body: "Phone fixture" });
   const desktop = await post("/api/study-progress", null);
+  assert.equal(typeof desktop.stamp?.dataset_id, "string", JSON.stringify(desktop));
   assert.deepEqual(await post("/api/study-progress", null, phoneHeaders), desktop);
-  assert.equal((await send(host, "/api/games/detectors")).status, 200);
+  const sql = new DatabaseSync(database, { timeout: 5000 });
+  const { dataset_id: contextDataset, policy } = sql.prepare(
+    "SELECT dataset_id, policy FROM store_state WHERE singleton=1"
+  ).get();
+  assert.equal(desktop.stamp.dataset_id, contextDataset);
+  const { user_version } = sql.prepare("PRAGMA user_version").get();
+  try {
+    sql.prepare("UPDATE store_state SET policy='not-json' WHERE singleton=1").run();
+    const expected = { status: "ready", dataset_id: contextDataset, schema_version: user_version };
+    for (const headers of [{}, phoneHeaders]) {
+      const context = await send(host, "/api/context", { headers });
+      assert.equal(context.status, 200, context.body);
+      assert.deepEqual(JSON.parse(context.body), expected);
+    }
+    assert.equal((await post("/api/study", { command: "study_status" })).status, "error");
+    assert.equal((await send(host, "/api/context", {
+      headers: { ...phoneHeaders, "Tailscale-User-Login": "other@example.invalid" },
+    })).status, 403);
+  } finally {
+    sql.prepare("UPDATE store_state SET policy=? WHERE singleton=1").run(policy);
+    sql.close();
+  }
+
+  const retiredDetector = await send(host, "/api/games/detectors");
+  assert.equal(retiredDetector.status, 410);
+  assert.equal(JSON.parse(retiredDetector.body).code, "retired_feature");
   assert.equal((await send(host, "/api/games")).status, 200);
 
+  // Reject oversized disposable input before decoding its command.
+  const beforeAdmission = databaseRows(database);
+  const oversizedPgn = { command: "save", pgn: " ".repeat(2 * 1024 * 1024) };
+  for (const route of ["/api/repertoires", "/api/tactics", "/api/games/import"]) {
+    const reply = await send(host, route, {
+      method: "POST",
+      payload: oversizedPgn,
+      headers: {
+        Expect: "100-continue",
+        "Content-Length": Buffer.byteLength(JSON.stringify(oversizedPgn)),
+      },
+    });
+    assert.equal(reply.status, 413, reply.body);
+    const error = JSON.parse(reply.body);
+    assert.equal(error.code, "invalid_command");
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /2048 KiB/);
+  }
+  assert.deepEqual(databaseRows(database), beforeAdmission);
   const before = databaseRows(database);
   const presence = { tab: "7a791296-6215-4d60-ae7c-58bab00ce975", sequence: 1, state: "active" };
   assert.deepEqual(await send(host, "/api/study/presence", {
@@ -115,6 +166,11 @@ test("phone Study retains its shared commands and denies desktop routes after in
     ["/api/games/gap-analysis", "GET"], ["/api/games/gap-explorer", "POST"],
     ["/api/study", "PUT"], ["/api/study", "GET"], ["/api/study/presence", "GET"],
   ]) assert.equal((await send(host, route, { method, headers: phoneHeaders, payload: {} })).status, 404, route);
+  for (const path of ["/api/games/gap-analysis", "/api/games/gap-analysis/status"]) {
+    const retired = await send(host, path, { method: "POST", headers: phoneHeaders, payload: {} });
+    assert.equal(retired.status, 410);
+    assert.equal(JSON.parse(retired.body).code, "retired_feature");
+  }
   for (const changes of [
     { Host: "another.ts.net:8443" }, { "X-Forwarded-Host": "another.ts.net:8443" },
     { "X-Forwarded-Proto": "http" }, { "Tailscale-User-Login": "other@example.invalid" },
@@ -163,7 +219,30 @@ test("phone Study retains its shared commands and denies desktop routes after in
   const scan = await post("/api/games/coverage/status", { dataset_id, repertoire_id }, phoneHeaders);
   assert.equal(scan.status, "idle");
   const issued = await post("/api/study", { command: "next" }, phoneHeaders);
-  const resumed = await post("/api/study", { command: "resume", attempt_id: issued.attempt_id });
+  const resumeSql = new DatabaseSync(database, { timeout: 5000 });
+  const { state: learningBeforeResume } = resumeSql.prepare(
+    "SELECT state FROM learning WHERE target_id=?"
+  ).get(issued.target_id);
+  const { item: issuedItem, version: issuedVersion } = resumeSql.prepare(
+    "SELECT h.item,h.version FROM content_history h JOIN current_content c USING(dataset_id,target_id,version) WHERE h.target_id=?"
+  ).get(issued.target_id);
+  let resumed;
+  try {
+    resumeSql.prepare("UPDATE learning SET state='not-json' WHERE target_id=?").run(issued.target_id);
+    resumeSql.prepare(
+      "UPDATE content_history SET item=json_set(item,'$.verified_tactic',json('{}')) WHERE dataset_id=? AND target_id=? AND version=?"
+    ).run(dataset_id, issued.target_id, issuedVersion);
+
+    resumed = await post("/api/study", { command: "resume", attempt_id: issued.attempt_id });
+    assert.equal(resumed.status, "ready");
+  } finally {
+    resumeSql.prepare("UPDATE learning SET state=? WHERE target_id=?").run(learningBeforeResume, issued.target_id);
+    resumeSql.prepare(
+      "UPDATE content_history SET item=? WHERE dataset_id=? AND target_id=? AND version=?"
+    ).run(issuedItem, dataset_id, issued.target_id, issuedVersion);
+
+    resumeSql.close();
+  }
   assert.equal(resumed.attempt_id, issued.attempt_id);
   assert.equal(resumed.dataset_id, dataset_id);
   const command = {
