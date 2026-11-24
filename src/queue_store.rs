@@ -125,7 +125,7 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
 
 pub fn committed_head(db: &Connection) -> Result<Option<(String, String)>> {
     Ok(db.query_row(
-        "SELECT d.card_id,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 1",
+        "SELECT d.card_id,c.kind FROM deck d CROSS JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 1",
         [], |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?)
 }
@@ -143,7 +143,7 @@ pub fn place_repeat(
     draw: u8,
 ) -> Result<u8> {
     let mut q = db.prepare(
-        "SELECT d.slot,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 22",
+        "SELECT d.slot,c.kind FROM deck d CROSS JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 22",
     )?;
     let mut queued = q
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?

@@ -140,18 +140,17 @@ impl Provider {
     }
 }
 
-pub fn resume_upload<R: std::io::Read + std::io::Seek>(
+pub fn upload_record<R: std::io::Read + std::io::Seek>(
     input: R,
     offset: u64,
     user: &str,
-    mut accept: impl FnMut(Option<games::Game>, u64) -> Result<()>,
-) -> Result<()> {
-    chess::resume_pgn(input, offset, |parsed, next| {
-        accept(
+) -> Result<Option<(Option<games::Game>, u64)>> {
+    Ok(chess::pgn_record(input, offset)?.map(|(parsed, next)| {
+        (
             parsed.and_then(|game| games::archive_game(game, user)).ok(),
             next,
         )
-    })
+    }))
 }
 
 pub fn supply_pgn(
@@ -253,21 +252,12 @@ mod tests {
             "[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n",
             "[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. d4 d5 1-0\n",
         );
-        let mut cursor = 0;
-        let mut first = None;
-        let interrupted = resume_upload(std::io::Cursor::new(pgn), 0, "Learner", |game, offset| {
-            cursor = offset;
-            first = Some(game.unwrap().id);
-            anyhow::bail!("fixture interrupted import");
-        });
-        assert!(interrupted.is_err());
-        let mut resumed = Vec::new();
-        resume_upload(std::io::Cursor::new(pgn), cursor, "Learner", |game, _| {
-            resumed.push(game.unwrap().id);
-            Ok(())
-        })?;
-        assert_eq!(resumed.len(), 1);
-        assert_ne!(first.unwrap(), resumed[0]);
+        let (first, cursor) =
+            upload_record(std::io::Cursor::new(pgn), 0, "Learner")?.context("first record")?;
+        let (second, end) = upload_record(std::io::Cursor::new(pgn), cursor, "Learner")?
+            .context("second record")?;
+        assert_ne!(first.unwrap().id, second.unwrap().id);
+        assert!(upload_record(std::io::Cursor::new(pgn), end, "Learner")?.is_none());
         Ok(())
     }
 }

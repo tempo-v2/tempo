@@ -1,4 +1,4 @@
-use crate::{db::Database, queue::Counts, review};
+use crate::db::Database;
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
 use std::{
@@ -10,17 +10,41 @@ use tokio::sync::Semaphore;
 const DEADLINE: Duration = Duration::from_millis(250);
 const VM_BUDGET: u32 = 2_000_000;
 const CLOCK_CHECK_INTERVAL: u32 = 1_000;
-static SLOT: Semaphore = Semaphore::const_new(1);
-
+#[derive(Debug, Clone, Copy)]
 pub struct Unavailable;
 
-pub async fn read(database: PathBuf) -> Result<Option<Counts>, Unavailable> {
-    run(&SLOT, DEADLINE, move |deadline| {
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This view is temporarily unavailable.")
+    }
+}
+impl std::error::Error for Unavailable {}
+
+pub enum Reader {
+    Counts,
+    StudyContext,
+    GamesStatus,
+}
+
+pub async fn read<T: Send + 'static>(
+    reader: Reader,
+    database: PathBuf,
+    work: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+) -> Result<T, Unavailable> {
+    static COUNTS: Semaphore = Semaphore::const_new(1);
+    static STUDY_CONTEXT: Semaphore = Semaphore::const_new(1);
+    static GAMES_STATUS: Semaphore = Semaphore::const_new(1);
+    let slot = match reader {
+        Reader::Counts => &COUNTS,
+        Reader::StudyContext => &STUDY_CONTEXT,
+        Reader::GamesStatus => &GAMES_STATUS,
+    };
+    run(slot, DEADLINE, move |deadline| {
         let mut db = Database::read_with_busy_timeout(&database, Duration::ZERO)?;
         limit_query(&db, deadline, VM_BUDGET);
-        let counts = review::counts(&mut db)?;
-        ensure!(Instant::now() < deadline, "Study counts expired");
-        Ok(counts)
+        let result = work(&mut db)?;
+        ensure!(Instant::now() < deadline, "Optional read expired");
+        Ok(result)
     })
     .await
     .ok_or(Unavailable)
