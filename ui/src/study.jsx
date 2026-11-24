@@ -46,7 +46,10 @@ function useStudyCounts() {
       try {
         const response = await fetch("/api/study/counts", { signal: request.signal });
         const totals = response.ok ? await response.json() : null;
-        if (active && !dirty) setCounts(totals);
+        const valid = [totals?.new, totals?.reviews].every(
+          (value) => Number.isSafeInteger(value) && value >= 0
+        );
+        if (active && !dirty) setCounts(valid ? totals : null);
       } catch {
         if (active && !dirty) setCounts(null);
       } finally {
@@ -124,8 +127,13 @@ export function Study({ openGame, sounds }) {
     mounted.current = true;
     run(async () => {
       const unresolved = localStorage.getItem("tempo.pending-answer.v2");
+      let replayAccepted = false;
       if (unresolved) {
-        try { await api("study/answer", JSON.parse(unresolved)); }
+        try {
+          await api("study/answer", JSON.parse(unresolved));
+          replayAccepted = true;
+          invalidateCounts.current?.();
+        }
         catch (error) {
           if (!["stale_dataset", "answer_conflict"].includes(error.code)) throw error;
         }
@@ -134,7 +142,7 @@ export function Study({ openGame, sounds }) {
       const active = await api("study");
       setCard(active ?? await api("study/next", { after: null }));
       setLoaded(true);
-      invalidateCounts.current?.();
+      if (!replayAccepted || !active) invalidateCounts.current?.();
     });
     return () => { mounted.current = false; sounds.cancel(); };
   }, []);

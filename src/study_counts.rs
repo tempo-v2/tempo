@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 
 const DEADLINE: Duration = Duration::from_millis(250);
 const VM_BUDGET: u32 = 2_000_000;
-const PROGRESS_INTERVAL: u32 = 1_000;
+const CLOCK_CHECK_INTERVAL: u32 = 1_000;
 static SLOT: Semaphore = Semaphore::const_new(1);
 
 pub struct Unavailable;
@@ -54,10 +54,11 @@ async fn run<T: Send + 'static>(
 fn limit_query(db: &Connection, deadline: Instant, budget: u32) {
     let mut steps = 0;
     db.progress_handler(
-        PROGRESS_INTERVAL as i32,
+        1,
         Some(move || {
-            steps += PROGRESS_INTERVAL;
-            steps >= budget || Instant::now() >= deadline
+            steps += 1;
+            steps >= budget
+                || (steps.is_multiple_of(CLOCK_CHECK_INTERVAL) && Instant::now() >= deadline)
         }),
     );
 }
@@ -82,6 +83,12 @@ mod tests {
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::OperationInterrupted
         ));
+        // Even work below a coarse progress interval contributes to the shared budget.
+        limit_query(&db, Instant::now() + Duration::from_secs(2), 100);
+        let completed = (0..100)
+            .take_while(|_| db.execute_batch("SELECT 1").is_ok())
+            .count();
+        assert!(completed > 0 && completed < 100);
         Ok(())
     }
 
