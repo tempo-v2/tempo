@@ -248,7 +248,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         .route("/api/openings/pgn", post(preview_opening))
         .route("/api/tactics", get(tactics).post(save_tactic))
         .route("/api/games", get(archives))
-        .route("/api/games/{id}", get(read_game))
+        .route("/api/games/archive/{id}", get(read_game))
         .route("/api/games/jobs", get(job_views).post(start_job))
         .route("/api/games/jobs/{id}/retry", post(retry_job))
         .route("/api/settings", get(settings).post(save_settings))

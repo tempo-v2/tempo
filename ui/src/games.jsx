@@ -61,7 +61,7 @@ export function Games({ jump, addOpening, settings }) {
   useEffect(() => {
     if (!jump) return;
     let active = true;
-    api("games/" + jump.id).then((result) => {
+    api("games/archive/" + jump.id).then((result) => {
       if (active) { setGame(result); setPly(Math.min(jump.ply ?? 0, result.route.moves.length)); }
     }).catch((error) => { if (active) setError(error.message); });
     return () => { active = false; };
