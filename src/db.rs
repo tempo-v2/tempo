@@ -16,8 +16,13 @@ impl Database {
     }
 
     pub fn read(path: &Path) -> Result<Connection> {
+        Self::read_with_busy_timeout(path, Duration::from_secs(2))
+    }
+
+    pub fn read_with_busy_timeout(path: &Path, busy_timeout: Duration) -> Result<Connection> {
         let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Self::configure(&db)?;
+        db.busy_timeout(busy_timeout)?;
+        Self::configure_pragmas(&db)?;
         Ok(db)
     }
 
@@ -60,6 +65,10 @@ impl Database {
 
     fn configure(db: &Connection) -> Result<()> {
         db.busy_timeout(Duration::from_secs(2))?;
+        Self::configure_pragmas(db)
+    }
+
+    fn configure_pragmas(db: &Connection) -> Result<()> {
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")?;
         Ok(())
     }

@@ -46,6 +46,29 @@ impl CardKind {
     }
 }
 
+/// Pausing new openings affects uncommitted candidates. Committed work is kept.
+pub fn admits_uncommitted_new(kind: CardKind, openings_paused: bool) -> bool {
+    kind != CardKind::Opening || !openings_paused
+}
+
+impl Counts {
+    /// Add committed work absent from the indexed, unreserved candidate totals.
+    pub fn include_committed(
+        &mut self,
+        kind: CardKind,
+        due_at: Option<i64>,
+        reserved: bool,
+        openings_paused: bool,
+        now: i64,
+    ) {
+        match due_at {
+            None if reserved || !admits_uncommitted_new(kind, openings_paused) => self.new += 1,
+            Some(due_at) if reserved || due_at > now => self.reviews += 1,
+            _ => {}
+        }
+    }
+}
+
 pub enum Candidates {
     Due,
     NewByRank,
@@ -71,15 +94,14 @@ pub fn select<T, E>(
     }
     let preferences = preferences()?;
     for kind in kinds {
-        if kind == Opening {
-            if preferences.paused {
-                continue;
-            }
-            if matches!(preferences.ordering, NewOpeningOrder::SavedRank)
-                && let Some(id) = first(kind, Candidates::NewByRank)?
-            {
-                return Ok(Some((id, kind)));
-            }
+        if !admits_uncommitted_new(kind, preferences.paused) {
+            continue;
+        }
+        if kind == Opening
+            && matches!(preferences.ordering, NewOpeningOrder::SavedRank)
+            && let Some(id) = first(kind, Candidates::NewByRank)?
+        {
+            return Ok(Some((id, kind)));
         }
         if let Some(id) = first(kind, Candidates::New)? {
             return Ok(Some((id, kind)));

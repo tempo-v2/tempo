@@ -30,10 +30,50 @@ function markedMove(move, brush) {
   return [{ orig, dest, brush }, { orig: dest, brush }];
 }
 
+function useStudyCounts() {
+  const [counts, setCounts] = useState(null);
+  const invalidate = useRef(null);
+  useEffect(() => {
+    let active = true;
+    let pending = null;
+    let dirty = false;
+    async function refresh() {
+      if (!active || pending) return;
+      const request = new AbortController();
+      pending = request;
+      dirty = false;
+      const timeout = setTimeout(() => request.abort(), 1000);
+      try {
+        const response = await fetch("/api/study/counts", { signal: request.signal });
+        const totals = response.ok ? await response.json() : null;
+        if (active && !dirty) setCounts(totals);
+      } catch {
+        if (active && !dirty) setCounts(null);
+      } finally {
+        clearTimeout(timeout);
+        pending = null;
+        if (dirty) refresh();
+      }
+    }
+    invalidate.current = () => {
+      setCounts(null);
+      dirty = true;
+      refresh();
+    };
+    window.addEventListener("focus", refresh);
+    return () => {
+      active = false;
+      invalidate.current = null;
+      pending?.abort();
+      window.removeEventListener("focus", refresh);
+    };
+  }, []);
+  return [counts, invalidate];
+}
+
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
-  const [counts, setCounts] = useState(null);
-  const [countsRevision, setCountsRevision] = useState(0);
+  const [counts, invalidateCounts] = useStudyCounts();
   const [source, setSource] = useState(null);
   const [opponent, setOpponent] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -77,7 +117,7 @@ export function Study({ openGame, sounds }) {
     return run(async () => {
       setCard(await api("study/next", { after, dataset: card?.dataset }));
       setLoaded(true);
-      setCountsRevision((revision) => revision + 1);
+      invalidateCounts.current?.();
     });
   }
   useEffect(() => {
@@ -94,26 +134,10 @@ export function Study({ openGame, sounds }) {
       const active = await api("study");
       setCard(active ?? await api("study/next", { after: null }));
       setLoaded(true);
-      setCountsRevision((revision) => revision + 1);
+      invalidateCounts.current?.();
     });
     return () => { mounted.current = false; sounds.cancel(); };
   }, []);
-  useEffect(() => {
-    if (countsRevision === 0) return;
-    let current = 0;
-    let active = true;
-    async function refreshCounts() {
-      const request = ++current;
-      const counts = await api("study/counts").catch(() => null);
-      if (active && request === current) setCounts(counts);
-    }
-    refreshCounts();
-    window.addEventListener("focus", refreshCounts);
-    return () => {
-      active = false;
-      window.removeEventListener("focus", refreshCounts);
-    };
-  }, [countsRevision]);
   useEffect(() => {
     let active = true;
     setSource(null);
@@ -162,7 +186,7 @@ export function Study({ openGame, sounds }) {
       localStorage.removeItem("tempo.pending-answer.v2");
       if (!mounted.current) return;
       setCard((old) => ({ ...old, result }));
-      setCountsRevision((revision) => revision + 1);
+      invalidateCounts.current?.();
       if (result.display_move) {
         const board = new Chess(card.fen);
         const move = play(board, result.display_move);

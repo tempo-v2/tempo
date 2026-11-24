@@ -14,6 +14,7 @@ mod queue_store;
 mod review;
 mod scanner;
 mod study;
+mod study_counts;
 mod study_store;
 mod uploads;
 mod writer;
@@ -334,10 +335,11 @@ async fn current(State(db): State<App>) -> ApiResult {
     with_db(db, move |c| study_store::current(c)).await
 }
 async fn study_counts(State(db): State<App>) -> impl IntoResponse {
-    (
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
-        with_db(db, review::counts).await,
-    )
+    let response = match study_counts::read(db.database.clone()).await {
+        Ok(counts) => Json(counts).into_response(),
+        Err(study_counts::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    ([(axum::http::header::CACHE_CONTROL, "no-store")], response)
 }
 async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> ApiResult {
     write_db(db, move |c| review::next(c, input)).await

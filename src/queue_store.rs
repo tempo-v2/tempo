@@ -2,6 +2,19 @@ use crate::queue::{self, Candidates, CardKind, Counts, NewOpeningOrder, NewOpeni
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
+const PREPARED_UNSEEN: &str = "FROM prepared_queue
+    WHERE active=1 AND reserved=0 AND due_at IS NULL AND kind=?1";
+const PREPARED_DUE: &str = "FROM prepared_queue
+    WHERE active=1 AND reserved=0 AND due_at IS NOT NULL AND kind=?1 AND due_at<=?2";
+
+fn card_kind(kind: &str) -> Result<CardKind> {
+    match kind {
+        "opening" => Ok(CardKind::Opening),
+        "tactic" => Ok(CardKind::Tactic),
+        _ => anyhow::bail!("Unknown prepared card kind"),
+    }
+}
+
 pub fn new_opening_settings(db: &Connection) -> Result<NewOpeningSettings> {
     let (paused, ordering): (bool, String) = db.query_row(
         "SELECT paused, ordering FROM new_opening_settings WHERE singleton=1",
@@ -32,32 +45,30 @@ pub fn select(
     previous: Option<&str>,
     now: i64,
 ) -> Result<Option<(String, String)>> {
-    let previous = match previous {
-        Some("opening") => Some(CardKind::Opening),
-        Some("tactic") => Some(CardKind::Tactic),
-        None => None,
-        Some(_) => anyhow::bail!("Unknown previous card kind"),
-    };
-    let due = "SELECT card_id FROM prepared_queue
-        WHERE active=1 AND reserved=0 AND due_at IS NOT NULL AND due_at<=?1 AND kind=?2
-        ORDER BY due_at,card_id LIMIT 1";
-    let unseen = "SELECT card_id FROM prepared_queue
-        WHERE active=1 AND reserved=0 AND due_at IS NULL AND kind=?1 ORDER BY card_id LIMIT 1";
-    let ranked = "SELECT card_id FROM prepared_queue
-        WHERE active=1 AND reserved=0 AND due_at IS NULL AND rank IS NOT NULL AND kind='opening'
-        ORDER BY rank,card_id LIMIT 1";
+    let previous = previous.map(card_kind).transpose()?;
     let chosen = queue::select(
         previous,
         || new_opening_settings(db),
         |kind, candidates| {
             Ok(match candidates {
                 Candidates::Due => db
-                    .query_row(due, params![now, kind.as_str()], |r| r.get(0))
+                    .prepare_cached(&format!(
+                        "SELECT card_id {PREPARED_DUE} ORDER BY due_at,card_id LIMIT 1"
+                    ))?
+                    .query_row(params![kind.as_str(), now], |r| r.get(0))
                     .optional(),
                 Candidates::New => db
-                    .query_row(unseen, [kind.as_str()], |r| r.get(0))
+                    .prepare_cached(&format!(
+                        "SELECT card_id {PREPARED_UNSEEN} ORDER BY card_id LIMIT 1"
+                    ))?
+                    .query_row([kind.as_str()], |r| r.get(0))
                     .optional(),
-                Candidates::NewByRank => db.query_row(ranked, [], |r| r.get(0)).optional(),
+                Candidates::NewByRank => db
+                    .prepare_cached(&format!(
+                        "SELECT card_id {PREPARED_UNSEEN} AND rank IS NOT NULL ORDER BY rank,card_id LIMIT 1"
+                    ))?
+                    .query_row([kind.as_str()], |r| r.get(0))
+                    .optional(),
             }?)
         },
     )?;
@@ -78,36 +89,37 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
     if !prepared(db)? {
         return Ok(None);
     }
-    let paused = new_opening_settings(db)?.paused;
-    let counts = db.query_row(
+    let paused = db.query_row(
+        "SELECT paused FROM new_opening_settings WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut counts = Counts { new: 0, reviews: 0 };
+    let mut unseen = db.prepare(&format!("SELECT count(*) {PREPARED_UNSEEN}"))?;
+    let mut due = db.prepare(&format!("SELECT count(*) {PREPARED_DUE}"))?;
+    for kind in [CardKind::Opening, CardKind::Tactic] {
+        if queue::admits_uncommitted_new(kind, paused) {
+            counts.new += unseen.query_row([kind.as_str()], |row| row.get::<_, usize>(0))?;
+        }
+        counts.reviews +=
+            due.query_row(params![kind.as_str(), now], |row| row.get::<_, usize>(0))?;
+    }
+    // SQLite preserves CROSS JOIN order. Drive the lookups from committed
+    // identities so the optimizer cannot scan the entire prepared queue.
+    let mut committed = db.prepare(
         "WITH committed(card_id) AS (
             SELECT card_id FROM deck
             UNION SELECT card_id FROM repeat_obligation
-            UNION SELECT ?3 WHERE ?3 IS NOT NULL
-        ), extra AS (
-            SELECT q.kind,q.due_at,q.reserved FROM committed c
-            JOIN prepared_queue q ON q.card_id=c.card_id WHERE q.active=1
+            UNION SELECT ?1 WHERE ?1 IS NOT NULL
         )
-        SELECT
-            (SELECT count(*) FROM prepared_queue
-                WHERE active=1 AND reserved=0 AND due_at IS NULL AND kind='tactic')
-            + CASE WHEN ?2 THEN 0 ELSE (SELECT count(*) FROM prepared_queue
-                WHERE active=1 AND reserved=0 AND due_at IS NULL AND kind='opening') END
-            + (SELECT count(*) FROM extra
-                WHERE due_at IS NULL AND (reserved=1 OR (?2 AND kind='opening'))),
-            (SELECT count(*) FROM prepared_queue
-                WHERE active=1 AND reserved=0 AND due_at IS NOT NULL AND due_at<=?1
-                    AND kind IN ('opening','tactic'))
-            + (SELECT count(*) FROM extra
-                WHERE due_at IS NOT NULL AND (reserved=1 OR due_at>?1))",
-        params![now, paused, unanswered],
-        |row| {
-            Ok(Counts {
-                new: row.get(0)?,
-                reviews: row.get(1)?,
-            })
-        },
+        SELECT q.kind,q.due_at,q.reserved FROM committed c
+        CROSS JOIN prepared_queue q ON q.card_id=c.card_id WHERE q.active=1",
     )?;
+    let mut rows = committed.query([unanswered])?;
+    while let Some(row) = rows.next()? {
+        let kind: String = row.get(0)?;
+        counts.include_committed(card_kind(&kind)?, row.get(1)?, row.get(2)?, paused, now);
+    }
     Ok(Some(counts))
 }
 
@@ -307,6 +319,61 @@ mod tests {
         assert_eq!(
             counts(&db, 10, Some("issued-new"))?,
             Some(Counts { new: 4, reviews: 3 })
+        );
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        db.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "cards" | "learning" | "games" | "opening_order",
+                ..
+            }
+            | AuthAction::Read {
+                table_name: "new_opening_settings",
+                column_name: "ordering",
+            }
+            | AuthAction::Read {
+                table_name: "prepared_queue",
+                column_name: "rank",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }));
+        assert_eq!(
+            counts(&db, 10, Some("issued-new"))?,
+            Some(Counts { new: 4, reviews: 3 })
+        );
+        db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+        let measure = || -> Result<usize> {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&steps);
+            db.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Relaxed);
+                    false
+                }),
+            );
+            let result = counts(&db, 10, Some("issued-new"));
+            db.progress_handler(0, None::<fn() -> bool>);
+            assert_eq!(result?, Some(Counts { new: 4, reviews: 3 }));
+            Ok(steps.load(Relaxed))
+        };
+        let baseline = measure()?;
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
+             INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
+             SELECT 'other-'||i, CASE WHEN i%2=0 THEN 'opening' ELSE 'tactic' END,
+                    '', 'white', '', '', '[]', i%2=0 FROM n;
+             INSERT INTO learning
+             SELECT id,1,1,1,1000 FROM cards WHERE id LIKE 'other-%' AND kind='tactic';",
+        )?;
+        let populated = measure()?;
+        assert!(
+            populated <= baseline + 100,
+            "irrelevant cards grew count work from {baseline} to {populated} SQLite steps"
         );
         Ok(())
     }
