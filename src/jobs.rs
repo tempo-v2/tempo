@@ -45,6 +45,7 @@ pub struct Job {
     pub operation: String,
     pub window_offset: u64,
     pub window_rejected: usize,
+    pub replay_upload: bool,
 }
 
 pub fn valid_user(user: &str) -> Result<&str> {
@@ -155,12 +156,15 @@ fn run(
     match (job.provider.as_str(), job.operation.as_str()) {
         ("pgn", "upload") => {
             let upload = db.upload(id)?;
-            let offset = db
-                .cursor(id)?
-                .as_deref()
-                .map(str::parse::<u64>)
-                .transpose()?
-                .unwrap_or(0);
+            let offset = if job.replay_upload {
+                job.window_offset
+            } else {
+                db.cursor(id)?
+                    .as_deref()
+                    .map(str::parse::<u64>)
+                    .transpose()?
+                    .unwrap_or(0)
+            };
             let Some(upload) = upload else {
                 let pgn = db.inline_upload(id)?.context("PGN is missing")?;
                 ensure!(Instant::now() < deadline, "Games turn timed out.");
@@ -176,13 +180,23 @@ fn run(
                 offset,
                 &job.username,
             )?;
+            let replay = job.replay_upload;
             match record {
                 Some((Some(game), next)) => {
                     return writer.background_until(deadline, move |db| {
-                        game_pipeline::archive_upload(db, &game, id, next)
+                        if replay {
+                            game_pipeline::archive_staged_record(db, &game, id, next)
+                        } else {
+                            game_pipeline::archive_upload(db, &game, id, next)
+                        }
                     });
                 }
                 Some((None, next)) => {
+                    if replay {
+                        return writer.background_until(deadline, move |db| {
+                            job_store::reject_staged_record(db, id, next)
+                        });
+                    }
                     return yield_turn(writer, deadline, id, Some(next.to_string()), 1);
                 }
                 None => upload_file = Some(upload),
@@ -321,13 +335,13 @@ fn provider_turn(
         match providers::upload_record(input, job.window_offset, &job.username)? {
             Some((Some(game), offset)) => {
                 writer.background_until(deadline, move |db| {
-                    game_pipeline::archive_provider_record(db, &game, id, offset)
+                    game_pipeline::archive_staged_record(db, &game, id, offset)
                 })?;
                 return Ok(());
             }
             Some((None, offset)) => {
                 writer.background_until(deadline, move |db| {
-                    job_store::reject_provider_record(db, id, offset)
+                    job_store::reject_staged_record(db, id, offset)
                 })?;
                 return Ok(());
             }

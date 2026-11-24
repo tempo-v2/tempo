@@ -37,14 +37,14 @@ fn enqueue(db: &Connection, parent: i64, operation: &str, game: &str) -> Result<
     Ok(())
 }
 
-pub fn archive_provider_record(
+pub fn archive_staged_record(
     db: &mut Connection,
     game: &Game,
     job: i64,
     offset: u64,
 ) -> Result<()> {
     archive_game(db, game, job, |tx| {
-        job_store::provider_record(tx, job, offset, false)
+        job_store::staged_record(tx, job, offset, false)
     })
 }
 

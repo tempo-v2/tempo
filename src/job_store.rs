@@ -141,8 +141,8 @@ pub fn next(db: &mut Connection, failed: Option<&FailedTurn>) -> Result<Option<J
             params![failed.job_id, failed.message],
         )?;
     }
-    let job = tx.query_row("SELECT id,provider,username,operation,window_offset,window_rejected FROM jobs INDEXED BY jobs_ready_order WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
-        |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,window_offset:r.get(4)?,window_rejected:r.get(5)? })).optional()?;
+    let job = tx.query_row("SELECT id,provider,username,operation,window_offset,window_rejected,replay_upload FROM jobs INDEXED BY jobs_ready_order WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
+        |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,window_offset:r.get(4)?,window_rejected:r.get(5)?,replay_upload:r.get(6)? })).optional()?;
     if let Some(job) = &job {
         tx.execute("UPDATE jobs SET status='running' WHERE id=?1", [job.id])?;
     }
@@ -173,7 +173,8 @@ pub fn complete(
     }
     tx.execute(
         "UPDATE jobs SET status='done',payload=NULL,upload_file=NULL,error=NULL,
-          rejected=max(rejected,?2) WHERE id=?1",
+          rejected=CASE WHEN replay_upload=1 THEN window_rejected ELSE max(rejected,?2) END,
+          replay_upload=0,window_offset=0,window_rejected=0 WHERE id=?1",
         params![id, checkpoint.map_or(0, |(_, rejected)| rejected)],
     )?;
     tx.commit()?;
@@ -224,21 +225,21 @@ pub fn checkpoint_provider_window(
     Ok(())
 }
 
-pub fn provider_record(tx: &Transaction<'_>, id: i64, next: u64, rejected: bool) -> Result<()> {
+pub fn staged_record(tx: &Transaction<'_>, id: i64, next: u64, rejected: bool) -> Result<()> {
     ensure!(
         tx.execute(
             "UPDATE jobs SET window_offset=?2,window_rejected=window_rejected+?3
              WHERE id=?1 AND status='running' AND window_offset<?2",
             params![id, next, rejected],
         )? == 1,
-        "provider byte checkpoint did not advance"
+        "staged byte checkpoint did not advance"
     );
     yield_turn(tx, id, None, 0)
 }
 
-pub fn reject_provider_record(db: &mut Connection, id: i64, next: u64) -> Result<()> {
+pub fn reject_staged_record(db: &mut Connection, id: i64, next: u64) -> Result<()> {
     let tx = db.transaction()?;
-    provider_record(&tx, id, next, true)?;
+    staged_record(&tx, id, next, true)?;
     tx.commit()?;
     Ok(())
 }

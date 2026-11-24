@@ -105,7 +105,11 @@ uses one 60-second deadline for new work and writer admission. Short recovery
 and claim attempts use separate two-second admission budgets. A claimed write
 resolves before another turn can use its result. The next bounded claim records
 a failed turn together with claiming the next job. Local blocking filesystem
-operations retain the worker until they physically return.
+operations retain the worker until they physically return. Unfinished
+older manual uploads with a prior rejection replay in bounded turns from
+the staged file because their old cursor can point inside a rejected game.
+Already accepted records are deduplicated. Completion uses the replay's
+physical rejection count.
 
 The Openings editor requests up to 50 destination choices by repertoire
 identity and practice color. Each choice keeps the first authored line as

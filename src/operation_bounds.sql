@@ -1,5 +1,12 @@
 ALTER TABLE jobs ADD COLUMN window_offset INTEGER NOT NULL DEFAULT 0 CHECK(window_offset >= 0);
 ALTER TABLE jobs ADD COLUMN window_rejected INTEGER NOT NULL DEFAULT 0 CHECK(window_rejected >= 0);
+ALTER TABLE jobs ADD COLUMN replay_upload INTEGER NOT NULL DEFAULT 0 CHECK(replay_upload IN (0,1));
+
+-- An older visitor could report a rejection before reaching the physical game boundary.
+-- Retain the old cursor and counts until a bounded, deduplicated replay finishes.
+UPDATE jobs SET replay_upload=1
+WHERE provider='pgn' AND operation='upload' AND status!='done'
+  AND cursor IS NOT NULL AND rejected>0;
 
 CREATE TABLE repertoire_choices (
     repertoire_id TEXT NOT NULL,
