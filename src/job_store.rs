@@ -2,7 +2,7 @@ use crate::{
     catalog,
     db::Database,
     game_pipeline,
-    jobs::{Job, JobView, StartJob, valid_user},
+    jobs::{Job, JobView, NewJob, valid_user},
     providers::Provider,
     scanner,
 };
@@ -58,41 +58,64 @@ pub fn views(db: &Connection) -> Result<Vec<JobView>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn start(db: &mut Connection, input: StartJob, upload: Option<&str>) -> Result<i64> {
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let n: usize = tx.query_row(
-        "SELECT count(*) FROM jobs WHERE status IN ('queued','running') AND parent_id IS NULL AND operation!='publish'",
+fn check_user_job_capacity(db: &Connection) -> Result<()> {
+    let full: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs INDEXED BY jobs_active_user
+         WHERE parent_id IS NULL AND operation!='publish' AND status IN ('queued','running')
+         LIMIT 1 OFFSET 3)",
         [],
         |r| r.get(0),
     )?;
-    ensure!(n < 4, "the import queue is full");
-    let username = match (input.provider.as_str(), input.operation.as_str()) {
-        ("pgn", "upload") => {
-            ensure!(upload.is_some(), "enter PGN up to 64 MiB");
-            valid_user(input.username.as_deref().unwrap_or(""))?.to_owned()
+    ensure!(!full, "the import queue is full");
+    Ok(())
+}
+
+fn active_user_job(
+    db: &Connection,
+    provider: &str,
+    operation: &str,
+    username: &str,
+) -> Result<Option<i64>> {
+    Ok(db
+        .query_row(
+            "SELECT id FROM jobs INDEXED BY jobs_active_user
+             WHERE parent_id IS NULL AND operation!='publish' AND status IN ('queued','running')
+               AND provider=?1 AND operation=?2 AND username=?3
+             ORDER BY status,id LIMIT 1",
+            params![provider, operation, username],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub fn start(db: &mut Connection, input: NewJob) -> Result<i64> {
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    check_user_job_capacity(&tx)?;
+    let (provider, operation, username, upload) = match input {
+        NewJob::Command(input) => {
+            let username = match (input.provider.as_str(), input.operation.as_str()) {
+                ("archive", "scan") => String::new(),
+                (name, "all" | "new") if Provider::named(name).is_some() => tx
+                    .query_row(
+                        "SELECT username FROM settings WHERE provider=?1",
+                        [&input.provider],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .context("save the username in Settings first")?,
+                _ => bail!("unknown import operation"),
+            };
+            if let Some(job) = active_user_job(&tx, &input.provider, &input.operation, &username)? {
+                return Ok(job);
+            }
+            (input.provider, input.operation, username, None)
         }
-        ("archive", "scan") => String::new(),
-        (name, "all" | "new") if Provider::named(name).is_some() => tx
-            .query_row(
-                "SELECT username FROM settings WHERE provider=?1",
-                [&input.provider],
-                |r| r.get(0),
-            )
-            .optional()?
-            .context("save the username in Settings first")?,
-        _ => bail!("unknown import operation"),
+        NewJob::Upload { username, file } => ("pgn".into(), "upload".into(), username, Some(file)),
     };
-    let existing = if input.provider != "pgn" {
-        tx.query_row("SELECT id FROM jobs WHERE provider=?1 AND operation=?2 AND username=?3 AND status IN ('queued','running') LIMIT 1",
-            params![input.provider,input.operation,username],|r|r.get::<_,i64>(0)).optional()?
-    } else {
-        None
-    };
-    if let Some(job) = existing {
-        return Ok(job);
-    }
-    tx.execute("INSERT INTO jobs(provider,username,operation,upload_file,status) VALUES (?1,?2,?3,?4,'queued')",
-        params![input.provider,username,input.operation,upload])?;
+    tx.execute(
+        "INSERT INTO jobs(provider,username,operation,upload_file,status) VALUES (?1,?2,?3,?4,'queued')",
+        params![provider, username, operation, upload],
+    )?;
     let id = tx.last_insert_rowid();
     tx.commit()?;
     Ok(id)
@@ -109,11 +132,7 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
         .optional()?
         .unwrap_or(false);
     if user_batch {
-        let n: usize = tx.query_row(
-            "SELECT count(*) FROM jobs WHERE status IN ('queued','running') AND parent_id IS NULL AND operation!='publish'",
-            [], |r| r.get(0),
-        )?;
-        ensure!(n < 4, "the import queue is full");
+        check_user_job_capacity(&tx)?;
     }
     ensure!(
         tx.execute(
@@ -372,6 +391,7 @@ mod tests {
         )?;
         db.execute_batch(include_str!("job_turns.sql"))?;
         db.execute_batch(include_str!("operation_bounds.sql"))?;
+        db.execute_batch(include_str!("job_admission.sql"))?;
         assert_eq!(recover_running(&mut db)?, 1);
 
         assert_eq!(next(&mut db, None)?.unwrap().id, 1);
@@ -400,6 +420,84 @@ mod tests {
             1
         );
         assert_eq!(next(&mut db, None)?.unwrap().id, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_work_excludes_children_and_finished_jobs() -> Result<()> {
+        use crate::jobs::StartJob;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+
+        let mut db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("game_pipeline.sql"),
+            include_str!("prepared_queue.sql"),
+            include_str!("job_turns.sql"),
+            include_str!("operation_bounds.sql"),
+            include_str!("job_admission.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        let scan = || {
+            NewJob::Command(StartJob {
+                provider: "archive".into(),
+                operation: "scan".into(),
+            })
+        };
+        let first = start(&mut db, scan())?;
+        let measure = |db: &Connection| -> Result<[usize; 3]> {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&steps);
+            db.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Relaxed);
+                    false
+                }),
+            );
+            check_user_job_capacity(db)?;
+            let capacity = steps.swap(0, Relaxed);
+            assert_eq!(active_user_job(db, "archive", "scan", "")?, Some(first));
+            let hit = steps.swap(0, Relaxed);
+            assert_eq!(active_user_job(db, "lichess", "new", "Fixture")?, None);
+            let miss = steps.load(Relaxed);
+            db.progress_handler(0, None::<fn() -> bool>);
+            Ok([capacity, hit, miss])
+        };
+        let small = measure(&db)?;
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(2) UNION ALL SELECT i+1 FROM n WHERE i<100001)
+             INSERT INTO jobs(id,parent_id,provider,username,operation,status)
+             SELECT i,CASE WHEN i%2=0 THEN i END,'archive','','scan',
+                    CASE WHEN i%2=0 THEN 'queued' ELSE 'done' END FROM n;",
+        )?;
+        let large = measure(&db)?;
+        eprintln!("Games admission SQL steps [capacity, hit, miss]: {small:?} -> {large:?}");
+        assert!(small.into_iter().chain(large).all(|steps| steps <= 100));
+        assert_eq!(start(&mut db, scan())?, first);
+
+        db.execute_batch(
+            "INSERT INTO jobs(provider,username,operation,status) VALUES
+            ('pgn','Fixture','upload','queued'), ('pgn','Fixture','upload','queued'),
+            ('pgn','Fixture','upload','queued'), ('pgn','Fixture','upload','failed');",
+        )?;
+        let failed = db.last_insert_rowid();
+        assert_eq!(
+            start(&mut db, scan()).unwrap_err().to_string(),
+            "the import queue is full"
+        );
+        assert_eq!(
+            retry(&mut db, failed).unwrap_err().to_string(),
+            "the import queue is full"
+        );
+        complete(&mut db, first, "archive", "", None)?;
+        retry(&mut db, failed)?;
         Ok(())
     }
 

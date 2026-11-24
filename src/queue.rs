@@ -1,10 +1,46 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+pub const COUNT_CAP: usize = 10_000;
+
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Counts {
     pub new: usize,
     pub reviews: usize,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum DisplayCount {
+    Exact(usize),
+    Capped { at_least: usize },
+}
+
+impl From<usize> for DisplayCount {
+    fn from(count: usize) -> Self {
+        if count <= COUNT_CAP {
+            Self::Exact(count)
+        } else {
+            Self::Capped {
+                at_least: COUNT_CAP,
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct DisplayCounts {
+    new: DisplayCount,
+    reviews: DisplayCount,
+}
+
+impl From<Counts> for DisplayCounts {
+    fn from(counts: Counts) -> Self {
+        Self {
+            new: counts.new.into(),
+            reviews: counts.reviews.into(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

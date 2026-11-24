@@ -30,6 +30,15 @@ function markedMove(move, brush) {
   return [{ orig, dest, brush }, { orig: dest, brush }];
 }
 
+function validStudyCount(value) {
+  return (Number.isSafeInteger(value) && value >= 0) ||
+    (Number.isSafeInteger(value?.at_least) && value.at_least > 0);
+}
+
+function formatStudyCount(value) {
+  return typeof value === "number" ? String(value) : `${value.at_least.toLocaleString("en-US")}+`;
+}
+
 function useStudyCounts() {
   const [counts, setCounts] = useState(null);
   const invalidate = useRef(null);
@@ -46,9 +55,7 @@ function useStudyCounts() {
       try {
         const response = await fetch("/api/study/counts", { signal: request.signal });
         const totals = response.ok ? await response.json() : null;
-        const valid = [totals?.new, totals?.reviews].every(
-          (value) => Number.isSafeInteger(value) && value >= 0
-        );
+        const valid = [totals?.new, totals?.reviews].every(validStudyCount);
         if (active && !dirty) setCounts(valid ? totals : null);
       } catch {
         if (active && !dirty) setCounts(null);
@@ -241,7 +248,7 @@ export function Study({ openGame, sounds }) {
     </div>
     <div className="study-panel">
       <h1>Study</h1>
-      {counts && <p>{counts.new} new · {counts.reviews} {counts.reviews === 1 ? "review" : "reviews"}</p>}
+      {counts && <p>{formatStudyCount(counts.new)} new · {formatStudyCount(counts.reviews)} {counts.reviews === 1 ? "review" : "reviews"}</p>}
       {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
       {!loaded && !error && <p>Loading your deck…</p>}
       {loaded && !card && <><p>No cards are ready. Add an opening or tactic to get started.</p>

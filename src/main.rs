@@ -297,23 +297,36 @@ async fn job_views(State(db): State<App>) -> ApiResult {
     })
     .await
 }
-async fn start_job(State(db): State<App>, Json(mut input): Json<jobs::StartJob>) -> ApiResult {
-    if let Some(pgn) = input.pgn.take() {
-        if input.provider != "pgn" || input.operation != "upload" {
-            return Err(ApiError(anyhow::anyhow!("PGN requires an upload job")));
-        }
-        jobs::valid_user(input.username.as_deref().unwrap_or("")).map_err(ApiError)?;
-        let database = db.database.clone();
-        let mut staged = prepare(move || uploads::stage(&database, &pgn)).await?;
-        return write_db(db, move |c| {
-            let id = job_store::start(c, input, Some(staged.id()))?;
-            staged.commit();
-            Ok(json!({"id":id}))
-        })
-        .await;
-    }
+async fn start_job(State(db): State<App>, Json(input): Json<jobs::StartJob>) -> ApiResult {
     write_db(db, move |c| {
-        Ok(json!({"id":job_store::start(c,input,None)?}))
+        Ok(json!({"id":job_store::start(c, jobs::NewJob::Command(input))?}))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GamesUpload {
+    username: String,
+    pgn: String,
+}
+
+async fn upload_games(State(db): State<App>, Json(input): Json<GamesUpload>) -> ApiResult {
+    let username = jobs::valid_user(&input.username)
+        .map_err(ApiError)?
+        .to_owned();
+    let database = db.database.clone();
+    let mut staged = prepare(move || uploads::stage(&database, &input.pgn)).await?;
+    write_db(db, move |c| {
+        let id = job_store::start(
+            c,
+            jobs::NewJob::Upload {
+                username,
+                file: staged.id().to_owned(),
+            },
+        )?;
+        staged.commit();
+        Ok(json!({"id":id}))
     })
     .await
 }
@@ -546,13 +559,12 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         )
         .route("/api/games", get(archives))
         .route("/api/games/archive/{id}", get(read_game))
+        .route("/api/games/jobs", get(job_views).post(start_job))
         .route(
-            "/api/games/jobs",
-            get(job_views).merge(
-                post(start_job)
-                    .layer(pgn_body_limit)
-                    .layer(middleware::from_fn(receive_pgn)),
-            ),
+            "/api/games/uploads",
+            post(upload_games)
+                .layer(pgn_body_limit)
+                .layer(middleware::from_fn(receive_pgn)),
         )
         .route("/api/games/jobs/{id}/retry", post(retry_job))
         .route("/api/settings", get(settings).post(save_settings))

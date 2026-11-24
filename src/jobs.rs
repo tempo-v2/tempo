@@ -18,11 +18,15 @@ const GAME_TURN: Duration = Duration::from_secs(60);
 const CLAIM_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartJob {
     pub provider: String,
     pub operation: String,
-    pub username: Option<String>,
-    pub pgn: Option<String>,
+}
+
+pub enum NewJob {
+    Command(StartJob),
+    Upload { username: String, file: String },
 }
 
 #[derive(Serialize)]
