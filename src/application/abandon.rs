@@ -125,6 +125,8 @@ impl Tempo {
             writes.push(Write::Active(None));
         }
         let at = skip.then(|| self.components.clock.now());
+        // Store resolves the exact obligation from the immutable issue and
+        // any assessment bound to this attempt in the Skip transaction.
         if let Some(at) = at.filter(|_| old.issued_work.is_some()) {
             self.store.commit_issued_skip(
                 Commit {
@@ -150,6 +152,107 @@ impl Tempo {
 #[cfg(test)]
 mod tests {
     use crate::AbandonCommand;
+
+    #[test]
+    fn missed_exact_test_skip_replays_after_restart() {
+        use crate::{IntroductionLimits, Tempo, components, wire::StudyCommand};
+        use serde_json::{Value, json};
+        use tempo_store::{Commit, SqliteStore, Store, Write};
+        use tempo_types::{WorkKind, WorkObligation, WorkToken};
+
+        let study = |app: &mut Tempo, command: Value| {
+            let command: StudyCommand = serde_json::from_value(command).unwrap();
+            serde_json::to_value(app.handle(command)).unwrap()
+        };
+        for first_command in ["answer", "give_up"] {
+            let (mut app, directory) = components::test_study();
+            let legacy = app.next_exercise().unwrap().unwrap();
+            let mut issued = app.snapshot().unwrap().attempts[&legacy.attempt.id].clone();
+            app.abandon(AbandonCommand {
+                dataset_id: legacy.attempt.dataset,
+                attempt_id: legacy.attempt.id,
+                expected_revision: legacy.attempt.revision,
+                submission_id: "legacy-stop".into(),
+            })
+            .unwrap();
+            drop(app);
+
+            let path = directory.path().join("study.sqlite");
+            let mut store = SqliteStore::open(&path).unwrap();
+            let before = store.snapshot().unwrap();
+            assert_eq!(issued.mode, tempo_store::ActivityMode::Test);
+            issued.attempt.id = "exact-test".into();
+            issued.issued_revision = Some(before.revision);
+            let target = issued.attempt.target.clone();
+            let dataset = before.dataset.clone();
+            let token = WorkToken {
+                day: issued.issued_at.day,
+                obligation: WorkObligation {
+                    target: target.clone(),
+                    version: issued.attempt.content_version,
+                    revision: issued.issued_miss_revision,
+                    kind: WorkKind::Test,
+                },
+            };
+            issued.issued_work = Some(token.clone());
+            let attempt_id = issued.attempt.id.clone();
+            store
+                .commit(Commit {
+                    expected_dataset: dataset.clone(),
+                    expected_revision: before.revision,
+                    writes: vec![
+                        Write::Issue(issued),
+                        Write::Active(Some(attempt_id.clone())),
+                    ],
+                })
+                .unwrap();
+            let open = |store| {
+                Tempo::daily(
+                    Box::new(store),
+                    components::test_components(),
+                    IntroductionLimits::default(),
+                    [42; 32],
+                    10,
+                )
+                .unwrap()
+            };
+            let mut app = open(store);
+            let mut first = json!({
+                "command": first_command, "dataset_id": dataset, "attempt_id": attempt_id,
+                "submission_id": "first-miss", "expected_revision": 0
+            });
+            if first_command == "answer" {
+                first["answer"] = json!({ "uci": "a2a3" });
+            }
+            let missed = study(&mut app, first);
+            assert_eq!(missed["status"], "ready", "{missed}");
+            let before_skip = app.snapshot().unwrap();
+            let bound = before_skip.assessments[0].transition.state.miss_revision;
+            assert_eq!(bound.0, token.obligation.revision.0 + 1);
+            let skip = json!({
+                "command": "skip", "dataset_id": dataset, "attempt_id": attempt_id,
+                "submission_id": "correction-skip", "expected_revision": missed["revision"],
+            });
+            drop(app);
+            let mut app = open(SqliteStore::open(&path).unwrap());
+            let skipped = study(&mut app, skip.clone());
+            assert_eq!(skipped["status"], "abandoned", "{skipped}");
+            let settled = app.snapshot().unwrap();
+            assert_eq!(settled.active_attempt, None);
+            assert_eq!(settled.assessments, before_skip.assessments);
+            assert_eq!(settled.learning, before_skip.learning);
+            assert_eq!(
+                settled.attempts[&attempt_id].issued_work,
+                Some(token.clone())
+            );
+            drop(app);
+
+            let mut app = open(SqliteStore::open(&path).unwrap());
+            let before_replay = app.snapshot().unwrap();
+            assert_eq!(study(&mut app, skip), skipped);
+            assert_eq!(app.snapshot().unwrap(), before_replay);
+        }
+    }
 
     #[test]
     fn abandoning_clears_the_active_pointer_and_allows_a_fresh_attempt() {
