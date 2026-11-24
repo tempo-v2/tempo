@@ -1,9 +1,10 @@
 use anyhow::{Result, ensure};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 fn directory(db: &Path) -> PathBuf {
@@ -97,8 +98,43 @@ fn path(db: &Path, id: &str) -> Result<PathBuf> {
     Ok(directory(db).join(id))
 }
 
-pub fn open(db: &Path, id: &str) -> Result<File> {
-    Ok(File::open(path(db, id)?)?)
+pub fn open(db: &Path, id: &str, deadline: Instant) -> Result<StagedInput> {
+    ensure!(Instant::now() < deadline, "Games turn timed out.");
+    Ok(StagedInput(File::open(path(db, id)?)?, deadline))
+}
+
+/// File reads during parsing observe the original monotonic turn deadline.
+pub struct StagedInput(File, Instant);
+
+impl Read for StagedInput {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        let n = self.0.read(bytes)?;
+        self.check()?;
+        Ok(n)
+    }
+}
+
+impl Seek for StagedInput {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.check()?;
+        let offset = self.0.seek(position)?;
+        self.check()?;
+        Ok(offset)
+    }
+}
+
+impl StagedInput {
+    fn check(&self) -> io::Result<()> {
+        if Instant::now() < self.1 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Games turn timed out.",
+            ))
+        }
+    }
 }
 
 pub fn remove(db: &Path, id: &str) {

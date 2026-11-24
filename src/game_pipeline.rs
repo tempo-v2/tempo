@@ -1,3 +1,4 @@
+use std::time::Instant;
 // Application orchestration. Games archives, the scanner compares, and Tactics publishes.
 use crate::{
     catalog, chess,
@@ -89,7 +90,12 @@ pub fn pending_game(db: &Connection, job: i64) -> Result<Option<String>> {
         .optional()?)
 }
 
-pub fn scan_findings(db: &Connection, job: i64, game: &str) -> Result<Option<scanner::Findings>> {
+pub fn scan_findings(
+    db: &Connection,
+    job: i64,
+    game: &str,
+    deadline: Instant,
+) -> Result<Option<scanner::Findings>> {
     let snapshot = db.unchecked_transaction()?;
     if snapshot
         .query_row(
@@ -107,7 +113,10 @@ pub fn scan_findings(db: &Connection, job: i64, game: &str) -> Result<Option<sca
         &archived.id,
         &archived.route,
         &archived.learner_color,
-        |position, color| catalog::answers_at(&snapshot, position, color),
+        |position, color| {
+            ensure!(Instant::now() < deadline, "Games turn timed out.");
+            catalog::answers_at(&snapshot, position, color)
+        },
     )?;
     snapshot.commit()?;
     Ok(Some(results))
@@ -291,7 +300,12 @@ mod tests {
     use super::*;
 
     fn scan_game(db: &mut Connection, job: i64, game: &str) -> Result<()> {
-        if let Some(found) = scan_findings(db, job, game)? {
+        if let Some(found) = scan_findings(
+            db,
+            job,
+            game,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )? {
             save_findings(db, job, game, &found.mismatches, &found.captures)?;
             finish_scan(db, job, game, None)?;
         }

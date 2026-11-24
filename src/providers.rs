@@ -4,7 +4,7 @@ use chrono::{DateTime, Datelike};
 use reqwest::blocking::{Client, Response};
 use serde::Deserialize;
 use std::{
-    io::{self, Read, Seek, SeekFrom},
+    io::Read,
     time::{Duration, Instant},
 };
 const MAX_DOWNLOAD: usize = 32 * 1024 * 1024;
@@ -152,40 +152,6 @@ impl Provider {
     }
 }
 
-/// File reads during parsing observe the original monotonic turn deadline.
-pub struct ProviderInput<R>(pub R, pub Instant);
-
-impl<R: Read> Read for ProviderInput<R> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.check()?;
-        let n = self.0.read(bytes)?;
-        self.check()?;
-        Ok(n)
-    }
-}
-
-impl<R: Seek> Seek for ProviderInput<R> {
-    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        self.check()?;
-        let offset = self.0.seek(position)?;
-        self.check()?;
-        Ok(offset)
-    }
-}
-
-impl<R> ProviderInput<R> {
-    fn check(&self) -> io::Result<()> {
-        if Instant::now() < self.1 {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Provider turn timed out.",
-            ))
-        }
-    }
-}
-
 pub fn upload_record<R: std::io::Read + std::io::Seek>(
     input: R,
     offset: u64,
@@ -227,11 +193,22 @@ mod tests {
         );
         server.join().expect("fixture server panicked")?;
         assert!(result.is_err());
-        let mut input = ProviderInput(std::io::Cursor::new(b"test"), Instant::now());
-        assert_eq!(
-            input.read(&mut [0; 2]).unwrap_err().kind(),
-            io::ErrorKind::TimedOut
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_variant_skips_the_whole_physical_game() -> Result<()> {
+        let pgn = concat!(
+            "[Variant \"Atomic\"]\n[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n",
+            "[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. d4 d5 1-0\n",
         );
+        let (rejected, next) = upload_record(std::io::Cursor::new(pgn), 0, "Learner")?
+            .context("unsupported variant")?;
+        assert!(rejected.is_none());
+        let (accepted, end) = upload_record(std::io::Cursor::new(pgn), next, "Learner")?
+            .context("next physical game")?;
+        assert!(accepted.is_some());
+        assert!(upload_record(std::io::Cursor::new(pgn), end, "Learner")?.is_none());
         Ok(())
     }
 

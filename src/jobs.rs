@@ -14,7 +14,8 @@ use std::{
 };
 
 pub const MAX_PGN: usize = 64 * 1024 * 1024;
-const PROVIDER_TURN: Duration = Duration::from_secs(60);
+const GAME_TURN: Duration = Duration::from_secs(60);
+const CLAIM_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 pub struct StartJob {
@@ -61,17 +62,30 @@ pub fn valid_user(user: &str) -> Result<&str> {
 
 pub fn worker(path: &Path, writer: Writer) -> Result<()> {
     let db = JobReads::open(path)?;
-    while writer.background(job_store::recover_running)? == 128 {}
+    loop {
+        match writer.background_until(Instant::now() + CLAIM_WAIT, job_store::recover_running) {
+            Ok(128) => {}
+            Ok(_) => break,
+            Err(error) => {
+                eprintln!("Games worker could not recover jobs: {error}");
+                std::thread::sleep(CLAIM_WAIT);
+            }
+        }
+    }
     let client = Provider::client()?;
     let mut failed: Option<FailedTurn> = None;
     loop {
         let prior = failed.clone();
-        let admission_deadline = Instant::now() + Duration::from_secs(2);
+        let admission_deadline = Instant::now() + CLAIM_WAIT;
         match writer.background_until(admission_deadline, move |db| {
             job_store::next(db, prior.as_ref())
         }) {
             Ok(Some(job)) => {
-                failed = run(path, &db, &writer, &client, &job)
+                let deadline = Instant::now() + GAME_TURN;
+                failed = db
+                    .within_turn(deadline, || {
+                        run(path, &db, &writer, &client, &job, deadline)
+                    })
                     .err()
                     .map(|error| FailedTurn {
                         job_id: job.id,
@@ -84,7 +98,7 @@ pub fn worker(path: &Path, writer: Writer) -> Result<()> {
             }
             Err(error) => {
                 eprintln!("Games worker could not claim work: {error}");
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(CLAIM_WAIT);
             }
         }
     }
@@ -96,13 +110,14 @@ fn scan_game(
     job: i64,
     game: String,
     cursor: Option<String>,
+    deadline: Instant,
 ) -> Result<()> {
-    let Some(found) = db.findings(job, &game)? else {
-        return yield_turn(writer, job, cursor, 0);
+    let Some(found) = db.findings(job, &game, deadline)? else {
+        return yield_turn(writer, deadline, job, cursor, 0);
     };
     let save = |mismatches: Vec<_>, captures: Vec<_>| {
         let game = game.clone();
-        writer.background(move |db| {
+        writer.background_until(deadline, move |db| {
             game_pipeline::save_findings(db, job, &game, &mismatches, &captures)
         })
     };
@@ -122,10 +137,19 @@ fn scan_game(
         }
         save(Vec::new(), batch)?;
     }
-    writer.background(move |db| game_pipeline::finish_scan(db, job, &game, cursor.as_deref()))
+    writer.background_until(deadline, move |db| {
+        game_pipeline::finish_scan(db, job, &game, cursor.as_deref())
+    })
 }
 
-fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) -> Result<()> {
+fn run(
+    path: &Path,
+    db: &JobReads,
+    writer: &Writer,
+    client: &Client,
+    job: &Job,
+    deadline: Instant,
+) -> Result<()> {
     let id = job.id;
     let mut upload_file = None;
     match (job.provider.as_str(), job.operation.as_str()) {
@@ -139,25 +163,27 @@ fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) 
                 .unwrap_or(0);
             let Some(upload) = upload else {
                 let pgn = db.inline_upload(id)?.context("PGN is missing")?;
+                ensure!(Instant::now() < deadline, "Games turn timed out.");
                 let mut staged = crate::uploads::stage(path, &pgn)?;
-                return writer.background(move |db| {
+                return writer.background_until(deadline, move |db| {
                     job_store::stage_inline_upload(db, id, staged.id())?;
                     staged.commit();
                     Ok(())
                 });
             };
             let record = providers::upload_record(
-                crate::uploads::open(path, &upload)?,
+                crate::uploads::open(path, &upload, deadline)?,
                 offset,
                 &job.username,
             )?;
             match record {
                 Some((Some(game), next)) => {
-                    return writer
-                        .background(move |db| game_pipeline::archive_upload(db, &game, id, next));
+                    return writer.background_until(deadline, move |db| {
+                        game_pipeline::archive_upload(db, &game, id, next)
+                    });
                 }
                 Some((None, next)) => {
-                    return yield_turn(writer, id, Some(next.to_string()), 1);
+                    return yield_turn(writer, deadline, id, Some(next.to_string()), 1);
                 }
                 None => upload_file = Some(upload),
             }
@@ -166,18 +192,27 @@ fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) 
             let mut cursor = ArchiveCursor::load(db, db.cursor(id)?.as_deref())?;
             if let Some(game) = db.archive_next(&cursor.after, cursor.through)? {
                 cursor.after.clone_from(&game);
-                return scan_game(db, writer, id, game, Some(serde_json::to_string(&cursor)?));
+                return scan_game(
+                    db,
+                    writer,
+                    id,
+                    game,
+                    Some(serde_json::to_string(&cursor)?),
+                    deadline,
+                );
             }
         }
         ("archive", "scan_new") => {
             if let Some(game) = db.pending_game(id)? {
-                return scan_game(db, writer, id, game, None);
+                return scan_game(db, writer, id, game, None, deadline);
             }
         }
         ("archive", "publish") => {
             if let Some(game) = db.pending_game(id)? {
                 let plans = db.publication_batch(&game)?;
-                writer.background(move |db| game_pipeline::publish_batch(db, id, &game, &plans))?;
+                writer.background_until(deadline, move |db| {
+                    game_pipeline::publish_batch(db, id, &game, &plans)
+                })?;
                 return Ok(());
             }
         }
@@ -189,22 +224,30 @@ fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) 
                 client,
                 job,
                 Provider::named(name).context("unknown provider")?,
-                Instant::now() + PROVIDER_TURN,
+                deadline,
             );
         }
         _ => bail!("unknown provider"),
     }
     let provider = job.provider.clone();
     let username = job.username.to_ascii_lowercase();
-    writer.background(move |db| job_store::complete(db, id, &provider, &username, None))?;
+    writer.background_until(deadline, move |db| {
+        job_store::complete(db, id, &provider, &username, None)
+    })?;
     if let Some(file) = upload_file {
         crate::uploads::remove(path, &file);
     }
     Ok(())
 }
 
-fn yield_turn(writer: &Writer, id: i64, cursor: Option<String>, rejected: usize) -> Result<()> {
-    writer.background(move |db| {
+fn yield_turn(
+    writer: &Writer,
+    deadline: Instant,
+    id: i64,
+    cursor: Option<String>,
+    rejected: usize,
+) -> Result<()> {
+    writer.background_until(deadline, move |db| {
         let tx = db.transaction()?;
         job_store::yield_turn(&tx, id, cursor.as_deref(), rejected)?;
         tx.commit()?;
@@ -274,12 +317,8 @@ fn provider_turn(
     let id = job.id;
     let upload = db.upload(id)?;
     if let Some(file) = &upload {
-        let input = crate::uploads::open(path, file)?;
-        match providers::upload_record(
-            providers::ProviderInput(input, deadline),
-            job.window_offset,
-            &job.username,
-        )? {
+        let input = crate::uploads::open(path, file, deadline)?;
+        match providers::upload_record(input, job.window_offset, &job.username)? {
             Some((Some(game), offset)) => {
                 writer.background_until(deadline, move |db| {
                     game_pipeline::archive_provider_record(db, &game, id, offset)

@@ -9,6 +9,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 pub fn settings(db: &Connection) -> Result<std::collections::BTreeMap<String, String>> {
     let mut q = db.prepare("SELECT provider,username FROM settings")?;
@@ -261,7 +262,19 @@ pub fn stage_inline_upload(db: &mut Connection, id: i64, file: &str) -> Result<(
 pub struct JobReads(Connection);
 impl JobReads {
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self(Database::read(path)?))
+        Ok(Self(Database::read_with_busy_timeout(
+            path,
+            Duration::ZERO,
+        )?))
+    }
+
+    pub fn within_turn<T>(&self, deadline: Instant, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.0.busy_timeout(Duration::ZERO)?;
+        self.0
+            .progress_handler(1_000, Some(move || Instant::now() >= deadline));
+        let result = work();
+        self.0.progress_handler(0, None::<fn() -> bool>);
+        result
     }
 
     pub fn cursor(&self, id: i64) -> Result<Option<String>> {
@@ -318,8 +331,13 @@ impl JobReads {
             .optional()?)
     }
 
-    pub fn findings(&self, job: i64, game: &str) -> Result<Option<scanner::Findings>> {
-        game_pipeline::scan_findings(&self.0, job, game)
+    pub fn findings(
+        &self,
+        job: i64,
+        game: &str,
+        deadline: Instant,
+    ) -> Result<Option<scanner::Findings>> {
+        game_pipeline::scan_findings(&self.0, job, game, deadline)
     }
 
     pub fn pending_game(&self, job: i64) -> Result<Option<String>> {
