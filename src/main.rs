@@ -237,7 +237,7 @@ async fn current(State(db): State<App>) -> ApiResult {
     with_db(db, move |c| study::current(c)).await
 }
 async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> ApiResult {
-    with_db(db, move |c| study::next(c, input)).await
+    with_db(db, move |c| review::next(c, input)).await
 }
 async fn answer(State(db): State<App>, Json(input): Json<study::Answer>) -> ApiResult {
     with_db(db, move |c| review::answer(c, input)).await
@@ -287,8 +287,6 @@ async fn loopback(State(port): State<u16>, req: Request, next: Next) -> Response
 }
 
 async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
-    Database::init(&db)?;
-    let db = db.canonicalize()?;
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/dist");
     ensure!(
         path.join("index.html").is_file(),
@@ -296,16 +294,28 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     let port = listener.local_addr()?.port();
-    let _worker_lock = if without_worker {
-        None
+    let db = if db.exists() {
+        db.canonicalize()?
     } else {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(db.with_extension("worker.lock"))?;
-        lock.try_lock_exclusive()
-            .context("another worker owns this database")?;
+        let directory = db
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        directory
+            .canonicalize()?
+            .join(db.file_name().context("enter a database file name")?)
+    };
+    // Fence the previous worker before any schema or data writes.
+    let database_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(db.with_extension("worker.lock"))?;
+    database_lock
+        .try_lock_exclusive()
+        .context("another service owns this database")?;
+    Database::init(&db)?;
+    if !without_worker {
         let worker_db = db.clone();
         std::thread::Builder::new()
             .name("games-worker".into())
@@ -314,8 +324,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
                     eprintln!("Games worker stopped: {error:#}");
                 }
             })?;
-        Some(lock)
-    };
+    }
     let pgn_body_limit = DefaultBodyLimit::max(jobs::MAX_PGN * 2 + 4096);
     let app = Router::new()
         .route(
@@ -355,6 +364,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         .with_state(Arc::new(db));
     println!("Tempo at http://127.0.0.1:{port}");
     axum::serve(listener, app).await?;
+    drop(database_lock);
     Ok(())
 }
 

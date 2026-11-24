@@ -78,7 +78,9 @@ pub struct Repertoire {
 
 pub fn repertoires(db: &Connection) -> Result<Vec<Repertoire>> {
     let mut q = db.prepare(
-        "SELECT repertoire_id,min(name),color FROM openings GROUP BY repertoire_id,color ORDER BY min(name),repertoire_id",
+        "SELECT repertoire_id,name,color FROM openings
+        WHERE rowid IN (SELECT min(rowid) FROM openings GROUP BY repertoire_id,color)
+        ORDER BY name,repertoire_id",
     )?;
     Ok(q.query_map([], |r| {
         Ok(Repertoire {

@@ -1,7 +1,6 @@
-use crate::{chess, queue_store};
+use crate::chess;
 use anyhow::{Result, ensure};
-use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
@@ -158,48 +157,50 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
     .transpose()
 }
 
-pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current_dataset = crate::db::dataset(&tx)?;
-    if input.after.is_some() && input.dataset.as_deref() != Some(&current_dataset) {
+pub enum NextState {
+    Current,
+    Select { previous_kind: Option<String> },
+}
+
+fn state(db: &Connection) -> Result<(Option<i64>, Option<String>)> {
+    Ok(db.query_row("SELECT active,last_kind FROM study", [], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })?)
+}
+
+pub fn begin_next(db: &Connection, input: &Next) -> Result<NextState> {
+    let dataset = crate::db::dataset(db)?;
+    if input.after.is_some() && input.dataset.as_deref() != Some(&dataset) {
         return Err(Conflict::Dataset.into());
     }
-    let (active, last): (Option<i64>, Option<String>) =
-        tx.query_row("SELECT active,last_kind FROM study", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+    let (active, previous_kind) = state(db)?;
     if let Some(active) = active {
-        let accepted: bool = tx.query_row(
+        let accepted: bool = db.query_row(
             "SELECT result IS NOT NULL FROM attempts WHERE id=?1",
             [active],
             |r| r.get(0),
         )?;
         if !accepted || input.after != Some(active) {
-            return current(&tx);
+            return Ok(NextState::Current);
         }
     } else if input.after.is_some() {
-        return current(&tx);
+        return Ok(NextState::Current);
     }
-    let queued = queue_store::committed_head(&tx)?;
-    let next = if queued.is_some() {
-        queued
-    } else {
-        queue_store::select(&tx, last.as_deref(), Utc::now().timestamp())?
-    };
-    if let Some((id, kind)) = next {
-        tx.execute("INSERT INTO attempts(card_id) VALUES (?1)", [&id])?;
-        let attempt = tx.last_insert_rowid();
-        tx.execute("DELETE FROM deck WHERE card_id=?1", [&id])?;
-        tx.execute(
+    Ok(NextState::Select { previous_kind })
+}
+
+pub fn issue(db: &Connection, card: Option<(&str, &str)>) -> Result<()> {
+    if let Some((id, kind)) = card {
+        db.execute("INSERT INTO attempts(card_id) VALUES (?1)", [id])?;
+        let attempt = db.last_insert_rowid();
+        db.execute(
             "UPDATE study SET active=?1,last_kind=?2",
             params![attempt, kind],
         )?;
     } else {
-        tx.execute("UPDATE study SET active=NULL", [])?;
+        db.execute("UPDATE study SET active=NULL", [])?;
     }
-    let view = current(&tx)?;
-    tx.commit()?;
-    Ok(view)
+    Ok(())
 }
 
 pub struct IssuedAnswer {
@@ -207,6 +208,7 @@ pub struct IssuedAnswer {
     pub fen: String,
     pub answers: Vec<String>,
     pub played_in_game: Option<String>,
+    pub previous_kind: Option<String>,
     payload: String,
 }
 
@@ -252,7 +254,7 @@ pub fn begin_answer(db: &Connection, input: &Answer) -> Result<AnswerState> {
             input.played.as_deref(),
         )));
     }
-    let active: Option<i64> = db.query_row("SELECT active FROM study", [], |r| r.get(0))?;
+    let (active, previous_kind) = state(db)?;
     ensure!(active == Some(input.attempt), "the active card changed");
     let answers: Vec<String> = serde_json::from_str(&answers)?;
     Ok(AnswerState::Pending(IssuedAnswer {
@@ -260,6 +262,7 @@ pub fn begin_answer(db: &Connection, input: &Answer) -> Result<AnswerState> {
         fen,
         answers,
         played_in_game,
+        previous_kind,
         payload,
     }))
 }

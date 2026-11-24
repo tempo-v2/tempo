@@ -80,7 +80,12 @@ pub fn save_settings(
 }
 
 pub fn views(db: &Connection) -> Result<Vec<JobView>> {
-    let mut q = db.prepare("SELECT id,provider,operation,status,added,existing,rejected,found,error FROM jobs ORDER BY (status='failed') DESC,id DESC LIMIT 12")?;
+    let mut q = db.prepare(
+        "SELECT id,provider,operation,status,added,existing,rejected,found,error FROM jobs
+        WHERE id IN (SELECT id FROM jobs ORDER BY id DESC LIMIT 12)
+           OR id IN (SELECT id FROM jobs WHERE status='failed' ORDER BY id DESC LIMIT 12)
+        ORDER BY id DESC",
+    )?;
     let rows = q.query_map([], |r| {
         Ok(JobView {
             id: r.get(0)?,
@@ -411,4 +416,23 @@ fn fetch_provider(db: &mut Connection, client: &Client, job: &Job) -> Result<i64
         )?;
     }
     Ok(cursor.through)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_job_remains_visible_alongside_prior_failures() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(include_str!("schema.sql"))?;
+        for _ in 0..12 {
+            db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('pgn','Learner','upload','failed')", [])?;
+        }
+        db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('archive','','scan','queued')", [])?;
+        let jobs = views(&db)?;
+        assert_eq!(jobs[0].status, "queued");
+        assert_eq!(jobs.iter().filter(|job| job.status == "failed").count(), 12);
+        Ok(())
+    }
 }

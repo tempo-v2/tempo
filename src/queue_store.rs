@@ -81,7 +81,18 @@ pub fn committed_head(db: &Connection) -> Result<Option<(String, String)>> {
     ).optional()?)
 }
 
-pub fn place_repeat(db: &Connection, card: &str, now: i64, draw: u8) -> Result<u8> {
+pub fn consume(db: &Connection, card: &str) -> Result<()> {
+    db.execute("DELETE FROM deck WHERE card_id=?1", [card])?;
+    Ok(())
+}
+
+pub fn place_repeat(
+    db: &Connection,
+    card: &str,
+    previous_kind: Option<&str>,
+    now: i64,
+    draw: u8,
+) -> Result<u8> {
     let mut q = db.prepare(
         "SELECT d.card_id,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot",
     )?;
@@ -91,7 +102,7 @@ pub fn place_repeat(db: &Connection, card: &str, now: i64, draw: u8) -> Result<u
     let mut previous = if let Some((_, kind)) = queued.last() {
         Some(kind.clone())
     } else {
-        db.query_row("SELECT last_kind FROM study", [], |r| r.get(0))?
+        previous_kind.map(str::to_owned)
     };
     while queued.len() < usize::from(draw) {
         let Some((id, kind)) = select(db, previous.as_deref(), now)? else {

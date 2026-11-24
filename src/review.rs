@@ -3,7 +3,7 @@ use crate::{
     chess, db,
     learning::{self, Rating},
     queue, queue_store,
-    study::{self, AcceptedView, Answer, AnswerState},
+    study::{self, AcceptedView, Answer, AnswerState, Next, NextState, Review},
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -29,6 +29,7 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
             Some(queue_store::place_repeat(
                 &tx,
                 &issued.card,
+                issued.previous_kind.as_deref(),
                 now,
                 queue::draw_repeat_offset(),
             )?)
@@ -38,4 +39,27 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
     let accepted = study::accept_answer(&tx, &input, issued, rating.label(), repeat_after)?;
     tx.commit()?;
     Ok(accepted)
+}
+
+pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
+    let tx = db.transaction_with_behavior(Immediate)?;
+    let NextState::Select { previous_kind } = study::begin_next(&tx, &input)? else {
+        return study::current(&tx);
+    };
+    let selected = match queue_store::committed_head(&tx)? {
+        Some(card) => Some(card),
+        None => queue_store::select(&tx, previous_kind.as_deref(), Utc::now().timestamp())?,
+    };
+    study::issue(
+        &tx,
+        selected
+            .as_ref()
+            .map(|(id, kind)| (id.as_str(), kind.as_str())),
+    )?;
+    if let Some((id, _)) = selected {
+        queue_store::consume(&tx, &id)?;
+    }
+    let view = study::current(&tx)?;
+    tx.commit()?;
+    Ok(view)
 }
