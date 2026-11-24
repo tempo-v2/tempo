@@ -84,7 +84,7 @@ fn scan_game(
     cursor: Option<String>,
 ) -> Result<()> {
     let Some(found) = db.findings(job, &game)? else {
-        return writer.background(move |db| job_store::yield_turn(db, job, cursor.as_deref(), 0));
+        return yield_turn(writer, job, cursor, 0);
     };
     let save = |mismatches: Vec<_>, captures: Vec<_>| {
         let game = game.clone();
@@ -180,7 +180,10 @@ fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) 
                 Provider::named(name).context("unknown provider")?,
             )? {
                 ProviderTurn::Yielded => return Ok(()),
-                ProviderTurn::Complete(through) => Some(through),
+                ProviderTurn::Complete {
+                    through,
+                    rejected_floor,
+                } => Some((through, rejected_floor)),
             }
         }
         _ => bail!("unknown provider"),
@@ -195,7 +198,12 @@ fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) 
 }
 
 fn yield_turn(writer: &Writer, id: i64, cursor: Option<String>, rejected: usize) -> Result<()> {
-    writer.background(move |db| job_store::yield_turn(db, id, cursor.as_deref(), rejected))
+    writer.background(move |db| {
+        let tx = db.transaction()?;
+        job_store::yield_turn(&tx, id, cursor.as_deref(), rejected)?;
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -222,11 +230,34 @@ struct ProviderCursor {
     through: i64,
     next: usize,
     windows: Option<Vec<String>>,
+    recounted_rejected: Option<usize>,
+}
+
+impl ProviderCursor {
+    fn freeze(&mut self, provider: Provider, windows: Vec<String>) {
+        // Schema 3 recorded an ordinal against a mutable Chess.com month list.
+        // Reconcile every current month because inserting one before that ordinal can skip a month.
+        if matches!(provider, Provider::ChessCom) && self.next != 0 {
+            self.next = 0;
+            self.recounted_rejected = Some(0);
+        }
+        self.windows = Some(windows);
+    }
+
+    fn advance(&mut self, rejected: usize) -> usize {
+        self.next += 1;
+        if let Some(total) = self.recounted_rejected.as_mut() {
+            *total += rejected;
+            0
+        } else {
+            rejected
+        }
+    }
 }
 
 enum ProviderTurn {
     Yielded,
-    Complete(i64),
+    Complete { through: i64, rejected_floor: usize },
 }
 
 fn provider_turn(
@@ -256,11 +287,13 @@ fn provider_turn(
                 through,
                 next: 0,
                 windows: None,
+                recounted_rejected: None,
             }
         }
     };
     if cursor.windows.is_none() {
-        cursor.windows = Some(provider.windows(client, &user, cursor.from, cursor.through)?);
+        let windows = provider.windows(client, &user, cursor.from, cursor.through)?;
+        cursor.freeze(provider, windows);
         yield_turn(writer, id, Some(serde_json::to_string(&cursor)?), 0)?;
         return Ok(ProviderTurn::Yielded);
     }
@@ -273,12 +306,45 @@ fn provider_turn(
         "saved provider checkpoint exceeds the window inventory"
     );
     let Some(window) = windows.get(cursor.next) else {
-        return Ok(ProviderTurn::Complete(cursor.through));
+        return Ok(ProviderTurn::Complete {
+            through: cursor.through,
+            rejected_floor: cursor.recounted_rejected.unwrap_or_default(),
+        });
     };
     let rejected = Provider::supply(client, &job.username, window, |game| {
         writer.background(move |db| game_pipeline::archive_import(db, &game, id))
     })?;
-    cursor.next += 1;
+    let rejected = cursor.advance(rejected);
     yield_turn(writer, id, Some(serde_json::to_string(&cursor)?), rejected)?;
     Ok(ProviderTurn::Yielded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn predecessor_chesscom_cursor_reconciles_changed_window_inventory() -> Result<()> {
+        let mut saved: ProviderCursor =
+            serde_json::from_str(r#"{"from":0,"through":100,"next":1}"#)?;
+        saved.freeze(
+            Provider::ChessCom,
+            vec!["inserted".into(), "original".into(), "last".into()],
+        );
+        assert_eq!(saved.next, 0);
+        assert_eq!(saved.advance(2), 0);
+        let mut restarted: ProviderCursor = serde_json::from_str(&serde_json::to_string(&saved)?)?;
+        assert_eq!(
+            restarted.windows.as_ref().unwrap()[restarted.next],
+            "original"
+        );
+        assert_eq!(restarted.advance(3), 0);
+        assert_eq!(restarted.recounted_rejected, Some(5));
+        let mut lichess: ProviderCursor =
+            serde_json::from_str(r#"{"from":0,"through":100,"next":1}"#)?;
+        lichess.freeze(Provider::Lichess, vec!["original".into(), "last".into()]);
+        assert_eq!(lichess.next, 1);
+        assert_eq!(lichess.advance(2), 2);
+        Ok(())
+    }
 }

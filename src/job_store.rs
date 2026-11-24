@@ -7,7 +7,7 @@ use crate::{
     scanner,
 };
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 
 pub fn settings(db: &Connection) -> Result<std::collections::BTreeMap<String, String>> {
@@ -127,7 +127,7 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
 
 pub fn next(db: &mut Connection) -> Result<Option<Job>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let job = tx.query_row("SELECT id,provider,username,operation,cursor FROM jobs WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
+    let job = tx.query_row("SELECT id,provider,username,operation,cursor FROM jobs INDEXED BY jobs_ready_order WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
         |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,cursor:r.get(4)? })).optional()?;
     if let Some(job) = &job {
         tx.execute("UPDATE jobs SET status='running' WHERE id=?1", [job.id])?;
@@ -157,42 +157,58 @@ pub fn complete(
     id: i64,
     provider: &str,
     username: &str,
-    checkpoint: Option<i64>,
+    checkpoint: Option<(i64, usize)>,
 ) -> Result<()> {
     let tx = db.transaction()?;
-    if let Some(through) = checkpoint {
+    if let Some((through, _)) = checkpoint {
         tx.execute("INSERT INTO provider_checkpoint VALUES (?1,?2,?3)
             ON CONFLICT(provider,username) DO UPDATE SET through_at=max(through_at,excluded.through_at)",
             params![provider,username,through])?;
     }
     tx.execute(
-        "UPDATE jobs SET status='done',payload=NULL,upload_file=NULL,error=NULL WHERE id=?1",
-        [id],
+        "UPDATE jobs SET status='done',payload=NULL,upload_file=NULL,error=NULL,
+          rejected=max(rejected,?2) WHERE id=?1",
+        params![id, checkpoint.map_or(0, |(_, rejected)| rejected)],
     )?;
     tx.commit()?;
     Ok(())
 }
 
 /// Commit the completed turn and return its job to the tail in the same transaction.
-pub fn yield_turn(db: &Connection, id: i64, cursor: Option<&str>, rejected: usize) -> Result<()> {
-    db.execute(
-        "UPDATE jobs SET status='queued',cursor=coalesce(?2,cursor),rejected=rejected+?3
+pub fn yield_turn(
+    tx: &Transaction<'_>,
+    id: i64,
+    cursor: Option<&str>,
+    rejected: usize,
+) -> Result<()> {
+    let moved = tx.execute(
+        "UPDATE jobs SET status='queued',cursor=coalesce(?2,cursor),rejected=rejected+?3,
+           ready_order=(SELECT last_order+1 FROM job_ready_clock WHERE singleton=1)
          WHERE id=?1 AND status='running'",
         params![id, cursor, rejected],
     )?;
+    if moved != 0 {
+        tx.execute(
+            "UPDATE job_ready_clock SET last_order=last_order+1 WHERE singleton=1",
+            [],
+        )?;
+    }
     Ok(())
 }
 
 /// The staged bytes are durable before replacing the old inline representation.
-pub fn stage_inline_upload(db: &Connection, id: i64, file: &str) -> Result<()> {
+pub fn stage_inline_upload(db: &mut Connection, id: i64, file: &str) -> Result<()> {
+    let tx = db.transaction()?;
     ensure!(
-        db.execute(
-            "UPDATE jobs SET upload_file=?2,payload=NULL,status='queued'
-         WHERE id=?1 AND status='running' AND upload_file IS NULL AND payload IS NOT NULL",
+        tx.execute(
+            "UPDATE jobs SET upload_file=?2,payload=NULL
+             WHERE id=?1 AND status='running' AND upload_file IS NULL AND payload IS NOT NULL",
             params![id, file],
         )? == 1,
         "the inline upload is no longer active"
     );
+    yield_turn(&tx, id, None, 0)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -278,14 +294,16 @@ mod tests {
         }
         db.execute_batch(
             "INSERT INTO jobs(provider,username,operation,status) VALUES
-             ('archive','','scan','queued'), ('archive','','scan','queued'),
-             ('archive','','scan','running')",
+             ('archive','','scan','running'), ('archive','','scan','queued'),
+             ('archive','','scan','queued')",
         )?;
         db.execute_batch(include_str!("job_turns.sql"))?;
         assert_eq!(recover_running(&mut db)?, 1);
 
         assert_eq!(next(&mut db)?.unwrap().id, 1);
-        yield_turn(&db, 1, Some("checkpoint"), 1)?;
+        let tx = db.transaction()?;
+        yield_turn(&tx, 1, Some("checkpoint"), 1)?;
+        tx.commit()?;
         assert_eq!(next(&mut db)?.unwrap().id, 2);
         fail(&db, 2, "fixture")?;
         retry(&mut db, 2)?;

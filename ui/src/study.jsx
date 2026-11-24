@@ -11,8 +11,7 @@ function openingFrames(route, targetFen) {
   if (!route?.moves?.length) return null;
   try {
     const game = new Chess(route.fen);
-    const source = sourceRead?.key === attemptKey ? sourceRead.result : null;
-  const frames = [{ fen: game.fen() }];
+    const frames = [{ fen: game.fen() }];
     for (const uci of route.moves) {
       const { from, to, color } = play(game, uci);
       frames.push({ fen: game.fen(), lastMove: [from, to], movedBy: color });
