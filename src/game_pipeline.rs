@@ -2,7 +2,7 @@
 use crate::{
     catalog, chess,
     games::{self, Game},
-    scanner,
+    job_store, scanner,
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
@@ -61,22 +61,20 @@ fn archive_game(db: &mut Connection, game: &Game, job: i64, offset: Option<u64>)
         }
     }
     if let Some(offset) = offset {
-        tx.execute(
-            "UPDATE jobs SET cursor=?2 WHERE id=?1",
-            params![job, offset.to_string()],
-        )?;
+        job_store::yield_turn(&tx, job, Some(&offset.to_string()), 0)?;
     }
     tx.commit()?;
     Ok(())
 }
 
-pub fn pending_games(db: &Connection, job: i64) -> Result<Vec<String>> {
-    let mut query = db.prepare(
-        "SELECT game_id FROM job_games WHERE job_id=?1 AND scanned=0 ORDER BY game_id LIMIT 25",
-    )?;
-    Ok(query
-        .query_map([job], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?)
+pub fn pending_game(db: &Connection, job: i64) -> Result<Option<String>> {
+    Ok(db
+        .query_row(
+            "SELECT game_id FROM job_games WHERE job_id=?1 AND scanned=0 ORDER BY game_id LIMIT 1",
+            [job],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 pub fn scan_findings(db: &Connection, job: i64, game: &str) -> Result<Option<scanner::Findings>> {
@@ -144,7 +142,7 @@ pub fn save_findings(
     Ok(())
 }
 
-pub fn finish_scan(db: &mut Connection, job: i64, game: &str) -> Result<()> {
+pub fn finish_scan(db: &mut Connection, job: i64, game: &str, cursor: Option<&str>) -> Result<()> {
     let tx = db.transaction_with_behavior(Immediate)?;
     let saved = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM missed_captures m WHERE game_id=?1 AND NOT EXISTS
@@ -156,6 +154,7 @@ pub fn finish_scan(db: &mut Connection, job: i64, game: &str) -> Result<()> {
         enqueue(&tx, job, "publish", game)?;
     }
     complete(&tx, job, game)?;
+    job_store::yield_turn(&tx, job, cursor, 0)?;
     tx.commit()?;
     Ok(())
 }
@@ -223,6 +222,7 @@ pub fn publish_batch(
     if done {
         complete(&tx, job, game)?;
     }
+    job_store::yield_turn(&tx, job, None, 0)?;
     tx.commit()?;
     Ok(done)
 }
@@ -281,7 +281,7 @@ mod tests {
     fn scan_game(db: &mut Connection, job: i64, game: &str) -> Result<()> {
         if let Some(found) = scan_findings(db, job, game)? {
             save_findings(db, job, game, &found.mismatches, &found.captures)?;
-            finish_scan(db, job, game)?;
+            finish_scan(db, job, game, None)?;
         }
         Ok(())
     }
@@ -308,14 +308,17 @@ mod tests {
         archive_import(&mut db, &game, 1)?;
         archive_import(&mut db, &game, 1)?;
         let scan = stage(&db, 1, "scan_new")?;
-        assert_eq!(pending_games(&db, scan)?, std::slice::from_ref(&game.id));
+        assert_eq!(pending_game(&db, scan)?.as_deref(), Some(game.id.as_str()));
         scan_game(&mut db, scan, &game.id)?;
         scan_game(&mut db, scan, &game.id)?;
         let publish = stage(&db, scan, "publish")?;
         db.execute_batch("CREATE TRIGGER fail_publish BEFORE INSERT ON tactics BEGIN SELECT raise(abort,'fixture failure'); END;")?;
         assert!(publish_game(&mut db, publish, &game.id).is_err());
-        assert!(pending_games(&db, scan)?.is_empty());
-        assert_eq!(pending_games(&db, publish)?, std::slice::from_ref(&game.id));
+        assert!(pending_game(&db, scan)?.is_none());
+        assert_eq!(
+            pending_game(&db, publish)?.as_deref(),
+            Some(game.id.as_str())
+        );
         assert_eq!(
             db.query_row("SELECT count(*) FROM missed_captures", [], |r| r
                 .get::<_, usize>(0))?,
@@ -324,7 +327,7 @@ mod tests {
         db.execute_batch("DROP TRIGGER fail_publish;")?;
         publish_game(&mut db, publish, &game.id)?;
         publish_game(&mut db, publish, &game.id)?;
-        assert!(pending_games(&db, publish)?.is_empty());
+        assert!(pending_game(&db, publish)?.is_none());
         assert_eq!(catalog::tactics(&db, "")?.len(), 1);
         Ok(())
     }

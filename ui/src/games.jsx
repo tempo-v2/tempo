@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { api, fileText } from "./api.js";
 import { Replay } from "./board.jsx";
 import { More, useList } from "./library.jsx";
@@ -14,23 +14,54 @@ export function Games({ jump, addOpening, settings, sounds }) {
   const [jobs, setJobs] = useState([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const refreshJobs = useRef(null);
   useEffect(() => {
     let live = true;
     let timer;
+    let pending;
+    let dirty = false;
     let prior = "";
     async function poll() {
+      clearTimeout(timer);
+      if (!live || document.hidden || pending) return;
+      const request = new AbortController();
+      pending = request;
+      dirty = false;
       try {
-        const jobs = await api("games/jobs");
-        if (!live) return;
-        const fingerprint = JSON.stringify(jobs.map(({ id, added, status }) => [id, added, status]));
+        const result = await api("games/jobs", undefined, request.signal);
+        if (!live || request.signal.aborted) return;
+        const fingerprint = JSON.stringify(result.map(({ id, added, status }) => [id, added, status]));
         if (prior && prior !== fingerprint) list.load();
         prior = fingerprint;
-        setJobs(jobs);
-      } catch (error) { if (live) setError(error.message); }
-      if (live) timer = setTimeout(poll, 2000);
+        setJobs(result);
+      } catch (error) {
+        if (live && !request.signal.aborted && error.code !== "view_unavailable") setError(error.message);
+      } finally {
+        pending = null;
+        if (live && !document.hidden) timer = setTimeout(poll, dirty ? 0 : 2000);
+      }
     }
+    refreshJobs.current = () => {
+      dirty = true;
+      poll();
+    };
+    function visibilityChanged() {
+      if (document.hidden) {
+        clearTimeout(timer);
+        pending?.abort();
+      } else {
+        refreshJobs.current?.();
+      }
+    }
+    document.addEventListener("visibilitychange", visibilityChanged);
     poll();
-    return () => { live = false; clearTimeout(timer); };
+    return () => {
+      live = false;
+      refreshJobs.current = null;
+      clearTimeout(timer);
+      pending?.abort();
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
   }, []);
   useEffect(() => {
     if (!jump) return;
@@ -42,7 +73,7 @@ export function Games({ jump, addOpening, settings, sounds }) {
   }, [jump]);
   async function job(path, body) {
     setBusy(true); setError("");
-    try { await api(path, body); setJobs(await api("games/jobs")); }
+    try { await api(path, body); refreshJobs.current?.(); }
     catch (error) { setError(error.message); }
     finally { setBusy(false); }
   }

@@ -1,7 +1,7 @@
 use crate::{
     catalog,
     db::Database,
-    game_pipeline, games,
+    game_pipeline,
     jobs::{Job, JobView, StartJob, valid_user},
     providers::Provider,
     scanner,
@@ -127,7 +127,7 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
 
 pub fn next(db: &mut Connection) -> Result<Option<Job>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let job = tx.query_row("SELECT id,provider,username,operation,cursor FROM jobs WHERE status='queued' ORDER BY id LIMIT 1",[],
+    let job = tx.query_row("SELECT id,provider,username,operation,cursor FROM jobs WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
         |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,cursor:r.get(4)? })).optional()?;
     if let Some(job) = &job {
         tx.execute("UPDATE jobs SET status='running' WHERE id=?1", [job.id])?;
@@ -173,11 +173,26 @@ pub fn complete(
     Ok(())
 }
 
-pub fn save_cursor(db: &Connection, id: i64, cursor: &str, rejected: usize) -> Result<()> {
+/// Commit the completed turn and return its job to the tail in the same transaction.
+pub fn yield_turn(db: &Connection, id: i64, cursor: Option<&str>, rejected: usize) -> Result<()> {
     db.execute(
-        "UPDATE jobs SET cursor=?2,rejected=rejected+?3 WHERE id=?1",
+        "UPDATE jobs SET status='queued',cursor=coalesce(?2,cursor),rejected=rejected+?3
+         WHERE id=?1 AND status='running'",
         params![id, cursor, rejected],
     )?;
+    Ok(())
+}
+
+/// The staged bytes are durable before replacing the old inline representation.
+pub fn stage_inline_upload(db: &Connection, id: i64, file: &str) -> Result<()> {
+    ensure!(
+        db.execute(
+            "UPDATE jobs SET upload_file=?2,payload=NULL,status='queued'
+         WHERE id=?1 AND status='running' AND upload_file IS NULL AND payload IS NOT NULL",
+            params![id, file],
+        )? == 1,
+        "the inline upload is no longer active"
+    );
     Ok(())
 }
 
@@ -187,12 +202,20 @@ impl JobReads {
         Ok(Self(Database::read(path)?))
     }
 
-    pub fn upload(&self, id: i64) -> Result<(Option<String>, Option<String>)> {
-        Ok(self.0.query_row(
-            "SELECT upload_file,payload FROM jobs WHERE id=?1",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?)
+    pub fn upload(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .query_row("SELECT upload_file FROM jobs WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
+    }
+
+    pub fn inline_upload(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .query_row("SELECT payload FROM jobs WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
     }
 
     pub fn checkpoint(&self, provider: &str, user: &str) -> Result<Option<i64>> {
@@ -206,16 +229,31 @@ impl JobReads {
             .optional()?)
     }
 
-    pub fn archive(&self, cursor: &str) -> Result<Vec<games::Game>> {
-        games::archive(&self.0, cursor, 25)
+    pub fn archive_end(&self) -> Result<i64> {
+        Ok(self
+            .0
+            .query_row("SELECT coalesce(max(rowid),0) FROM games", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    pub fn archive_next(&self, after: &str, through: i64) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT id FROM games WHERE id>?1 AND rowid<=?2 ORDER BY id LIMIT 1",
+                params![after, through],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn findings(&self, job: i64, game: &str) -> Result<Option<scanner::Findings>> {
         game_pipeline::scan_findings(&self.0, job, game)
     }
 
-    pub fn pending_games(&self, job: i64) -> Result<Vec<String>> {
-        game_pipeline::pending_games(&self.0, job)
+    pub fn pending_game(&self, job: i64) -> Result<Option<String>> {
+        game_pipeline::pending_game(&self.0, job)
     }
 
     pub fn publication_batch(&self, game: &str) -> Result<Vec<catalog::TacticPlan>> {
@@ -225,6 +263,45 @@ impl JobReads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_turns_migrate_and_rotate_in_durable_order() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("game_pipeline.sql"),
+            include_str!("prepared_queue.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        db.execute_batch(
+            "INSERT INTO jobs(provider,username,operation,status) VALUES
+             ('archive','','scan','queued'), ('archive','','scan','queued'),
+             ('archive','','scan','running')",
+        )?;
+        db.execute_batch(include_str!("job_turns.sql"))?;
+        assert_eq!(recover_running(&mut db)?, 1);
+
+        assert_eq!(next(&mut db)?.unwrap().id, 1);
+        yield_turn(&db, 1, Some("checkpoint"), 1)?;
+        assert_eq!(next(&mut db)?.unwrap().id, 2);
+        fail(&db, 2, "fixture")?;
+        retry(&mut db, 2)?;
+        assert_eq!(next(&mut db)?.unwrap().id, 3);
+        complete(&mut db, 3, "archive", "", None)?;
+
+        let resumed = next(&mut db)?.unwrap();
+        assert_eq!(resumed.id, 1);
+        assert_eq!(resumed.cursor.as_deref(), Some("checkpoint"));
+        assert_eq!(
+            views(&db)?.iter().find(|job| job.id == 1).unwrap().rejected,
+            1
+        );
+        assert_eq!(next(&mut db)?.unwrap().id, 2);
+        Ok(())
+    }
 
     #[test]
     fn recent_job_remains_visible_alongside_prior_failures() -> Result<()> {

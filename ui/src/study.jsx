@@ -11,7 +11,8 @@ function openingFrames(route, targetFen) {
   if (!route?.moves?.length) return null;
   try {
     const game = new Chess(route.fen);
-    const frames = [{ fen: game.fen() }];
+    const source = sourceRead?.key === attemptKey ? sourceRead.result : null;
+  const frames = [{ fen: game.fen() }];
     for (const uci of route.moves) {
       const { from, to, color } = play(game, uci);
       frames.push({ fen: game.fen(), lastMove: [from, to], movedBy: color });
@@ -77,7 +78,7 @@ function useStudyCounts() {
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
   const [counts, invalidateCounts] = useStudyCounts();
-  const [source, setSource] = useState(null);
+  const [sourceRead, setSource] = useState(null);
   const [opponent, setOpponent] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(null);
@@ -86,12 +87,14 @@ export function Study({ openGame, sounds }) {
   const waiting = useRef(false);
   const retry = useRef(null);
   const nextButton = useRef(null);
+  const opponentRead = useRef(null);
   const [promotionTarget, setPromotionTarget] = useState(null);
   const [epoch, setEpoch] = useState(0);
   const [advanceAfter, setAdvanceAfter] = useState(null);
   const mounted = useRef(true);
   const [openingProgress, setOpeningProgress] = useState(null);
   const attemptKey = card ? `${card.dataset}/${card.attempt}` : null;
+  const source = sourceRead?.key === attemptKey ? sourceRead.result : null;
   const frames = useMemo(() => openingFrames(card?.lead_in, card?.fen), [card?.lead_in, card?.fen]);
   const openingPly = openingProgress?.key === attemptKey ? openingProgress.ply : 0;
   const lastPly = frames ? frames.length - 1 : 0;
@@ -147,22 +150,31 @@ export function Study({ openGame, sounds }) {
     return () => { mounted.current = false; sounds.cancel(); };
   }, []);
   useEffect(() => {
-    let active = true;
-    setSource(null);
-    if (card?.result) api(`study/${card.attempt}/context`).then((result) => {
-      if (active) setSource(result);
-    }).catch(() => {});
-    return () => { active = false; };
-  }, [card?.attempt, Boolean(card?.result)]);
+    if (!attemptKey || card.kind === "opening") return;
+    const request = new AbortController();
+    opponentRead.current = api(`study/${card.attempt}/opponent-move`, undefined, request.signal)
+      .then((move) => {
+        if (!request.signal.aborted && move) {
+          setOpponent({ key: attemptKey, move: [move.slice(0, 2), move.slice(2, 4)] });
+        }
+      }).catch(() => {});
+    return () => {
+      request.abort();
+      opponentRead.current = null;
+    };
+  }, [attemptKey, card?.kind]);
 
   useEffect(() => {
-    if (!attemptKey || card.kind === "opening") return;
-    let active = true;
-    api(`study/${card.attempt}/opponent-move`).then((move) => {
-      if (active && move) setOpponent({ key: attemptKey, move: [move.slice(0, 2), move.slice(2, 4)] });
+    setSource(null);
+    if (!card?.result) return;
+    const request = new AbortController();
+    Promise.resolve(opponentRead.current).then(async () => {
+      if (request.signal.aborted) return;
+      const result = await api(`study/${card.attempt}/context`, undefined, request.signal);
+      if (!request.signal.aborted) setSource({ key: attemptKey, result });
     }).catch(() => {});
-    return () => { active = false; };
-  }, [attemptKey, card?.kind]);
+    return () => request.abort();
+  }, [attemptKey, Boolean(card?.result)]);
 
   useEffect(() => {
     if (advanceAfter === null) return;

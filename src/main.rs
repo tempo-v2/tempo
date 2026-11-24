@@ -8,13 +8,13 @@ mod jobs;
 mod learning;
 mod legacy;
 mod opening_rank;
+mod optional_read;
 mod providers;
 mod queue;
 mod queue_store;
 mod review;
 mod scanner;
 mod study;
-mod study_counts;
 mod study_store;
 mod uploads;
 mod writer;
@@ -66,6 +66,13 @@ impl IntoResponse for ApiError {
                 Json(json!({
                     "code":"study_preparing", "error":self.0.to_string()
                 })),
+            )
+                .into_response();
+        }
+        if self.0.is::<optional_read::Unavailable>() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"code":"view_unavailable","error":self.0.to_string()})),
             )
                 .into_response();
         }
@@ -274,7 +281,10 @@ async fn read_game(State(db): State<App>, UrlPath(id): UrlPath<String>) -> ApiRe
     with_db(db, move |c| games::read(c, &id)).await
 }
 async fn job_views(State(db): State<App>) -> ApiResult {
-    with_db(db, move |c| job_store::views(c)).await
+    optional_view(db, optional_read::Reader::GamesStatus, |c| {
+        job_store::views(c)
+    })
+    .await
 }
 async fn start_job(State(db): State<App>, Json(mut input): Json<jobs::StartJob>) -> ApiResult {
     if let Some(pgn) = input.pgn.take() {
@@ -335,10 +345,9 @@ async fn current(State(db): State<App>) -> ApiResult {
     with_db(db, move |c| study_store::current(c)).await
 }
 async fn study_counts(State(db): State<App>) -> impl IntoResponse {
-    let response = match study_counts::read(db.database.clone()).await {
-        Ok(counts) => Json(counts).into_response(),
-        Err(study_counts::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let response = optional_view(db, optional_read::Reader::Counts, review::counts)
+        .await
+        .into_response();
     ([(axum::http::header::CACHE_CONTROL, "no-store")], response)
 }
 async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> ApiResult {
@@ -347,8 +356,21 @@ async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> A
 async fn answer(State(db): State<App>, Json(input): Json<study::Answer>) -> ApiResult {
     write_db(db, move |c| review::answer(c, input)).await
 }
+async fn optional_view<T: Serialize>(
+    db: App,
+    reader: optional_read::Reader,
+    work: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+) -> ApiResult {
+    optional_read::read(reader, db.database.clone(), move |c| {
+        Ok(serde_json::to_value(work(c)?)?)
+    })
+    .await
+    .map(Json)
+    .map_err(|error| ApiError(error.into()))
+}
+
 async fn context(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult {
-    with_db(db, move |c| {
+    optional_view(db, optional_read::Reader::StudyContext, move |c| {
         let source = study_store::context_source(c, id)?;
         let mut context = source.context;
         if let (Some(repertoire), Some(version)) = (source.repertoire_id, source.answer_version)
@@ -365,7 +387,7 @@ async fn context(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult 
 }
 
 async fn opponent_move(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult {
-    with_db(db, move |c| {
+    optional_view(db, optional_read::Reader::StudyContext, move |c| {
         let Some(anchor) = study_store::game_anchor(c, id)? else {
             return Ok(None);
         };

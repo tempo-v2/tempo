@@ -76,11 +76,16 @@ pub fn worker(path: &Path, writer: Writer) -> Result<()> {
     }
 }
 
-fn scan_game(db: &JobReads, writer: &Writer, job: i64, game: &str) -> Result<()> {
-    let Some(found) = db.findings(job, game)? else {
-        return Ok(());
+fn scan_game(
+    db: &JobReads,
+    writer: &Writer,
+    job: i64,
+    game: String,
+    cursor: Option<String>,
+) -> Result<()> {
+    let Some(found) = db.findings(job, &game)? else {
+        return writer.background(move |db| job_store::yield_turn(db, job, cursor.as_deref(), 0));
     };
-    let game = game.to_owned();
     let save = |mismatches: Vec<_>, captures: Vec<_>| {
         let game = game.clone();
         writer.background(move |db| {
@@ -103,7 +108,7 @@ fn scan_game(db: &JobReads, writer: &Writer, job: i64, game: &str) -> Result<()>
         }
         save(Vec::new(), batch)?;
     }
-    writer.background(move |db| game_pipeline::finish_scan(db, job, &game))
+    writer.background(move |db| game_pipeline::finish_scan(db, job, &game, cursor.as_deref()))
 }
 
 fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) -> Result<()> {
@@ -111,77 +116,73 @@ fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) 
     let mut upload_file = None;
     let checkpoint = match (job.provider.as_str(), job.operation.as_str()) {
         ("pgn", "upload") => {
-            let (upload, legacy) = db.upload(id)?;
+            let upload = db.upload(id)?;
             let offset = job
                 .cursor
                 .as_deref()
                 .map(str::parse::<u64>)
                 .transpose()?
                 .unwrap_or(0);
-            let accept = |game, next: u64| match game {
-                Some(game) => {
-                    writer.background(move |db| game_pipeline::archive_upload(db, &game, id, next))
-                }
-                None => save_cursor(writer, id, next.to_string(), 1),
+            let Some(upload) = upload else {
+                let pgn = db.inline_upload(id)?.context("PGN is missing")?;
+                let mut staged = crate::uploads::stage(path, &pgn)?;
+                return writer.background(move |db| {
+                    job_store::stage_inline_upload(db, id, staged.id())?;
+                    staged.commit();
+                    Ok(())
+                });
             };
-            if let Some(file) = upload.as_deref() {
-                providers::resume_upload(
-                    crate::uploads::open(path, file)?,
-                    offset,
-                    &job.username,
-                    accept,
-                )?;
-            } else {
-                let pgn = legacy.context("PGN is missing")?;
-                providers::resume_upload(std::io::Cursor::new(pgn), offset, &job.username, accept)?;
+            let record = providers::upload_record(
+                crate::uploads::open(path, &upload)?,
+                offset,
+                &job.username,
+            )?;
+            match record {
+                Some((Some(game), next)) => {
+                    return writer
+                        .background(move |db| game_pipeline::archive_upload(db, &game, id, next));
+                }
+                Some((None, next)) => {
+                    return yield_turn(writer, id, Some(next.to_string()), 1);
+                }
+                None => upload_file = Some(upload),
             }
-            upload_file = upload;
             None
         }
         ("archive", "scan") => {
-            let mut cursor = job.cursor.clone().unwrap_or_default();
-            loop {
-                let games = db.archive(&cursor)?;
-                if games.is_empty() {
-                    break;
-                }
-                for game in &games {
-                    scan_game(db, writer, id, &game.id)?;
-                }
-                cursor = games.last().unwrap().id.clone();
-                save_cursor(writer, id, cursor.clone(), 0)?;
+            let mut cursor = ArchiveCursor::load(db, job.cursor.as_deref())?;
+            if let Some(game) = db.archive_next(&cursor.after, cursor.through)? {
+                cursor.after.clone_from(&game);
+                return scan_game(db, writer, id, game, Some(serde_json::to_string(&cursor)?));
             }
             None
         }
-        ("archive", operation @ ("scan_new" | "publish")) => {
-            loop {
-                let games = db.pending_games(id)?;
-                if games.is_empty() {
-                    break;
-                }
-                for game in games {
-                    if operation == "scan_new" {
-                        scan_game(db, writer, id, &game)?;
-                    } else {
-                        let plans = db.publication_batch(&game)?;
-                        let done = writer.background(move |db| {
-                            game_pipeline::publish_batch(db, id, &game, &plans)
-                        })?;
-                        if !done {
-                            break;
-                        }
-                    }
-                }
+        ("archive", "scan_new") => {
+            if let Some(game) = db.pending_game(id)? {
+                return scan_game(db, writer, id, game, None);
             }
             None
         }
-        (name, "all" | "new") => Some(fetch_provider(
-            db,
-            writer,
-            client,
-            job,
-            Provider::named(name).context("unknown provider")?,
-        )?),
+        ("archive", "publish") => {
+            if let Some(game) = db.pending_game(id)? {
+                let plans = db.publication_batch(&game)?;
+                writer.background(move |db| game_pipeline::publish_batch(db, id, &game, &plans))?;
+                return Ok(());
+            }
+            None
+        }
+        (name, "all" | "new") => {
+            match provider_turn(
+                db,
+                writer,
+                client,
+                job,
+                Provider::named(name).context("unknown provider")?,
+            )? {
+                ProviderTurn::Yielded => return Ok(()),
+                ProviderTurn::Complete(through) => Some(through),
+            }
+        }
         _ => bail!("unknown provider"),
     };
     let provider = job.provider.clone();
@@ -193,8 +194,26 @@ fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) 
     Ok(())
 }
 
-fn save_cursor(writer: &Writer, id: i64, cursor: String, rejected: usize) -> Result<()> {
-    writer.background(move |db| job_store::save_cursor(db, id, &cursor, rejected))
+fn yield_turn(writer: &Writer, id: i64, cursor: Option<String>, rejected: usize) -> Result<()> {
+    writer.background(move |db| job_store::yield_turn(db, id, cursor.as_deref(), rejected))
+}
+
+#[derive(Serialize, Deserialize)]
+struct ArchiveCursor {
+    through: i64,
+    after: String,
+}
+
+impl ArchiveCursor {
+    fn load(db: &JobReads, saved: Option<&str>) -> Result<Self> {
+        match saved {
+            Some(json) if json.starts_with('{') => Ok(serde_json::from_str(json)?),
+            after => Ok(Self {
+                through: db.archive_end()?,
+                after: after.unwrap_or_default().to_owned(),
+            }),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -202,17 +221,24 @@ struct ProviderCursor {
     from: i64,
     through: i64,
     next: usize,
+    windows: Option<Vec<String>>,
 }
 
-fn fetch_provider(
+enum ProviderTurn {
+    Yielded,
+    Complete(i64),
+}
+
+fn provider_turn(
     db: &JobReads,
     writer: &Writer,
-    client: &reqwest::blocking::Client,
+    client: &Client,
     job: &Job,
     provider: Provider,
-) -> Result<i64> {
+) -> Result<ProviderTurn> {
     let user = job.username.to_ascii_lowercase();
-    let mut cursor = match &job.cursor {
+    let id = job.id;
+    let mut cursor = match job.cursor.as_deref() {
         Some(json) => serde_json::from_str::<ProviderCursor>(json)?,
         None => {
             let previous = if job.operation == "new" {
@@ -225,23 +251,34 @@ fn fetch_provider(
                 Some(value) => value.saturating_sub(86_400_000),
                 None => provider.first_date(client, &user)?,
             };
-            let cursor = ProviderCursor {
+            ProviderCursor {
                 from,
                 through,
                 next: 0,
-            };
-            save_cursor(writer, job.id, serde_json::to_string(&cursor)?, 0)?;
-            cursor
+                windows: None,
+            }
         }
     };
-    let id = job.id;
-    let windows = provider.windows(client, &user, cursor.from, cursor.through)?;
-    for (index, window) in windows.iter().enumerate().skip(cursor.next) {
-        let rejected = Provider::supply(client, &job.username, window, |game| {
-            writer.background(move |db| game_pipeline::archive_import(db, &game, id))
-        })?;
-        cursor.next = index + 1;
-        save_cursor(writer, id, serde_json::to_string(&cursor)?, rejected)?;
+    if cursor.windows.is_none() {
+        cursor.windows = Some(provider.windows(client, &user, cursor.from, cursor.through)?);
+        yield_turn(writer, id, Some(serde_json::to_string(&cursor)?), 0)?;
+        return Ok(ProviderTurn::Yielded);
     }
-    Ok(cursor.through)
+    let windows = cursor
+        .windows
+        .as_ref()
+        .context("provider inventory is missing")?;
+    ensure!(
+        cursor.next <= windows.len(),
+        "saved provider checkpoint exceeds the window inventory"
+    );
+    let Some(window) = windows.get(cursor.next) else {
+        return Ok(ProviderTurn::Complete(cursor.through));
+    };
+    let rejected = Provider::supply(client, &job.username, window, |game| {
+        writer.background(move |db| game_pipeline::archive_import(db, &game, id))
+    })?;
+    cursor.next += 1;
+    yield_turn(writer, id, Some(serde_json::to_string(&cursor)?), rejected)?;
+    Ok(ProviderTurn::Yielded)
 }

@@ -97,6 +97,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn committed_next_and_again_work_stays_bounded_as_catalog_grows() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+
+        fn measure(noise: usize, first: &str) -> Result<(String, usize, usize)> {
+            let mut db = Connection::open_in_memory()?;
+            for schema in [
+                include_str!("schema.sql"),
+                include_str!("opening_policy.sql"),
+                include_str!("opening_order.sql"),
+                include_str!("game_pipeline.sql"),
+                include_str!("prepared_queue.sql"),
+            ] {
+                db.execute_batch(schema)?;
+            }
+            db.execute_batch("INSERT INTO metadata VALUES ('fixture')")?;
+            let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+            for id in ["a", "b"] {
+                db.execute(
+                    r#"INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+                     VALUES (?1,'tactic',?1,'white',?2,?1,'["e2e4"]')"#,
+                    (id, fen),
+                )?;
+            }
+            db.execute_batch(
+                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
+                 VALUES ('quarantined','opening','','white','unused','unused','[]',1);
+                 INSERT INTO deck VALUES (1,'quarantined');
+                 UPDATE prepared_queue_state SET ready=1;",
+            )?;
+            db.execute(
+                "INSERT INTO deck VALUES (2,?1),(3,?2)",
+                (first, if first == "a" { "b" } else { "a" }),
+            )?;
+            db.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 WHERE ?1>0 UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                 INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
+                 SELECT printf('unrelated%06d',i),'opening','','white','unused','unused','[]',1 FROM n",
+                [noise],
+            )?;
+            let steps = Arc::new(AtomicUsize::new(0));
+            let count = steps.clone();
+            db.progress_handler(
+                1,
+                Some(move || {
+                    count.fetch_add(1, Relaxed);
+                    false
+                }),
+            );
+            let review = next(
+                &mut db,
+                Next {
+                    after: None,
+                    dataset: None,
+                },
+            )?
+            .unwrap();
+            let next_steps = steps.swap(0, Relaxed);
+            answer(
+                &mut db,
+                Answer {
+                    attempt: review.attempt,
+                    dataset: review.dataset,
+                    played: None,
+                },
+            )?;
+            Ok((review.title, next_steps, steps.load(Relaxed)))
+        }
+
+        let small = measure(0, "a")?;
+        let large = measure(100_000, "a")?;
+        assert_eq!(small.0, "a");
+        assert_eq!(large.0, "a");
+        assert!(
+            large.1 <= small.1 + 50,
+            "Next steps grew from {} to {}",
+            small.1,
+            large.1
+        );
+        assert!(
+            large.2 <= small.2 + 50,
+            "Again steps grew from {} to {}",
+            small.2,
+            large.2
+        );
+        assert_eq!(measure(0, "b")?.0, "b");
+        Ok(())
+    }
+
+    #[test]
     fn studied_commands_do_not_read_games_or_live_rank() -> Result<()> {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
         let mut db = Connection::open_in_memory()?;
