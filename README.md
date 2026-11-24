@@ -67,3 +67,7 @@ to 64 MiB. Games parses archives one game at a time.
 Opening reviews replay the saved lead-in from its first position, then
 stop at the scheduled response. Playback is ungraded, and **Skip to
 your move** starts the issued decision immediately.
+
+A saved opening order can prioritize new opening cards after the existing
+due work check. This is a static list of card identities. Study never
+runs a model or imports game evidence to decide that order.
