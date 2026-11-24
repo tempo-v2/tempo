@@ -17,12 +17,15 @@ impl Database {
 
     pub fn init(path: &Path) -> Result<Connection> {
         if path.exists() {
-            return Self::open(path);
+            let db = Self::open(path)?;
+            db.execute_batch(include_str!("opening_order.sql"))?;
+            return Ok(db);
         }
         let db = Connection::open(path)?;
         Self::configure(&db)?;
         db.execute_batch("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;")?;
         db.execute_batch(include_str!("schema.sql"))?;
+        db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],

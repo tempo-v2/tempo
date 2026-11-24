@@ -180,6 +180,21 @@ fn select(db: &Connection, previous: Option<&str>, now: i64) -> Result<Option<(S
         }
     }
     for kind in kinds {
+        if kind == "opening"
+            && let Some(card) = db
+                .query_row(
+                    "SELECT o.card_id FROM opening_order o CROSS JOIN cards c ON c.id=o.card_id
+                     WHERE c.kind='opening'
+                     AND NOT EXISTS (SELECT 1 FROM learning l WHERE l.card_id=o.card_id)
+                     AND NOT EXISTS (SELECT 1 FROM deck d WHERE d.card_id=o.card_id)
+                     ORDER BY o.rank LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?
+        {
+            return Ok(Some((card, kind.to_owned())));
+        }
         if let Some(card) = db.query_row(unseen, [kind], |r| r.get(0)).optional()? {
             return Ok(Some((card, kind.to_owned())));
         }
@@ -419,6 +434,34 @@ pub fn context(db: &Connection, attempt: i64) -> Result<CardContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_opening_order_only_prioritizes_unseen_opening_cards() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(include_str!("schema.sql"))?;
+        db.execute_batch(include_str!("opening_order.sql"))?;
+        db.execute_batch(
+            "INSERT INTO cards (id,kind,title,color,fen,position_id,answers) VALUES
+                ('a','opening','First by id','white','','a','[]'),
+                ('b','opening','First by rank','white','','b','[]'),
+                ('t','tactic','Tactic','white','','t','[]');
+             INSERT INTO opening_order VALUES (1,'b');",
+        )?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "b");
+        assert_eq!(select(&db, Some("opening"), 10)?.unwrap().0, "t");
+
+        db.execute("INSERT INTO deck VALUES (0,'b')", [])?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
+        db.execute("DELETE FROM deck", [])?;
+
+        db.execute("INSERT INTO learning VALUES ('a',2,2,0,5)", [])?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
+        db.execute("UPDATE learning SET due_at=20 WHERE card_id='a'", [])?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "b");
+        db.execute("INSERT INTO learning VALUES ('b',2,2,0,20)", [])?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "t");
+        Ok(())
+    }
+
     #[test]
     fn spacing_clamps_to_the_remaining_deck() {
         assert_eq!(repeat_after(5, 20), 5);
