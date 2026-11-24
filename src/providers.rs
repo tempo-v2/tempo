@@ -178,6 +178,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replacement_http_feed_uses_the_archive_intake() -> Result<()> {
+        use crate::{game_pipeline, queue_store, review, study::Next, writer::Writer};
+        use rusqlite::Connection;
+        use std::{io::Write, net::TcpListener};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let endpoint = format!("http://{}/games.pgn", listener.local_addr()?);
+        let serve = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0; 4096];
+            ensure!(stream.read(&mut request)? > 0, "provider request was empty");
+            let pgn = "[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{pgn}",
+                pgn.len()
+            )?;
+            Ok(())
+        });
+
+        let mut db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("game_pipeline.sql"),
+            include_str!("prepared_queue.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        db.execute("INSERT INTO metadata VALUES ('fixture')", [])?;
+        db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('fixture','Learner','all','running')", [])?;
+        queue_store::seed_batch(&mut db)?;
+        let writer = Writer::start(db, None)?;
+        let client = Provider::client()?;
+        assert_eq!(
+            Provider::supply(&client, "Learner", &endpoint, |game| writer
+                .background(move |db| game_pipeline::archive_import(db, &game, 1)))?,
+            0
+        );
+        serve.join().expect("fixture server panicked")?;
+        writer.background(|db| {
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM games", [], |row| row
+                    .get::<_, usize>(0))?,
+                1
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM jobs WHERE operation='scan_new'",
+                    [],
+                    |row| row.get::<_, usize>(0)
+                )?,
+                1
+            );
+            assert!(
+                review::next(
+                    db,
+                    Next {
+                        after: None,
+                        dataset: None
+                    }
+                )?
+                .is_none()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn upload_checkpoint_restarts_after_the_committed_game() -> Result<()> {
         let pgn = concat!(
             "[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n",
