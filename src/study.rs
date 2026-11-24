@@ -53,6 +53,8 @@ pub struct Review {
     pub color: String,
     pub fen: String,
     pub legal: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lead_in: Option<chess::Route>,
     pub result: Option<AcceptedView>,
 }
 
@@ -101,7 +103,7 @@ pub struct CardContext {
 pub fn current(db: &Connection) -> Result<Option<Review>> {
     let row = db
         .query_row(
-            "SELECT a.id,c.kind,c.title,c.color,c.fen,a.result,a.submission
+            "SELECT a.id,c.kind,c.title,c.color,c.fen,a.result,a.submission,c.context
         FROM study s JOIN attempts a ON a.id=s.active JOIN cards c ON c.id=a.card_id",
             [],
             |r| {
@@ -113,38 +115,48 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
                     r.get::<_, String>(4)?,
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(attempt, kind, title, color, fen, result, submission)| {
-        let legal = chess::legal(&chess::position(&fen)?);
-        let result = result
-            .as_deref()
-            .map(|saved| -> Result<_> {
-                let played = submission
-                    .as_deref()
-                    .map(serde_json::from_str::<Option<String>>)
-                    .transpose()?
-                    .flatten();
-                Ok(accepted_view(
-                    serde_json::from_str(saved)?,
-                    &fen,
-                    played.as_deref(),
-                ))
+    row.map(
+        |(attempt, kind, title, color, fen, result, submission, context)| {
+            let legal = chess::legal(&chess::position(&fen)?);
+            let result = result
+                .as_deref()
+                .map(|saved| -> Result<_> {
+                    let played = submission
+                        .as_deref()
+                        .map(serde_json::from_str::<Option<String>>)
+                        .transpose()?
+                        .flatten();
+                    Ok(accepted_view(
+                        serde_json::from_str(saved)?,
+                        &fen,
+                        played.as_deref(),
+                    ))
+                })
+                .transpose()?;
+            // Opening context contains only authored moves before this issued decision.
+            let lead_in = if kind == "opening" && result.is_none() {
+                context.and_then(|route| serde_json::from_str(&route).ok())
+            } else {
+                None
+            };
+            Ok(Review {
+                attempt,
+                dataset: crate::db::dataset(db)?,
+                kind,
+                title,
+                color,
+                fen,
+                legal,
+                lead_in,
+                result,
             })
-            .transpose()?;
-        Ok(Review {
-            attempt,
-            dataset: crate::db::dataset(db)?,
-            kind,
-            title,
-            color,
-            fen,
-            legal,
-            result,
-        })
-    })
+        },
+    )
     .transpose()
 }
 

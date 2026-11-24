@@ -1,10 +1,28 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api } from "./api.js";
 import { ChessBoard, play } from "./board.jsx";
 import { moveCue } from "./sounds.js";
 
 const successPauseMs = 800;
+const openingPlyMs = 260;
+
+function openingFrames(route, targetFen) {
+  if (!route?.moves?.length) return null;
+  try {
+    const game = new Chess(route.fen);
+    const frames = [{ fen: game.fen() }];
+    for (const uci of route.moves) {
+      const { from, to } = play(game, uci);
+      frames.push({ fen: game.fen(), lastMove: [from, to] });
+    }
+    // Display context may be missing in older content or invalid. The issued
+    // position remains the sole input and grading position.
+    return game.fen() === new Chess(targetFen).fen() ? frames : null;
+  } catch {
+    return null;
+  }
+}
 
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
@@ -17,6 +35,21 @@ export function Study({ openGame, sounds }) {
   const [epoch, setEpoch] = useState(0);
   const [advanceAfter, setAdvanceAfter] = useState(null);
   const mounted = useRef(true);
+  const [openingProgress, setOpeningProgress] = useState(null);
+  const openingKey = card ? `${card.dataset}/${card.attempt}` : null;
+  const frames = useMemo(() => openingFrames(card?.lead_in, card?.fen), [card?.lead_in, card?.fen]);
+  const openingPly = openingProgress?.key === openingKey ? openingProgress.ply : 0;
+  const lastPly = frames ? frames.length - 1 : 0;
+  const openingPlaying = Boolean(frames && !card?.result && openingPly < lastPly);
+
+  useEffect(() => {
+    if (!openingPlaying) return;
+    const timer = setTimeout(() => {
+      setOpeningProgress((current) => current?.key === openingKey && current.ply > openingPly
+        ? current : { key: openingKey, ply: openingPly + 1 });
+    }, openingPlyMs);
+    return () => clearTimeout(timer);
+  }, [openingKey, openingPlaying, openingPly]);
   async function run(op) {
     if (waiting.current) return;
     waiting.current = true;
@@ -83,8 +116,10 @@ export function Study({ openGame, sounds }) {
     });
   }
 
-  const game = card && new Chess(card.fen);
+  const frame = frames?.[openingPly];
+  const game = card && new Chess(openingPlaying ? frame.fen : card.fen);
   const displayed = card?.result?.display_move;
+  const lastMove = displayed ? [displayed.slice(0, 2), displayed.slice(2, 4)] : frame?.lastMove;
   if (displayed) play(game, displayed);
   return <section aria-label="Study">
     <h1>Study</h1>
@@ -93,17 +128,19 @@ export function Study({ openGame, sounds }) {
     {loaded && !card && <><p>No cards are ready. Add an opening or tactic to get started.</p>
       <button onClick={() => next()} disabled={pending}>Check deck</button></>}
     {card && <>
-      <h2>{card.result ? card.title : card.kind === "opening" ? "Play your opening response" : "Find the tactic"}</h2>
-      <ChessBoard game={game} legal={card.legal} orientation={card.color}
-        identity={`study-${card.attempt}-${epoch}`} locked={pending || Boolean(error) || Boolean(card.result)}
-        lastMove={displayed ? [displayed.slice(0, 2), displayed.slice(2, 4)] : undefined}
+      <h2>{card.result ? card.title : card.kind === "opening" ? (openingPlaying ? "Playing opening moves" : "Play your opening response") : "Find the tactic"}</h2>
+      <ChessBoard game={game} legal={openingPlaying ? undefined : card.legal} orientation={card.color}
+        identity={`study-${card.attempt}-${epoch}`} locked={openingPlaying || pending || Boolean(error) || Boolean(card.result)}
+        lastMove={lastMove}
         onRejectedMove={() => sounds.play("illegal")}
-        onMove={card.result ? undefined : answer} />
+        onMove={openingPlaying || card.result ? undefined : answer} />
       <div className="controls">
         {card.result ? <>
           <strong role="status">{card.result.rating}</strong>
           <button className="primary" disabled={pending} onClick={() => next(card.attempt)}>Next card</button>
-        </> : <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>}
+        </> : openingPlaying
+          ? <button onClick={() => setOpeningProgress({ key: openingKey, ply: lastPly })}>Skip to your move</button>
+          : <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>}
       </div>
       {card.result && <div className="feedback">
         <p>Answer: {card.result.answers.map((move) => play(new Chess(card.fen), move).san).join(" or ")}</p>

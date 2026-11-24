@@ -114,7 +114,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
         <h2>Saved openings</h2>
         {opening && <button onClick={() => setOpening(null)}>Back to editor</button>}
         <ul className="items">{list.rows.map((line) => <li key={line.id}>
-          <button onClick={() => { setOpening(line); setPly(line.start_at); }}>{line.name} <small>{line.color}</small></button>
+          <button onClick={() => { setOpening(line); setPly(0); }}>{line.name} <small>{line.color}</small></button>
         </li>)}</ul>
         <More list={list} />
       </div>

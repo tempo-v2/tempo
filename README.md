@@ -63,3 +63,7 @@ load fails, Retry sends only Next. Returning to a saved answer shows its
 result without advancing. Board sounds are browser-local and can be
 changed in Settings. Game, opening, and puzzle PGN uploads accept up
 to 64 MiB. Games parses archives one game at a time.
+
+Opening reviews replay the saved lead-in from its first position, then
+stop at the scheduled response. Playback is ungraded, and **Skip to
+your move** starts the issued decision immediately.
