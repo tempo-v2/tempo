@@ -41,6 +41,13 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if let Some(error) = self.0.downcast_ref::<catalog::OpeningConflict>() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"code":"opening_reply_conflict","error":error.to_string()})),
+            )
+                .into_response();
+        }
         let status = if self.0.downcast_ref::<rusqlite::Error>().is_some() {
             eprintln!("Tempo database operation failed: {:#}", self.0);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -81,13 +88,22 @@ struct Page {
 async fn openings(State(db): State<App>, Query(q): Query<Page>) -> ApiResult {
     with_db(db, move |c| catalog::openings(c, &q.after)).await
 }
-async fn save_opening(
-    State(db): State<App>,
-    Json(input): Json<catalog::OpeningInput>,
-) -> ApiResult {
+#[derive(Deserialize)]
+struct SaveOpening {
+    #[serde(flatten)]
+    opening: catalog::OpeningInput,
+    source_opening: Option<String>,
+}
+
+async fn save_opening(State(db): State<App>, Json(input): Json<SaveOpening>) -> ApiResult {
     with_db(db, move |c| {
-        let t = c.transaction()?;
-        let id = catalog::save_opening(&t, &input, None)?;
+        let t = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let repertoire = input
+            .source_opening
+            .as_deref()
+            .map(|source| catalog::branch_repertoire(&t, source, &input.opening.color))
+            .transpose()?;
+        let id = catalog::save_opening(&t, &input.opening, repertoire.as_deref())?;
         t.commit()?;
         Ok(json!({"id":id}))
     })
@@ -179,6 +195,17 @@ async fn save_settings(
     })
     .await
 }
+async fn new_opening_settings(State(db): State<App>) -> ApiResult {
+    with_db(db, |c| study::new_opening_settings(c)).await
+}
+
+async fn save_new_opening_settings(
+    State(db): State<App>,
+    Json(input): Json<study::NewOpeningSettings>,
+) -> ApiResult {
+    with_db(db, |c| study::save_new_opening_settings(c, input)).await
+}
+
 async fn current(State(db): State<App>) -> ApiResult {
     with_db(db, move |c| study::current(c)).await
 }
@@ -272,6 +299,10 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         )
         .route("/api/games/jobs/{id}/retry", post(retry_job))
         .route("/api/settings", get(settings).post(save_settings))
+        .route(
+            "/api/settings/new-openings",
+            get(new_opening_settings).post(save_new_opening_settings),
+        )
         .route("/api/study", get(current))
         .route("/api/study/next", post(next_review))
         .route("/api/study/answer", post(answer))

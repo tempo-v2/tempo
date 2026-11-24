@@ -322,6 +322,7 @@ mod tests {
     fn puzzle_write_failure_keeps_raw_game_and_finding_for_retry() -> Result<()> {
         let mut db = Connection::open_in_memory()?;
         db.execute_batch(include_str!("schema.sql"))?;
+        db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('pgn','Learner','upload','running')", [])?;
         let text = "[White \"Learner\"]\n[Black \"Opponent\"]\n[Result \"1/2-1/2\"]\n[SetUp \"1\"]\n[FEN \"4k3/8/8/3n4/8/8/8/3RK3 w - - 0 1\"]\n\n1. Ke2 1/2-1/2";
         let game = archive_game(chess::parse_pgn(text, false, 1)?.remove(0)?, "Learner")?;

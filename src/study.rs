@@ -160,16 +160,64 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
     .transpose()
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewOpeningSettings {
+    paused: bool,
+    ordering: NewOpeningOrder,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NewOpeningOrder {
+    Maia,
+    Standard,
+}
+
+impl NewOpeningOrder {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Maia => "maia",
+            Self::Standard => "standard",
+        }
+    }
+}
+
+pub fn new_opening_settings(db: &Connection) -> Result<NewOpeningSettings> {
+    let (paused, ordering): (bool, String) = db.query_row(
+        "SELECT paused, ordering FROM new_opening_settings WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let ordering = match ordering.as_str() {
+        "maia" => NewOpeningOrder::Maia,
+        "standard" => NewOpeningOrder::Standard,
+        _ => anyhow::bail!("Unknown new opening order"),
+    };
+    Ok(NewOpeningSettings { paused, ordering })
+}
+
+pub fn save_new_opening_settings(
+    db: &Connection,
+    preferences: NewOpeningSettings,
+) -> Result<NewOpeningSettings> {
+    db.execute(
+        "UPDATE new_opening_settings SET paused=?1, ordering=?2 WHERE singleton=1",
+        params![preferences.paused, preferences.ordering.as_str()],
+    )?;
+    Ok(preferences)
+}
+
 fn select(db: &Connection, previous: Option<&str>, now: i64) -> Result<Option<(String, String)>> {
     let kinds = if previous == Some("opening") {
         ["tactic", "opening"]
     } else {
         ["opening", "tactic"]
     };
-    let due = "SELECT l.card_id FROM learning l JOIN cards c ON c.id=l.card_id
+    let due = "SELECT l.card_id FROM learning l JOIN active_cards c ON c.id=l.card_id
         WHERE l.due_at<=?1 AND c.kind=?2 AND NOT EXISTS (SELECT 1 FROM deck d WHERE d.card_id=l.card_id)
         ORDER BY l.due_at,l.card_id LIMIT 1";
-    let unseen = "SELECT c.id FROM cards c WHERE c.kind=?1 AND NOT EXISTS (SELECT 1 FROM learning l WHERE l.card_id=c.id)
+    let unseen = "SELECT c.id FROM active_cards c WHERE c.kind=?1 AND NOT EXISTS (SELECT 1 FROM learning l WHERE l.card_id=c.id)
         AND NOT EXISTS (SELECT 1 FROM deck d WHERE d.card_id=c.id) ORDER BY c.id LIMIT 1";
     for kind in kinds {
         if let Some(card) = db
@@ -179,11 +227,16 @@ fn select(db: &Connection, previous: Option<&str>, now: i64) -> Result<Option<(S
             return Ok(Some((card, kind.to_owned())));
         }
     }
+    let settings = new_opening_settings(db)?;
     for kind in kinds {
+        if kind == "opening" && settings.paused {
+            continue;
+        }
         if kind == "opening"
+            && matches!(settings.ordering, NewOpeningOrder::Maia)
             && let Some(card) = db
                 .query_row(
-                    "SELECT o.card_id FROM opening_order o CROSS JOIN cards c ON c.id=o.card_id
+                    "SELECT o.card_id FROM opening_order o CROSS JOIN active_cards c ON c.id=o.card_id
                      WHERE c.kind='opening'
                      AND NOT EXISTS (SELECT 1 FROM learning l WHERE l.card_id=o.card_id)
                      AND NOT EXISTS (SELECT 1 FROM deck d WHERE d.card_id=o.card_id)
@@ -224,7 +277,7 @@ pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
     } else if input.after.is_some() {
         return current(&tx);
     }
-    let queued = tx.query_row("SELECT d.card_id,c.kind FROM deck d JOIN cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 1",
+    let queued = tx.query_row("SELECT d.card_id,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 1",
         [],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
     let next = if queued.is_some() {
         queued
@@ -249,7 +302,7 @@ pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
 
 fn place_repeat(db: &Connection, card: &str, now: i64, draw: u8) -> Result<u8> {
     let mut q = db.prepare(
-        "SELECT d.card_id,c.kind FROM deck d JOIN cards c ON c.id=d.card_id ORDER BY d.slot",
+        "SELECT d.card_id,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot",
     )?;
     let mut queued = q
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -363,7 +416,12 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
     tx.execute("INSERT INTO learning VALUES (?1,?2,?3,?4,?5)
         ON CONFLICT(card_id) DO UPDATE SET stability=excluded.stability,difficulty=excluded.difficulty,last_at=excluded.last_at,due_at=excluded.due_at",
         params![card,item.memory.stability,item.memory.difficulty,now,due])?;
-    let repeat_after = if good {
+    let quarantined = tx.query_row(
+        "SELECT quarantined FROM cards WHERE id=?1",
+        [&card],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let repeat_after = if good || quarantined {
         None
     } else {
         Some(place_repeat(
@@ -463,6 +521,7 @@ mod tests {
     fn saved_opening_order_only_prioritizes_unseen_opening_cards() -> Result<()> {
         let db = Connection::open_in_memory()?;
         db.execute_batch(include_str!("schema.sql"))?;
+        db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute_batch(
             "INSERT INTO cards (id,kind,title,color,fen,position_id,answers) VALUES
@@ -473,6 +532,37 @@ mod tests {
         )?;
         assert_eq!(select(&db, None, 10)?.unwrap().0, "b");
         assert_eq!(select(&db, Some("opening"), 10)?.unwrap().0, "t");
+
+        save_new_opening_settings(
+            &db,
+            NewOpeningSettings {
+                paused: false,
+                ordering: NewOpeningOrder::Standard,
+            },
+        )?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
+        save_new_opening_settings(
+            &db,
+            NewOpeningSettings {
+                paused: true,
+                ordering: NewOpeningOrder::Maia,
+            },
+        )?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "t");
+        db.execute("INSERT INTO learning VALUES ('a',2,2,0,5)", [])?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
+        db.execute("DELETE FROM learning", [])?;
+        save_new_opening_settings(
+            &db,
+            NewOpeningSettings {
+                paused: false,
+                ordering: NewOpeningOrder::Maia,
+            },
+        )?;
+
+        db.execute("UPDATE cards SET quarantined=1 WHERE id='b'", [])?;
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
+        db.execute("UPDATE cards SET quarantined=0 WHERE id='b'", [])?;
 
         db.execute("INSERT INTO deck VALUES (0,'b')", [])?;
         assert_eq!(select(&db, None, 10)?.unwrap().0, "a");

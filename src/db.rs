@@ -17,14 +17,20 @@ impl Database {
 
     pub fn init(path: &Path) -> Result<Connection> {
         if path.exists() {
-            let db = Self::open(path)?;
-            db.execute_batch(include_str!("opening_order.sql"))?;
+            let mut db = Self::open(path)?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("opening_order.sql"))?;
+            if tx.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))? == 0 {
+                tx.execute_batch(include_str!("opening_policy.sql"))?;
+            }
+            tx.commit()?;
             return Ok(db);
         }
         let db = Connection::open(path)?;
         Self::configure(&db)?;
         db.execute_batch("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;")?;
         db.execute_batch(include_str!("schema.sql"))?;
+        db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",

@@ -1,7 +1,7 @@
 use crate::chess::{self, Route};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use pgn_reader::shakmaty::Position;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +66,33 @@ pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
     .collect()
 }
 
+#[derive(Debug)]
+pub struct OpeningConflict(String);
+
+impl std::fmt::Display for OpeningConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OpeningConflict {}
+
+pub fn branch_repertoire(db: &Connection, source: &str, color: &str) -> Result<String> {
+    let (repertoire, saved_color): (String, String) = db
+        .query_row(
+            "SELECT repertoire_id,color FROM openings WHERE id=?1",
+            [source],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .context("The opening you branched from is no longer available.")?;
+    ensure!(
+        color == saved_color,
+        "Use the source opening's practice color when branching."
+    );
+    Ok(repertoire)
+}
+
 pub fn save_opening(
     db: &Connection,
     input: &OpeningInput,
@@ -104,12 +131,35 @@ pub fn save_opening(
             let version = chess::id(&["answer-v1", &normalized]);
             let position_id = chess::position_id(&board);
             let card_id = chess::id(&["opening-card-v1", repertoire, &position_id, &version]);
+            let prior = db
+                .query_row(
+                    "SELECT id,quarantined FROM cards
+                 WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2
+                     ORDER BY quarantined LIMIT 1",
+                    params![repertoire, position_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+                )
+                .optional()?;
+            if let Some((id, quarantined)) = prior {
+                let ply = board.fullmoves();
+                if quarantined {
+                    return Err(OpeningConflict(format!(
+                        "Move {ply}: this repertoire has conflicting replies at this position awaiting resolution."
+                    )).into());
+                }
+                if id != card_id {
+                    return Err(OpeningConflict(format!(
+                        "Move {ply}: this repertoire already has a different reply at this position."
+                    )).into());
+                }
+            }
             let context = Route {
                 fen: route.fen.clone(),
                 moves: route.moves[..ply].to_vec(),
             };
             db.execute(
-                "INSERT OR IGNORE INTO cards VALUES (?1,'opening',?2,?3,?4,?5,?6,?7,?8,NULL,?9,NULL,NULL)",
+                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,repertoire_id,answer_version,context)
+                 VALUES (?1,'opening',?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO NOTHING",
                 params![
                     card_id,
                     name,
@@ -220,7 +270,8 @@ pub fn publish_tactic(db: &Connection, input: TacticInput<'_>) -> Result<String>
         params![id, name, encoded, game, ply],
     )?;
     db.execute(
-        "INSERT OR IGNORE INTO cards VALUES (?1,'tactic',?2,?3,?4,?5,?6,NULL,NULL,?7,NULL,?8,?9)",
+        "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,played_move,source_game_id,source_ply)
+         VALUES (?1,'tactic',?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO NOTHING",
         params![
             id,
             name,
@@ -243,7 +294,7 @@ pub struct ReferenceAnswer {
 }
 
 pub fn answers_at(db: &Connection, position: &str, color: &str) -> Result<Vec<ReferenceAnswer>> {
-    let mut q = db.prepare_cached("SELECT repertoire_id,answer_version,answers FROM cards WHERE position_id=?1 AND kind='opening' AND color=?2")?;
+    let mut q = db.prepare_cached("SELECT repertoire_id,answer_version,answers FROM active_cards WHERE position_id=?1 AND kind='opening' AND color=?2")?;
     let rows = q.query_map(params![position, color], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
     })?;

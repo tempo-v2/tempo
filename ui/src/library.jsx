@@ -49,7 +49,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
       let route;
       try { route = { fen: new Chess(startingText.trim()).fen(), moves: [] }; }
       catch { route = await api("openings/pgn", { pgn: startingText }); }
-      setDraft({ ...route, start_at: useExistingMoves ? 0 : route.moves.length });
+      setDraft({ ...draft, ...route, start_at: useExistingMoves ? 0 : route.moves.length });
       setOpening(null);
       setNotice("Position loaded. Play your continuation.");
     } catch (error) { setError(error.message); }
@@ -60,7 +60,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
     setNotice("");
     setBusy(true);
     try {
-      await api("openings", { name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at });
+      await api("openings", { name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at, source_opening: draft.source_opening });
       setNotice("Opening saved. Its responses are ready in Study.");
       await list.load();
       onSaved();
@@ -73,8 +73,11 @@ export function Openings({ fromGame, onSaved, sounds }) {
         {opening ? <><h2>{opening.name}</h2>
           <Replay sounds={sounds} route={opening.route} color={opening.color} ply={ply} onPly={setPly} />
           <button className="primary" onClick={() => {
-            setDraft({ ...opening.route, moves: opening.route.moves.slice(0, ply), start_at: ply });
-            setName(opening.name + " variation");
+            setDraft({
+              ...opening.route, moves: opening.route.moves.slice(0, ply), start_at: ply,
+              source_opening: opening.id, sourceName: opening.name,
+            });
+            setName(Array.from(opening.name).slice(0, 150).join("") + " variation");
             setColor(opening.color);
             setOpening(null);
           }}>Branch here</button>
@@ -97,8 +100,9 @@ export function Openings({ fromGame, onSaved, sounds }) {
       </div>
       <div>
         {!opening && <form onSubmit={save}>
+          {draft.sourceName && <small>Branching from {draft.sourceName}</small>}
           <label>Opening name<input required maxLength={160} value={name} onChange={(e) => setName(e.target.value)} /></label>
-          <label>Practice color<select value={color} onChange={(e) => setColor(e.target.value)}>
+          <label>Practice color<select disabled={Boolean(draft.source_opening)} value={color} onChange={(e) => setColor(e.target.value)}>
             <option value="white">White</option><option value="black">Black</option>
           </select></label>
           <button className="primary" disabled={busy || draft.moves.length <= draft.start_at}>Save opening</button>
