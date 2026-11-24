@@ -13,8 +13,8 @@ function openingFrames(route, targetFen) {
     const game = new Chess(route.fen);
     const frames = [{ fen: game.fen() }];
     for (const uci of route.moves) {
-      const { from, to } = play(game, uci);
-      frames.push({ fen: game.fen(), lastMove: [from, to] });
+      const { from, to, color } = play(game, uci);
+      frames.push({ fen: game.fen(), lastMove: [from, to], movedBy: color });
     }
     // Display context may be missing in older content or invalid. The issued
     // position remains the sole input and grading position.
@@ -24,9 +24,16 @@ function openingFrames(route, targetFen) {
   }
 }
 
+function markedMove(move, brush) {
+  if (!move) return [];
+  const [orig, dest] = move;
+  return [{ orig, dest, brush }, { orig: dest, brush }];
+}
+
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
   const [source, setSource] = useState(null);
+  const [opponent, setOpponent] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
@@ -36,20 +43,20 @@ export function Study({ openGame, sounds }) {
   const [advanceAfter, setAdvanceAfter] = useState(null);
   const mounted = useRef(true);
   const [openingProgress, setOpeningProgress] = useState(null);
-  const openingKey = card ? `${card.dataset}/${card.attempt}` : null;
+  const attemptKey = card ? `${card.dataset}/${card.attempt}` : null;
   const frames = useMemo(() => openingFrames(card?.lead_in, card?.fen), [card?.lead_in, card?.fen]);
-  const openingPly = openingProgress?.key === openingKey ? openingProgress.ply : 0;
+  const openingPly = openingProgress?.key === attemptKey ? openingProgress.ply : 0;
   const lastPly = frames ? frames.length - 1 : 0;
   const openingPlaying = Boolean(frames && !card?.result && openingPly < lastPly);
 
   useEffect(() => {
     if (!openingPlaying) return;
     const timer = setTimeout(() => {
-      setOpeningProgress((current) => current?.key === openingKey && current.ply > openingPly
-        ? current : { key: openingKey, ply: openingPly + 1 });
+      setOpeningProgress((current) => current?.key === attemptKey && current.ply > openingPly
+        ? current : { key: attemptKey, ply: openingPly + 1 });
     }, openingPlyMs);
     return () => clearTimeout(timer);
-  }, [openingKey, openingPlaying, openingPly]);
+  }, [attemptKey, openingPlaying, openingPly]);
   async function run(op) {
     if (waiting.current) return;
     waiting.current = true;
@@ -94,6 +101,15 @@ export function Study({ openGame, sounds }) {
   }, [card?.attempt, Boolean(card?.result)]);
 
   useEffect(() => {
+    if (!attemptKey || card.kind === "opening") return;
+    let active = true;
+    api(`study/${card.attempt}/opponent-move`).then((move) => {
+      if (active && move) setOpponent({ key: attemptKey, move: [move.slice(0, 2), move.slice(2, 4)] });
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [attemptKey, card?.kind]);
+
+  useEffect(() => {
     if (advanceAfter === null) return;
     const timer = setTimeout(() => next(advanceAfter), successPauseMs);
     return () => clearTimeout(timer);
@@ -116,10 +132,15 @@ export function Study({ openGame, sounds }) {
     });
   }
 
-  const frame = frames?.[openingPly];
+  const frame = openingPlaying ? frames[openingPly] : frames?.at(-1);
   const game = card && new Chess(openingPlaying ? frame.fen : card.fen);
   const displayed = card?.result?.display_move;
-  const lastMove = displayed ? [displayed.slice(0, 2), displayed.slice(2, 4)] : frame?.lastMove;
+  const played = displayed ? [displayed.slice(0, 2), displayed.slice(2, 4)] : undefined;
+  const learner = card?.color === "white" ? "w" : "b";
+  const previous = card?.kind === "opening"
+    ? (frame?.movedBy !== learner ? frame?.lastMove : undefined)
+    : (opponent?.key === attemptKey ? opponent?.move : undefined);
+  const shapes = [...markedMove(previous, "red"), ...markedMove(played, "green")];
   if (displayed) play(game, displayed);
   return <section aria-label="Study">
     <h1>Study</h1>
@@ -131,7 +152,8 @@ export function Study({ openGame, sounds }) {
       <h2>{card.result ? card.title : card.kind === "opening" ? (openingPlaying ? "Playing opening moves" : "Play your opening response") : "Find the tactic"}</h2>
       <ChessBoard game={game} legal={openingPlaying ? undefined : card.legal} orientation={card.color}
         identity={`study-${card.attempt}-${epoch}`} locked={openingPlaying || pending || Boolean(error) || Boolean(card.result)}
-        lastMove={lastMove}
+        lastMove={played ?? frame?.lastMove}
+        shapes={shapes}
         onRejectedMove={() => sounds.play("illegal")}
         onMove={openingPlaying || card.result ? undefined : answer} />
       <div className="controls">
@@ -139,12 +161,11 @@ export function Study({ openGame, sounds }) {
           <strong role="status">{card.result.rating}</strong>
           <button className="primary" disabled={pending} onClick={() => next(card.attempt)}>Next card</button>
         </> : openingPlaying
-          ? <button onClick={() => setOpeningProgress({ key: openingKey, ply: lastPly })}>Skip to your move</button>
+          ? <button onClick={() => setOpeningProgress({ key: attemptKey, ply: lastPly })}>Skip to your move</button>
           : <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>}
       </div>
       {card.result && <div className="feedback">
         <p>Answer: {card.result.answers.map((move) => play(new Chess(card.fen), move).san).join(" or ")}</p>
-        {card.result.repeat_after !== null && <p>{card.result.repeat_after > 0 ? `Returns after ${card.result.repeat_after} cards.` : "Returns next."}</p>}
         {(card.result.played_in_game || source?.played) &&
           <p>In the game you played {play(new Chess(card.fen), card.result.played_in_game || source.played).san}.</p>}
         {source?.game_id && <button onClick={() => openGame(source.game_id, source.ply)}>View source game</button>}

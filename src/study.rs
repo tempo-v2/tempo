@@ -139,7 +139,7 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
                 })
                 .transpose()?;
             // Opening context contains only authored moves before this issued decision.
-            let lead_in = if kind == "opening" && result.is_none() {
+            let lead_in = if kind == "opening" {
                 context.and_then(|route| serde_json::from_str(&route).ok())
             } else {
                 None
@@ -385,6 +385,31 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
     )?;
     tx.commit()?;
     Ok(accepted_view(result, &fen, input.played.as_deref()))
+}
+
+pub struct GameAnchor {
+    pub game_id: String,
+    pub ply: usize,
+    pub fen: String,
+}
+
+/// Read only the source identity of the issued card. Its answer remains private.
+pub fn game_anchor(db: &Connection, attempt: i64) -> Result<Option<GameAnchor>> {
+    Ok(db
+        .query_row(
+            "SELECT c.source_game_id,c.source_ply,c.fen
+         FROM attempts a JOIN cards c ON c.id=a.card_id
+         WHERE a.id=?1 AND c.source_game_id IS NOT NULL AND c.source_ply>0",
+            [attempt],
+            |r| {
+                Ok(GameAnchor {
+                    game_id: r.get(0)?,
+                    ply: r.get(1)?,
+                    fen: r.get(2)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 type ContextRow = (

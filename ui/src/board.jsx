@@ -13,7 +13,7 @@ export function position(route, ply = route.moves.length) {
   return game;
 }
 
-export function ChessBoard({ game, legal = [], orientation, identity, onMove, onRejectedMove, lastMove, locked = false }) {
+export function ChessBoard({ game, legal = [], orientation, identity, onMove, onRejectedMove, lastMove, shapes, locked = false }) {
   const [promotion, setPromotion] = useState(null);
   const ref = useRef(null);
   const fen = game.fen();
@@ -32,7 +32,7 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
   const turn = game.turn() === "w" ? "white" : "black";
   return <div className="board-shell">
     <Board ref={ref} positionIdentity={key} positionRevision={0} fen={fen}
-      orientation={orientation} turn={turn} check={game.isCheck() ? turn : false} lastMove={lastMove}
+      orientation={orientation} turn={turn} check={game.isCheck() ? turn : false} lastMove={lastMove} shapes={shapes}
       mode="legal" readOnly={!onMove} locked={locked || Boolean(choices)}
       retainMoveOnLock={Boolean(choices)} coordinates="edges" maxSize={570}
       destinations={destinations}

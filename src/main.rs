@@ -192,6 +192,16 @@ async fn context(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult 
     with_db(db, move |c| study::context(c, id)).await
 }
 
+async fn opponent_move(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult {
+    with_db(db, move |c| {
+        let Some(anchor) = study::game_anchor(c, id)? else {
+            return Ok(None);
+        };
+        games::preceding_move(c, &anchor.game_id, anchor.ply, &anchor.fen)
+    })
+    .await
+}
+
 async fn loopback(State(port): State<u16>, req: Request, next: Next) -> Response {
     let hostname = req.headers().get("host").and_then(|h| h.to_str().ok());
     let host_ok = hostname.is_some_and(|host| {
@@ -266,6 +276,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         .route("/api/study/next", post(next_review))
         .route("/api/study/answer", post(answer))
         .route("/api/study/{id}/context", get(context))
+        .route("/api/study/{id}/opponent-move", get(opponent_move))
         .route_service("/", ServeFile::new(path.join("index.html")))
         .nest_service("/assets", ServeDir::new(path.join("assets")))
         .layer(middleware::from_fn_with_state(port, loopback))

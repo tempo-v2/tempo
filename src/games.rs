@@ -187,6 +187,24 @@ fn accept_game(db: &mut Connection, game: &Game, job_id: i64) -> Result<bool> {
     Ok(false)
 }
 
+/// Return a recorded predecessor only when the source replay reaches the card.
+pub fn preceding_move(
+    db: &Connection,
+    game_id: &str,
+    ply: usize,
+    issued: &str,
+) -> Result<Option<String>> {
+    let game = read(db, game_id)?;
+    if ply == 0 || ply > game.route.moves.len() {
+        return Ok(None);
+    }
+    let mut board = chess::board_at(&game.route, ply - 1)?;
+    let played = chess::parse_move(&board, &game.route.moves[ply - 1])?;
+    board.play_unchecked(played);
+    let issued = chess::position(issued)?;
+    Ok((chess::position_id(&board) == chess::position_id(&issued)).then(|| chess::uci(played)))
+}
+
 pub fn scan_and_store(db: &mut Connection, game: &Game, job_id: i64) -> Result<()> {
     if accept_game(db, game, job_id)? {
         return Ok(());
