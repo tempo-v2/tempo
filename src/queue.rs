@@ -1,6 +1,12 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Counts {
+    pub new: usize,
+    pub reviews: usize,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewOpeningSettings {

@@ -32,6 +32,8 @@ function markedMove(move, brush) {
 
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
+  const [counts, setCounts] = useState(null);
+  const [countsRevision, setCountsRevision] = useState(0);
   const [source, setSource] = useState(null);
   const [opponent, setOpponent] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -75,6 +77,7 @@ export function Study({ openGame, sounds }) {
     return run(async () => {
       setCard(await api("study/next", { after, dataset: card?.dataset }));
       setLoaded(true);
+      setCountsRevision((revision) => revision + 1);
     });
   }
   useEffect(() => {
@@ -91,9 +94,26 @@ export function Study({ openGame, sounds }) {
       const active = await api("study");
       setCard(active ?? await api("study/next", { after: null }));
       setLoaded(true);
+      setCountsRevision((revision) => revision + 1);
     });
     return () => { mounted.current = false; sounds.cancel(); };
   }, []);
+  useEffect(() => {
+    if (countsRevision === 0) return;
+    let current = 0;
+    let active = true;
+    async function refreshCounts() {
+      const request = ++current;
+      const counts = await api("study/counts").catch(() => null);
+      if (active && request === current) setCounts(counts);
+    }
+    refreshCounts();
+    window.addEventListener("focus", refreshCounts);
+    return () => {
+      active = false;
+      window.removeEventListener("focus", refreshCounts);
+    };
+  }, [countsRevision]);
   useEffect(() => {
     let active = true;
     setSource(null);
@@ -142,6 +162,7 @@ export function Study({ openGame, sounds }) {
       localStorage.removeItem("tempo.pending-answer.v2");
       if (!mounted.current) return;
       setCard((old) => ({ ...old, result }));
+      setCountsRevision((revision) => revision + 1);
       if (result.display_move) {
         const board = new Chess(card.fen);
         const move = play(board, result.display_move);
@@ -153,6 +174,7 @@ export function Study({ openGame, sounds }) {
 
   const frame = openingPlaying ? frames[openingPly] : frames?.at(-1);
   const game = card && new Chess(openingPlaying ? frame.fen : card.fen);
+  const movePrompt = game?.turn() === "w" ? "White to move" : "Black to move";
   const displayed = card?.result?.display_move;
   const awaitingResult = !card?.result && !openingPlaying && submitted?.key === attemptKey ? submitted?.move : undefined;
   const boardMove = displayed ?? awaitingResult;
@@ -176,12 +198,13 @@ export function Study({ openGame, sounds }) {
     </div>
     <div className="study-panel">
       <h1>Study</h1>
+      {counts && <p>{counts.new} new · {counts.reviews} {counts.reviews === 1 ? "review" : "reviews"}</p>}
       {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
       {!loaded && !error && <p>Loading your deck…</p>}
       {loaded && !card && <><p>No cards are ready. Add an opening or tactic to get started.</p>
         <button onClick={() => next()} disabled={pending}>Check deck</button></>}
       {card && <>
-        <h2>{card.result ? card.title : card.kind === "opening" ? (openingPlaying ? "Playing opening moves" : "Play your opening response") : "Find the tactic"}</h2>
+        <h2>{card.result ? card.title : openingPlaying ? "Playing opening moves" : movePrompt}</h2>
         <div ref={setPromotionTarget} />
         <div className="controls">
           {card.result ? <>

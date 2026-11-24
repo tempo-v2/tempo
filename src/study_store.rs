@@ -68,6 +68,16 @@ fn state(db: &Connection) -> Result<(Option<i64>, Option<String>)> {
     })?)
 }
 
+pub fn unanswered_card(db: &Connection) -> Result<Option<String>> {
+    Ok(db
+        .query_row(
+            "SELECT a.card_id FROM study s JOIN attempts a ON a.id=s.active WHERE a.result IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 pub fn begin_next(db: &Connection, input: &Next) -> Result<NextState> {
     let dataset = crate::db::dataset(db)?;
     if input.after.is_some() {

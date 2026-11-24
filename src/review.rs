@@ -10,6 +10,12 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{Connection, TransactionBehavior::Immediate};
 
+pub fn counts(db: &mut Connection) -> Result<Option<queue::Counts>> {
+    let snapshot = db.transaction()?;
+    let unanswered = study_store::unanswered_card(&snapshot)?;
+    queue_store::counts(&snapshot, Utc::now().timestamp(), unanswered.as_deref())
+}
+
 pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
     let tx = db.transaction_with_behavior(Immediate)?;
     let issued = match study_store::begin_answer(&tx, &input)? {

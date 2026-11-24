@@ -1,4 +1,4 @@
-use crate::queue::{self, Candidates, CardKind, NewOpeningOrder, NewOpeningSettings};
+use crate::queue::{self, Candidates, CardKind, Counts, NewOpeningOrder, NewOpeningSettings};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -70,6 +70,45 @@ pub fn can_repeat(db: &Connection, card: &str) -> Result<bool> {
         [card],
         |r| r.get(0),
     )?)
+}
+
+/// Count prepared candidates and committed work in the caller's read snapshot.
+/// A missing result means initial membership preparation is still in progress.
+pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Option<Counts>> {
+    if !prepared(db)? {
+        return Ok(None);
+    }
+    let paused = new_opening_settings(db)?.paused;
+    let counts = db.query_row(
+        "WITH committed(card_id) AS (
+            SELECT card_id FROM deck
+            UNION SELECT card_id FROM repeat_obligation
+            UNION SELECT ?3 WHERE ?3 IS NOT NULL
+        ), extra AS (
+            SELECT q.kind,q.due_at,q.reserved FROM committed c
+            JOIN prepared_queue q ON q.card_id=c.card_id WHERE q.active=1
+        )
+        SELECT
+            (SELECT count(*) FROM prepared_queue
+                WHERE active=1 AND reserved=0 AND due_at IS NULL AND kind='tactic')
+            + CASE WHEN ?2 THEN 0 ELSE (SELECT count(*) FROM prepared_queue
+                WHERE active=1 AND reserved=0 AND due_at IS NULL AND kind='opening') END
+            + (SELECT count(*) FROM extra
+                WHERE due_at IS NULL AND (reserved=1 OR (?2 AND kind='opening'))),
+            (SELECT count(*) FROM prepared_queue
+                WHERE active=1 AND reserved=0 AND due_at IS NOT NULL AND due_at<=?1
+                    AND kind IN ('opening','tactic'))
+            + (SELECT count(*) FROM extra
+                WHERE due_at IS NOT NULL AND (reserved=1 OR due_at>?1))",
+        params![now, paused, unanswered],
+        |row| {
+            Ok(Counts {
+                new: row.get(0)?,
+                reviews: row.get(1)?,
+            })
+        },
+    )?;
+    Ok(Some(counts))
 }
 
 pub fn committed_head(db: &Connection) -> Result<Option<(String, String)>> {
@@ -213,6 +252,64 @@ pub fn place_deferred(db: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::queue::repeat_offset;
+
+    #[test]
+    fn counts_respect_readiness_pause_due_time_and_committed_work() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("game_pipeline.sql"),
+            include_str!("prepared_queue.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        db.execute_batch(
+            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined) VALUES
+                ('paused','opening','','white','','paused','[]',0),
+                ('queued-new','opening','','white','','queued-new','[]',0),
+                ('issued-new','opening','','white','','issued-new','[]',0),
+                ('inactive','opening','','white','','inactive','[]',1),
+                ('new','tactic','','white','','new','[]',0),
+                ('due','tactic','','white','','due','[]',0),
+                ('future','tactic','','white','','future','[]',0),
+                ('repeat','tactic','','white','','repeat','[]',0),
+                ('deferred','tactic','','white','','deferred','[]',0);
+             INSERT INTO learning VALUES ('due',1,1,1,10), ('future',1,1,1,11),
+                 ('repeat',1,1,1,20), ('deferred',1,1,1,20);
+             INSERT INTO deck VALUES (1,'queued-new'), (2,'repeat'), (3,'due');
+             INSERT INTO attempts(id,card_id,result) VALUES (1,'deferred','saved');
+             INSERT INTO repeat_obligation VALUES (1,'deferred','tactic',1,5);
+             UPDATE new_opening_settings SET paused=1;",
+        )?;
+        assert_eq!(counts(&db, 10, Some("issued-new"))?, None);
+        assert!(seed_batch(&mut db)?);
+        let changes: u64 = db.total_changes();
+        assert_eq!(
+            counts(&db, 10, Some("issued-new"))?,
+            Some(Counts { new: 3, reviews: 3 })
+        );
+        assert_eq!(
+            counts(&db, 11, Some("repeat"))?,
+            Some(Counts { new: 2, reviews: 4 })
+        );
+        assert_eq!(db.total_changes(), changes);
+        db.execute(
+            "UPDATE new_opening_settings SET paused=0,ordering='standard'",
+            [],
+        )?;
+        assert_eq!(
+            counts(&db, 10, Some("issued-new"))?,
+            Some(Counts { new: 4, reviews: 3 })
+        );
+        db.execute("UPDATE new_opening_settings SET ordering='maia'", [])?;
+        assert_eq!(
+            counts(&db, 10, Some("issued-new"))?,
+            Some(Counts { new: 4, reviews: 3 })
+        );
+        Ok(())
+    }
     #[test]
     fn seed_progress_observes_interleaved_changes_even_behind_the_cursor() -> Result<()> {
         let mut db = Connection::open_in_memory()?;

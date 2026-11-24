@@ -333,6 +333,12 @@ async fn save_new_opening_settings(
 async fn current(State(db): State<App>) -> ApiResult {
     with_db(db, move |c| study_store::current(c)).await
 }
+async fn study_counts(State(db): State<App>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        with_db(db, review::counts).await,
+    )
+}
 async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> ApiResult {
     write_db(db, move |c| review::next(c, input)).await
 }
@@ -518,6 +524,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
             get(new_opening_settings).post(save_new_opening_settings),
         )
         .route("/api/study", get(current))
+        .route("/api/study/counts", get(study_counts))
         .route("/api/study/next", post(next_review))
         .route("/api/study/answer", post(answer))
         .route("/api/study/{id}/context", get(context))
