@@ -226,16 +226,6 @@ impl PhoneStudy {
                     | "/api/study/review-mark"
                     | "/api/study/card-details"
                     | "/api/repertoires"
-                    | "/api/games/coverage"
-                    | "/api/games/coverage/status"
-                    | "/api/games/coverage/starting-line"
-                    | "/api/games/coverage/starting-line/save"
-                    | "/api/games/gaps"
-                    | "/api/games/gap-draft"
-                    | "/api/games/gap-line"
-                    | "/api/games/gap-line/status"
-                    | "/api/games/gap-analysis"
-                    | "/api/games/gap-analysis/status"
             ),
             _ => false,
         }
@@ -603,17 +593,6 @@ fn respond_inner(
             (&Method::POST, "/api/games/gaps") => (
                 200,
                 command::<GapPage>(&request, MAX_COMMAND_BYTES).and_then(|page| {
-                    if surface == AuthoringSurface::PhoneBuild
-                        && page
-                            .forecast_repertoire
-                            .as_deref()
-                            .is_none_or(str::is_empty)
-                    {
-                        return Err(AppError::new(
-                            "phone_build_only",
-                            "Choose a repertoire to view its coverage gaps.",
-                        ));
-                    }
                     app.opponent_gap_page(page.offset, page.forecast_repertoire.as_deref())
                 }),
             ),
@@ -625,7 +604,7 @@ fn respond_inner(
             (&Method::POST, "/api/games/gap-draft") => (
                 200,
                 command::<GapRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| app.game_gap_draft_on(intent, surface)),
+                    .and_then(|intent| app.game_gap_draft(intent)),
             ),
             (&Method::POST, "/api/study/relevance") => (
                 200,
@@ -927,6 +906,78 @@ fn respond_traced(request: Request, response: Response) -> std::io::Result<()> {
 #[cfg(test)]
 mod diagnostics_tests {
     use super::diagnostic_route;
+
+    #[test]
+    fn phone_build_routes_are_absent_from_the_authenticated_ingress() {
+        use super::*;
+        use hyper::http::HeaderMap;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("study.sqlite");
+        let phone_authority = "tempo.example.ts.net:8443";
+        let phone_origin = "https://tempo.example.ts.net:8443";
+        let login = "learner@example.test";
+        let surfaces = HttpSurfaces {
+            address: "127.0.0.1:3000".into(),
+            origin: "http://127.0.0.1:3000".into(),
+            desktop: BTreeMap::new(),
+            phone: Some(PhoneStudy {
+                origin: phone_origin.into(),
+                authority: phone_authority.into(),
+                login: login.into(),
+                assets: BTreeMap::new(),
+            }),
+            context: ContextReader::start(&database).unwrap(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("host", phone_authority.parse().unwrap());
+        headers.insert("x-forwarded-host", phone_authority.parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("tailscale-user-login", login.parse().unwrap());
+        headers.insert("origin", phone_origin.parse().unwrap());
+        for path in [
+            "/api/games/coverage",
+            "/api/games/coverage/status",
+            "/api/games/coverage/starting-line",
+            "/api/games/coverage/starting-line/save",
+            "/api/games/gaps",
+            "/api/games/gap-draft",
+            "/api/games/gap-line",
+            "/api/games/gap-line/status",
+            "/api/games/gap-analysis",
+            "/api/games/gap-analysis/status",
+        ] {
+            assert_eq!(
+                surfaces
+                    .admitted(&Head::fixture(Method::POST, path, headers.clone()))
+                    .err(),
+                Some(StatusCode::NOT_FOUND),
+                "{path}",
+            );
+        }
+        for path in ["/api/study", "/api/study-progress", "/api/repertoires"] {
+            assert!(matches!(
+                surfaces.admitted(&Head::fixture(Method::POST, path, headers.clone())),
+                Ok(Admission::Foreground {
+                    surface: AuthoringSurface::PhoneBuild,
+                    ..
+                }),
+            ));
+        }
+        assert!(matches!(
+            surfaces.admitted(&Head::fixture(Method::GET, "/api/context", headers)),
+            Ok(Admission::Context(_)),
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:3000".parse().unwrap());
+        assert!(matches!(
+            surfaces.admitted(&Head::fixture(Method::POST, "/api/repertoires", headers)),
+            Ok(Admission::Foreground {
+                surface: AuthoringSurface::Desktop,
+                ..
+            }),
+        ));
+    }
 
     #[test]
     fn routes_never_include_payloads_or_query_values() {

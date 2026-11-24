@@ -47,6 +47,15 @@ pub(super) struct Head {
 }
 
 impl Head {
+    #[cfg(test)]
+    pub(super) fn fixture(method: Method, url: &str, headers: HeaderMap) -> Self {
+        Self {
+            method,
+            url: url.into(),
+            headers,
+        }
+    }
+
     pub(super) fn method(&self) -> &Method {
         &self.method
     }

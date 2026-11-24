@@ -104,14 +104,13 @@ impl Tempo {
         command: RepertoireCommand,
         surface: AuthoringSurface,
     ) -> Result<Value, AppError> {
-        if surface == AuthoringSurface::PhoneBuild
-            && !matches!(&command, RepertoireCommand::List)
-            && !matches!(&command, RepertoireCommand::Save { token, .. } if is_phone_forecast(token))
+        if let RepertoireCommand::Save { input, token } = &command
+            && is_phone_forecast(token)
         {
-            return Err(AppError::new(
-                "phone_build_only",
-                "Phone Build can save only replies or lines previewed there.",
-            ));
+            return self.replay_phone_forecast(input, token);
+        }
+        if surface == AuthoringSurface::PhoneBuild {
+            return Err(phone_build_retired());
         }
         let key = self
             .daily
@@ -287,12 +286,9 @@ impl Tempo {
                 Ok(preview(&snapshot, &incoming, &plan, token))
             }
             RepertoireCommand::Save { input, token } => {
-                let from_phone = is_phone_forecast(&token);
                 let forecast = read_forecast_preview(&key, &token, &input)?;
                 let (revision_in_token, id) = if let Some((revision, id, _)) = &forecast {
                     (*revision, *id)
-                } else if let Some(versioned) = token.strip_prefix(PHONE_FORECAST) {
-                    read_preview(&key, versioned, &(PHONE_FORECAST, &input))?
                 } else if let Some(versioned) = token.strip_prefix(DOCUMENT_PREVIEW) {
                     read_preview(&key, versioned, &(DOCUMENT_PREVIEW, &input))?
                 } else {
@@ -304,9 +300,6 @@ impl Tempo {
                 }
                 if revision != revision_in_token {
                     return Err(stale_preview());
-                }
-                if from_phone && suspended.contains(id) {
-                    return Err(suspended_repertoire());
                 }
                 let (source, _, plan) = prepare(&snapshot, &input, id)?;
                 let authored = AuthoredRepertoire::parse(&input.pgn)
@@ -360,6 +353,31 @@ impl Tempo {
                 Ok(reply)
             }
         }
+    }
+
+    fn replay_phone_forecast(
+        &self,
+        input: &RepertoireInput,
+        token: &str,
+    ) -> Result<Value, AppError> {
+        let key = self
+            .daily
+            .as_ref()
+            .ok_or_else(|| AppError::new("unsupported", "Use the local study release."))?
+            .preview_key;
+        if let Some(signed) = token.strip_prefix(PHONE_FORECAST) {
+            read_preview(&key, signed, &(PHONE_FORECAST, input))?;
+        } else {
+            read_forecast_preview(&key, token, input)?.ok_or_else(stale_preview)?;
+        }
+        if self.store.dataset_id()? != input.dataset_id {
+            return Err(super::content_preview::stale_dataset());
+        }
+        let saved = self
+            .store
+            .content_receipt(token)?
+            .ok_or_else(phone_build_retired)?;
+        serde_json::from_str(&saved).map_err(|error| domain("invalid_receipt", error))
     }
 
     fn set_repertoire_activity(
@@ -464,6 +482,10 @@ const PHONE_FORECAST: &str = "phone-forecast-v1:";
 
 const DESKTOP_FORECAST_V2: &str = "desktop-forecast-v2:";
 const PHONE_FORECAST_V2: &str = "phone-forecast-v2:";
+
+fn phone_build_retired() -> AppError {
+    AppError::new("retired_feature", "Phone Build has been retired.")
+}
 
 fn is_phone_forecast(token: &str) -> bool {
     token.starts_with(PHONE_FORECAST) || token.starts_with(PHONE_FORECAST_V2)
@@ -678,4 +700,147 @@ fn preview(
         "positions": incoming.items.len(), "routes": incoming.lines.len(),
         "added": added, "removed": removed, "changed": changed, "affected_learning": affected_learning,
     })
+}
+
+#[cfg(test)]
+mod phone_recovery_tests {
+    use super::*;
+    use crate::{DailyComponents, IntroductionLimits};
+    use tempo_learning::LearningPolicy;
+    use tempo_store::{Commit, SqliteStore, Store};
+
+    const KEY: [u8; 32] = [42; 32];
+
+    #[test]
+    fn phone_save_replays_exact_signed_receipts_and_cannot_admit_new_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("phone-receipts.sqlite");
+        let dataset = DatasetId::from("phone-recovery");
+        let policy = DailyLearning::default();
+        let mut store = SqliteStore::create(
+            &path,
+            dataset.clone(),
+            Catalog::default(),
+            policy.settings(),
+        )
+        .unwrap();
+        let input = RepertoireInput {
+            dataset_id: dataset.clone(),
+            repertoire_id: Some("earlier-book".into()),
+            name: "Earlier book".into(),
+            learner_color: LearnerColor::White,
+            pgn: "Historical content is not parsed during recovery.".into(),
+        };
+        let basis = CoverageEditBasis {
+            report_id: "removed-report".into(),
+            scope_revision: 25,
+        };
+        let modern = |input: &RepertoireInput| {
+            forecast_preview(
+                &KEY,
+                Revision(42),
+                "earlier-book",
+                input,
+                AuthoringSurface::PhoneBuild,
+                &basis,
+            )
+        };
+        let tokens = [
+            scoped_preview(&KEY, Revision(41), "earlier-book", &input, PHONE_FORECAST),
+            modern(&input),
+        ];
+        let reply = json!({
+            "schema_version": CONTENT_WIRE_VERSION, "status": "repertoires",
+            "dataset_id": dataset, "repertoires": [],
+        });
+        for token in &tokens {
+            let before = store.snapshot().unwrap();
+            store
+                .commit_content(
+                    Commit {
+                        expected_dataset: dataset.clone(),
+                        expected_revision: before.revision,
+                        writes: vec![],
+                    },
+                    None,
+                    Some(ContentReceipt {
+                        request: token,
+                        reply: &reply.to_string(),
+                    }),
+                )
+                .unwrap();
+        }
+        let before = store.snapshot().unwrap();
+        drop(store);
+        let mut app = Tempo::daily(
+            Box::new(SqliteStore::open(&path).unwrap()),
+            DailyComponents {
+                learning: Box::new(policy),
+                ..crate::components::test_components()
+            },
+            IntroductionLimits::default(),
+            KEY,
+            0,
+        )
+        .unwrap();
+        let save = |input, token| RepertoireCommand::Save { input, token };
+        for token in tokens {
+            assert_eq!(
+                app.handle_repertoire_on(
+                    save(input.clone(), token.clone()),
+                    AuthoringSurface::PhoneBuild
+                ),
+                reply
+            );
+            let changed = RepertoireInput {
+                name: "Changed after signing".into(),
+                ..input.clone()
+            };
+            assert_eq!(
+                app.handle_repertoire_on(save(changed, token), AuthoringSurface::PhoneBuild)["code"],
+                "stale_preview"
+            );
+        }
+        let foreign = RepertoireInput {
+            dataset_id: "other".into(),
+            ..input.clone()
+        };
+        let token = modern(&foreign);
+        assert_eq!(
+            app.handle_repertoire_on(save(foreign, token), AuthoringSurface::PhoneBuild)["code"],
+            "stale_dataset"
+        );
+
+        let fresh = RepertoireInput {
+            pgn: "1. e4 e5 2. Nf3 *".into(),
+            repertoire_id: None,
+            ..input
+        };
+        let token = modern(&fresh);
+        for surface in [AuthoringSurface::PhoneBuild, AuthoringSurface::Desktop] {
+            assert_eq!(
+                app.handle_repertoire_on(save(fresh.clone(), token.clone()), surface)["code"],
+                "retired_feature"
+            );
+        }
+        assert_eq!(
+            app.handle_repertoire_on(RepertoireCommand::List, AuthoringSurface::PhoneBuild)["code"],
+            "retired_feature"
+        );
+        let preview = app.handle_repertoire(RepertoireCommand::Preview(fresh.clone()));
+        let token = preview["token"].as_str().unwrap().to_owned();
+        assert_eq!(
+            app.handle_repertoire_on(
+                save(fresh.clone(), token.clone()),
+                AuthoringSurface::PhoneBuild
+            )["code"],
+            "retired_feature"
+        );
+        assert_eq!(app.snapshot().unwrap(), before);
+        assert_eq!(
+            app.handle_repertoire(save(fresh, token))["status"],
+            "repertoires"
+        );
+        assert_ne!(app.snapshot().unwrap(), before);
+    }
 }
