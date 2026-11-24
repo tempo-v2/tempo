@@ -183,8 +183,19 @@ enum OpeningDestination {
     Existing { repertoire_id: String },
 }
 
-async fn repertoires(State(db): State<App>) -> ApiResult {
-    with_db(db, |c| catalog::repertoires(c)).await
+#[derive(Default, Deserialize)]
+struct RepertoirePage {
+    #[serde(default)]
+    after: String,
+    #[serde(default)]
+    color: String,
+}
+
+async fn repertoires(State(db): State<App>, Query(page): Query<RepertoirePage>) -> ApiResult {
+    optional_view(db, optional_read::Reader::Repertoires, move |c| {
+        catalog::repertoires(c, &page.after, &page.color)
+    })
+    .await
 }
 
 fn apply_opening(
@@ -501,9 +512,11 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
     if !without_worker {
         let worker_db = db.clone();
         let worker_writer = writer.clone();
+        let runtime = tokio::runtime::Handle::current();
         std::thread::Builder::new()
             .name("games-worker".into())
             .spawn(move || {
+                let _runtime = runtime.enter();
                 if let Err(error) = jobs::worker(&worker_db, worker_writer) {
                     eprintln!("Games worker stopped: {error:#}");
                 }

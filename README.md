@@ -93,3 +93,20 @@ A service backup that must resume queued PGN uploads includes the SQLite
 database and its adjacent `.uploads` directory. Stop the service before
 copying both for a coordinated release or rollback. The `opening-rank-apply`
 and legacy opening import commands also require exclusive database ownership.
+
+## Provider turns and repertoire choices
+
+A provider job freezes its window inventory, stages each nonempty download
+(up to 32 MiB), and accepts at most one record per turn. The file reference,
+byte offset, accepted game or rejected record, and ready order are durable.
+Restart and Retry continue the staged window at its saved offset. The
+account checkpoint advances after all windows finish. Each turn uses one
+60-second deadline for new work and writer admission. A claimed write
+resolves before another turn can use its result. Local blocking filesystem
+operations retain the worker until they physically return.
+
+The Openings editor requests up to 50 destination choices by repertoire
+identity and practice color. Each choice keeps the first authored line as
+its display example. The picker follows the same indexed lookup through
+migration and newly saved content. Choice paging has its own read slot and
+the same SQL budget as other optional reads.

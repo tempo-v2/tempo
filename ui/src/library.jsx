@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api, fileText } from "./api.js";
 import { ChessBoard, Replay, play, position } from "./board.jsx";
@@ -43,14 +43,47 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const list = useList("openings");
   const [draft, setDraft] = useState(fromGame ?? initial);
   const [repertoires, setRepertoires] = useState([]);
+  const [moreRepertoires, setMoreRepertoires] = useState(false);
+  const [loadingRepertoires, setLoadingRepertoires] = useState(false);
+  const [repertoireFailure, setRepertoireFailure] = useState(null);
+  const repertoireRequest = useRef(null);
   const [destination, setDestination] = useState(fromGame ? "" : "new");
-  const saveDestination = repertoires.find((entry) => entry.id === destination);
+  const [branchChoice, setBranchChoice] = useState(null);
+  const choiceKey = ({ id, color }) => id + "/" + color;
+  const choices = branchChoice && !repertoires.some((entry) => choiceKey(entry) === choiceKey(branchChoice))
+    ? [branchChoice, ...repertoires] : repertoires;
+  const saveDestination = choices.find((entry) => choiceKey(entry) === destination);
+  async function loadRepertoires(append = false) {
+    if (repertoireRequest.current) {
+      if (append) return;
+      repertoireRequest.current.abort();
+    }
+    const request = new AbortController();
+    repertoireRequest.current = request;
+    setLoadingRepertoires(true);
+    const tail = append ? repertoires.at(-1) : null;
+    const cursor = tail ? "?" + new URLSearchParams({ after: tail.id, color: tail.color }) : "";
+    try {
+      const page = await api("openings/repertoires" + cursor, undefined, request.signal);
+      if (request.signal.aborted) return;
+      setRepertoires((rows) => append ? [...rows, ...page] : page);
+      setMoreRepertoires(page.length === 50);
+      setRepertoireFailure(null);
+    } catch (error) {
+      if (!request.signal.aborted) setRepertoireFailure({ message: error.message, append });
+    } finally {
+      if (repertoireRequest.current === request) {
+        repertoireRequest.current = null;
+        setLoadingRepertoires(false);
+      }
+    }
+  }
   useEffect(() => {
-    let active = true;
-    api("openings/repertoires").then((rows) => {
-      if (active) setRepertoires(rows);
-    }).catch((error) => { if (active) setError(error.message); });
-    return () => { active = false; };
+    loadRepertoires();
+    return () => {
+      repertoireRequest.current?.abort();
+      repertoireRequest.current = null;
+    };
   }, []);
   const [name, setName] = useState("");
   const [color, setColor] = useState(fromGame?.color ?? "white");
@@ -83,14 +116,14 @@ export function Openings({ fromGame, onSaved, sounds }) {
     setOfflineDraft(null);
     const request = {
       name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at,
-      destination: destination === "new" ? { kind: "new" } : { kind: "existing", repertoire_id: destination },
+      destination: destination === "new" ? { kind: "new" } : { kind: "existing", repertoire_id: saveDestination.id },
     };
     try {
       await api("openings", request);
       setNotice("Opening saved. Its responses are ready in Study.");
       onSaved();
       await list.load();
-      api("openings/repertoires").then(setRepertoires).catch((error) => setError(error.message));
+      if (destination === "new") loadRepertoires();
     } catch (error) {
       setError(error.message);
       if (error.code === "content_over_budget") setOfflineDraft(request);
@@ -109,7 +142,9 @@ export function Openings({ fromGame, onSaved, sounds }) {
             });
             setName(Array.from(opening.name).slice(0, 150).join("") + " variation");
             setColor(opening.color);
-            setDestination(opening.repertoire_id);
+            const choice = { id: opening.repertoire_id, color: opening.color, example_line: opening.name };
+            setBranchChoice(choice);
+            setDestination(choiceKey(choice));
             setOpening(null);
           }}>Branch here</button>
         </> : <>
@@ -134,13 +169,18 @@ export function Openings({ fromGame, onSaved, sounds }) {
           <label>Repertoire<select required value={destination} onChange={(e) => {
             const next = e.target.value;
             setDestination(next);
-            const entry = repertoires.find((item) => item.id === next);
+            const entry = choices.find((item) => choiceKey(item) === next);
             if (entry) setColor(entry.color);
           }}>
             <option value="" disabled>Choose a repertoire</option>
-            {repertoires.map((entry) => <option key={entry.id} value={entry.id}>{entry.example_line} ({entry.color})</option>)}
+            {choices.map((entry) => <option key={choiceKey(entry)} value={choiceKey(entry)}>{entry.example_line} ({entry.color})</option>)}
             <option value="new">New repertoire</option>
           </select></label>
+          {repertoireFailure && <p className="error" role="alert">{repertoireFailure.message}</p>}
+          {(moreRepertoires || repertoireFailure) && <button type="button" disabled={loadingRepertoires}
+            onClick={() => loadRepertoires(repertoireFailure?.append ?? true)}>
+            {repertoireFailure ? "Retry loading repertoires" : "Load more repertoires"}
+          </button>}
           <label>Opening name<input required maxLength={160} value={name} onChange={(e) => setName(e.target.value)} /></label>
           <label>Practice color<select disabled={Boolean(saveDestination) || (destination !== "" && destination !== "new")} value={color} onChange={(e) => setColor(e.target.value)}>
             <option value="white">White</option><option value="black">Black</option>
