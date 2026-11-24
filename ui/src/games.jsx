@@ -5,7 +5,7 @@ import { More, useList } from "./library.jsx";
 
 const labels = { chesscom: "Chess.com", lichess: "Lichess", pgn: "PGN", archive: "Archive scan" };
 
-export function Settings() {
+export function Settings({ sounds }) {
   const [names, setNames] = useState({ chesscom: "", lichess: "" });
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -15,6 +15,10 @@ export function Settings() {
       .catch((error) => setError(error.message));
   }, []);
   return <section><h1>Settings</h1>
+    <label className="board-sound-setting">
+      <input type="checkbox" defaultChecked={sounds.enabled} onChange={(event) => sounds.setEnabled(event.target.checked)} />
+      Board sounds
+    </label>
     <form className="settings" onSubmit={async (e) => {
       e.preventDefault();
       setMessage(""); setError("");
@@ -31,7 +35,7 @@ export function Settings() {
   </section>;
 }
 
-export function Games({ jump, addOpening, settings }) {
+export function Games({ jump, addOpening, settings, sounds }) {
   const list = useList("games");
   const [game, setGame] = useState(null);
   const [ply, setPly] = useState(0);
@@ -76,7 +80,7 @@ export function Games({ jump, addOpening, settings }) {
     <div className="split">
       <div>{game && <>
         <h2>{game.white} vs {game.black}</h2>
-        <Replay route={game.route} color={game.learner_color} ply={ply} onPly={setPly} />
+        <Replay sounds={sounds} route={game.route} color={game.learner_color} ply={ply} onPly={setPly} />
         <div className="controls">
           <button className="primary" onClick={() => addOpening({
             fen: game.route.fen, moves: game.route.moves.slice(0, ply), start_at: ply, color: game.learner_color,

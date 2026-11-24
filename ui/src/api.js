@@ -16,6 +16,6 @@ export async function api(path, data) {
 export function fileText(event, setter, setError) {
   const file = event.target.files?.[0];
   if (!file) return;
-  if (file.size > 4 * 1024 * 1024) { setError("Choose a PGN up to 4 MiB."); return; }
+  if (file.size > 64 * 1024 * 1024) { setError("Choose a PGN up to 64 MiB."); return; }
   file.text().then(setter, (error) => setError(error.message));
 }

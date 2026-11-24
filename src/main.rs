@@ -102,7 +102,7 @@ struct PgnInput {
 
 async fn preview_opening(Json(input): Json<PgnInput>) -> ApiResult {
     let result = (|| -> Result<_> {
-        ensure!(input.pgn.len() <= jobs::MAX_PGN, "PGN exceeds 4 MiB");
+        ensure!(input.pgn.len() <= jobs::MAX_PGN, "PGN exceeds 64 MiB");
         let mut games = chess::parse_pgn(&input.pgn, false, 1)?;
         Ok(games.remove(0)?.main)
     })()
@@ -115,7 +115,7 @@ async fn tactics(State(db): State<App>, Query(q): Query<Page>) -> ApiResult {
 }
 async fn save_tactic(State(db): State<App>, Json(input): Json<PgnInput>) -> ApiResult {
     with_db(db, move |c| {
-        ensure!(input.pgn.len() <= jobs::MAX_PGN, "PGN exceeds 4 MiB");
+        ensure!(input.pgn.len() <= jobs::MAX_PGN, "PGN exceeds 64 MiB");
         let mut pgn = chess::parse_pgn(&input.pgn, true, 1)?;
         let puzzle = pgn.remove(0)?;
         let name = input.name.as_deref().context("enter a puzzle name")?;
@@ -239,17 +239,27 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
             })?;
         Some(lock)
     };
+    let pgn_body_limit = DefaultBodyLimit::max(jobs::MAX_PGN * 2 + 4096);
     let app = Router::new()
         .route(
             "/api/health",
             get(|| async { Json(json!({"status":"ready","profile":"lean"})) }),
         )
         .route("/api/openings", get(openings).post(save_opening))
-        .route("/api/openings/pgn", post(preview_opening))
-        .route("/api/tactics", get(tactics).post(save_tactic))
+        .route(
+            "/api/openings/pgn",
+            post(preview_opening).layer(pgn_body_limit),
+        )
+        .route(
+            "/api/tactics",
+            get(tactics).post(save_tactic).layer(pgn_body_limit),
+        )
         .route("/api/games", get(archives))
         .route("/api/games/archive/{id}", get(read_game))
-        .route("/api/games/jobs", get(job_views).post(start_job))
+        .route(
+            "/api/games/jobs",
+            get(job_views).post(start_job).layer(pgn_body_limit),
+        )
         .route("/api/games/jobs/{id}/retry", post(retry_job))
         .route("/api/settings", get(settings).post(save_settings))
         .route("/api/study", get(current))
@@ -258,7 +268,6 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         .route("/api/study/{id}/context", get(context))
         .route_service("/", ServeFile::new(path.join("index.html")))
         .nest_service("/assets", ServeDir::new(path.join("assets")))
-        .layer(DefaultBodyLimit::max(jobs::MAX_PGN * 2 + 4096))
         .layer(middleware::from_fn_with_state(port, loopback))
         .with_state(Arc::new(db));
     println!("Tempo at http://127.0.0.1:{port}");

@@ -2,8 +2,11 @@ import React, { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api } from "./api.js";
 import { ChessBoard, play } from "./board.jsx";
+import { moveCue } from "./sounds.js";
 
-export function Study({ openGame }) {
+const successPauseMs = 800;
+
+export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
   const [source, setSource] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -12,6 +15,8 @@ export function Study({ openGame }) {
   const waiting = useRef(false);
   const retry = useRef(null);
   const [epoch, setEpoch] = useState(0);
+  const [advanceAfter, setAdvanceAfter] = useState(null);
+  const mounted = useRef(true);
   async function run(op) {
     if (waiting.current) return;
     waiting.current = true;
@@ -23,12 +28,14 @@ export function Study({ openGame }) {
     finally { waiting.current = false; setPending(false); }
   }
   function next(after = null) {
+    setAdvanceAfter(null);
     return run(async () => {
       setCard(await api("study/next", { after, dataset: card?.dataset }));
       setLoaded(true);
     });
   }
   useEffect(() => {
+    mounted.current = true;
     run(async () => {
       const unresolved = localStorage.getItem("tempo.pending-answer.v2");
       if (unresolved) {
@@ -42,6 +49,7 @@ export function Study({ openGame }) {
       setCard(active ?? await api("study/next", { after: null }));
       setLoaded(true);
     });
+    return () => { mounted.current = false; sounds.cancel(); };
   }, []);
   useEffect(() => {
     let active = true;
@@ -52,16 +60,32 @@ export function Study({ openGame }) {
     return () => { active = false; };
   }, [card?.attempt, Boolean(card?.result)]);
 
+  useEffect(() => {
+    if (advanceAfter === null) return;
+    const timer = setTimeout(() => next(advanceAfter), successPauseMs);
+    return () => clearTimeout(timer);
+  }, [advanceAfter]);
+
   function answer(played) {
     const submission = { attempt: card.attempt, dataset: card.dataset, played };
     run(async () => {
       localStorage.setItem("tempo.pending-answer.v2", JSON.stringify(submission));
       const result = await api("study/answer", submission);
       localStorage.removeItem("tempo.pending-answer.v2");
+      if (!mounted.current) return;
       setCard((old) => ({ ...old, result }));
+      if (result.display_move) {
+        const board = new Chess(card.fen);
+        const move = play(board, result.display_move);
+        sounds.play(moveCue(move, board));
+      }
+      if (result.rating === "Good") setAdvanceAfter(card.attempt);
     });
   }
 
+  const game = card && new Chess(card.fen);
+  const displayed = card?.result?.display_move;
+  if (displayed) play(game, displayed);
   return <section aria-label="Study">
     <h1>Study</h1>
     {error && <div className="error" role="alert">{error} <button onClick={() => run(retry.current)}>Retry</button></div>}
@@ -70,9 +94,10 @@ export function Study({ openGame }) {
       <button onClick={() => next()} disabled={pending}>Check deck</button></>}
     {card && <>
       <h2>{card.result ? card.title : card.kind === "opening" ? "Play your opening response" : "Find the tactic"}</h2>
-      <ChessBoard game={new Chess(card.fen)} legal={card.legal} orientation={card.color}
+      <ChessBoard game={game} legal={card.legal} orientation={card.color}
         identity={`study-${card.attempt}-${epoch}`} locked={pending || Boolean(error) || Boolean(card.result)}
-        shapes={card.result?.answers.map((move) => ({ orig: move.slice(0, 2), dest: move.slice(2, 4), brush: "green" }))}
+        lastMove={displayed ? [displayed.slice(0, 2), displayed.slice(2, 4)] : undefined}
+        onRejectedMove={() => sounds.play("illegal")}
         onMove={card.result ? undefined : answer} />
       <div className="controls">
         {card.result ? <>
