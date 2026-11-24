@@ -1646,7 +1646,7 @@ fn combined_books_match_italian_play_and_repair_an_unstudied_position_at_zero_qu
 }
 
 #[test]
-fn a_saved_choice_stays_resolved_after_duplicate_import_and_reopen() {
+fn ambiguous_game_import_still_records_evidence_without_admitting_choice() {
     let directory = tempfile::tempdir().unwrap();
     let today = Arc::new(AtomicI32::new(20_004));
     let db = directory.path().join("choices.sqlite");
@@ -1666,53 +1666,17 @@ fn a_saved_choice_stays_resolved_after_duplicate_import_and_reopen() {
         "ply":ply, "target_id":target["target_id"]
     })).unwrap()
     };
-    assert!(
-        app.choose_game_correction(request("wrong-ply", &targets[0], 2))
-            .is_err()
-    );
-    let choice = app
-        .choose_game_correction(request("choose", &targets[0], 1))
-        .unwrap();
+    let before = app.snapshot().unwrap();
     assert_eq!(
-        serde_json::to_value(&choice).unwrap()["results"][0]["effect"],
-        "again_applied"
+        app.choose_game_correction(request("choose", &targets[0], 1)).err().unwrap().code,
+        "retired_feature",
     );
-    assert_eq!(
-        serde_json::to_vec(&choice).unwrap(),
-        serde_json::to_vec(
-            &app.choose_game_correction(request("choose", &targets[0], 1))
-                .unwrap()
-        )
-        .unwrap()
-    );
-    assert!(
-        app.choose_game_correction(request("change-choice", &targets[1], 1))
-            .is_err()
-    );
-    let repair = study(&mut app, json!({"command":"next"}));
-    assert_eq!(repair["target_id"], targets[0]["target_id"]);
-    assert_eq!(repair_context(&app, &repair)["played_san"], "c4");
-    let duplicate = date_only_import(&mut app, "same-game-before-reopen", "2024.10.06", "1. c4 e5");
-    assert_eq!(duplicate["results"][0]["effect"], "already_addressed");
-    assert!(duplicate["results"][0].get("choices").is_none());
-    let store = SqliteStore::open(&db).unwrap();
-    let dataset = app.snapshot().unwrap().dataset;
-    let relevance = store.game_relevance(&dataset, "").unwrap();
-    let selected = TargetId::from(targets[0]["target_id"].as_str().unwrap());
-    let other = TargetId::from(targets[1]["target_id"].as_str().unwrap());
-    assert_eq!(
-        (relevance[&selected].exposure, relevance[&selected].misses),
-        (1, 1)
-    );
-    assert_eq!(
-        (relevance[&other].exposure, relevance[&other].misses),
-        (1, 0)
-    );
+    assert_eq!(app.snapshot().unwrap(), before);
     drop(app);
     let mut app = open(&db, today, limits, 1);
     let duplicate = date_only_import(&mut app, "same-game", "2024.10.06", "1. c4 e5");
-    assert_eq!(duplicate["results"][0]["effect"], "already_addressed");
-    assert!(duplicate["results"][0].get("choices").is_none());
+    assert_eq!(duplicate["results"][0]["effect"], "choice_required");
+    assert_eq!(app.snapshot().unwrap().learning, before.learning);
 }
 
 #[test]
@@ -2871,7 +2835,7 @@ fn repertoire_suspension_leaves_another_books_signed_edit_valid() {
 }
 
 #[test]
-fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
+fn repertoire_suspension_preserves_historical_choice_candidates_without_admission() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("suspend-chosen-book.sqlite");
     let mut app = open(
@@ -2880,8 +2844,7 @@ fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
         IntroductionLimits::default(),
         0,
     );
-    let (_, created) = preview_and_save(&mut app, SHORT, "Italian", None);
-    let italian = created["repertoires"][0]["id"].as_str().unwrap();
+    preview_and_save(&mut app, SHORT, "Italian", None);
     let (_, books) = preview_and_save(&mut app, "1. d4 d5 2. Bf4 *", "London", None);
     let london = books["repertoires"]
         .as_array()
@@ -2905,7 +2868,6 @@ fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
             .unwrap();
         TargetId::from(id)
     };
-    let italian_target = target(italian);
     let london_target = target(london);
     assert_eq!(candidates.len(), 2, "{choice}");
 
@@ -2926,37 +2888,12 @@ fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
     assert_eq!(content(&mut app, resume)["status"], "activity_set");
     assert!(app.game_history().unwrap()["results"][0]["correction_choice_status"].is_null());
 
-    app.choose_game_correction(serde_json::from_value(json!({
+    let before = app.snapshot().unwrap();
+    let choice = app.choose_game_correction(serde_json::from_value(json!({
         "command_id":"choose-london", "dataset_id":"opening-proof", "learner":"learner",
         "source":result["source"], "game_id":result["game_id"], "comparison_id":result["comparison_id"],
         "ply":choice["ply"], "target_id":london_target,
-    })).unwrap()).unwrap();
-    let store = SqliteStore::open(&db).unwrap();
-    let misses = || {
-        let facts = store
-            .game_relevance(&"opening-proof".into(), tempo_store::REACH_MODEL_KEY)
-            .unwrap();
-        (facts[&italian_target].misses, facts[&london_target].misses)
-    };
-    assert_eq!(misses(), (0, 1));
-    let before = app.snapshot().unwrap();
-    assert_eq!(
-        content(
-            &mut app,
-            activity_change(london, "suspend-chosen", "suspended")
-        )["status"],
-        "activity_set"
-    );
-    assert_eq!(app.reconcile_choice_encounters().unwrap().repaired, 0);
-    assert_eq!(misses(), (0, 1));
-    date_only_import(&mut app, "reprocess-suspended", "2024.10.01", played);
-    assert_eq!(misses(), (0, 1));
-    assert_eq!(
-        content(&mut app, activity_change(london, "resume-chosen", "active"))["status"],
-        "activity_set"
-    );
-    assert_eq!(misses(), (0, 1));
-    let after = app.snapshot().unwrap();
-    assert_eq!(after.assessments, before.assessments);
-    assert_eq!(after.learning, before.learning);
+    })).unwrap());
+    assert_eq!(choice.err().unwrap().code, "retired_feature");
+    assert_eq!(app.snapshot().unwrap(), before);
 }

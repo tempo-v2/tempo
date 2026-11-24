@@ -17,7 +17,7 @@ use tempo_learning::{
     AssessmentInput, AssessmentSource, DailyLearning, GameReviewEffect, LearningState,
 };
 use tempo_store::{
-    AcceptedGameChoice, AcceptedGames, AssessmentRecord, ChoiceAttribution, Commit, ComparedGame,
+    AcceptedGames, AssessmentRecord, Commit, ComparedGame,
     ComparedRelevance, EncounterRepair, GameChoice, GameChoiceTarget, GameChoices,
     GameComparisonBasis, GameEncounters, GameFailureKey, GameHistoryEntry, GameObservation,
     GameReceipt, GameRecord, GameSummary, PgnTiming, RepertoireDisagreement, StoreError, Write,
@@ -214,89 +214,29 @@ impl Tempo {
             },
             None,
             None,
-            None,
         )
     }
 
+    /// Replay a previously accepted choice with the original fingerprint.
     pub fn choose_game_correction(
-        &mut self,
+        &self,
         request: crate::game_evidence::ChooseGameCorrection,
     ) -> Result<GameReport, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.choose_game_correction");
         check_id(&request.command_id)?;
+        if self.game_dataset()? != request.dataset_id {
+            return Err(AppError::new("stale_dataset", "The active dataset changed."));
+        }
         let fingerprint = fingerprint("choose_correction", &request)?;
         if let Some(report) =
             self.replay_game(&request.dataset_id, &request.command_id, &fingerprint)?
         {
             return Ok(report);
         }
-        let saved = self
-            .store
-            .game_comparison(&request.dataset_id, &request.comparison_id)?
-            .filter(|result| {
-                result.source == request.source
-                    && result.game_id == request.game_id
-                    && result.learner == request.learner
-            })
-            .ok_or_else(|| invalid("The comparison was not found."))?;
-        let choice = saved
-            .choices
-            .iter()
-            .find(|choice| {
-                choice.ply == request.ply
-                    && choice
-                        .candidates
-                        .iter()
-                        .any(|candidate| candidate.target_id == request.target_id)
-            })
-            .ok_or_else(|| invalid("Choose a target from the saved miss."))?;
-        if self
-            .store
-            .game_choices(&request.dataset_id, &request.source, &request.game_id)?
-            .contains_key(&choice.position)
-        {
-            return Err(invalid("This corrective position has already been chosen."));
-        }
-        let backfill = saved
-            .backfill_id
-            .as_deref()
-            .map(|id| self.read_backfill(&request.dataset_id, id))
-            .transpose()?
-            .flatten();
-        if saved.backfill_id.is_some() && backfill.is_none() {
-            return Err(invalid(
-                "The historical job for this choice is unavailable.",
-            ));
-        }
-        let chosen_version = choice
-            .candidates
-            .iter()
-            .find(|candidate| candidate.target_id == request.target_id)
-            .expect("choice checked")
-            .version;
-        let game = self
-            .store
-            .stored_game(&request.dataset_id, &request.source, &request.game_id)?
-            .ok_or_else(|| invalid("This game was not found."))?;
-        self.compare_games(
-            &request.dataset_id,
-            (&request.command_id, &fingerprint),
-            &request.learner,
-            vec![parse_stored_game(game)],
-            GameReport {
-                fetched: 1,
-                ..Default::default()
-            },
-            Some(&SelectedCorrection {
-                comparison_id: request.comparison_id,
-                ply: request.ply,
-                target: request.target_id,
-                position: choice.position.clone(),
-                chosen_version,
-            }),
-            None,
-            backfill.as_ref(),
-        )
+        Err(AppError::new(
+            "retired_feature",
+            "This choice was not accepted. Corrective Games choices have been retired.",
+        ))
     }
 
     /// Upgrade only outstanding legacy obligations backed by stored evidence.
@@ -373,7 +313,6 @@ impl Tempo {
                     fetched: 1,
                     ..Default::default()
                 },
-                None,
                 Some(&plies),
                 None,
             )?;
@@ -486,7 +425,6 @@ impl Tempo {
         learner: &str,
         mut games: Vec<Result<(GameRecord, PlayedGame), String>>,
         mut report: GameReport,
-        selection: Option<&SelectedCorrection>,
         legacy_plies: Option<&BTreeSet<usize>>,
         backfill: Option<&crate::game_backfill::BackfillJob>,
     ) -> Result<GameReport, AppError> {
@@ -618,12 +556,6 @@ impl Tempo {
                 repertoires,
                 backfill.map(|job| &job.id)
             ]));
-            if let Some(selection) = selection
-                && selection.comparison_id != comparison_id
-                && selection.comparison_id != previous_comparison_id
-            {
-                return Err(invalid("The comparison changed. Compare the game again."));
-            }
             let mut summary = GameSummary {
                 source: game.source.clone(),
                 game_id: game.id.clone(),
@@ -663,7 +595,6 @@ impl Tempo {
             let mut observations = Vec::new();
             let mut failures = Vec::new();
             let mut choice_groups = BTreeSet::new();
-            let mut resolved = false;
             for decision in &decisions {
                 for observation in decision
                     .observations
@@ -697,23 +628,7 @@ impl Tempo {
                     }
                     continue;
                 }
-                let candidate = if let Some(selection) = selection {
-                    if decision.ply != selection.ply || decision.position.0 != selection.position {
-                        continue;
-                    }
-                    if candidates.len() <= 1 {
-                        return Err(invalid("This miss has no unresolved choice."));
-                    }
-                    let chosen = candidates
-                        .iter()
-                        .find(|obs| {
-                            obs.target == selection.target
-                                && obs.version == selection.chosen_version
-                        })
-                        .ok_or_else(|| invalid("Choose a current target from the comparison."))?;
-                    resolved = true;
-                    chosen
-                } else if let [only] = candidates.as_slice() {
+                let candidate = if let [only] = candidates.as_slice() {
                     only
                 } else {
                     let eligible: Vec<_> = candidates
@@ -738,11 +653,6 @@ impl Tempo {
                 };
                 let repertoire = repertoire_of(&candidate.target);
                 if !may_apply(&repertoire) {
-                    if selection.is_some() {
-                        return Err(invalid(
-                            "The repertoire reset prevents further learning from this comparison.",
-                        ));
-                    }
                     continue;
                 }
                 observations.push(GameObservation {
@@ -757,7 +667,7 @@ impl Tempo {
                     game_id: game.id.clone(),
                     target: candidate.target.clone(),
                     version: candidate.version,
-                    chosen_position: selection.map(|selection| selection.position.clone()),
+                    chosen_position: None,
                 };
                 if self.store.game_failed(&snapshot.dataset, &key)?
                     || !accepted.insert((
@@ -810,24 +720,7 @@ impl Tempo {
                 });
                 summary.correction_effect = Some(GameReviewEffect::AgainApplied);
             }
-            if selection.is_some() && !resolved {
-                return Err(invalid("This miss is no longer available."));
-            }
-            let resolved_choice = selection.map(|selection| AcceptedGameChoice {
-                comparison_id: selection.comparison_id.clone(),
-                ply: selection.ply,
-                position: selection.position.clone(),
-                attribution: ChoiceAttribution {
-                    target: selection.target.clone(),
-                    answer_version: selection.chosen_version,
-                },
-            });
-            let mut projection_choices = relevance.prior_choices.clone();
-            if let Some(choice) = &resolved_choice {
-                projection_choices
-                    .insert(choice.position.clone(), Some(choice.attribution.clone()));
-            }
-            relevance.encounters = encounter_projection(&decisions, &projection_choices);
+            relevance.encounters = encounter_projection(&decisions, &relevance.prior_choices);
             summary.disagreements = disagreements
                 .into_iter()
                 .map(|(repertoire_id, plies)| RepertoireDisagreement {
@@ -838,17 +731,13 @@ impl Tempo {
             if !summary.choices.is_empty() {
                 summary.correction_effect = Some(GameReviewEffect::ChoiceRequired);
             }
-            let id = selection.map_or_else(
-                || comparison_id.clone(),
-                |selection| hash(&json!([comparison_id, selection.ply, selection.target])),
-            );
             comparisons.push(ComparedGame {
                 game,
-                id,
+                id: comparison_id,
                 summary,
                 observations,
                 failures,
-                resolved_choice,
+                resolved_choice: None,
                 relevance: legacy_plies.is_none().then_some(relevance),
             });
         }
@@ -1097,15 +986,6 @@ fn hash(value: &Value) -> String {
     blake3::hash(value.to_string().as_bytes())
         .to_hex()
         .to_string()
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
-pub struct SelectedCorrection {
-    pub comparison_id: String,
-    pub ply: usize,
-    pub target: TargetId,
-    pub position: String,
-    pub chosen_version: tempo_types::ContentVersion,
 }
 
 fn mainline_signature(game: &PlayedGame, white: &str, black: &str) -> String {

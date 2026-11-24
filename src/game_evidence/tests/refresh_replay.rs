@@ -165,3 +165,40 @@ fn exact_accepted_reprocess_replays_after_restart_without_writing() {
     );
     assert_eq!(reopened.snapshot().unwrap(), before);
 }
+
+#[test]
+fn exact_accepted_choice_replays_after_reopen_and_new_choice_cannot_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("choice.sqlite");
+    std::fs::write(&path, include_bytes!("../../../tests/fixtures/schema9-choice.sqlite")).unwrap();
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../../tests/fixtures/schema9-choice.json")).unwrap();
+    drop(SqliteStore::open(&path).unwrap());
+    let reopened = app(SqliteStore::open(&path).unwrap());
+    let before = reopened.snapshot().unwrap();
+    let before_db = std::fs::read(&path).unwrap();
+    let request = || serde_json::from_value::<ChooseGameCorrection>(fixture["command"].clone()).unwrap();
+
+    let (status, reply) = request().replay(&reopened).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(reply, fixture["accepted_reply"]);
+
+    let mut new = request();
+    new.command_id = "unaccepted-choice".into();
+    let (status, reply) = new.replay(&reopened).unwrap();
+    assert_eq!(status, 410);
+    assert_eq!(reply["code"], "retired_feature");
+    assert_eq!(reply["retryable"], false);
+    assert_eq!(reply["command_id"], "unaccepted-choice");
+    assert_eq!(reply["dataset_id"], "opening-proof");
+
+    let mut changed = request();
+    changed.ply += 1;
+    assert_eq!(changed.replay(&reopened).unwrap_err().code, "store_conflict");
+    let mut stale = request();
+    stale.dataset_id = "other-dataset".into();
+    assert_eq!(stale.replay(&reopened).unwrap_err().code, "stale_dataset");
+
+    assert_eq!(reopened.snapshot().unwrap(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), before_db);
+}

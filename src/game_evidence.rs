@@ -123,6 +123,21 @@ impl ReprocessGames {
     }
 }
 
+impl ChooseGameCorrection {
+    pub(crate) fn replay(self, app: &Tempo) -> Result<(u16, Value), AppError> {
+        let dataset_id = self.dataset_id.clone();
+        let command_id = self.command_id.clone();
+        match app.choose_game_correction(self) {
+            Ok(report) => Ok((200, json!(report))),
+            Err(error) if error.code == "retired_feature" => Ok((410, json!({
+                "status": "error", "code": error.code, "message": error.message,
+                "retryable": false, "dataset_id": dataset_id, "command_id": command_id,
+            }))),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 impl GameRefresh {
     /// Interpret the exact legacy input solely to recover its accepted receipt.
     pub(crate) fn replay(self, app: &Tempo) -> Result<(u16, Value), AppError> {

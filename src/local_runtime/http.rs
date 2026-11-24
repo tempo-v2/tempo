@@ -481,6 +481,16 @@ fn respond_inner(
                 .with_status_code(StatusCode::GONE)
                 .with_header(field("Cache-Control", "no-store")),
         )?;
+    } else if request.method() == &Method::POST && request.url() == "/api/games/choose" {
+        let (status, reply) = command::<crate::game_evidence::ChooseGameCorrection>(&request, MAX_COMMAND_BYTES)
+            .and_then(|intent| intent.replay(app))
+            .unwrap_or_else(|error| (400, serde_json::json!(ErrorView::for_content(error))));
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
     } else if request.method() == &Method::POST && request.url() == "/api/games/reprocess" {
         let (status, reply) = command::<ReprocessGames>(&request, MAX_COMMAND_BYTES)
             .and_then(|intent| intent.replay(app))
@@ -672,12 +682,6 @@ fn respond_inner(
                 200,
                 command::<GameImport>(&request, MAX_CONTENT_COMMAND_BYTES)
                     .and_then(|intent| app.import_game_pgn(intent))
-                    .map(|report| serde_json::json!(report)),
-            ),
-            (&Method::POST, "/api/games/choose") => (
-                200,
-                command::<crate::game_evidence::ChooseGameCorrection>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| app.choose_game_correction(intent))
                     .map(|report| serde_json::json!(report)),
             ),
             _ => (
