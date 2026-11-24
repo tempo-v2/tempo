@@ -80,3 +80,16 @@ The command rejects a changed catalogue, foreign dataset, or unknown card
 before writing. Cards omitted from the snapshot use the ordinary unranked
 queue rules. Snapshots contain repertoire answers and are intended for use
 by local tooling.
+
+## Offline large content saves
+
+If the browser reports that an opening save exceeds its row budget, stop the
+service and run `tempo import-content DATABASE opening INPUT.json` with the same
+opening save payload (name, color, route and destination). The `tactic` form
+takes the same PGN and name input as the browser. These commands hold the
+service's database lock and use the same atomic validation and conflict checks.
+
+A service backup that must resume queued PGN uploads includes the SQLite
+database and its adjacent `.uploads` directory. Stop the service before
+copying both for a coordinated release or rollback. The `opening-rank-apply`
+and legacy opening import commands also require exclusive database ownership.

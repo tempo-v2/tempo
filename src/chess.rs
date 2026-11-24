@@ -271,6 +271,31 @@ pub fn read_pgn(
     Ok(())
 }
 
+/// Resume at a game boundary reported by this same parser. The offset excludes
+/// read-ahead bytes so a restarted import does not miss the next game.
+pub fn resume_pgn<R: std::io::Read + std::io::Seek>(
+    mut input: R,
+    offset: u64,
+    mut visit: impl FnMut(Result<Pgn>, u64) -> Result<()>,
+) -> Result<()> {
+    input.seek(std::io::SeekFrom::Start(offset))?;
+    let mut reader = Reader::new(input);
+    let mut parser = Parser { branches: false };
+    let mut seen = offset != 0;
+    while let Some(game) = reader.read_game(&mut parser)? {
+        seen = true;
+        let buffered = reader.buffer().len() as u64;
+        let next = reader
+            .get_mut()
+            .stream_position()?
+            .checked_sub(buffered)
+            .context("invalid PGN checkpoint")?;
+        visit(game, next)?;
+    }
+    ensure!(seen, "PGN has no games");
+    Ok(())
+}
+
 pub fn parse_pgn(text: &str, branches: bool, limit: usize) -> Result<Vec<Result<Pgn>>> {
     let mut games = Vec::new();
     read_pgn(text, branches, |game| {
