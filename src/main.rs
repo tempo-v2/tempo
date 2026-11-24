@@ -1,9 +1,16 @@
 mod catalog;
 mod chess;
 mod db;
+mod game_pipeline;
 mod games;
 mod jobs;
+mod learning;
 mod legacy;
+mod opening_rank;
+mod queue;
+mod queue_store;
+mod review;
+mod scanner;
 mod study;
 
 use anyhow::{Context, Result, ensure};
@@ -93,16 +100,36 @@ struct SaveOpening {
     #[serde(flatten)]
     opening: catalog::OpeningInput,
     source_opening: Option<String>,
+    destination: Option<OpeningDestination>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum OpeningDestination {
+    New,
+    Existing { repertoire_id: String },
+}
+
+async fn repertoires(State(db): State<App>) -> ApiResult {
+    with_db(db, |c| catalog::repertoires(c)).await
 }
 
 async fn save_opening(State(db): State<App>, Json(input): Json<SaveOpening>) -> ApiResult {
     with_db(db, move |c| {
         let t = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let repertoire = input
-            .source_opening
-            .as_deref()
-            .map(|source| catalog::branch_repertoire(&t, source, &input.opening.color))
-            .transpose()?;
+        let repertoire = match (input.destination, input.source_opening) {
+            (Some(OpeningDestination::Existing { repertoire_id }), None) => {
+                catalog::existing_repertoire(&t, &repertoire_id, &input.opening.color)?;
+                Some(repertoire_id)
+            }
+            (Some(OpeningDestination::New) | None, None) => None,
+            (None, Some(source)) => Some(catalog::branch_repertoire(
+                &t,
+                &source,
+                &input.opening.color,
+            )?),
+            (Some(_), Some(_)) => anyhow::bail!("Choose one opening destination."),
+        };
         let id = catalog::save_opening(&t, &input.opening, repertoire.as_deref())?;
         t.commit()?;
         Ok(json!({"id":id}))
@@ -196,14 +223,14 @@ async fn save_settings(
     .await
 }
 async fn new_opening_settings(State(db): State<App>) -> ApiResult {
-    with_db(db, |c| study::new_opening_settings(c)).await
+    with_db(db, |c| queue_store::new_opening_settings(c)).await
 }
 
 async fn save_new_opening_settings(
     State(db): State<App>,
-    Json(input): Json<study::NewOpeningSettings>,
+    Json(input): Json<queue::NewOpeningSettings>,
 ) -> ApiResult {
-    with_db(db, |c| study::save_new_opening_settings(c, input)).await
+    with_db(db, |c| queue_store::save_new_opening_settings(c, input)).await
 }
 
 async fn current(State(db): State<App>) -> ApiResult {
@@ -213,10 +240,23 @@ async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> A
     with_db(db, move |c| study::next(c, input)).await
 }
 async fn answer(State(db): State<App>, Json(input): Json<study::Answer>) -> ApiResult {
-    with_db(db, move |c| study::answer(c, input)).await
+    with_db(db, move |c| review::answer(c, input)).await
 }
 async fn context(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult {
-    with_db(db, move |c| study::context(c, id)).await
+    with_db(db, move |c| {
+        let source = study::context_source(c, id)?;
+        let mut context = source.context;
+        if let (Some(repertoire), Some(version)) = (source.repertoire_id, source.answer_version)
+            && let Some((game, ply, played)) =
+                games::mismatch_context(c, &source.position_id, &repertoire, &version)?
+        {
+            context.game_id = Some(game);
+            context.ply = Some(ply);
+            context.played = Some(played);
+        }
+        Ok(context)
+    })
+    .await
 }
 
 async fn opponent_move(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult {
@@ -283,6 +323,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
             get(|| async { Json(json!({"status":"ready","profile":"lean"})) }),
         )
         .route("/api/openings", get(openings).post(save_opening))
+        .route("/api/openings/repertoires", get(repertoires))
         .route(
             "/api/openings/pgn",
             post(preview_opening).layer(pgn_body_limit),
@@ -329,8 +370,20 @@ async fn main() -> Result<()> {
         [command, source, dest] if command == "import-openings" => {
             legacy::import(Path::new(source), Path::new(dest))
         }
+        [command, db] if command == "opening-rank-input" => {
+            let mut database = Database::open(Path::new(db))?;
+            let snapshot = database.transaction()?;
+            serde_json::to_writer(std::io::stdout().lock(), &opening_rank::read(&snapshot)?)?;
+            Ok(())
+        }
+        [command, db, input] if command == "opening-rank-apply" => {
+            let mut database = Database::open(Path::new(db))?;
+            let snapshot =
+                serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(input)?))?;
+            opening_rank::replace(&mut database, snapshot)
+        }
         _ => anyhow::bail!(
-            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo import-openings OLD_DB NEW_DB"
+            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT"
         ),
     }
 }

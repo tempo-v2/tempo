@@ -16,6 +16,7 @@ pub struct OpeningInput {
 #[derive(Serialize)]
 pub struct Opening {
     pub id: String,
+    pub repertoire_id: String,
     pub name: String,
     pub color: String,
     pub route: Route,
@@ -42,21 +43,23 @@ pub fn name(value: &str) -> Result<&str> {
 
 pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
     let mut q = db.prepare(
-        "SELECT id,name,color,route,start_at FROM openings WHERE id>?1 ORDER BY id LIMIT 100",
+        "SELECT id,repertoire_id,name,color,route,start_at FROM openings WHERE id>?1 ORDER BY id LIMIT 100",
     )?;
     let rows = q.query_map([after], |r| {
         Ok((
             r.get(0)?,
             r.get(1)?,
             r.get(2)?,
-            r.get::<_, String>(3)?,
-            r.get(4)?,
+            r.get(3)?,
+            r.get::<_, String>(4)?,
+            r.get(5)?,
         ))
     })?;
     rows.map(|r| {
-        let (id, name, color, route, start_at) = r?;
+        let (id, repertoire_id, name, color, route, start_at) = r?;
         Ok(Opening {
             id,
+            repertoire_id,
             name,
             color,
             route: serde_json::from_str(&route)?,
@@ -64,6 +67,39 @@ pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
         })
     })
     .collect()
+}
+
+#[derive(Serialize)]
+pub struct Repertoire {
+    pub id: String,
+    pub example_line: String,
+    pub color: String,
+}
+
+pub fn repertoires(db: &Connection) -> Result<Vec<Repertoire>> {
+    let mut q = db.prepare(
+        "SELECT repertoire_id,min(name),color FROM openings GROUP BY repertoire_id,color ORDER BY min(name),repertoire_id",
+    )?;
+    Ok(q.query_map([], |r| {
+        Ok(Repertoire {
+            id: r.get(0)?,
+            example_line: r.get(1)?,
+            color: r.get(2)?,
+        })
+    })?
+    .collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn existing_repertoire(db: &Connection, id: &str, color: &str) -> Result<()> {
+    ensure!(
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM openings WHERE repertoire_id=?1 AND color=?2)",
+            params![id, color],
+            |row| row.get::<_, bool>(0),
+        )?,
+        "The selected repertoire is unavailable for this practice color."
+    );
+    Ok(())
 }
 
 #[derive(Debug)]

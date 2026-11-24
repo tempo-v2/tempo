@@ -1,4 +1,4 @@
-use crate::{chess, db::Database, games};
+use crate::{chess, db::Database, game_pipeline, games};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Datelike, Utc};
 use reqwest::blocking::{Client, Response};
@@ -80,7 +80,7 @@ pub fn save_settings(
 }
 
 pub fn views(db: &Connection) -> Result<Vec<JobView>> {
-    let mut q = db.prepare("SELECT id,provider,operation,status,added,existing,rejected,found,error FROM jobs ORDER BY id DESC LIMIT 12")?;
+    let mut q = db.prepare("SELECT id,provider,operation,status,added,existing,rejected,found,error FROM jobs ORDER BY (status='failed') DESC,id DESC LIMIT 12")?;
     let rows = q.query_map([], |r| {
         Ok(JobView {
             id: r.get(0)?,
@@ -100,7 +100,7 @@ pub fn views(db: &Connection) -> Result<Vec<JobView>> {
 pub fn start(db: &mut Connection, input: StartJob) -> Result<i64> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let n: usize = tx.query_row(
-        "SELECT count(*) FROM jobs WHERE status IN ('queued','running')",
+        "SELECT count(*) FROM jobs WHERE status IN ('queued','running') AND parent_id IS NULL AND operation!='publish'",
         [],
         |r| r.get(0),
     )?;
@@ -143,12 +143,21 @@ pub fn start(db: &mut Connection, input: StartJob) -> Result<i64> {
 
 pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let n: usize = tx.query_row(
-        "SELECT count(*) FROM jobs WHERE status IN ('queued','running')",
-        [],
-        |r| r.get(0),
-    )?;
-    ensure!(n < 4, "the import queue is full");
+    let user_batch = tx
+        .query_row(
+            "SELECT parent_id IS NULL AND operation!='publish' FROM jobs WHERE id=?1",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if user_batch {
+        let n: usize = tx.query_row(
+            "SELECT count(*) FROM jobs WHERE status IN ('queued','running') AND parent_id IS NULL AND operation!='publish'",
+            [], |r| r.get(0),
+        )?;
+        ensure!(n < 4, "the import queue is full");
+    }
     ensure!(
         tx.execute(
             "UPDATE jobs SET status='queued',error=NULL WHERE id=?1 AND status='failed'",
@@ -200,12 +209,12 @@ pub fn worker(path: &Path) -> Result<()> {
 
 fn run(db: &mut Connection, client: &Client, job: &Job) -> Result<()> {
     let mut rejected = 0;
-    let checkpoint = match job.provider.as_str() {
-        "pgn" => {
+    let checkpoint = match (job.provider.as_str(), job.operation.as_str()) {
+        ("pgn", "upload") => {
             rejected = ingest(db, job, job.payload.as_deref().context("PGN is missing")?)?;
             None
         }
-        "archive" => {
+        ("archive", "scan") => {
             let mut cursor = job.cursor.clone().unwrap_or_default();
             loop {
                 let games = games::archive(db, &cursor, 25)?;
@@ -213,14 +222,31 @@ fn run(db: &mut Connection, client: &Client, job: &Job) -> Result<()> {
                     break;
                 }
                 for game in &games {
-                    games::scan_and_store(db, game, job.id)?;
+                    game_pipeline::scan_game(db, job.id, &game.id)?;
                 }
                 cursor = games.last().unwrap().id.clone();
                 save_cursor(db, job.id, &cursor)?;
             }
             None
         }
-        "chesscom" | "lichess" => Some(fetch_provider(db, client, job)?),
+        ("archive", operation @ ("scan_new" | "publish")) => {
+            let process = if operation == "scan_new" {
+                game_pipeline::scan_game
+            } else {
+                game_pipeline::publish_game
+            };
+            loop {
+                let games = game_pipeline::pending_games(db, job.id)?;
+                if games.is_empty() {
+                    break;
+                }
+                for game in games {
+                    process(db, job.id, &game)?;
+                }
+            }
+            None
+        }
+        ("chesscom" | "lichess", "all" | "new") => Some(fetch_provider(db, client, job)?),
         _ => bail!("unknown provider"),
     };
     let tx = db.transaction()?;
@@ -248,7 +274,7 @@ fn ingest(db: &mut Connection, job: &Job, pgn: &str) -> Result<usize> {
     let mut rejected = 0;
     chess::read_pgn(pgn, false, |pgn| {
         match pgn.and_then(|pgn| games::archive_game(pgn, &job.username)) {
-            Ok(game) => games::scan_and_store(db, &game, job.id)?,
+            Ok(game) => game_pipeline::archive_import(db, &game, job.id)?,
             Err(_) => rejected += 1,
         }
         Ok(())

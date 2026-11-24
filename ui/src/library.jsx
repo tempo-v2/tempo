@@ -33,6 +33,16 @@ const initial = { fen: new Chess().fen(), moves: [], start_at: 0 };
 export function Openings({ fromGame, onSaved, sounds }) {
   const list = useList("openings");
   const [draft, setDraft] = useState(fromGame ?? initial);
+  const [repertoires, setRepertoires] = useState([]);
+  const [destination, setDestination] = useState(fromGame ? "" : "new");
+  const saveDestination = repertoires.find((entry) => entry.id === destination);
+  useEffect(() => {
+    let active = true;
+    api("openings/repertoires").then((rows) => {
+      if (active) setRepertoires(rows);
+    }).catch((error) => { if (active) setError(error.message); });
+    return () => { active = false; };
+  }, []);
   const [name, setName] = useState("");
   const [color, setColor] = useState(fromGame?.color ?? "white");
   const [startingText, setStartingText] = useState("");
@@ -56,14 +66,17 @@ export function Openings({ fromGame, onSaved, sounds }) {
   }
   async function save(event) {
     event.preventDefault();
+    if (!destination) return;
     setError("");
     setNotice("");
     setBusy(true);
     try {
-      await api("openings", { name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at, source_opening: draft.source_opening });
+      await api("openings", { name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at,
+        destination: destination === "new" ? { kind: "new" } : { kind: "existing", repertoire_id: destination } });
       setNotice("Opening saved. Its responses are ready in Study.");
-      await list.load();
       onSaved();
+      await list.load();
+      api("openings/repertoires").then(setRepertoires).catch((error) => setError(error.message));
     } catch (error) { setError(error.message); }
     finally { setBusy(false); }
   }
@@ -75,10 +88,11 @@ export function Openings({ fromGame, onSaved, sounds }) {
           <button className="primary" onClick={() => {
             setDraft({
               ...opening.route, moves: opening.route.moves.slice(0, ply), start_at: ply,
-              source_opening: opening.id, sourceName: opening.name,
+
             });
             setName(Array.from(opening.name).slice(0, 150).join("") + " variation");
             setColor(opening.color);
+            setDestination(opening.repertoire_id);
             setOpening(null);
           }}>Branch here</button>
         </> : <>
@@ -93,19 +107,28 @@ export function Openings({ fromGame, onSaved, sounds }) {
             }} />
           <div className="controls">
             <button disabled={draft.moves.length <= draft.start_at} onClick={() => setDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
-            <button onClick={() => { setDraft(initial); setNotice(""); }}>Start over</button>
+            <button onClick={() => { setDraft(initial); setDestination(fromGame ? "" : "new"); setNotice(""); }}>Start over</button>
             <span>{draft.moves.length - draft.start_at} continuation plies</span>
           </div>
         </>}
       </div>
       <div>
         {!opening && <form onSubmit={save}>
-          {draft.sourceName && <small>Branching from {draft.sourceName}</small>}
+          <label>Repertoire<select required value={destination} onChange={(e) => {
+            const next = e.target.value;
+            setDestination(next);
+            const entry = repertoires.find((item) => item.id === next);
+            if (entry) setColor(entry.color);
+          }}>
+            <option value="" disabled>Choose a repertoire</option>
+            {repertoires.map((entry) => <option key={entry.id} value={entry.id}>{entry.example_line} ({entry.color})</option>)}
+            <option value="new">New repertoire</option>
+          </select></label>
           <label>Opening name<input required maxLength={160} value={name} onChange={(e) => setName(e.target.value)} /></label>
-          <label>Practice color<select disabled={Boolean(draft.source_opening)} value={color} onChange={(e) => setColor(e.target.value)}>
+          <label>Practice color<select disabled={Boolean(saveDestination) || (destination !== "" && destination !== "new")} value={color} onChange={(e) => setColor(e.target.value)}>
             <option value="white">White</option><option value="black">Black</option>
           </select></label>
-          <button className="primary" disabled={busy || draft.moves.length <= draft.start_at}>Save opening</button>
+          <button className="primary" disabled={busy || !destination || draft.moves.length <= draft.start_at}>Save opening</button>
         </form>}
         {notice && <p role="status">{notice}</p>}
         {error && <p className="error" role="alert">{error}</p>}
