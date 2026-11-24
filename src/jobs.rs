@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path, time::Duration};
 
-pub const MAX_PGN: usize = 4 * 1024 * 1024;
+pub const MAX_PGN: usize = 64 * 1024 * 1024;
 const MAX_DOWNLOAD: usize = 32 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -110,7 +110,7 @@ pub fn start(db: &mut Connection, input: StartJob) -> Result<i64> {
             let pgn = input.pgn.as_deref().unwrap_or("");
             ensure!(
                 !pgn.trim().is_empty() && pgn.len() <= MAX_PGN,
-                "enter PGN up to 4 MiB"
+                "enter PGN up to 64 MiB"
             );
             valid_user(input.username.as_deref().unwrap_or(""))?.to_owned()
         }
@@ -245,14 +245,14 @@ fn ingest(db: &mut Connection, job: &Job, pgn: &str) -> Result<usize> {
     if pgn.trim().is_empty() {
         return Ok(0);
     }
-    let parsed = chess::parse_pgn(pgn, false, 20_000)?;
     let mut rejected = 0;
-    for pgn in parsed {
+    chess::read_pgn(pgn, false, |pgn| {
         match pgn.and_then(|pgn| games::archive_game(pgn, &job.username)) {
             Ok(game) => games::scan_and_store(db, &game, job.id)?,
             Err(_) => rejected += 1,
         }
-    }
+        Ok(())
+    })?;
     Ok(rejected)
 }
 

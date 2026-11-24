@@ -56,3 +56,10 @@ Each submitted Again places the card into the persisted queue at the
 drawn offset, or at the end of a shorter queue. Subsequent Again results
 insert their own cards into that same queue. A replay leaves the recorded
 insertion untouched.
+
+Study shows the submitted move after Good and the solution after Again.
+After a brief pause, a newly accepted Good loads the next card. If that
+load fails, Retry sends only Next. Returning to a saved answer shows its
+result without advancing. Board sounds are browser-local and can be
+changed in Settings. Game, opening, and puzzle PGN uploads accept up
+to 64 MiB. Games parses archives one game at a time.

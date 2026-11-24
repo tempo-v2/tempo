@@ -245,17 +245,31 @@ impl Visitor for Parser {
     }
 }
 
-pub fn parse_pgn(text: &str, branches: bool, limit: usize) -> Result<Vec<Result<Pgn>>> {
+pub fn read_pgn(
+    text: &str,
+    branches: bool,
+    mut visit: impl FnMut(Result<Pgn>) -> Result<()>,
+) -> Result<()> {
     if text.trim().is_empty() {
         bail!("enter a PGN");
     }
     let mut reader = Reader::new(Cursor::new(text.as_bytes()));
+    let mut parser = Parser { branches };
+    let first = reader.read_game(&mut parser)?.context("PGN has no games")?;
+    visit(first)?;
+    while let Some(game) = reader.read_game(&mut parser)? {
+        visit(game)?;
+    }
+    Ok(())
+}
+
+pub fn parse_pgn(text: &str, branches: bool, limit: usize) -> Result<Vec<Result<Pgn>>> {
     let mut games = Vec::new();
-    while let Some(game) = reader.read_game(&mut Parser { branches })? {
+    read_pgn(text, branches, |game| {
         ensure!(games.len() < limit, "too many games in this batch");
         games.push(game);
-    }
-    ensure!(!games.is_empty(), "PGN has no games");
+        Ok(())
+    })?;
     Ok(games)
 }
 

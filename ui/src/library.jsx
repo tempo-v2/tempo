@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { Chess } from "chess.js";
 import { api, fileText } from "./api.js";
-import { ChessBoard, Replay, position } from "./board.jsx";
+import { ChessBoard, Replay, play, position } from "./board.jsx";
+import { moveCue } from "./sounds.js";
 
 export function useList(endpoint) {
   const [rows, setRows] = useState([]);
@@ -29,7 +30,7 @@ export function More({ list }) {
 
 const initial = { fen: new Chess().fen(), moves: [], start_at: 0 };
 
-export function Openings({ fromGame, onSaved }) {
+export function Openings({ fromGame, onSaved, sounds }) {
   const list = useList("openings");
   const [draft, setDraft] = useState(fromGame ?? initial);
   const [name, setName] = useState("");
@@ -70,7 +71,7 @@ export function Openings({ fromGame, onSaved }) {
     <div className="split">
       <div>
         {opening ? <><h2>{opening.name}</h2>
-          <Replay route={opening.route} color={opening.color} ply={ply} onPly={setPly} />
+          <Replay sounds={sounds} route={opening.route} color={opening.color} ply={ply} onPly={setPly} />
           <button className="primary" onClick={() => {
             setDraft({ ...opening.route, moves: opening.route.moves.slice(0, ply), start_at: ply });
             setName(opening.name + " variation");
@@ -79,7 +80,14 @@ export function Openings({ fromGame, onSaved }) {
           }}>Branch here</button>
         </> : <>
           <ChessBoard game={game} legal={legal} orientation={color} identity="opening-editor"
-            onMove={(move) => { setDraft({ ...draft, moves: [...draft.moves, move] }); setNotice(""); }} />
+            onRejectedMove={() => sounds.play("illegal")}
+            onMove={(move) => {
+              const board = position(draft);
+              const played = play(board, move);
+              sounds.play(moveCue(played, board));
+              setDraft({ ...draft, moves: [...draft.moves, move] });
+              setNotice("");
+            }} />
           <div className="controls">
             <button disabled={draft.moves.length <= draft.start_at} onClick={() => setDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
             <button onClick={() => { setDraft(initial); setNotice(""); }}>Start over</button>
@@ -114,7 +122,7 @@ export function Openings({ fromGame, onSaved }) {
   </section>;
 }
 
-export function Tactics({ openGame }) {
+export function Tactics({ openGame, sounds }) {
   const list = useList("tactics");
   const [name, setName] = useState("");
   const [pgn, setPgn] = useState("");
@@ -134,7 +142,7 @@ export function Tactics({ openGame }) {
     <div className="split">
       <div>{problem && <>
         <h2>{problem.name}</h2>
-        <Replay route={problem.route} color={position(problem.route, 0).turn() === "w" ? "white" : "black"} ply={ply} onPly={setPly} />
+        <Replay sounds={sounds} route={problem.route} color={position(problem.route, 0).turn() === "w" ? "white" : "black"} ply={ply} onPly={setPly} />
         {problem.source_game && <button onClick={() => openGame(problem.source_game, problem.source_ply)}>View source game</button>}
       </>}</div>
       <div><form onSubmit={save}>

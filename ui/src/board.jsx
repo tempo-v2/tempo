@@ -1,6 +1,7 @@
 import React, { useMemo, useRef, useState } from "react";
 import { Board } from "@tempo-v2/core-components";
 import { Chess } from "chess.js";
+import { moveCue } from "./sounds.js";
 
 export function play(game, move) {
   return game.move({ from: move.slice(0, 2), to: move.slice(2, 4), promotion: move[4] });
@@ -12,7 +13,7 @@ export function position(route, ply = route.moves.length) {
   return game;
 }
 
-export function ChessBoard({ game, legal = [], orientation, identity, onMove, onRejectedMove, shapes = [], locked = false }) {
+export function ChessBoard({ game, legal = [], orientation, identity, onMove, onRejectedMove, lastMove, locked = false }) {
   const [promotion, setPromotion] = useState(null);
   const ref = useRef(null);
   const fen = game.fen();
@@ -31,7 +32,7 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
   const turn = game.turn() === "w" ? "white" : "black";
   return <div className="board-shell">
     <Board ref={ref} positionIdentity={key} positionRevision={0} fen={fen}
-      orientation={orientation} turn={turn} check={game.isCheck() ? turn : false} shapes={shapes}
+      orientation={orientation} turn={turn} check={game.isCheck() ? turn : false} lastMove={lastMove}
       mode="legal" readOnly={!onMove} locked={locked || Boolean(choices)}
       retainMoveOnLock={Boolean(choices)} coordinates="edges" maxSize={570}
       destinations={destinations}
@@ -52,21 +53,30 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
   </div>;
 }
 
-export function Replay({ route, color, ply, onPly }) {
+export function Replay({ route, color, ply, onPly, sounds }) {
   const game = position(route, ply);
   const timeline = position(route).history({ verbose: true });
+  function seek(next) {
+    if (next > ply) {
+      const board = position(route, next - 1);
+      const move = play(board, route.moves[next - 1]);
+      const player = color === "white" ? "w" : "b";
+      sounds.play(moveCue(move, board, move.color === player ? "move-self" : "move-opponent"));
+    }
+    onPly(next);
+  }
   return <>
     <ChessBoard game={game} orientation={color} identity="replay" />
     <div className="controls">
-      <button disabled={ply === 0} onClick={() => onPly(0)} aria-label="First position">⏮</button>
-      <button disabled={ply === 0} onClick={() => onPly(ply - 1)} aria-label="Previous move">◀</button>
-      <button disabled={ply === route.moves.length} onClick={() => onPly(ply + 1)} aria-label="Next move">▶</button>
-      <button disabled={ply === route.moves.length} onClick={() => onPly(route.moves.length)} aria-label="Last position">⏭</button>
+      <button disabled={ply === 0} onClick={() => seek(0)} aria-label="First position">⏮</button>
+      <button disabled={ply === 0} onClick={() => seek(ply - 1)} aria-label="Previous move">◀</button>
+      <button disabled={ply === route.moves.length} onClick={() => seek(ply + 1)} aria-label="Next move">▶</button>
+      <button disabled={ply === route.moves.length} onClick={() => seek(route.moves.length)} aria-label="Last position">⏭</button>
       <span>Position {ply} of {route.moves.length}</span>
     </div>
     <div className="moves" aria-label="Game moves">
       {timeline.map(({ san }, index) => <button className={index + 1 === ply ? "selected" : ""} key={index}
-        onClick={() => onPly(index + 1)}>{san}</button>)}
+        onClick={() => seek(index + 1)}>{san}</button>)}
     </div>
   </>;
 }

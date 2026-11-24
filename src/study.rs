@@ -53,7 +53,7 @@ pub struct Review {
     pub color: String,
     pub fen: String,
     pub legal: Vec<String>,
-    pub result: Option<Accepted>,
+    pub result: Option<AcceptedView>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -62,6 +62,32 @@ pub struct Accepted {
     pub repeat_after: Option<u8>,
     pub answers: Vec<String>,
     pub played_in_game: Option<String>,
+}
+
+// The receipt stays in its original format. Project the displayed move
+// from the accepted submission, including for receipts from older releases.
+#[derive(Serialize)]
+pub struct AcceptedView {
+    #[serde(flatten)]
+    result: Accepted,
+    display_move: Option<String>,
+}
+
+fn accepted_view(result: Accepted, fen: &str, played: Option<&str>) -> AcceptedView {
+    let played = played
+        .filter(|_| result.rating == "Good")
+        .and_then(|played| {
+            chess::position(fen)
+                .ok()
+                .and_then(|board| chess::parse_move(&board, played).ok())
+        })
+        .map(chess::uci)
+        .filter(|played| result.answers.contains(played));
+    let display_move = played.or_else(|| result.answers.first().cloned());
+    AcceptedView {
+        result,
+        display_move,
+    }
 }
 
 #[derive(Serialize)]
@@ -75,7 +101,7 @@ pub struct CardContext {
 pub fn current(db: &Connection) -> Result<Option<Review>> {
     let row = db
         .query_row(
-            "SELECT a.id,c.kind,c.title,c.color,c.fen,a.result
+            "SELECT a.id,c.kind,c.title,c.color,c.fen,a.result,a.submission
         FROM study s JOIN attempts a ON a.id=s.active JOIN cards c ON c.id=a.card_id",
             [],
             |r| {
@@ -86,13 +112,28 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
                     r.get(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(attempt, kind, title, color, fen, result)| {
+    row.map(|(attempt, kind, title, color, fen, result, submission)| {
         let legal = chess::legal(&chess::position(&fen)?);
-        let result = result.as_deref().map(serde_json::from_str).transpose()?;
+        let result = result
+            .as_deref()
+            .map(|saved| -> Result<_> {
+                let played = submission
+                    .as_deref()
+                    .map(serde_json::from_str::<Option<String>>)
+                    .transpose()?
+                    .flatten();
+                Ok(accepted_view(
+                    serde_json::from_str(saved)?,
+                    &fen,
+                    played.as_deref(),
+                ))
+            })
+            .transpose()?;
         Ok(Review {
             attempt,
             dataset: crate::db::dataset(db)?,
@@ -216,7 +257,7 @@ fn repeat_after(draw: u8, other_cards: u8) -> u8 {
     draw.min(other_cards)
 }
 
-pub fn answer(db: &mut Connection, input: Answer) -> Result<Accepted> {
+pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if crate::db::dataset(&tx)? != input.dataset {
         return Err(Conflict::Dataset.into());
@@ -248,7 +289,11 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<Accepted> {
         if submission.as_deref() != Some(&payload) {
             return Err(Conflict::Submission.into());
         }
-        return Ok(serde_json::from_str(&saved)?);
+        return Ok(accepted_view(
+            serde_json::from_str(&saved)?,
+            &fen,
+            input.played.as_deref(),
+        ));
     }
     let active: Option<i64> = tx.query_row("SELECT active FROM study", [], |r| r.get(0))?;
     ensure!(active == Some(input.attempt), "the active card changed");
@@ -312,7 +357,7 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<Accepted> {
         params![payload, serde_json::to_string(&result)?, input.attempt],
     )?;
     tx.commit()?;
-    Ok(result)
+    Ok(accepted_view(result, &fen, input.played.as_deref()))
 }
 
 type ContextRow = (
