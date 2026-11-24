@@ -12,25 +12,28 @@ export function Settings({ sounds }) {
     api("settings").then((values) => { setNames((n) => ({ ...n, ...values })); setReady(true); })
       .catch((error) => setError(error.message));
   }, []);
-  return <section><h1>Settings</h1>
-    <label className="board-sound-setting">
+  return <section className="settings-page"><h1>Settings</h1>
+    <label className="settings-toggle">
       <input type="checkbox" defaultChecked={sounds.enabled} onChange={(event) => sounds.setEnabled(event.target.checked)} />
       Board sounds
     </label>
     <NewOpeningSettings />
-    <form className="settings" onSubmit={async (e) => {
-      e.preventDefault();
-      setMessage(""); setError("");
-      try { await api("settings", names); setMessage("Saved."); }
-      catch (error) { setError(error.message); }
-    }}>
-      {["chesscom", "lichess"].map((provider) => <label key={provider}>{labels[provider]} username
-        <input value={names[provider]} onChange={(e) => setNames({ ...names, [provider]: e.target.value })} autoComplete="off" />
-      </label>)}
-      <button className="primary" disabled={!ready}>Save settings</button>
-    </form>
-    {message && <p role="status">{message}</p>}
-    {error && <p className="error" role="alert">{error}</p>}
+    <section aria-labelledby="game-account-settings">
+      <h2 id="game-account-settings">Game accounts</h2>
+      <form onSubmit={async (e) => {
+        e.preventDefault();
+        setMessage(""); setError("");
+        try { await api("settings", names); setMessage("Saved."); }
+        catch (error) { setError(error.message); }
+      }}>
+        {["chesscom", "lichess"].map((provider) => <label key={provider}>{labels[provider]} username
+          <input value={names[provider]} onChange={(e) => setNames({ ...names, [provider]: e.target.value })} autoComplete="off" />
+        </label>)}
+        <button className="primary" disabled={!ready}>Save settings</button>
+      </form>
+      {message && <p role="status">{message}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+    </section>
   </section>;
 }
 
@@ -61,8 +64,8 @@ function NewOpeningSettings() {
 
   return <section aria-labelledby="new-opening-settings">
     <h2 id="new-opening-settings">New opening cards</h2>
-    {settings && <form className="settings" onSubmit={save}>
-      <label className="board-sound-setting">
+    {settings && <form onSubmit={save}>
+      <label className="settings-toggle">
         <input type="checkbox" checked={settings.paused} disabled={saving}
           onChange={(event) => setSettings({ ...settings, paused: event.target.checked })} />
         Pause adding new openings to the queue
