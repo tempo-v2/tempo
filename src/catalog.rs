@@ -20,6 +20,7 @@ pub struct OpeningInput {
 pub struct Opening {
     pub id: String,
     pub repertoire_id: String,
+    pub repertoire_example: String,
     pub name: String,
     pub color: String,
     pub route: Route,
@@ -46,7 +47,10 @@ pub fn name(value: &str) -> Result<&str> {
 
 pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
     let mut q = db.prepare(
-        "SELECT id,repertoire_id,name,color,route,start_at FROM openings WHERE id>?1 ORDER BY id LIMIT 100",
+        "SELECT o.id,o.repertoire_id,r.example_line,o.name,o.color,o.route,o.start_at
+         FROM openings o CROSS JOIN repertoire_choices r
+         ON r.repertoire_id=o.repertoire_id AND r.color=o.color
+         WHERE o.id>?1 ORDER BY o.id LIMIT 100",
     )?;
     let rows = q.query_map([after], |r| {
         Ok((
@@ -54,15 +58,17 @@ pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
             r.get(1)?,
             r.get(2)?,
             r.get(3)?,
-            r.get::<_, String>(4)?,
-            r.get(5)?,
+            r.get(4)?,
+            r.get::<_, String>(5)?,
+            r.get(6)?,
         ))
     })?;
     rows.map(|r| {
-        let (id, repertoire_id, name, color, route, start_at) = r?;
+        let (id, repertoire_id, repertoire_example, name, color, route, start_at) = r?;
         Ok(Opening {
             id,
             repertoire_id,
+            repertoire_example,
             name,
             color,
             route: serde_json::from_str(&route)?,

@@ -125,8 +125,21 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-pub fn next(db: &mut Connection) -> Result<Option<Job>> {
+#[derive(Clone)]
+pub struct FailedTurn {
+    pub job_id: i64,
+    pub message: String,
+}
+
+/// Record a failed turn with the next claim. A refused admission leaves both untouched.
+pub fn next(db: &mut Connection, failed: Option<&FailedTurn>) -> Result<Option<Job>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(failed) = failed {
+        tx.execute(
+            "UPDATE jobs SET status='failed',error=?2 WHERE id=?1 AND status='running'",
+            params![failed.job_id, failed.message],
+        )?;
+    }
     let job = tx.query_row("SELECT id,provider,username,operation,window_offset,window_rejected FROM jobs INDEXED BY jobs_ready_order WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
         |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,window_offset:r.get(4)?,window_rejected:r.get(5)? })).optional()?;
     if let Some(job) = &job {
@@ -142,14 +155,6 @@ pub fn recover_running(db: &mut Connection) -> Result<usize> {
         (SELECT id FROM jobs WHERE status='running' ORDER BY id LIMIT 128)",
         [],
     )?)
-}
-
-pub fn fail(db: &Connection, id: i64, error: &str) -> Result<()> {
-    db.execute(
-        "UPDATE jobs SET status='failed',error=?2 WHERE id=?1",
-        params![id, error],
-    )?;
-    Ok(())
 }
 
 pub fn complete(
@@ -350,17 +355,20 @@ mod tests {
         db.execute_batch(include_str!("operation_bounds.sql"))?;
         assert_eq!(recover_running(&mut db)?, 1);
 
-        assert_eq!(next(&mut db)?.unwrap().id, 1);
+        assert_eq!(next(&mut db, None)?.unwrap().id, 1);
         let tx = db.transaction()?;
         yield_turn(&tx, 1, Some("checkpoint"), 1)?;
         tx.commit()?;
-        assert_eq!(next(&mut db)?.unwrap().id, 2);
-        fail(&db, 2, "fixture")?;
+        assert_eq!(next(&mut db, None)?.unwrap().id, 2);
+        let failed = FailedTurn {
+            job_id: 2,
+            message: "fixture".into(),
+        };
+        assert_eq!(next(&mut db, Some(&failed))?.unwrap().id, 3);
         retry(&mut db, 2)?;
-        assert_eq!(next(&mut db)?.unwrap().id, 3);
         complete(&mut db, 3, "archive", "", None)?;
 
-        let resumed = next(&mut db)?.unwrap();
+        let resumed = next(&mut db, None)?.unwrap();
         assert_eq!(resumed.id, 1);
         assert_eq!(
             db.query_row("SELECT cursor FROM jobs WHERE id=?1", [resumed.id], |row| {
@@ -372,7 +380,7 @@ mod tests {
             views(&db)?.iter().find(|job| job.id == 1).unwrap().rejected,
             1
         );
-        assert_eq!(next(&mut db)?.unwrap().id, 2);
+        assert_eq!(next(&mut db, None)?.unwrap().id, 2);
         Ok(())
     }
 

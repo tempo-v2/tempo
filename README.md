@@ -102,7 +102,8 @@ byte offset, accepted game or rejected record, and ready order are durable.
 Restart and Retry continue the staged window at its saved offset. The
 account checkpoint advances after all windows finish. Each turn uses one
 60-second deadline for new work and writer admission. A claimed write
-resolves before another turn can use its result. Local blocking filesystem
+resolves before another turn can use its result. The next bounded claim records
+a failed turn together with claiming the next job. Local blocking filesystem
 operations retain the worker until they physically return.
 
 The Openings editor requests up to 50 destination choices by repertoire

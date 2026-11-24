@@ -47,12 +47,11 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const [loadingRepertoires, setLoadingRepertoires] = useState(false);
   const [repertoireFailure, setRepertoireFailure] = useState(null);
   const repertoireRequest = useRef(null);
-  const [destination, setDestination] = useState(fromGame ? "" : "new");
-  const [branchChoice, setBranchChoice] = useState(null);
+  const [destination, setDestination] = useState(fromGame ? null : "new");
   const choiceKey = ({ id, color }) => id + "/" + color;
-  const choices = branchChoice && !repertoires.some((entry) => choiceKey(entry) === choiceKey(branchChoice))
-    ? [branchChoice, ...repertoires] : repertoires;
-  const saveDestination = choices.find((entry) => choiceKey(entry) === destination);
+  const saveDestination = destination === "new" ? null : destination;
+  const choices = saveDestination && !repertoires.some((entry) => choiceKey(entry) === choiceKey(saveDestination))
+    ? [saveDestination, ...repertoires] : repertoires;
   async function loadRepertoires(append = false) {
     if (repertoireRequest.current) {
       if (append) return;
@@ -115,7 +114,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
     setBusy(true);
     setOfflineDraft(null);
     const request = {
-      name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at,
+      name, color: saveDestination?.color ?? color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at,
       destination: destination === "new" ? { kind: "new" } : { kind: "existing", repertoire_id: saveDestination.id },
     };
     try {
@@ -142,9 +141,10 @@ export function Openings({ fromGame, onSaved, sounds }) {
             });
             setName(Array.from(opening.name).slice(0, 150).join("") + " variation");
             setColor(opening.color);
-            const choice = { id: opening.repertoire_id, color: opening.color, example_line: opening.name };
-            setBranchChoice(choice);
-            setDestination(choiceKey(choice));
+            setDestination({
+              id: opening.repertoire_id, color: opening.color,
+              example_line: opening.repertoire_example ?? opening.name,
+            });
             setOpening(null);
           }}>Branch here</button>
         </> : <>
@@ -159,17 +159,17 @@ export function Openings({ fromGame, onSaved, sounds }) {
             }} />
           <div className="controls">
             <button disabled={draft.moves.length <= draft.start_at} onClick={() => setDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
-            <button onClick={() => { setDraft(initial); setDestination(fromGame ? "" : "new"); setNotice(""); }}>Start over</button>
+            <button onClick={() => { setDraft(initial); setDestination(fromGame ? null : "new"); setNotice(""); }}>Start over</button>
             <span>{draft.moves.length - draft.start_at} continuation plies</span>
           </div>
         </>}
       </div>
       <div>
         {!opening && <form onSubmit={save}>
-          <label>Repertoire<select required value={destination} onChange={(e) => {
+          <label>Repertoire<select required value={saveDestination ? choiceKey(saveDestination) : destination ?? ""} onChange={(e) => {
             const next = e.target.value;
-            setDestination(next);
             const entry = choices.find((item) => choiceKey(item) === next);
+            setDestination(next === "new" ? "new" : entry ?? null);
             if (entry) setColor(entry.color);
           }}>
             <option value="" disabled>Choose a repertoire</option>
@@ -182,7 +182,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
             {repertoireFailure ? "Retry loading repertoires" : "Load more repertoires"}
           </button>}
           <label>Opening name<input required maxLength={160} value={name} onChange={(e) => setName(e.target.value)} /></label>
-          <label>Practice color<select disabled={Boolean(saveDestination) || (destination !== "" && destination !== "new")} value={color} onChange={(e) => setColor(e.target.value)}>
+          <label>Practice color<select disabled={Boolean(saveDestination)} value={color} onChange={(e) => setColor(e.target.value)}>
             <option value="white">White</option><option value="black">Black</option>
           </select></label>
           <button className="primary" disabled={busy || !destination || draft.moves.length <= draft.start_at}>Save opening</button>

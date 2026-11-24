@@ -1,6 +1,6 @@
 use crate::{
     game_pipeline,
-    job_store::{self, JobReads},
+    job_store::{self, FailedTurn, JobReads},
     providers::{self, Provider},
     writer::Writer,
 };
@@ -63,16 +63,25 @@ pub fn worker(path: &Path, writer: Writer) -> Result<()> {
     let db = JobReads::open(path)?;
     while writer.background(job_store::recover_running)? == 128 {}
     let client = Provider::client()?;
+    let mut failed: Option<FailedTurn> = None;
     loop {
-        match writer.background(job_store::next) {
+        let prior = failed.clone();
+        let admission_deadline = Instant::now() + Duration::from_secs(2);
+        match writer.background_until(admission_deadline, move |db| {
+            job_store::next(db, prior.as_ref())
+        }) {
             Ok(Some(job)) => {
-                if let Err(error) = run(path, &db, &writer, &client, &job) {
-                    let message = error.to_string();
-                    let id = job.id;
-                    writer.background(move |db| job_store::fail(db, id, &message))?;
-                }
+                failed = run(path, &db, &writer, &client, &job)
+                    .err()
+                    .map(|error| FailedTurn {
+                        job_id: job.id,
+                        message: error.to_string(),
+                    });
             }
-            Ok(None) => std::thread::sleep(Duration::from_secs(1)),
+            Ok(None) => {
+                failed = None;
+                std::thread::sleep(Duration::from_secs(1));
+            }
             Err(error) => {
                 eprintln!("Games worker could not claim work: {error}");
                 std::thread::sleep(Duration::from_secs(2));
