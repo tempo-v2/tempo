@@ -15,6 +15,12 @@ impl Database {
         Ok(db)
     }
 
+    pub fn read(path: &Path) -> Result<Connection> {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::configure(&db)?;
+        Ok(db)
+    }
+
     pub fn init(path: &Path) -> Result<Connection> {
         if path.exists() {
             let mut db = Self::open(path)?;
@@ -22,13 +28,16 @@ impl Database {
             tx.execute_batch(include_str!("opening_order.sql"))?;
             let version =
                 tx.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?;
-            ensure!(version <= 2, "this Tempo database requires a newer release");
+            ensure!(version <= 3, "this Tempo database requires a newer release");
             if version < 1 {
                 tx.execute_batch(include_str!("opening_policy.sql"))?;
             }
             if version < 2 {
                 tx.execute_batch(include_str!("game_pipeline.sql"))?;
                 crate::game_pipeline::recover_legacy(&tx)?;
+            }
+            if version < 3 {
+                tx.execute_batch(include_str!("prepared_queue.sql"))?;
             }
             tx.commit()?;
             return Ok(db);
@@ -40,6 +49,7 @@ impl Database {
         db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute_batch(include_str!("game_pipeline.sql"))?;
+        db.execute_batch(include_str!("prepared_queue.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],

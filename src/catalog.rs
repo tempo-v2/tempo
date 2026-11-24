@@ -1,4 +1,7 @@
-use crate::chess::{self, Route};
+use crate::{
+    chess::{self, Route},
+    scanner::ReferenceAnswer,
+};
 use anyhow::{Context, Result, ensure};
 use pgn_reader::shakmaty::Position;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -131,17 +134,40 @@ pub fn branch_repertoire(db: &Connection, source: &str, color: &str) -> Result<S
     Ok(repertoire)
 }
 
-pub fn save_opening(
-    db: &Connection,
-    input: &OpeningInput,
-    inherited_book: Option<&str>,
-) -> Result<String> {
-    let name = name(&input.name)?;
+#[derive(Debug)]
+pub struct OverBudget;
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This save exceeds the online row budget. Use tempo import-content.")
+    }
+}
+impl std::error::Error for OverBudget {}
+
+pub struct OpeningPlan {
+    pub color: String,
+    name: String,
+    fen: String,
+    moves: String,
+    route: String,
+    start_at: usize,
+    cards: Vec<OpeningCard>,
+}
+
+struct OpeningCard {
+    ply: std::num::NonZeroU32,
+    position: String,
+    version: String,
+    fen: String,
+    answers: String,
+    context: String,
+}
+
+pub fn prepare_opening(input: &OpeningInput) -> Result<OpeningPlan> {
+    let name = name(&input.name)?.to_owned();
     ensure!(
         matches!(input.color.as_str(), "white" | "black"),
         "select a practice color"
     );
-    let encoded = serde_json::to_string(&input.route.moves)?;
     let mut board = chess::position(&input.route.fen)?;
     let route = Route {
         fen: chess::fen(&board),
@@ -151,85 +177,115 @@ pub fn save_opening(
         input.start_at < route.moves.len() && route.moves.len() <= chess::MAX_PLIES,
         "enter a continuation"
     );
+    let mut cards = Vec::new();
+    for (ply, played) in route.moves.iter().enumerate() {
+        let movement = chess::parse_move(&board, played)?;
+        if ply >= input.start_at && chess::color_name(board.turn()) == input.color {
+            let normalized = chess::uci(movement);
+            cards.push(OpeningCard {
+                ply: board.fullmoves(),
+                position: chess::position_id(&board),
+                version: chess::id(&["answer-v1", &normalized]),
+                fen: chess::fen(&board),
+                answers: serde_json::to_string(&[normalized])?,
+                context: serde_json::to_string(&Route {
+                    fen: route.fen.clone(),
+                    moves: route.moves[..ply].to_vec(),
+                })?,
+            });
+        }
+        board.play_unchecked(movement);
+    }
+    ensure!(
+        !cards.is_empty(),
+        "the continuation needs a move for the selected color"
+    );
+    Ok(OpeningPlan {
+        name,
+        color: input.color.clone(),
+        fen: route.fen.clone(),
+        moves: serde_json::to_string(&route.moves)?,
+        route: serde_json::to_string(&route)?,
+        start_at: input.start_at,
+        cards,
+    })
+}
+
+pub fn apply_opening(
+    db: &Connection,
+    plan: &OpeningPlan,
+    inherited_book: Option<&str>,
+    online: bool,
+) -> Result<String> {
     let id = chess::id(&[
         "opening-v1",
         inherited_book.unwrap_or(""),
-        name,
-        &input.color,
-        &route.fen,
-        &encoded,
-        &input.start_at.to_string(),
+        &plan.name,
+        &plan.color,
+        &plan.fen,
+        &plan.moves,
+        &plan.start_at.to_string(),
     ]);
     let repertoire = inherited_book.unwrap_or(&id);
-    let mut cards = 0;
-    for (ply, played) in route.moves.iter().enumerate() {
-        let m = chess::parse_move(&board, played)?;
-        if ply >= input.start_at && chess::color_name(board.turn()) == input.color {
-            let normalized = chess::uci(m);
-            let version = chess::id(&["answer-v1", &normalized]);
-            let position_id = chess::position_id(&board);
-            let card_id = chess::id(&["opening-card-v1", repertoire, &position_id, &version]);
-            let prior = db
-                .query_row(
-                    "SELECT id,quarantined FROM cards
-                 WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2
-                     ORDER BY quarantined LIMIT 1",
-                    params![repertoire, position_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
-                )
-                .optional()?;
-            if let Some((id, quarantined)) = prior {
-                let ply = board.fullmoves();
-                if quarantined {
-                    return Err(OpeningConflict(format!(
-                        "Move {ply}: this repertoire has conflicting replies at this position awaiting resolution."
-                    )).into());
-                }
-                if id != card_id {
-                    return Err(OpeningConflict(format!(
-                        "Move {ply}: this repertoire already has a different reply at this position."
-                    )).into());
-                }
-            }
-            let context = Route {
-                fen: route.fen.clone(),
-                moves: route.moves[..ply].to_vec(),
-            };
-            db.execute(
-                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,repertoire_id,answer_version,context)
-                 VALUES (?1,'opening',?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO NOTHING",
-                params![
-                    card_id,
-                    name,
-                    input.color,
-                    chess::fen(&board),
-                    position_id,
-                    serde_json::to_string(&[normalized])?,
-                    repertoire,
-                    version,
-                    serde_json::to_string(&context)?
-                ],
-            )?;
-            cards += 1;
+    let mut pending = std::collections::HashMap::new();
+    for card in &plan.cards {
+        let card_id = chess::id(&["opening-card-v1", repertoire, &card.position, &card.version]);
+        let prior = db.query_row(
+            "SELECT id,quarantined FROM cards WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2
+             ORDER BY quarantined LIMIT 1",
+            params![repertoire,card.position],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?)),
+        ).optional()?;
+        if prior.as_ref().is_some_and(|(_, quarantined)| *quarantined) {
+            return Err(OpeningConflict(format!(
+                "Move {}: this repertoire has conflicting replies at this position awaiting resolution.", card.ply
+            )).into());
         }
-        board.play_unchecked(m);
+        let earlier = prior
+            .as_ref()
+            .map(|(id, _)| id)
+            .or_else(|| pending.get(&card.position).map(|(id, _)| id));
+        if let Some(earlier) = earlier {
+            if earlier != &card_id {
+                return Err(OpeningConflict(format!(
+                    "Move {}: this repertoire already has a different reply at this position.",
+                    card.ply
+                ))
+                .into());
+            }
+        } else {
+            pending.insert(card.position.clone(), (card_id, card));
+            // One authoritative card and one prepared entry, plus the authored line.
+            ensure!(!online || pending.len() * 2 < 128, OverBudget);
+        }
     }
-    ensure!(
-        cards > 0,
-        "the continuation needs a move for the selected color"
-    );
+    for (card_id, card) in pending.into_values() {
+        db.execute(
+            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,repertoire_id,answer_version,context)
+             VALUES (?1,'opening',?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![card_id,plan.name,plan.color,card.fen,card.position,card.answers,repertoire,card.version,card.context],
+        )?;
+    }
     db.execute(
         "INSERT OR IGNORE INTO openings VALUES (?1,?2,?3,?4,?5,?6)",
         params![
             id,
             repertoire,
-            name,
-            input.color,
-            serde_json::to_string(&route)?,
-            input.start_at
+            plan.name,
+            plan.color,
+            plan.route,
+            plan.start_at
         ],
     )?;
     Ok(id)
+}
+
+pub fn save_opening(
+    db: &Connection,
+    input: &OpeningInput,
+    inherited_book: Option<&str>,
+) -> Result<String> {
+    apply_opening(db, &prepare_opening(input)?, inherited_book, false)
 }
 
 pub fn tactics(db: &Connection, after: &str) -> Result<Vec<Tactic>> {
@@ -265,7 +321,18 @@ pub struct TacticInput<'a> {
     pub source: Option<(&'a str, usize, &'a str)>,
 }
 
-pub fn publish_tactic(db: &Connection, input: TacticInput<'_>) -> Result<String> {
+pub struct TacticPlan {
+    name: String,
+    route: String,
+    id: String,
+    fen: String,
+    color: String,
+    position: String,
+    answers: String,
+    source: Option<(String, usize, String)>,
+}
+
+pub fn prepare_tactic(input: TacticInput<'_>) -> Result<TacticPlan> {
     let name = name(input.name)?;
     ensure!(
         !input.answers.is_empty() && !input.route.moves.is_empty(),
@@ -303,32 +370,48 @@ pub fn publish_tactic(db: &Connection, input: TacticInput<'_>) -> Result<String>
         Some((game, ply, played)) => (Some(game), Some(ply), Some(played)),
         None => (None, None, None),
     };
+    Ok(TacticPlan {
+        name: name.to_owned(),
+        route: encoded,
+        id,
+        fen: chess::fen(&board),
+        color: chess::color_name(board.turn()).to_owned(),
+        position: position_id,
+        answers,
+        source: game
+            .zip(ply)
+            .zip(played)
+            .map(|((game, ply), played)| (game.to_owned(), ply, played.to_owned())),
+    })
+}
+
+pub fn apply_tactic(db: &Connection, plan: &TacticPlan) -> Result<String> {
+    let (game, ply, played) = plan
+        .source
+        .as_ref()
+        .map_or((None, None, None), |(game, ply, played)| {
+            (Some(game), Some(ply), Some(played))
+        });
     db.execute(
         "INSERT OR IGNORE INTO tactics VALUES (?1,?2,?3,?4,?5)",
-        params![id, name, encoded, game, ply],
+        params![plan.id, plan.name, plan.route, game, ply],
     )?;
     db.execute(
         "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,played_move,source_game_id,source_ply)
          VALUES (?1,'tactic',?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO NOTHING",
         params![
-            id,
-            name,
-            chess::color_name(board.turn()),
-            chess::fen(&board),
-            position_id,
-            answers,
+            plan.id,
+            plan.name,
+            plan.color,
+            plan.fen,
+            plan.position,
+            plan.answers,
             played,
             game,
             ply
         ],
     )?;
-    Ok(id)
-}
-
-pub struct ReferenceAnswer {
-    pub repertoire_id: String,
-    pub answer_version: String,
-    pub moves: Vec<String>,
+    Ok(plan.id.clone())
 }
 
 pub fn answers_at(db: &Connection, position: &str, color: &str) -> Result<Vec<ReferenceAnswer>> {

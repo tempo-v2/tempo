@@ -38,16 +38,14 @@ pub fn select(
         None => None,
         Some(_) => anyhow::bail!("Unknown previous card kind"),
     };
-    let due = "SELECT l.card_id FROM learning l JOIN active_cards c ON c.id=l.card_id
-        WHERE l.due_at<=?1 AND c.kind=?2 AND NOT EXISTS (SELECT 1 FROM deck d WHERE d.card_id=l.card_id)
-        ORDER BY l.due_at,l.card_id LIMIT 1";
-    let unseen = "SELECT c.id FROM active_cards c WHERE c.kind=?1 AND NOT EXISTS (SELECT 1 FROM learning l WHERE l.card_id=c.id)
-        AND NOT EXISTS (SELECT 1 FROM deck d WHERE d.card_id=c.id) ORDER BY c.id LIMIT 1";
-    let ranked = "SELECT o.card_id FROM opening_order o CROSS JOIN active_cards c ON c.id=o.card_id
-                     WHERE c.kind='opening'
-                     AND NOT EXISTS (SELECT 1 FROM learning l WHERE l.card_id=o.card_id)
-                     AND NOT EXISTS (SELECT 1 FROM deck d WHERE d.card_id=o.card_id)
-                     ORDER BY o.rank LIMIT 1";
+    let due = "SELECT card_id FROM prepared_queue
+        WHERE active=1 AND reserved=0 AND due_at IS NOT NULL AND due_at<=?1 AND kind=?2
+        ORDER BY due_at,card_id LIMIT 1";
+    let unseen = "SELECT card_id FROM prepared_queue
+        WHERE active=1 AND reserved=0 AND due_at IS NULL AND kind=?1 ORDER BY card_id LIMIT 1";
+    let ranked = "SELECT card_id FROM prepared_queue
+        WHERE active=1 AND reserved=0 AND due_at IS NULL AND rank IS NOT NULL AND kind='opening'
+        ORDER BY rank,card_id LIMIT 1";
     let chosen = queue::select(
         previous,
         || new_opening_settings(db),
@@ -94,35 +92,121 @@ pub fn place_repeat(
     draw: u8,
 ) -> Result<u8> {
     let mut q = db.prepare(
-        "SELECT d.card_id,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot",
+        "SELECT d.slot,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 22",
     )?;
     let mut queued = q
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut previous = if let Some((_, kind)) = queued.last() {
-        Some(kind.clone())
-    } else {
-        previous_kind.map(str::to_owned)
-    };
+    anyhow::ensure!(
+        queued.len() <= 20,
+        "repeat deck exceeds its supported bound"
+    );
+    let mut previous = queued
+        .last()
+        .map(|(_, kind)| kind.clone())
+        .or_else(|| previous_kind.map(str::to_owned));
     while queued.len() < usize::from(draw) {
         let Some((id, kind)) = select(db, previous.as_deref(), now)? else {
             break;
         };
-        db.execute(
-            "INSERT INTO deck SELECT coalesce(max(slot),0)+1,?1 FROM deck",
-            [&id],
-        )?;
+        let slot = queued.last().map_or(1, |(slot, _)| slot + 1);
+        db.execute("INSERT INTO deck VALUES (?1,?2)", params![slot, id])?;
         previous = Some(kind.clone());
-        queued.push((id, kind));
+        queued.push((slot, kind));
     }
     let offset = queue::repeat_offset(draw, queued.len());
-    db.execute("DELETE FROM deck", [])?;
-    let mut ids = queued.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
-    ids.insert(usize::from(offset), card.to_string());
-    for (slot, id) in ids.into_iter().enumerate() {
-        db.execute("INSERT INTO deck VALUES (?1,?2)", params![slot, id])?;
-    }
+    let slot = if let Some((slot, _)) = queued.get(usize::from(offset)) {
+        for (position, _) in queued[usize::from(offset)..].iter().rev() {
+            db.execute(
+                "UPDATE deck SET slot=?2 WHERE slot=?1",
+                params![position, position + 1],
+            )?;
+        }
+        *slot
+    } else {
+        queued.last().map_or(1, |(slot, _)| slot + 1)
+    };
+    db.execute("INSERT INTO deck VALUES (?1,?2)", params![slot, card])?;
     Ok(offset)
+}
+
+/// Every seeded row and its cursor are committed together. Ordinary writes maintain
+/// already-seeded entries in their own transactions, including inserts behind the cursor.
+pub fn seed_batch(db: &mut Connection) -> Result<bool> {
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (ready, cursor): (bool, String) = tx.query_row(
+        "SELECT ready,cursor FROM prepared_queue_state WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if ready {
+        return Ok(true);
+    }
+    let ids = {
+        let mut query = tx.prepare("SELECT id FROM cards WHERE id>?1 ORDER BY id LIMIT 127")?;
+        query
+            .query_map([cursor], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut insert = tx.prepare_cached(
+        "INSERT OR IGNORE INTO prepared_queue
+         SELECT c.id,c.kind,NOT c.quarantined,l.due_at,o.rank,d.card_id IS NOT NULL
+         FROM cards c LEFT JOIN learning l ON l.card_id=c.id
+         LEFT JOIN opening_order o ON o.card_id=c.id LEFT JOIN deck d ON d.card_id=c.id
+         WHERE c.id=?1",
+    )?;
+    for id in &ids {
+        insert.execute([id])?;
+    }
+    drop(insert);
+    let complete = ids.len() < 127;
+    tx.execute(
+        "UPDATE prepared_queue_state SET ready=?1,cursor=coalesce(?2,cursor) WHERE singleton=1",
+        params![complete, ids.last()],
+    )?;
+    tx.commit()?;
+    Ok(complete)
+}
+
+pub fn prepared(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT ready FROM prepared_queue_state WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+pub fn defer_repeat(
+    db: &Connection,
+    attempt: i64,
+    card: &str,
+    previous: Option<&str>,
+    now: i64,
+    draw: u8,
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO repeat_obligation VALUES (?1,?2,?3,?4,?5)",
+        params![attempt, card, previous, now, draw],
+    )?;
+    Ok(())
+}
+
+pub fn place_deferred(db: &Connection) -> Result<()> {
+    let obligation = db.query_row(
+        "SELECT attempt_id,card_id,previous_kind,accepted_at,draw FROM repeat_obligation ORDER BY attempt_id LIMIT 1", [],
+        |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,i64>(3)?,row.get::<_,u8>(4)?)),
+    ).optional()?;
+    let Some((attempt, card, previous, now, draw)) = obligation else {
+        return Ok(());
+    };
+    if can_repeat(db, &card)? {
+        place_repeat(db, &card, previous.as_deref(), now, draw)?;
+    }
+    db.execute(
+        "DELETE FROM repeat_obligation WHERE attempt_id=?1",
+        [attempt],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -130,11 +214,53 @@ mod tests {
     use super::*;
     use crate::queue::repeat_offset;
     #[test]
+    fn seed_progress_observes_interleaved_changes_even_behind_the_cursor() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("game_pipeline.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        for id in 1..=130 {
+            db.execute(
+                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+                VALUES (?1,'tactic','','white','','','[]')",
+                [format!("{id:04}")],
+            )?;
+        }
+        db.execute_batch(include_str!("prepared_queue.sql"))?;
+        assert!(!seed_batch(&mut db)?);
+        assert!(!prepared(&db)?);
+        db.execute("INSERT INTO learning VALUES ('0001',1,1,1,9)", [])?;
+        db.execute(
+            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+            VALUES ('0000','tactic','','white','','','[]')",
+            [],
+        )?;
+        db.execute("INSERT INTO deck VALUES (1,'0000')", [])?;
+        assert!(seed_batch(&mut db)?);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM prepared_queue", [], |r| r
+                .get::<_, usize>(0))?,
+            131
+        );
+        assert_eq!(select(&db, None, 8)?.unwrap().0, "0002");
+        assert_eq!(select(&db, None, 9)?.unwrap().0, "0001");
+        consume(&db, "0000")?;
+        assert_eq!(select(&db, None, 8)?.unwrap().0, "0000");
+        Ok(())
+    }
+
+    #[test]
     fn saved_opening_order_only_prioritizes_unseen_opening_cards() -> Result<()> {
         let db = Connection::open_in_memory()?;
         db.execute_batch(include_str!("schema.sql"))?;
         db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
+        db.execute_batch(include_str!("prepared_queue.sql"))?;
         db.execute_batch(
             "INSERT INTO cards (id,kind,title,color,fen,position_id,answers) VALUES
                 ('a','opening','First by id','white','','a','[]'),

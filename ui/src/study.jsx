@@ -35,7 +35,7 @@ export function Study({ openGame, sounds }) {
   const [source, setSource] = useState(null);
   const [opponent, setOpponent] = useState(null);
   const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(null);
   const [pending, setPending] = useState(false);
   const [submitted, setSubmitted] = useState(null);
   const waiting = useRef(false);
@@ -64,10 +64,10 @@ export function Study({ openGame, sounds }) {
     if (waiting.current) return;
     waiting.current = true;
     retry.current = op;
-    setError("");
+    setError(null);
     setPending(true);
     try { await op(); retry.current = null; }
-    catch (error) { setError(error.message); setEpoch((n) => n + 1); }
+    catch (error) { setError(error); setEpoch((n) => n + 1); }
     finally { waiting.current = false; setPending(false); }
   }
   function next(after = null) {
@@ -176,7 +176,7 @@ export function Study({ openGame, sounds }) {
     </div>
     <div className="study-panel">
       <h1>Study</h1>
-      {error && <div className="error" role="alert">{error} <button onClick={() => run(retry.current)}>Retry</button></div>}
+      {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
       {!loaded && !error && <p>Loading your deck…</p>}
       {loaded && !card && <><p>No cards are ready. Add an opening or tactic to get started.</p>
         <button onClick={() => next()} disabled={pending}>Check deck</button></>}
