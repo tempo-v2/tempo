@@ -191,17 +191,14 @@ pub fn defer_repeat(
     Ok(())
 }
 
-pub fn place_deferred(db: &Connection) -> Result<bool> {
+pub fn place_deferred(db: &Connection) -> Result<()> {
     let obligation = db.query_row(
         "SELECT attempt_id,card_id,previous_kind,accepted_at,draw FROM repeat_obligation ORDER BY attempt_id LIMIT 1", [],
         |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,i64>(3)?,row.get::<_,u8>(4)?)),
     ).optional()?;
     let Some((attempt, card, previous, now, draw)) = obligation else {
-        return Ok(true);
+        return Ok(());
     };
-    if !prepared(db)? {
-        return Ok(false);
-    }
     if can_repeat(db, &card)? {
         place_repeat(db, &card, previous.as_deref(), now, draw)?;
     }
@@ -209,13 +206,54 @@ pub fn place_deferred(db: &Connection) -> Result<bool> {
         "DELETE FROM repeat_obligation WHERE attempt_id=?1",
         [attempt],
     )?;
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::queue::repeat_offset;
+    #[test]
+    fn seed_progress_observes_interleaved_changes_even_behind_the_cursor() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("game_pipeline.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        for id in 1..=130 {
+            db.execute(
+                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+                VALUES (?1,'tactic','','white','','','[]')",
+                [format!("{id:04}")],
+            )?;
+        }
+        db.execute_batch(include_str!("prepared_queue.sql"))?;
+        assert!(!seed_batch(&mut db)?);
+        assert!(!prepared(&db)?);
+        db.execute("INSERT INTO learning VALUES ('0001',1,1,1,9)", [])?;
+        db.execute(
+            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+            VALUES ('0000','tactic','','white','','','[]')",
+            [],
+        )?;
+        db.execute("INSERT INTO deck VALUES (1,'0000')", [])?;
+        assert!(seed_batch(&mut db)?);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM prepared_queue", [], |r| r
+                .get::<_, usize>(0))?,
+            131
+        );
+        assert_eq!(select(&db, None, 8)?.unwrap().0, "0002");
+        assert_eq!(select(&db, None, 9)?.unwrap().0, "0001");
+        consume(&db, "0000")?;
+        assert_eq!(select(&db, None, 8)?.unwrap().0, "0000");
+        Ok(())
+    }
+
     #[test]
     fn saved_opening_order_only_prioritizes_unseen_opening_cards() -> Result<()> {
         let db = Connection::open_in_memory()?;

@@ -143,7 +143,7 @@ impl Writer {
             deadline,
             claim: claim.clone(),
             apply: Box::new(move |db, timely| {
-                let result = if timely && !send.is_closed() {
+                let result = if timely {
                     apply(db)
                 } else {
                     Err(Unavailable.into())

@@ -1,4 +1,7 @@
-use crate::chess::{self, Route};
+use crate::{
+    chess::{self, Route},
+    scanner::ReferenceAnswer,
+};
 use anyhow::{Context, Result, ensure};
 use pgn_reader::shakmaty::Position;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -409,12 +412,6 @@ pub fn apply_tactic(db: &Connection, plan: &TacticPlan) -> Result<String> {
         ],
     )?;
     Ok(plan.id.clone())
-}
-
-pub struct ReferenceAnswer {
-    pub repertoire_id: String,
-    pub answer_version: String,
-    pub moves: Vec<String>,
 }
 
 pub fn answers_at(db: &Connection, position: &str, color: &str) -> Result<Vec<ReferenceAnswer>> {

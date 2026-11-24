@@ -1,3 +1,5 @@
+CREATE INDEX opening_position_lookup ON cards(repertoire_id,position_id,quarantined) WHERE kind='opening';
+
 CREATE TABLE prepared_queue_state (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   ready INTEGER NOT NULL CHECK (ready IN (0,1)),

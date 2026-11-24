@@ -1,4 +1,4 @@
-use crate::{catalog::ReferenceAnswer, chess};
+use crate::chess;
 use anyhow::Result;
 use pgn_reader::shakmaty::Position;
 use serde::Serialize;
@@ -25,6 +25,12 @@ pub struct MissedCaptureFound {
 pub struct Findings {
     pub mismatches: Vec<RepertoireMismatch>,
     pub captures: Vec<MissedCaptureFound>,
+}
+
+pub struct ReferenceAnswer {
+    pub repertoire_id: String,
+    pub answer_version: String,
+    pub moves: Vec<String>,
 }
 
 /// Compare a game against the active replies supplied by the opening catalog.

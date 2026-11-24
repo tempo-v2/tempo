@@ -66,13 +66,11 @@ pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
     let NextState::Select { previous_kind } = study_store::begin_next(&tx, &input)? else {
         return study_store::current(&tx);
     };
-    anyhow::ensure!(queue_store::place_deferred(&tx)?, Preparing);
+    anyhow::ensure!(queue_store::prepared(&tx)?, Preparing);
+    queue_store::place_deferred(&tx)?;
     let selected = match queue_store::committed_head(&tx)? {
         Some(card) => Some(card),
-        None => {
-            anyhow::ensure!(queue_store::prepared(&tx)?, Preparing);
-            queue_store::select(&tx, previous_kind.as_deref(), Utc::now().timestamp())?
-        }
+        None => queue_store::select(&tx, previous_kind.as_deref(), Utc::now().timestamp())?,
     };
     study_store::issue(
         &tx,
@@ -93,6 +91,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn studied_commands_do_not_read_games_or_live_rank() -> Result<()> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let mut db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("game_pipeline.sql"),
+            include_str!("prepared_queue.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        db.execute("INSERT INTO metadata VALUES ('fixture')", [])?;
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2500)
+             INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
+             SELECT printf('unavailable%04d',i),'opening','', 'white','unused','unused','[]',1 FROM n",
+        )?;
+        db.execute(
+            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+            VALUES ('a','tactic','Title','white',?1,'a','[\"e2e4\"]')",
+            ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
+        )?;
+        while !queue_store::seed_batch(&mut db)? {}
+        db.flush_prepared_statement_cache();
+        db.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "games" | "jobs" | "mismatches" | "missed_captures" | "opening_order",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }));
+        let review = next(
+            &mut db,
+            Next {
+                after: None,
+                dataset: None,
+            },
+        )?
+        .unwrap();
+        assert_eq!(review.title, "Title");
+        let accepted = answer(
+            &mut db,
+            Answer {
+                attempt: review.attempt,
+                dataset: review.dataset,
+                played: Some("e2e4".into()),
+            },
+        )?;
+        assert_eq!(serde_json::to_value(accepted)?["rating"], "Good");
+        Ok(())
+    }
+
+    #[test]
     fn accepted_again_survives_an_unprepared_queue_and_places_once() -> Result<()> {
         let mut db = Connection::open_in_memory()?;
         for schema in [
@@ -110,7 +162,7 @@ mod tests {
              VALUES ('a','tactic','First','white',?1,'a','[\"e2e4\"]')",
             ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
         )?;
-        db.execute("INSERT INTO deck VALUES (1,'a')", [])?;
+        study_store::issue(&db, Some(("a", "tactic")))?;
         let review = next(
             &mut db,
             Next {

@@ -28,6 +28,15 @@ export function More({ list }) {
     {list.more && <button disabled={list.busy} onClick={() => list.load(true)}>Load more</button>}</>;
 }
 
+function downloadOpeningDraft(draft) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(draft)], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "tempo-opening.json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 const initial = { fen: new Chess().fen(), moves: [], start_at: 0 };
 
 export function Openings({ fromGame, onSaved, sounds }) {
@@ -50,6 +59,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const [ply, setPly] = useState(0);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [offlineDraft, setOfflineDraft] = useState(null);
   const [busy, setBusy] = useState(false);
   const game = position(draft);
   const legal = game.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? ""));
@@ -70,14 +80,21 @@ export function Openings({ fromGame, onSaved, sounds }) {
     setError("");
     setNotice("");
     setBusy(true);
+    setOfflineDraft(null);
+    const request = {
+      name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at,
+      destination: destination === "new" ? { kind: "new" } : { kind: "existing", repertoire_id: destination },
+    };
     try {
-      await api("openings", { name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at,
-        destination: destination === "new" ? { kind: "new" } : { kind: "existing", repertoire_id: destination } });
+      await api("openings", request);
       setNotice("Opening saved. Its responses are ready in Study.");
       onSaved();
       await list.load();
       api("openings/repertoires").then(setRepertoires).catch((error) => setError(error.message));
-    } catch (error) { setError(error.message); }
+    } catch (error) {
+      setError(error.message);
+      if (error.code === "content_over_budget") setOfflineDraft(request);
+    }
     finally { setBusy(false); }
   }
   return <section aria-label="Openings"><h1>Openings</h1>
@@ -132,6 +149,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
         </form>}
         {notice && <p role="status">{notice}</p>}
         {error && <p className="error" role="alert">{error}</p>}
+        {offlineDraft && <button onClick={() => downloadOpeningDraft(offlineDraft)}>Download for offline import</button>}
         <details><summary>Start from PGN or FEN</summary>
           <textarea aria-label="Opening PGN or FEN" value={startingText} onChange={(e) => setStartingText(e.target.value)} />
           <label>Upload opening PGN<input type="file" accept=".pgn,text/plain" onChange={(e) => fileText(e, setStartingText, setError)} /></label>

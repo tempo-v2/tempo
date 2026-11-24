@@ -1,13 +1,12 @@
 use crate::{
-    db::Database,
-    game_pipeline, games,
+    game_pipeline,
+    job_store::{self, JobReads},
     providers::{self, Provider},
     writer::Writer,
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use reqwest::blocking::Client;
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
@@ -34,12 +33,12 @@ pub struct JobView {
     pub error: Option<String>,
 }
 
-struct Job {
-    id: i64,
-    provider: String,
-    username: String,
-    operation: String,
-    cursor: Option<String>,
+pub struct Job {
+    pub id: i64,
+    pub provider: String,
+    pub username: String,
+    pub operation: String,
+    pub cursor: Option<String>,
 }
 
 pub fn valid_user(user: &str) -> Result<&str> {
@@ -55,156 +54,17 @@ pub fn valid_user(user: &str) -> Result<&str> {
     Ok(user)
 }
 
-pub fn settings(db: &Connection) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut q = db.prepare("SELECT provider,username FROM settings")?;
-    let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
-pub fn save_settings(
-    db: &mut Connection,
-    names: std::collections::BTreeMap<String, String>,
-) -> Result<()> {
-    let tx = db.transaction()?;
-    for (provider, name) in names {
-        ensure!(Provider::named(&provider).is_some(), "unknown provider");
-        if name.trim().is_empty() {
-            tx.execute("DELETE FROM settings WHERE provider=?1", [&provider])?;
-        } else {
-            tx.execute("INSERT INTO settings VALUES (?1,?2) ON CONFLICT(provider) DO UPDATE SET username=excluded.username",
-                params![provider,valid_user(&name)?])?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-pub fn views(db: &Connection) -> Result<Vec<JobView>> {
-    let mut q = db.prepare(
-        "SELECT id,provider,operation,status,added,existing,rejected,found,error FROM jobs
-        WHERE id IN (SELECT id FROM jobs ORDER BY id DESC LIMIT 12)
-           OR id IN (SELECT id FROM jobs WHERE status='failed' ORDER BY id DESC LIMIT 12)
-        ORDER BY id DESC",
-    )?;
-    let rows = q.query_map([], |r| {
-        Ok(JobView {
-            id: r.get(0)?,
-            provider: r.get(1)?,
-            operation: r.get(2)?,
-            status: r.get(3)?,
-            added: r.get(4)?,
-            existing: r.get(5)?,
-            rejected: r.get(6)?,
-            found: r.get(7)?,
-            error: r.get(8)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
-pub fn start(db: &mut Connection, input: StartJob, upload: Option<&str>) -> Result<i64> {
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let n: usize = tx.query_row(
-        "SELECT count(*) FROM jobs WHERE status IN ('queued','running') AND parent_id IS NULL AND operation!='publish'",
-        [],
-        |r| r.get(0),
-    )?;
-    ensure!(n < 4, "the import queue is full");
-    let username = match (input.provider.as_str(), input.operation.as_str()) {
-        ("pgn", "upload") => {
-            ensure!(upload.is_some(), "enter PGN up to 64 MiB");
-            valid_user(input.username.as_deref().unwrap_or(""))?.to_owned()
-        }
-        ("archive", "scan") => String::new(),
-        (name, "all" | "new") if Provider::named(name).is_some() => tx
-            .query_row(
-                "SELECT username FROM settings WHERE provider=?1",
-                [&input.provider],
-                |r| r.get(0),
-            )
-            .optional()?
-            .context("save the username in Settings first")?,
-        _ => bail!("unknown import operation"),
-    };
-    let existing = if input.provider != "pgn" {
-        tx.query_row("SELECT id FROM jobs WHERE provider=?1 AND operation=?2 AND username=?3 AND status IN ('queued','running') LIMIT 1",
-            params![input.provider,input.operation,username],|r|r.get::<_,i64>(0)).optional()?
-    } else {
-        None
-    };
-    if let Some(job) = existing {
-        return Ok(job);
-    }
-    tx.execute("INSERT INTO jobs(provider,username,operation,upload_file,status) VALUES (?1,?2,?3,?4,'queued')",
-        params![input.provider,username,input.operation,upload])?;
-    let id = tx.last_insert_rowid();
-    tx.commit()?;
-    Ok(id)
-}
-
-pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let user_batch = tx
-        .query_row(
-            "SELECT parent_id IS NULL AND operation!='publish' FROM jobs WHERE id=?1",
-            [id],
-            |r| r.get::<_, bool>(0),
-        )
-        .optional()?
-        .unwrap_or(false);
-    if user_batch {
-        let n: usize = tx.query_row(
-            "SELECT count(*) FROM jobs WHERE status IN ('queued','running') AND parent_id IS NULL AND operation!='publish'",
-            [], |r| r.get(0),
-        )?;
-        ensure!(n < 4, "the import queue is full");
-    }
-    ensure!(
-        tx.execute(
-            "UPDATE jobs SET status='queued',error=NULL WHERE id=?1 AND status='failed'",
-            [id]
-        )? == 1,
-        "the job is not waiting for retry"
-    );
-    tx.commit()?;
-    Ok(())
-}
-
-fn next(db: &mut Connection) -> Result<Option<Job>> {
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let job = tx.query_row("SELECT id,provider,username,operation,cursor FROM jobs WHERE status='queued' ORDER BY id LIMIT 1",[],
-        |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,cursor:r.get(4)? })).optional()?;
-    if let Some(job) = &job {
-        tx.execute("UPDATE jobs SET status='running' WHERE id=?1", [job.id])?;
-    }
-    tx.commit()?;
-    Ok(job)
-}
-
 pub fn worker(path: &Path, writer: Writer) -> Result<()> {
-    let db = Database::read(path)?;
-    while writer.background(|db| {
-        Ok(db.execute(
-            "UPDATE jobs SET status='queued' WHERE id IN
-            (SELECT id FROM jobs WHERE status='running' ORDER BY id LIMIT 128)",
-            [],
-        )?)
-    })? == 128
-    {}
+    let db = JobReads::open(path)?;
+    while writer.background(job_store::recover_running)? == 128 {}
     let client = Provider::client()?;
     loop {
-        match writer.background(next) {
+        match writer.background(job_store::next) {
             Ok(Some(job)) => {
                 if let Err(error) = run(path, &db, &writer, &client, &job) {
                     let message = error.to_string();
                     let id = job.id;
-                    writer.background(move |db| {
-                        db.execute(
-                            "UPDATE jobs SET status='failed',error=?2 WHERE id=?1",
-                            params![id, message],
-                        )?;
-                        Ok(())
-                    })?;
+                    writer.background(move |db| job_store::fail(db, id, &message))?;
                 }
             }
             Ok(None) => std::thread::sleep(Duration::from_secs(1)),
@@ -216,8 +76,8 @@ pub fn worker(path: &Path, writer: Writer) -> Result<()> {
     }
 }
 
-fn scan_game(db: &Connection, writer: &Writer, job: i64, game: &str) -> Result<()> {
-    let Some(found) = game_pipeline::scan_findings(db, job, game)? else {
+fn scan_game(db: &JobReads, writer: &Writer, job: i64, game: &str) -> Result<()> {
+    let Some(found) = db.findings(job, game)? else {
         return Ok(());
     };
     let game = game.to_owned();
@@ -246,16 +106,12 @@ fn scan_game(db: &Connection, writer: &Writer, job: i64, game: &str) -> Result<(
     writer.background(move |db| game_pipeline::finish_scan(db, job, &game))
 }
 
-fn run(path: &Path, db: &Connection, writer: &Writer, client: &Client, job: &Job) -> Result<()> {
+fn run(path: &Path, db: &JobReads, writer: &Writer, client: &Client, job: &Job) -> Result<()> {
     let id = job.id;
     let mut upload_file = None;
     let checkpoint = match (job.provider.as_str(), job.operation.as_str()) {
         ("pgn", "upload") => {
-            let (upload, legacy): (Option<String>, Option<String>) = db.query_row(
-                "SELECT upload_file,payload FROM jobs WHERE id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let (upload, legacy) = db.upload(id)?;
             let offset = job
                 .cursor
                 .as_deref()
@@ -285,7 +141,7 @@ fn run(path: &Path, db: &Connection, writer: &Writer, client: &Client, job: &Job
         ("archive", "scan") => {
             let mut cursor = job.cursor.clone().unwrap_or_default();
             loop {
-                let games = games::archive(db, &cursor, 25)?;
+                let games = db.archive(&cursor)?;
                 if games.is_empty() {
                     break;
                 }
@@ -299,7 +155,7 @@ fn run(path: &Path, db: &Connection, writer: &Writer, client: &Client, job: &Job
         }
         ("archive", operation @ ("scan_new" | "publish")) => {
             loop {
-                let games = game_pipeline::pending_games(db, id)?;
+                let games = db.pending_games(id)?;
                 if games.is_empty() {
                     break;
                 }
@@ -307,7 +163,7 @@ fn run(path: &Path, db: &Connection, writer: &Writer, client: &Client, job: &Job
                     if operation == "scan_new" {
                         scan_game(db, writer, id, &game)?;
                     } else {
-                        let plans = game_pipeline::publication_batch(db, &game)?;
+                        let plans = db.publication_batch(&game)?;
                         let done = writer.background(move |db| {
                             game_pipeline::publish_batch(db, id, &game, &plans)
                         })?;
@@ -330,16 +186,7 @@ fn run(path: &Path, db: &Connection, writer: &Writer, client: &Client, job: &Job
     };
     let provider = job.provider.clone();
     let username = job.username.to_ascii_lowercase();
-    writer.background(move |db| {
-        let tx = db.transaction()?;
-        if let Some(through) = checkpoint {
-            tx.execute("INSERT INTO provider_checkpoint VALUES (?1,?2,?3) ON CONFLICT(provider,username) DO UPDATE SET through_at=max(through_at,excluded.through_at)",
-                params![provider, username, through])?;
-        }
-        tx.execute("UPDATE jobs SET status='done',payload=NULL,upload_file=NULL,error=NULL WHERE id=?1", [id])?;
-        tx.commit()?;
-        Ok(())
-    })?;
+    writer.background(move |db| job_store::complete(db, id, &provider, &username, checkpoint))?;
     if let Some(file) = upload_file {
         crate::uploads::remove(path, &file);
     }
@@ -347,13 +194,7 @@ fn run(path: &Path, db: &Connection, writer: &Writer, client: &Client, job: &Job
 }
 
 fn save_cursor(writer: &Writer, id: i64, cursor: String, rejected: usize) -> Result<()> {
-    writer.background(move |db| {
-        db.execute(
-            "UPDATE jobs SET cursor=?2,rejected=rejected+?3 WHERE id=?1",
-            params![id, cursor, rejected],
-        )?;
-        Ok(())
-    })
+    writer.background(move |db| job_store::save_cursor(db, id, &cursor, rejected))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -364,7 +205,7 @@ struct ProviderCursor {
 }
 
 fn fetch_provider(
-    db: &Connection,
+    db: &JobReads,
     writer: &Writer,
     client: &reqwest::blocking::Client,
     job: &Job,
@@ -375,12 +216,7 @@ fn fetch_provider(
         Some(json) => serde_json::from_str::<ProviderCursor>(json)?,
         None => {
             let previous = if job.operation == "new" {
-                db.query_row(
-                    "SELECT through_at FROM provider_checkpoint WHERE provider=?1 AND username=?2",
-                    params![job.provider, user],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
+                db.checkpoint(&job.provider, &user)?
             } else {
                 None
             };
@@ -408,23 +244,4 @@ fn fetch_provider(
         save_cursor(writer, id, serde_json::to_string(&cursor)?, rejected)?;
     }
     Ok(cursor.through)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recent_job_remains_visible_alongside_prior_failures() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        db.execute_batch(include_str!("schema.sql"))?;
-        for _ in 0..12 {
-            db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('pgn','Learner','upload','failed')", [])?;
-        }
-        db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('archive','','scan','queued')", [])?;
-        let jobs = views(&db)?;
-        assert_eq!(jobs[0].status, "queued");
-        assert_eq!(jobs.iter().filter(|job| job.status == "failed").count(), 12);
-        Ok(())
-    }
 }

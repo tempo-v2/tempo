@@ -3,6 +3,7 @@ mod chess;
 mod db;
 mod game_pipeline;
 mod games;
+mod job_store;
 mod jobs;
 mod learning;
 mod legacy;
@@ -272,7 +273,7 @@ async fn read_game(State(db): State<App>, UrlPath(id): UrlPath<String>) -> ApiRe
     with_db(db, move |c| games::read(c, &id)).await
 }
 async fn job_views(State(db): State<App>) -> ApiResult {
-    with_db(db, move |c| jobs::views(c)).await
+    with_db(db, move |c| job_store::views(c)).await
 }
 async fn start_job(State(db): State<App>, Json(mut input): Json<jobs::StartJob>) -> ApiResult {
     if let Some(pgn) = input.pgn.take() {
@@ -283,13 +284,16 @@ async fn start_job(State(db): State<App>, Json(mut input): Json<jobs::StartJob>)
         let database = db.database.clone();
         let mut staged = prepare(move || uploads::stage(&database, &pgn)).await?;
         return write_db(db, move |c| {
-            let id = jobs::start(c, input, Some(staged.id()))?;
+            let id = job_store::start(c, input, Some(staged.id()))?;
             staged.commit();
             Ok(json!({"id":id}))
         })
         .await;
     }
-    write_db(db, move |c| Ok(json!({"id":jobs::start(c,input,None)?}))).await
+    write_db(db, move |c| {
+        Ok(json!({"id":job_store::start(c,input,None)?}))
+    })
+    .await
 }
 async fn retry_job(
     State(db): State<App>,
@@ -297,21 +301,21 @@ async fn retry_job(
     Json(_): Json<Value>,
 ) -> ApiResult {
     write_db(db, move |c| {
-        jobs::retry(c, id)?;
+        job_store::retry(c, id)?;
         Ok(json!({"id":id}))
     })
     .await
 }
 async fn settings(State(db): State<App>) -> ApiResult {
-    with_db(db, move |c| jobs::settings(c)).await
+    with_db(db, move |c| job_store::settings(c)).await
 }
 async fn save_settings(
     State(db): State<App>,
     Json(names): Json<std::collections::BTreeMap<String, String>>,
 ) -> ApiResult {
     write_db(db, move |c| {
-        jobs::save_settings(c, names)?;
-        jobs::settings(c)
+        job_store::save_settings(c, names)?;
+        job_store::settings(c)
     })
     .await
 }
