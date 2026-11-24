@@ -4,7 +4,8 @@ import "@tempo-v2/core-components/styles.css";
 import "./style.css";
 import { Study } from "./study.jsx";
 import { Openings, Tactics } from "./library.jsx";
-import { Games, Settings } from "./games.jsx";
+import { Games } from "./games.jsx";
+import { Settings } from "./settings.jsx";
 import { createBoardSounds } from "./sounds.js";
 
 const tabs = ["Study", "Openings", "Tactics", "Games", "Settings"];

@@ -54,6 +54,14 @@ pub fn uci(m: Move) -> String {
     UciMove::from_move(m, MODE).to_string()
 }
 
+pub fn answer_matches(fen: &str, accepted: &[String], played: Option<&str>) -> Result<bool> {
+    let Some(played) = played else {
+        return Ok(false);
+    };
+    let board = position(fen)?;
+    Ok(accepted.contains(&uci(parse_move(&board, played)?)))
+}
+
 pub fn legal(board: &Chess) -> Vec<String> {
     board.legal_moves().into_iter().map(uci).collect()
 }
