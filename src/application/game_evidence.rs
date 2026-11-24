@@ -17,10 +17,10 @@ use tempo_learning::{
     AssessmentInput, AssessmentSource, DailyLearning, GameReviewEffect, LearningState,
 };
 use tempo_store::{
-    AcceptedGames, AssessmentRecord, Commit, ComparedGame,
-    ComparedRelevance, EncounterRepair, GameChoice, GameChoiceTarget, GameChoices,
-    GameComparisonBasis, GameEncounters, GameFailureKey, GameHistoryEntry, GameObservation,
-    GameReceipt, GameRecord, GameSummary, PgnTiming, RepertoireDisagreement, StoreError, Write,
+    AcceptedGames, AssessmentRecord, Commit, ComparedGame, ComparedRelevance, EncounterRepair,
+    GameChoice, GameChoiceTarget, GameChoices, GameComparisonBasis, GameEncounters, GameFailureKey,
+    GameHistoryEntry, GameObservation, GameReceipt, GameRecord, GameSummary, PgnTiming,
+    RepertoireDisagreement, StoreError, Write,
 };
 use tempo_types::{DatasetId, Grade, TargetId};
 
@@ -182,39 +182,61 @@ impl Tempo {
         if let Some(report) = self.replay_game(&request.dataset_id, &request.command_id, &key)? {
             return Ok(report);
         }
+        if self.game_dataset()? != request.dataset_id {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
+        }
+        let learner = request.learner.trim().to_lowercase();
+        if learner.is_empty() || learner.len() > 100 {
+            return Err(invalid("Choose the learner with their exact player name."));
+        }
         let records =
             parse_played_games(&request.pgn).map_err(|error| domain("invalid_game", error))?;
-        let fetched = records.len();
+        let mut report = GameReport {
+            fetched: records.len(),
+            ..GameReport::default()
+        };
         let at = self.components.clock.now().unix_ms;
-        let games = records
-            .into_iter()
-            .map(|record| {
-                let played = record.map_err(|error| error.to_string())?;
-                let mut game = uploaded_record(&played, at)?;
-                if let Some(url) = source_url(&played) {
-                    if let Some(verified) = self
-                        .store
-                        .verified_game(&request.dataset_id, &url, &game.mainline_signature)
-                        .map_err(|error| error.to_string())?
-                    {
-                        game = verified;
+        let mut games = Vec::new();
+        for (index, record) in records.into_iter().enumerate() {
+            let (game, url) = match record
+                .map_err(|error| error.to_string())
+                .and_then(|played| {
+                    let game = uploaded_record(&played, at)?;
+                    if learner_side(&game, &learner).is_none() {
+                        return Err("The learner does not identify exactly one player.".into());
                     }
+                    Ok((game, source_url(&played)))
+                }) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    report.errors.push(format!("Game {}: {error}", index + 1));
+                    continue;
                 }
-                Ok((game, played))
-            })
-            .collect();
-        self.compare_games(
+            };
+            let verified = match url {
+                Some(url) => {
+                    self.store
+                        .verified_game(&request.dataset_id, &url, &game.mainline_signature)?
+                }
+                None => None,
+            };
+            games.push(verified.unwrap_or(game));
+        }
+        let reply =
+            serde_json::to_string(&report).map_err(|error| domain("invalid_game_report", error))?;
+        let stored = self.store.apply_manual_games(
             &request.dataset_id,
-            (&request.command_id, &key),
-            &request.learner,
-            games,
-            GameReport {
-                fetched,
-                ..GameReport::default()
+            &games,
+            GameReceipt {
+                id: &request.command_id,
+                fingerprint: &key,
+                report: &reply,
             },
-            None,
-            None,
-        )
+        )?;
+        report_from_receipt(stored)
     }
 
     /// Replay a previously accepted choice with the original fingerprint.
@@ -225,7 +247,10 @@ impl Tempo {
         let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.choose_game_correction");
         check_id(&request.command_id)?;
         if self.game_dataset()? != request.dataset_id {
-            return Err(AppError::new("stale_dataset", "The active dataset changed."));
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
         }
         let fingerprint = fingerprint("choose_correction", &request)?;
         if let Some(report) =
