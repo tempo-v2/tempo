@@ -37,6 +37,5 @@ pub mod game_evidence;
 pub mod game_backfill;
 pub mod game_model;
 
-mod maia;
 
 pub mod local_runtime;

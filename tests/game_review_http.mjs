@@ -63,6 +63,26 @@ try {
   const address = { dataset_id, source: row.source, game_id: row.game_id, learner: row.learner, repertoire_id: italian };
   const review = (changes = {}) => post("games/review", { ...address, ...changes });
   const before = snapshot();
+  for (const method of ["GET", "POST"]) {
+    const model = await fetch(origin + "/api/games/model", method === "GET" ? { method } : {
+      method, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dataset_id }),
+    });
+    assert.equal(model.status, 410);
+    assert.equal((await model.json()).code, "retired_feature");
+  }
+  const reprocess = await fetch(origin + "/api/games/reprocess", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      dataset_id, command_id: "previously-undelivered", learner: row.learner,
+      from_ms: Date.UTC(2026, 10, 17), to_ms: Date.UTC(2026, 10, 18),
+    }),
+  });
+  assert.equal(reprocess.status, 410);
+  assert.deepEqual(await reprocess.json(), {
+    status: "error", code: "retired_feature", retryable: false,
+    message: "This reprocess request was not accepted. Reprocessing saved games has been retired.",
+    command_id: "previously-undelivered", dataset_id,
+  });
   const italianReview = await review();
   assert.equal(italianReview.status, "review");
   assert.equal(italianReview.positions.length, 9);

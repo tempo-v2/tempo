@@ -1646,7 +1646,7 @@ fn combined_books_match_italian_play_and_repair_an_unstudied_position_at_zero_qu
 }
 
 #[test]
-fn a_saved_choice_stays_resolved_after_reprocessing_and_reopen() {
+fn a_saved_choice_stays_resolved_after_duplicate_import_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let today = Arc::new(AtomicI32::new(20_004));
     let db = directory.path().join("choices.sqlite");
@@ -1692,18 +1692,9 @@ fn a_saved_choice_stays_resolved_after_reprocessing_and_reopen() {
     let repair = study(&mut app, json!({"command":"next"}));
     assert_eq!(repair["target_id"], targets[0]["target_id"]);
     assert_eq!(repair_context(&app, &repair)["played_san"], "c4");
-    let start = 20_002_u64 * 86_400_000;
-    let reprocessed = app
-        .reprocess_games(
-            serde_json::from_value(json!({
-                "command_id":"saved-window","dataset_id":"opening-proof","learner":"learner",
-                "from_ms":start, "to_ms":start + 86_400_000
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    assert_eq!(reprocessed.fetched, 1);
-    assert!(reprocessed.results[0].summary.choices.is_empty());
+    let duplicate = date_only_import(&mut app, "same-game-before-reopen", "2024.10.06", "1. c4 e5");
+    assert_eq!(duplicate["results"][0]["effect"], "already_addressed");
+    assert!(duplicate["results"][0].get("choices").is_none());
     let store = SqliteStore::open(&db).unwrap();
     let dataset = app.snapshot().unwrap().dataset;
     let relevance = store.game_relevance(&dataset, "").unwrap();

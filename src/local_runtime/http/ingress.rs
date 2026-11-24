@@ -18,7 +18,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     time::{Duration, Instant},
 };
@@ -251,14 +251,6 @@ impl Server {
                 }
             })?;
         Ok(Self(receive))
-    }
-
-    pub(super) fn try_recv(&self) -> io::Result<Option<Request>> {
-        match self.0.try_recv() {
-            Ok(request) => Ok(Some(request)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(io::Error::other("Tempo HTTP ingress stopped")),
-        }
     }
 
     pub(super) fn recv_timeout(&self, wait: Duration) -> io::Result<Option<Request>> {

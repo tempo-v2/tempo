@@ -1,4 +1,4 @@
-//! Answer-safe game views and immutable legacy refresh replay.
+//! Answer-safe game views and immutable legacy command replay.
 
 use crate::adapters::public_games::Provider;
 use crate::{AppError, Tempo};
@@ -96,6 +96,31 @@ pub(crate) fn check_id(id: &str) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+impl ReprocessGames {
+    /// Resolve the previous synchronous result by its unchanged command fingerprint.
+    pub(crate) fn replay(self, app: &Tempo) -> Result<(u16, Value), AppError> {
+        check_id(&self.command_id)?;
+        if app.game_dataset()? != self.dataset_id {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
+        }
+        let key = fingerprint("reprocess", &self)?;
+        if let Some(report) = app.replay_game(&self.dataset_id, &self.command_id, &key)? {
+            return Ok((200, json!(report)));
+        }
+        Ok((
+            410,
+            json!({
+                "status": "error", "code": "retired_feature",
+                "message": "This reprocess request was not accepted. Reprocessing saved games has been retired.",
+                "retryable": false, "dataset_id": self.dataset_id, "command_id": self.command_id,
+            }),
+        ))
+    }
 }
 
 impl GameRefresh {

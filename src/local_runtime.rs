@@ -81,14 +81,8 @@ pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
     let _diagnostics = crate::diagnostics::init(database);
     let _startup = crate::diagnostics::Span::new("runtime.startup");
     let mut app = open(database)?;
-    app.reconcile_legacy_game_requests()?;
-    let encounters = app.reconcile_choice_encounters()?;
-    eprintln!(
-        "Choice encounters examined={}, repaired={}, unresolved={}",
-        encounters.examined, encounters.repaired, encounters.unresolved
-    );
     drop(_startup);
-    http::serve(&mut app, &SqliteStore::open_read_only(database)?, database, ui, port)
+    http::serve(&mut app, database, ui, port)
 }
 
 fn stored_profile(store: &SqliteStore) -> LocalResult<String> {

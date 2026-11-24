@@ -162,7 +162,7 @@ Historical Games backfill has ended. Saved games, previously recognized
 player accounts, completed window effects and accepted correction provenance
 remain. Recovery of an original accepted Start or Retry reports its archived
 windows. Pending windows are stopped. Manual PGN import remains available in
-Games, and stored-game reprocessing keeps its original reset rules.
+Games. Previously accepted reprocessing commands can still replay their recorded results.
 
 The latest 200 eligible games supply personal position counts. A confirmed
 opponent gap opens the current repertoire at the position after the reply.
@@ -170,13 +170,3 @@ Play a legal response and choose Save response. Tempo previews the addition
 against the current document and only signs changes that preserve existing
 answers and learning. After saving, Tempo loads the next gap. Retained
 source PGNs are required to confirm authored replies and endpoints.
-
-To enable the local Rapid 1500 model, run `sh tempo/tools/maia/setup.sh PATH`
-with `PATH` set to the absolute path of a `maia` directory next to the
-active SQLite file. This uses Python 3.12, the pinned Maia-2 package, and
-its checksum-verified Rapid checkpoint. Choose Analyze Maia probabilities
-in Games. Inference persists full distributions as it progresses and can
-reuse them after interruption. An unavailable probability stays unknown.
-The displayed local coverage sums authored replies that have a saved learner
-response. Study also uses a separate modeled reach across authored routes
-where personal exposure is absent.

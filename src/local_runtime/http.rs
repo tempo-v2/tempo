@@ -8,8 +8,8 @@ use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
     game_backfill::{BackfillRequest, BackfillRetry},
-    game_evidence::{GameImport, GameRefresh},
-    game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
+    game_evidence::{GameImport, GameRefresh, ReprocessGames},
+    game_model::{AuthoringSurface, GapRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use hyper::{
@@ -26,16 +26,14 @@ use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tempo_store::SqliteStore;
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn serve(
     app: &mut Tempo,
-    model_reader: &SqliteStore,
     database: &Path,
     ui: &Path,
     port: u16,
@@ -58,44 +56,11 @@ pub(super) fn serve(
             "listen_port": surfaces.address.rsplit(':').next().and_then(|port| port.parse::<u16>().ok())
         }),
     );
-    let mut games = Games {
-        model: GameModel::new(database)?,
-    };
-    let mut model_marker = None;
-    let mut next_model_check = Instant::now();
     loop {
-        if let Some(request) = server.try_recv()? {
-            if let Err(error) = respond(app, &mut games, request) {
-                eprintln!("Tempo HTTP: {error}");
-            }
-            continue;
-        }
-        if Instant::now() >= next_model_check {
-            let mut trace = crate::diagnostics::Span::new("loop.model_schedule");
-            let scheduled = (|| -> LocalResult<()> {
-                let marker = model_reader.game_comparison_marker()?;
-                if model_marker.as_ref() != Some(&marker) {
-                    games.model.project_cached(marker.0.clone())?;
-                    model_marker = Some(marker);
-                }
-                Ok(())
-            })();
-            if let Err(error) = scheduled {
-                eprintln!("Tempo model scheduling: {error}");
-                trace.set_outcome("error");
-                crate::diagnostics::emit(
-                    "runtime.error",
-                    serde_json::json!({
-                        "operation": "loop.model_schedule", "error_code": "model_scheduling_failed"
-                    }),
-                );
-            }
-            next_model_check = Instant::now() + Duration::from_millis(250);
-        }
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
-        if let Err(error) = respond(app, &mut games, request) {
+        if let Err(error) = respond(app, request) {
             eprintln!("Tempo HTTP: {error}");
             crate::diagnostics::emit(
                 "runtime.error",
@@ -105,10 +70,6 @@ pub(super) fn serve(
             );
         }
     }
-}
-
-struct Games {
-    model: GameModel,
 }
 
 #[derive(serde::Deserialize)]
@@ -367,7 +328,6 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
 
 fn respond(
     app: &mut Tempo,
-    games: &mut Games,
     mut request: Request,
 ) -> LocalResult<()> {
     if !request.claim() {
@@ -392,7 +352,7 @@ fn respond(
         },
     );
     trace.field("route", diagnostic_route(request.url()));
-    let result = respond_inner(app, games, request);
+    let result = respond_inner(app, request);
     trace.set_outcome(if result.is_ok() {
         "returned"
     } else {
@@ -403,7 +363,6 @@ fn respond(
 
 fn respond_inner(
     app: &mut Tempo,
-    games: &mut Games,
     request: Request,
 ) -> LocalResult<()> {
     let surface = request.surface();
@@ -509,6 +468,29 @@ fn respond_inner(
             body("application/json; charset=utf-8", json_bytes(&retired)?)
                 .with_status_code(StatusCode::GONE),
         )?;
+    } else if matches!(request.method(), &Method::GET | &Method::POST)
+        && request.url() == "/api/games/model"
+    {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Games model analysis has been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE)
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
+    } else if request.method() == &Method::POST && request.url() == "/api/games/reprocess" {
+        let (status, reply) = command::<ReprocessGames>(&request, MAX_COMMAND_BYTES)
+            .and_then(|intent| intent.replay(app))
+            .unwrap_or_else(|error| (400, serde_json::json!(ErrorView::for_content(error))));
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
     } else if request.method() == &Method::GET && request.url() == "/api/games/job" {
         let retired = serde_json::json!({
             "status": "error", "code": "retired_feature",
@@ -567,8 +549,6 @@ fn respond_inner(
             | "/api/games/library"
             | "/api/games/import"
             | "/api/games/choose"
-            | "/api/games/reprocess"
-            | "/api/games/model"
             | "/api/games/coverage/starting-line"
             | "/api/games/coverage/starting-line/save"
             | "/api/games/gaps"
@@ -587,12 +567,6 @@ fn respond_inner(
                     .and_then(|r| app.game_library(r)),
             ),
             (&Method::GET, "/api/games") => (200, app.game_history()),
-            (&Method::GET, "/api/games/model") => (200, games.model.status(app)),
-            (&Method::POST, "/api/games/model") => (
-                202,
-                command::<ModelRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.model.start(app, intent)),
-            ),
             (&Method::POST, "/api/games/coverage/starting-line") => (
                 200,
                 command::<crate::application::PreviousCoverageLineRequest>(
@@ -704,12 +678,6 @@ fn respond_inner(
                 200,
                 command::<crate::game_evidence::ChooseGameCorrection>(&request, MAX_COMMAND_BYTES)
                     .and_then(|intent| app.choose_game_correction(intent))
-                    .map(|report| serde_json::json!(report)),
-            ),
-            (&Method::POST, "/api/games/reprocess") => (
-                200,
-                command::<crate::game_evidence::ReprocessGames>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| app.reprocess_games(intent))
                     .map(|report| serde_json::json!(report)),
             ),
             _ => (

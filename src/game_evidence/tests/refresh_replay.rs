@@ -104,3 +104,64 @@ fn exact_accepted_refresh_replays_after_restart_without_writing() {
     );
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
+
+#[test]
+fn exact_accepted_reprocess_replays_after_restart_without_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reprocess.sqlite");
+    let mut store = SqliteStore::create(
+        &path,
+        DatasetId::from("dataset-a"),
+        Catalog::default(),
+        DailyLearning::default().settings(),
+    )
+    .unwrap();
+    let intent = |id: &str, dataset: &str| ReprocessGames {
+        command_id: id.into(),
+        dataset_id: DatasetId::from(dataset),
+        learner: "learner".into(),
+        from_ms: NOW - 86_400_000,
+        to_ms: NOW,
+    };
+    let request = intent("accepted", "dataset-a");
+    let saved = GameReport {
+        fetched: 1,
+        ..GameReport::default()
+    };
+    let before = store.snapshot().unwrap();
+    store
+        .commit_games(
+            Commit {
+                expected_dataset: before.dataset,
+                expected_revision: before.revision,
+                writes: vec![],
+            },
+            &[],
+            None,
+            GameReceipt {
+                id: &request.command_id,
+                fingerprint: &fingerprint("reprocess", &request).unwrap(),
+                report: &serde_json::to_string(&saved).unwrap(),
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = app(SqliteStore::open(&path).unwrap());
+    let before = reopened.snapshot().unwrap();
+    assert_eq!(request.replay(&reopened).unwrap(), (200, json!(saved)));
+    let (status, retired) = intent("undelivered", "dataset-a").replay(&reopened).unwrap();
+    assert_eq!(status, 410);
+    assert_eq!(retired["code"], "retired_feature");
+    assert_eq!(retired["command_id"], "undelivered");
+    assert_eq!(retired["dataset_id"], "dataset-a");
+
+    let mut changed = intent("accepted", "dataset-a");
+    changed.learner = "other".into();
+    assert_eq!(changed.replay(&reopened).unwrap_err().code, "store_conflict");
+    assert_eq!(
+        intent("accepted", "other-dataset").replay(&reopened).unwrap_err().code,
+        "stale_dataset"
+    );
+    assert_eq!(reopened.snapshot().unwrap(), before);
+}

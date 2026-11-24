@@ -299,55 +299,6 @@ impl Tempo {
         )
     }
 
-    pub fn reprocess_games(
-        &mut self,
-        request: crate::game_evidence::ReprocessGames,
-    ) -> Result<GameReport, AppError> {
-        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.reprocess_games");
-        check_id(&request.command_id)?;
-        let fingerprint = fingerprint("reprocess", &request)?;
-        if let Some(report) =
-            self.replay_game(&request.dataset_id, &request.command_id, &fingerprint)?
-        {
-            return Ok(report);
-        }
-        if request.to_ms <= request.from_ms || request.to_ms - request.from_ms > 31 * 86_400_000 {
-            return Err(invalid("Choose a window of at most 31 days."));
-        }
-        let games =
-            self.store
-                .games_in_window(&request.dataset_id, request.from_ms, request.to_ms)?;
-        if games.len() > 500 {
-            return Err(invalid(
-                "This window contains more than 500 games. Choose a shorter window.",
-            ));
-        }
-        let learner = request.learner.trim().to_lowercase();
-        let games: Vec<_> = games
-            .into_iter()
-            .filter(|game| {
-                [&game.white, &game.black]
-                    .into_iter()
-                    .any(|player| player.to_lowercase() == learner)
-            })
-            .map(parse_stored_game)
-            .collect();
-        let fetched = games.len();
-        self.compare_games(
-            &request.dataset_id,
-            (&request.command_id, &fingerprint),
-            &request.learner,
-            games,
-            GameReport {
-                fetched,
-                ..Default::default()
-            },
-            None,
-            None,
-            None,
-        )
-    }
-
     /// Upgrade only outstanding legacy obligations backed by stored evidence.
     /// Each game transaction can safely be replayed if startup was interrupted.
     pub fn reconcile_legacy_game_requests(&mut self) -> Result<(), AppError> {

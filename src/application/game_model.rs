@@ -1,16 +1,13 @@
 //! Read verified authored context and the model evidence applied to it.
 use super::{Tempo, content_preview::source_id};
-use crate::game_model::{AuthoringSurface, GapKind, GapRequest};
-use crate::maia::{MODEL_KEY, PROFILE_LABEL, checked_distribution};
+use crate::game_model::{
+    AuthoringSurface, GapKind, GapRequest, MODEL_KEY, PROFILE_LABEL, checked_distribution,
+};
 use crate::{AppError, app_error::domain, commands::RepertoireInput};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use tempo_chess::{
-    AuthoredRepertoire, GapDraft, LearnerColor, legal_move_labels,
-};
-use tempo_store::{
-    CoverageEditBasis, ForecastGap, ProjectionStatus,
-};
+use tempo_chess::{AuthoredRepertoire, GapDraft, LearnerColor, legal_move_labels};
+use tempo_store::{CoverageEditBasis, ForecastGap, ProjectionStatus};
 use tempo_types::{DatasetId, Revision};
 
 struct CheckedGapRepertoire {
