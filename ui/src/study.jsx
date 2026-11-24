@@ -37,6 +37,7 @@ export function Study({ openGame, sounds }) {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
+  const [submitted, setSubmitted] = useState(null);
   const waiting = useRef(false);
   const retry = useRef(null);
   const [epoch, setEpoch] = useState(0);
@@ -118,6 +119,7 @@ export function Study({ openGame, sounds }) {
   function answer(played) {
     const submission = { attempt: card.attempt, dataset: card.dataset, played };
     run(async () => {
+      if (played) setSubmitted({ key: attemptKey, move: played });
       localStorage.setItem("tempo.pending-answer.v2", JSON.stringify(submission));
       const result = await api("study/answer", submission);
       localStorage.removeItem("tempo.pending-answer.v2");
@@ -135,13 +137,16 @@ export function Study({ openGame, sounds }) {
   const frame = openingPlaying ? frames[openingPly] : frames?.at(-1);
   const game = card && new Chess(openingPlaying ? frame.fen : card.fen);
   const displayed = card?.result?.display_move;
+  const awaitingResult = !card?.result && !openingPlaying && submitted?.key === attemptKey ? submitted?.move : undefined;
+  const boardMove = displayed ?? awaitingResult;
   const played = displayed ? [displayed.slice(0, 2), displayed.slice(2, 4)] : undefined;
+  const lastMove = boardMove ? [boardMove.slice(0, 2), boardMove.slice(2, 4)] : frame?.lastMove;
   const learner = card?.color === "white" ? "w" : "b";
   const previous = card?.kind === "opening"
     ? (frame?.movedBy !== learner ? frame?.lastMove : undefined)
     : (opponent?.key === attemptKey ? opponent?.move : undefined);
   const shapes = [...markedMove(previous, "red"), ...markedMove(played, "green")];
-  if (displayed) play(game, displayed);
+  if (boardMove) play(game, boardMove);
   return <section aria-label="Study">
     <h1>Study</h1>
     {error && <div className="error" role="alert">{error} <button onClick={() => run(retry.current)}>Retry</button></div>}
@@ -151,11 +156,11 @@ export function Study({ openGame, sounds }) {
     {card && <>
       <h2>{card.result ? card.title : card.kind === "opening" ? (openingPlaying ? "Playing opening moves" : "Play your opening response") : "Find the tactic"}</h2>
       <ChessBoard game={game} legal={openingPlaying ? undefined : card.legal} orientation={card.color}
-        identity={`study-${card.attempt}-${epoch}`} locked={openingPlaying || pending || Boolean(error) || Boolean(card.result)}
-        lastMove={played ?? frame?.lastMove}
+        identity={`study-${card.attempt}-${epoch}`} locked={openingPlaying || pending || Boolean(error) || Boolean(card.result) || Boolean(awaitingResult)}
+        lastMove={lastMove}
         shapes={shapes}
         onRejectedMove={() => sounds.play("illegal")}
-        onMove={openingPlaying || card.result ? undefined : answer} />
+        onMove={openingPlaying || card.result || awaitingResult ? undefined : answer} />
       <div className="controls">
         {card.result ? <>
           <strong role="status">{card.result.rating}</strong>
