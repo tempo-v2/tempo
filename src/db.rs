@@ -33,7 +33,7 @@ impl Database {
             tx.execute_batch(include_str!("opening_order.sql"))?;
             let version =
                 tx.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?;
-            ensure!(version <= 5, "this Tempo database requires a newer release");
+            ensure!(version <= 6, "this Tempo database requires a newer release");
             if version < 1 {
                 tx.execute_batch(include_str!("opening_policy.sql"))?;
             }
@@ -50,6 +50,9 @@ impl Database {
             if version < 5 {
                 tx.execute_batch(include_str!("operation_bounds.sql"))?;
             }
+            if version < 6 {
+                tx.execute_batch(include_str!("job_admission.sql"))?;
+            }
             tx.commit()?;
             return Ok(db);
         }
@@ -63,6 +66,7 @@ impl Database {
         db.execute_batch(include_str!("prepared_queue.sql"))?;
         db.execute_batch(include_str!("job_turns.sql"))?;
         db.execute_batch(include_str!("operation_bounds.sql"))?;
+        db.execute_batch(include_str!("job_admission.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],

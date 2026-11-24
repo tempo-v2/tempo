@@ -97,7 +97,7 @@ export function Games({ jump, addOpening, settings, sounds }) {
             <button disabled={busy} onClick={() => job("games/jobs", { provider, operation: "new" })}>Import new games</button>
           </div>)}
           <button onClick={settings}>Set provider usernames</button>
-          <form onSubmit={(e) => { e.preventDefault(); job("games/jobs", { provider: "pgn", operation: "upload", username, pgn }); }}>
+          <form onSubmit={(e) => { e.preventDefault(); job("games/uploads", { username, pgn }); }}>
             <label>PGN player name<input required value={username} onChange={(e) => setUsername(e.target.value)} /></label>
             <label>Games PGN<textarea required value={pgn} onChange={(e) => setPgn(e.target.value)} /></label>
             <label>Upload games PGN<input type="file" accept=".pgn,text/plain" onChange={(e) => fileText(e, setPgn, setError)} /></label>
