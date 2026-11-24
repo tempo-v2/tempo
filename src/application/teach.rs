@@ -72,6 +72,9 @@ impl Tempo {
         .map_err(study_input)?;
         let at = self.components.clock.now();
         let state = match old.mode {
+            ActivityMode::Repair if old.issued_work.is_some() => Ok(
+                DailyLearning::complete_human_correction(prior, item.version, old.issued_miss_revision),
+            ),
             ActivityMode::Repair => crate::diagnostics::measure("learning.repair", || {
                 DailyLearning::repair(prior, item.version, old.issued_miss_revision, at)
             }),

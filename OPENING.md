@@ -21,12 +21,6 @@ their history. Restoring a retired position compares its answer against the
 latest retained version. A changed answer preserves its first introduction and
 requires re-teaching without another introduction slot.
 
-Choose **Reset progress** on a saved repertoire to erase its Study history and
-review schedule. Confirm the repertoire by name. Its positions become new and
-Study teaches them under the usual daily allowance. The PGN, other repertoires,
-tactics and imported games are kept. Games played before the reset remain in
-Games history and do not affect the new Study schedule.
-
 Daily Study accepts repertoire PGN through the signed Preview and Save commands.
 The generic daily catalog method accepts active tactics only. The separate
 standard profile retains additive imports, which keep omitted content present.
@@ -92,10 +86,8 @@ desktop Tempo. Open the private HTTPS address in iPhone Safari, then use
 **Share → Add to Home Screen** to keep it handy. The Mac must be awake and
 reachable through Tailscale to start a session or submit a move.
 
-The phone's **Build** tab runs the existing repertoire coverage scan and
-saves reviewed replies or lines to the same repertoire as desktop Tempo.
-The phone route admits the configured owner and accepts repertoire saves
-signed by its forecast gap preview.
+The phone's **Build** tab opens saved coverage gaps and lets the configured
+owner save a reviewed reply with a signed preview.
 
 On the Mac, install the paired Tempo and UI build with the Serve HTTPS origin
 and your exact Tailscale login. The managed registration saves both values for
@@ -166,21 +158,11 @@ Opening imports support standard-start orthodox games. Tactic capture accepts ex
 
 ## Historical Games and Study relevance
 
-Games → Historical backfill takes public provider accounts and a fixed UTC date
-range. It reads bounded provider windows and dated, matching stored PGNs.
-Completed windows survive restart. Retry remaining windows uses the existing
-job and its saved child receipts. Unlisted archives, truncated windows and
-provider failures appear in the window details.
-
-Accounts entered here stay recognized. Leave a provider blank to skip it
-for this import. The first explicit account configuration scopes personal
-game relevance and opponent gaps to the recognized identities.
-
-Only this explicit historic job may add a new Game Again for a qualifying
-unapplied miss from before a repertoire's starting reset. A later accepted
-reset stops the job's remaining learning effects for that repertoire. Regular
-refresh and stored-game reprocessing keep their original reset rules.
-Distinct raw game and target identities retain their existing acceptance keys.
+Historical Games backfill has ended. Saved games, previously recognized
+player accounts, completed window effects and accepted correction provenance
+remain. Recovery of an original accepted Start or Retry reports its archived
+windows. Pending windows are stopped. Manual PGN import remains available in
+Games. Previously accepted reprocessing commands can still replay their recorded results.
 
 The latest 200 eligible games supply personal position counts. A confirmed
 opponent gap opens the current repertoire at the position after the reply.
@@ -188,43 +170,3 @@ Play a legal response and choose Save response. Tempo previews the addition
 against the current document and only signs changes that preserve existing
 answers and learning. After saving, Tempo loads the next gap. Retained
 source PGNs are required to confirm authored replies and endpoints.
-
-To enable the local Rapid 1500 model, run `sh tempo/tools/maia/setup.sh PATH`
-with `PATH` set to the absolute path of a `maia` directory next to the
-active SQLite file. This uses Python 3.12, the pinned Maia-2 package, and
-its checksum-verified Rapid checkpoint. Choose Analyze Maia probabilities
-in Games. Inference persists full distributions as it progresses and can
-reuse them after interruption. An unavailable probability stays unknown.
-The displayed local coverage sums authored replies that have a saved learner
-response. Study also uses a separate modeled reach across authored routes
-where personal exposure is absent.
-
-Opening a gap shows similar repertoire responses alongside a bounded
-Stockfish search. Nearby positions are ranked by pawn files, piece placement
-and castling rights. Tempo tries the most common reusable replies in the
-current repertoire first, then other saved repertoires for the same side.
-For replies backed by the same number of positions, a better comparable
-Stockfish evaluation wins the tie. Structural closeness breaks remaining ties.
-
-Tempo suggests the first reply within 50 centipawns of Stockfish's best.
-If the best comparable repertoire reply is 51–150 centipawns behind, the
-selection stays blank. Stockfish is suggested when every shortlisted reply
-can be compared and is more than 150 centipawns behind. Missing evidence can
-leave the selection blank. The arrow previews the suggestion on the original
-board. Play a different move or clear the suggestion any time before saving.
-
-The local comparison uses the existing Maia Python environment and the local
-Stockfish executable. It examines up to eight distinct nearby positions per
-group and compares up to sixteen distinct repertoire replies. Opening,
-comparing, staging and clearing are read-only.
-
-Lichess Explorer is optional. [Create a Lichess access token][explorer-token],
-name it “Tempo Explorer” and leave the permissions unchecked. Save only the
-token in a private plain-text file named `lichess-explorer.token` beside the
-active SQLite database. The Explorer setup panel shows the exact file path and
-can copy it. Choose **Retry Explorer** to pick up the file without restarting
-Tempo. The server sends only the current board position and the selected Rapid
-rating filter. You can remove the file or revoke the token in Lichess at any
-time. Local analysis and repertoire saves are available independently.
-
-[explorer-token]: https://lichess.org/account/oauth/token/create

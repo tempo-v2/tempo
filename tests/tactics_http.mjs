@@ -244,6 +244,61 @@ test('HTTP and SQLite retain the exact committed move across a lost reply, resta
     assert.equal((await client.next()).status, 'empty');
 });
 
+test('Next resumes the exact active issue without reading Learning or policy', { timeout: 15_000 }, async t => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'tempo-active-next-'));
+    const database = path.join(directory, 'study.sqlite');
+    const transfer = path.join(directory, 'normalized.json');
+    await writeFile(transfer, JSON.stringify({ schema_version: 1, puzzles: [tactic] }));
+    execFileSync(binary, ['init', database]);
+    execFileSync(binary, ['import-tactics', database, transfer]);
+    const host = await start(database);
+    t.after(async () => {
+        await host.stop();
+        await rm(directory, { recursive: true, force: true });
+    });
+    const command = async body => {
+        const response = await fetch(host.url + '/api/study', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 200);
+        return response.json();
+    };
+
+    const issued = await command({ command: 'next' });
+    assert.equal(issued.status, 'ready', JSON.stringify(issued));
+    assert.equal(issued.activity, 'test');
+    const sql = new DatabaseSync(database);
+    try {
+        sql.exec("UPDATE learning SET state='malformed'; UPDATE store_state SET policy='malformed'");
+        const poisoned = databaseRows(database);
+        const resumed = await command({ command: 'next' });
+        assert.deepEqual(resumed, await command({ command: 'resume', attempt_id: issued.attempt_id }));
+        for (const field of ['dataset_id', 'attempt_id', 'target_id', 'content_version', 'revision', 'display_fen']) {
+            assert.ok(Object.hasOwn(issued, field), field);
+            assert.deepEqual(resumed[field], issued[field], field);
+        }
+        assert.deepEqual(databaseRows(database), poisoned);
+
+        sql.prepare("UPDATE current_content SET item=json_set(item, '$.status', 'retired') WHERE target_id=?")
+            .run(issued.target_id);
+        const incompatible = databaseRows(database);
+        const stale = await command({ command: 'next' });
+        assert.equal(stale.code, 'stale_content', JSON.stringify(stale));
+        assert.deepEqual(stale, await command({ command: 'resume', attempt_id: issued.attempt_id }));
+        assert.deepEqual(databaseRows(database), incompatible);
+
+        sql.exec("PRAGMA foreign_keys=OFF; UPDATE store_state SET active_attempt_id='missing-issue'");
+        const missing = databaseRows(database);
+        const unavailable = await command({ command: 'next' });
+        assert.equal(unavailable.code, 'unknown_attempt', JSON.stringify(unavailable));
+        assert.deepEqual(databaseRows(database), missing);
+    } finally {
+        sql.close();
+    }
+});
+
 test('SQLite rolls back a teaching acknowledgement if its receipt cannot be stored', { timeout: 15_000 }, async t => {
     const dir = await mkdtemp(path.join(tmpdir(), 'tempo-v2-rollback-'));
     let host;

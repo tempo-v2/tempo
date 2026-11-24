@@ -11,7 +11,7 @@ use tempo::{Clock, CounterIds, DailyComponents, IntroductionLimits, Tempo};
 use tempo_chess::{Catalog, LegalSequenceGrader};
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::{SqliteStore, Store};
-use tempo_types::{StudyDay, StudyTime, TargetId};
+use tempo_types::{StudyDay, StudyTime};
 
 type Day = Arc<AtomicI32>;
 
@@ -82,22 +82,19 @@ fn date_only_import(app: &mut Tempo, id: &str, date: &str, moves: &str) -> Value
     .unwrap()
 }
 
-fn choose(app: &mut Tempo, original: &Value, choice: &Value, command_id: &str) {
+fn assert_retired_choice(app: &Tempo, original: &Value, choice: &Value, command_id: &str) {
     let result = &original["results"][0];
     let target = &choice["candidates"][0]["target_id"];
-    let report = app.choose_game_correction(serde_json::from_value(json!({
+    let reply = app.choose_game_correction(serde_json::from_value(json!({
         "command_id":command_id, "dataset_id":"opening-proof", "learner":"learner",
         "source":result["source"], "game_id":result["game_id"], "comparison_id":result["comparison_id"],
         "ply":choice["ply"], "target_id":target
-    })).unwrap()).unwrap();
-    assert!(matches!(
-        serde_json::to_value(report).unwrap()["results"][0]["effect"].as_str(),
-        Some("again_applied" | "already_addressed")
-    ));
+    })).unwrap());
+    assert_eq!(reply.err().unwrap().code, "retired_feature");
 }
 
 #[test]
-fn accepted_already_addressed_choice_keeps_its_miss_after_reprocessing() {
+fn a_fresh_choice_cannot_change_a_previously_corrected_target() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("choice-relevance.sqlite");
     let day = Arc::new(AtomicI32::new(20_004));
@@ -117,35 +114,16 @@ fn accepted_already_addressed_choice_keeps_its_miss_after_reprocessing() {
     let ambiguous = date_only_import(&mut app, "ambiguous", "2024.10.06", "1. c4 e5");
     let result = &ambiguous["results"][0];
     assert_eq!(result["effect"], "choice_required");
-    let accepted = app.choose_game_correction(serde_json::from_value(json!({
-        "command_id":"choose-previously-corrected", "dataset_id":"opening-proof", "learner":"learner",
-        "source":result["source"], "game_id":result["game_id"], "comparison_id":result["comparison_id"],
-        "ply":1, "target_id":corrected
-    })).unwrap()).unwrap();
-    assert_eq!(
-        serde_json::to_value(accepted).unwrap()["results"][0]["effect"],
-        "already_addressed"
-    );
+    let before = app.snapshot().unwrap();
+    assert_retired_choice(&app, &ambiguous, &result["choices"][0], "choose-previously-corrected");
+    assert_eq!(app.snapshot().unwrap(), before);
     let store = SqliteStore::open(&db).unwrap();
-    let dataset = app.snapshot().unwrap().dataset;
-    let before = store.game_relevance(&dataset, "").unwrap()[&corrected].clone();
-    assert_eq!((before.exposure, before.misses), (1, 1));
-    let learning = app.snapshot().unwrap().learning;
-    let reprocessed = date_only_import(&mut app, "reprocessed", "2024.10.06", "1. c4 e5");
-    assert_eq!(reprocessed["results"][0]["effect"], "already_addressed");
-    assert_eq!(app.snapshot().unwrap().learning, learning);
-    let after = store.game_relevance(&dataset, "").unwrap()[&corrected].clone();
-    eprintln!(
-        "already-addressed selected target {corrected:?}: before={before:?}, after={after:?}"
-    );
-    assert_eq!(
-        after.misses, before.misses,
-        "An accepted correction choice must retain its current-version miss attribution after reprocessing"
-    );
+    assert!(store.game_choices(&before.dataset, "pgn", result["game_id"].as_str().unwrap()).unwrap().is_empty());
+    assert!(before.learning[&corrected].correction.is_some());
 }
 
 #[test]
-fn choosing_second_ambiguous_position_keeps_first_positions_miss() {
+fn fresh_choices_for_multiple_ambiguous_positions_cannot_write() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("two-choices.sqlite");
     let day = Arc::new(AtomicI32::new(20_004));
@@ -175,22 +153,14 @@ fn choosing_second_ambiguous_position_keeps_first_positions_miss() {
             .iter()
             .all(|choice| choice["candidates"].as_array().unwrap().len() == 2)
     );
-    let first = TargetId::from(choices[0]["candidates"][0]["target_id"].as_str().unwrap());
-    let second = TargetId::from(choices[1]["candidates"][0]["target_id"].as_str().unwrap());
-    choose(&mut app, &ambiguous, &choices[0], "choose-first");
+    let before = app.snapshot().unwrap();
     let store = SqliteStore::open(&db).unwrap();
-    let dataset = app.snapshot().unwrap().dataset;
-    let before = store.game_relevance(&dataset, "").unwrap();
-    assert_eq!(before[&first].misses, 1);
-    choose(&mut app, &ambiguous, &choices[1], "choose-second");
-    let after = store.game_relevance(&dataset, "").unwrap();
-    assert_eq!(after[&second].misses, 1);
-    eprintln!(
-        "first position: before={:?}, after={:?}; second={:?}",
-        before[&first], after[&first], after[&second]
-    );
-    assert_eq!(
-        after[&first].misses, 1,
-        "Choosing another position must preserve the first resolved position's miss attribution"
-    );
+    let relevance = || store.game_relevance(&before.dataset, "").unwrap().into_iter()
+        .map(|(target, fact)| (target, fact.exposure, fact.misses))
+        .collect::<Vec<_>>();
+    let before_relevance = relevance();
+    assert_retired_choice(&app, &ambiguous, &choices[0], "choose-first");
+    assert_retired_choice(&app, &ambiguous, &choices[1], "choose-second");
+    assert_eq!(app.snapshot().unwrap(), before);
+    assert_eq!(relevance(), before_relevance);
 }

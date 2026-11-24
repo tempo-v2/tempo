@@ -14,7 +14,7 @@ use tempo_chess::{
 };
 use tempo_learning::{DailyLearning, LearningPolicy};
 use tempo_store::{
-    BookProjection, Commit, ModelAuthority, ProjectionBook, ProjectionScope, REACH_MODEL_KEY,
+    BookProjection, Commit, ProjectionBook, ProjectionScope, REACH_MODEL_KEY,
     SqliteStore, Store, StoreError, Write, model_targets,
 };
 use tempo_types::{DatasetId, StudyDay, StudyTime, TargetId};
@@ -338,11 +338,7 @@ fn equivalent_documents_keep_authority_until_only_one_books_route_changes() {
 
     drop(app);
     let mut app = open(&db, day, limits, 1);
-    app.bootstrap_model_inputs().unwrap();
-    assert_eq!(
-        store.repertoire_document(&book_id).unwrap().model_authority,
-        ModelAuthority::Unavailable
-    );
+    assert_eq!(store.repertoire_document(&book_id).unwrap().pgn, None);
 
     preview_and_save(&mut app, new_route, "First", Some(&book_id));
     let new = store

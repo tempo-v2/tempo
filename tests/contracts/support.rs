@@ -4,9 +4,8 @@ use tempo::{Clock, CounterIds, DailyComponents, IntroductionLimits, SubmitComman
 use tempo_chess::{Catalog, LegalSequenceGrader, demo_catalog};
 use tempo_learning::{DailyLearning, LearningPolicy, LearningState};
 use tempo_store::{
-    AnswerResult, Commit, DatasetIdentity, GameTargetRelevance, PortableGameEvidence, Snapshot,
-    SqliteStore, Store, StoreError, StudyOrderingWrite, StudyScope, StudyState, TacticalRequest,
-    Write,
+    AnswerResult, Commit, DatasetIdentity, GameTargetRelevance, Snapshot, SqliteStore, Store,
+    StoreError, StudyOrderingWrite, StudyScope, StudyState, TacticalRequest, Write,
 };
 use tempo_types::{AttemptId, DatasetId, Revision, StudyDay, StudyTime, TargetId};
 
@@ -24,6 +23,10 @@ impl DatasetIdentity for FailOnceStore {
 impl tempo_store::AddressedResume for FailOnceStore {
     fn resume_state(&self, id: &AttemptId) -> Result<tempo_store::ResumeState, StoreError> {
         self.store.resume_state(id)
+    }
+
+    fn active_resume_state(&self) -> Result<tempo_store::ResumeState, StoreError> {
+        self.store.active_resume_state()
     }
 }
 
@@ -125,10 +128,6 @@ impl Store for FailOnceStore {
         self.store.commit_study(commit, scope)
     }
 
-    fn portable_state(&self) -> Result<(Snapshot, PortableGameEvidence), StoreError> {
-        self.store.portable_state()
-    }
-
     fn commit(&mut self, commit: Commit) -> Result<Revision, StoreError> {
         self.store.commit(commit)
     }
@@ -172,16 +171,6 @@ pub(super) struct Harness {
     pub(super) app: Tempo,
     pub(super) fail_next_commit: Rc<Cell<bool>>,
     _directory: tempfile::TempDir,
-}
-
-pub(super) fn empty_store(directory: &tempfile::TempDir) -> SqliteStore {
-    SqliteStore::create(
-        directory.path().join("empty.sqlite"),
-        "empty-destination".into(),
-        Catalog::default(),
-        DailyLearning::default().settings(),
-    )
-    .unwrap()
 }
 
 pub(super) fn one(id: &str) -> Harness {

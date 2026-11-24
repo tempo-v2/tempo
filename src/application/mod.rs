@@ -9,9 +9,7 @@ pub(crate) use coverage_settings::{CoverageLineSave, PreviousCoverageLineRequest
 mod current_attempt;
 
 mod daily;
-mod export;
 mod game_backfill;
-mod game_detection;
 mod game_evidence;
 mod game_library;
 pub use game_library::GameLibraryRead;
@@ -22,6 +20,8 @@ mod handle;
 mod import_pgn;
 mod next_exercise;
 mod optional_tactics;
+#[cfg(test)]
+mod plan_builder;
 mod receipts;
 mod repertoires;
 mod study_analysis_context;
@@ -29,7 +29,6 @@ mod study_card_details;
 pub use study_analysis_context::StudyAnalysisLine;
 mod study_game_context;
 
-mod restore;
 mod resume;
 mod saved_reviews;
 pub use saved_reviews::{SaveStudyReview, SavedStudyReviewCommand};
@@ -39,7 +38,6 @@ pub use study_progress::{ProgressStamp, StudyProgress};
 mod tactic_capture;
 pub(crate) mod tactic_catalog_facts;
 mod tactic_preferences;
-pub(crate) mod tactical_analysis;
 mod tactics_collection;
 pub use tactics_collection::{TacticsRead, TacticsReadReply};
 

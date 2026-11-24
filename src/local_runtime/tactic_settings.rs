@@ -3,7 +3,7 @@ use super::Profile;
 use crate::{AppError, TacticThemes, Tempo, tactic_themes};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tempo_store::{SqliteStore, StoreError, StudyProfilePlanEffect};
+use tempo_store::{StoreError, StudyProfilePlanEffect};
 use tempo_types::DatasetId;
 
 #[derive(Deserialize)]
@@ -19,11 +19,7 @@ pub(crate) enum Command {
     },
 }
 
-pub(crate) fn handle(
-    app: &mut Tempo,
-    store: &SqliteStore,
-    command: Command,
-) -> Result<Value, AppError> {
+pub(crate) fn handle(app: &mut Tempo, command: Command) -> Result<Value, AppError> {
     let _trace = crate::diagnostics::Span::new("settings.tactics");
     let profile_error = || {
         AppError::new(
@@ -37,7 +33,7 @@ pub(crate) fn handle(
             "Settings changed in another session. Reload settings before saving.",
         )
     };
-    let mut raw = store.local_profile()?.ok_or_else(profile_error)?;
+    let mut raw = app.local_study_profile()?.ok_or_else(profile_error)?;
     let mut profile: Profile = serde_json::from_str(&raw).map_err(|_| profile_error())?;
     app.apply_local_study_settings(profile.introductions, profile.tactic_themes.clone());
     let (dataset, mut selection) = app.local_tactic_themes()?;
@@ -85,8 +81,7 @@ pub(crate) fn handle(
             profile.introductions.tactics = new_tactics_per_day;
             profile.tactic_themes = Some(requested.clone());
             let updated = serde_json::to_string(&profile).map_err(|_| profile_error())?;
-            store
-                .update_study_profile_for_plan(&dataset, &raw, &updated, plan_effect)
+            app.save_local_study_profile(&dataset, &raw, &updated, plan_effect)
                 .map_err(|error| match error {
                     StoreError::Conflict(_) => conflict(),
                     _ => error.into(),
@@ -112,6 +107,7 @@ pub(crate) fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempo_store::SqliteStore;
     use tempo_types::StudyDay;
 
     #[test]
@@ -121,18 +117,19 @@ mod tests {
         super::super::init(&path).unwrap();
         let mut app = super::super::open(&path).unwrap();
         let mut store = SqliteStore::open(&path).unwrap();
-        let initial = handle(&mut app, &store, Command::Get).unwrap();
+        let initial = handle(&mut app, Command::Get).unwrap();
         let dataset: DatasetId = serde_json::from_value(initial["dataset_id"].clone()).unwrap();
-        let limit = Profile::default().introductions.tactics;
+        let profile: Profile =
+            serde_json::from_str(&store.local_profile().unwrap().unwrap()).unwrap();
+        let limit = profile.introductions.tactics;
         let before = store
-            .observe_study_day(&dataset, StudyDay(100))
+            .observe_study_calendar_day(&dataset, &profile.study_timezone, StudyDay(100))
             .unwrap()
             .unwrap();
 
         let save = |app: &mut Tempo, previous: &Value, limit, selection| {
             handle(
                 app,
-                &store,
                 Command::Save {
                     dataset_id: dataset.clone(),
                     expected_revision: previous["revision"].as_str().unwrap().to_owned(),
@@ -191,10 +188,10 @@ mod tests {
         .unwrap();
         let mut app = super::super::open(&path).unwrap();
         let before = store
-            .observe_study_day(&dataset, StudyDay(100))
+            .observe_study_calendar_day(&dataset, &profile.study_timezone, StudyDay(100))
             .unwrap()
             .unwrap();
-        let original = handle(&mut app, &store, Command::Get).unwrap();
+        let original = handle(&mut app, Command::Get).unwrap();
         let save = |previous: &Value, openings, tactics| Command::Save {
             dataset_id: dataset.clone(),
             expected_revision: previous["revision"].as_str().unwrap().into(),
@@ -203,7 +200,7 @@ mod tests {
             selection: TacticThemes::Any,
         };
         let tactics = profile.introductions.tactics;
-        let changed = handle(&mut app, &store, save(&original, Some(0), tactics)).unwrap();
+        let changed = handle(&mut app, save(&original, Some(0), tactics)).unwrap();
         assert_eq!(changed["new_openings_per_day"], 0);
         let after = store.study_projection_basis(&dataset).unwrap().unwrap();
         assert_eq!(
@@ -211,20 +208,20 @@ mod tests {
             before.plan.membership_epoch.0 + 1
         );
         assert_eq!(after.summary.epoch.0, before.summary.epoch.0 + 1);
-        let repeated = handle(&mut app, &store, save(&original, Some(0), tactics)).unwrap();
+        let repeated = handle(&mut app, save(&original, Some(0), tactics)).unwrap();
         assert_eq!(changed, repeated);
         assert_eq!(
             store.study_projection_basis(&dataset).unwrap().as_ref(),
             Some(&after)
         );
-        assert!(handle(&mut app, &store, save(&original, Some(2), tactics)).is_err());
-        let legacy = handle(&mut app, &store, save(&changed, None, tactics + 1)).unwrap();
+        assert!(handle(&mut app, save(&original, Some(2), tactics)).is_err());
+        let legacy = handle(&mut app, save(&changed, None, tactics + 1)).unwrap();
         assert_eq!(legacy["new_openings_per_day"], 0);
         drop(app);
         drop(store);
         let mut app = super::super::open(&path).unwrap();
         let store = SqliteStore::open(&path).unwrap();
-        let restored = handle(&mut app, &store, Command::Get).unwrap();
+        let restored = handle(&mut app, Command::Get).unwrap();
         assert_eq!(restored, legacy);
         let persisted: Profile =
             serde_json::from_str(&store.local_profile().unwrap().unwrap()).unwrap();

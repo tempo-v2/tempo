@@ -31,7 +31,7 @@ pub struct AttemptView {
     /// Played moves only, from this response's issued version and cursor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<tempo_chess::RevealedLine>,
-    /// Dataset identity that invalidates commands after a portable restore.
+    /// Dataset identity used to reject commands for an earlier dataset.
     pub dataset_id: DatasetId,
     /// This attempt, shared by all learner decisions within it.
     pub attempt_id: AttemptId,

@@ -1,4 +1,5 @@
 //! Bounded loopback HTTP/1 transport. Only detached requests cross into Tempo.
+use super::read_context::ContextReader;
 use crate::{diagnostics, game_model::AuthoringSurface};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
@@ -17,7 +18,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     time::{Duration, Instant},
 };
@@ -46,6 +47,15 @@ pub(super) struct Head {
 }
 
 impl Head {
+    #[cfg(test)]
+    pub(super) fn fixture(method: Method, url: &str, headers: HeaderMap) -> Self {
+        Self {
+            method,
+            url: url.into(),
+            headers,
+        }
+    }
+
     pub(super) fn method(&self) -> &Method {
         &self.method
     }
@@ -60,9 +70,13 @@ impl Head {
     }
 }
 
-pub(super) struct Admission {
-    pub(super) surface: AuthoringSurface,
-    pub(super) body_bytes: Option<usize>,
+pub(super) enum Admission {
+    Immediate(Response),
+    Context(ContextReader),
+    Foreground {
+        surface: AuthoringSurface,
+        body_bytes: Option<usize>,
+    },
 }
 
 /// The sync owner receives bytes and a one-way response channel, never a socket.
@@ -248,14 +262,6 @@ impl Server {
         Ok(Self(receive))
     }
 
-    pub(super) fn try_recv(&self) -> io::Result<Option<Request>> {
-        match self.0.try_recv() {
-            Ok(request) => Ok(Some(request)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(io::Error::other("Tempo HTTP ingress stopped")),
-        }
-    }
-
     pub(super) fn recv_timeout(&self, wait: Duration) -> io::Result<Option<Request>> {
         match self.0.recv_timeout(wait) {
             Ok(request) => Ok(Some(request)),
@@ -346,12 +352,19 @@ async fn prepare(
     body_readers: Arc<Semaphore>,
     request_id: &str,
 ) -> Response {
-    let admission = match authorize(&head) {
-        Ok(admission) => admission,
+    let deadline = accepted + ADMISSION_WAIT;
+    let (surface, body_bytes) = match authorize(&head) {
+        Ok(Admission::Immediate(response)) => return trace_read_response(response, request_id),
+        Ok(Admission::Context(context)) => {
+            return trace_read_response(context.read(deadline).await, request_id);
+        }
+        Ok(Admission::Foreground {
+            surface,
+            body_bytes,
+        }) => (surface, body_bytes),
         Err(status) => return Response::empty(status),
     };
-    let deadline = accepted + ADMISSION_WAIT;
-    let body = if let Some(limit) = admission.body_bytes {
+    let body = if let Some(limit) = body_bytes {
         match read_body(&head, body, limit, deadline, &body_readers, request_id).await {
             Ok(body) => body,
             Err(response) => return response,
@@ -370,7 +383,7 @@ async fn prepare(
     let take_by = (queued + QUEUE_WAIT).min(deadline);
     let request = Request {
         head,
-        surface: admission.surface,
+        surface,
         body,
         delivery_id: request_id.to_owned(),
         queued,
@@ -391,6 +404,19 @@ async fn prepare(
         Ok(Ok(response)) => response,
         _ => uncertain(),
     }
+}
+
+fn trace_read_response(response: Response, request_id: &str) -> Response {
+    diagnostics::emit(
+        "http.response",
+        serde_json::json!({
+            "request_id": request_id,
+            "operation": "http.write_response",
+            "status_code": response.status_code().as_u16(),
+            "outcome": "queued_for_delivery",
+        }),
+    );
+    response
 }
 
 async fn read_body(

@@ -12,7 +12,7 @@ use tempo_types::{AttemptId, DatasetId, Revision, SubmissionId};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitCommand {
-    /// Dataset from the displayed attempt; changes after portable restore.
+    /// Dataset from the displayed attempt.
     pub dataset_id: DatasetId,
     /// The attempt containing this learner decision.
     pub attempt_id: AttemptId,

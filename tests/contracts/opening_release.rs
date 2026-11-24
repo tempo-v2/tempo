@@ -1266,183 +1266,6 @@ fn game_import_is_answer_safe_and_preserves_active_work_across_restart() {
     assert_eq!(app.snapshot().unwrap(), after);
 }
 
-fn dated_game(app: &mut Tempo, repertoire: &str, date: &str, play: &str, time: &str) -> Value {
-    let pgn = format!(
-        "[White \"Learner\"]\n[Black \"Other\"]\n[UTCDate \"{date}\"]\n[UTCTime \"{time}\"]\n[UTCEndDate \"{date}\"]\n[UTCEndTime \"23:00:00\"]\n{play} 1-0"
-    );
-    static IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let request = json!({"repertoire_id":repertoire,"learner":"learner","pgn":pgn,
-        "dataset_id":app.snapshot().unwrap().dataset,
-        "command_id":format!("fixture-{}", IDS.fetch_add(1, Ordering::Relaxed))});
-    serde_json::to_value(
-        app.import_game_pgn(serde_json::from_value(request).unwrap())
-            .unwrap(),
-    )
-    .unwrap()
-}
-
-#[test]
-fn reset_progress_scopes_study_history_and_games_and_replays_after_new_learning() {
-    use tempo_chess::ContentKind;
-    use tempo_learning::LearningState;
-
-    let directory = tempfile::tempdir().unwrap();
-    let db = directory.path().join("reset.sqlite");
-    let day = Arc::new(AtomicI32::new(20_000));
-    let limits = IntroductionLimits::default();
-    let mut app = open(&db, day.clone(), limits, 0);
-    let (_, saved) = preview_and_save(&mut app, SHORT, "London", None);
-    let london = saved["repertoires"][0]["id"].as_str().unwrap();
-    for index in 0..2 {
-        let lesson = study(&mut app, json!({"command":"next"}));
-        let mut ack = activity_command("acknowledge", &lesson, &format!("london-{index}"));
-        ack["answer"] = json!({"uci":lesson["lesson"]["move_uci"]});
-        assert_eq!(study(&mut app, ack)["status"], "complete");
-    }
-    preview_and_save(&mut app, "1. e4 *", "London", Some(london));
-    let (_, saved) = preview_and_save(&mut app, "1. d4 *", "Other", None);
-    let other = saved["repertoires"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["name"] == "Other")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap();
-    let lesson = study(&mut app, json!({"command":"next"}));
-    let mut other_ack = activity_command("acknowledge", &lesson, "other-lesson");
-    other_ack["answer"] = json!({"uci":"d2d4"});
-    let other_result = study(&mut app, other_ack.clone());
-    assert_eq!(other_result["status"], "complete");
-
-    day.store(20_001, Ordering::Relaxed);
-    let old_game = json!({
-        "repertoire_id":london, "learner":"learner", "command_id":"london-game",
-        "dataset_id":"opening-proof",
-        "pgn":"[White \"Learner\"]\n[Black \"Other\"]\n1. d4 d5 1-0",
-    });
-    let import = |app: &mut Tempo, request: Value| {
-        serde_json::to_value(
-            app.import_game_pgn(serde_json::from_value(request).unwrap())
-                .unwrap(),
-        )
-        .unwrap()
-    };
-    let original_game = import(&mut app, old_game.clone());
-    let mut london_test = None;
-    for index in 0..2 {
-        let test = study(&mut app, json!({"command":"next"}));
-        let mut answer = activity_command("answer", &test, &format!("test-{index}"));
-        answer["answer"] =
-            json!({"uci":if test["exercise_name"] == "London" {"e2e4"} else {"d2d4"}});
-        assert_eq!(study(&mut app, answer.clone())["assessment"], "good");
-        if test["exercise_name"] == "London" {
-            london_test = Some(answer);
-        }
-    }
-    let london_test = london_test.unwrap();
-    let before = app.snapshot().unwrap();
-    let read =
-        json!({"command":"read_document", "dataset_id":"opening-proof", "repertoire_id":london});
-    let document = content(&mut app, read.clone());
-    let reset = json!({"command":"reset_progress", "dataset_id":"opening-proof",
-        "repertoire_id":london, "command_id":"reset-london"});
-    assert_eq!(
-        content(
-            &mut app,
-            json!({
-                "command":"reset_progress", "dataset_id":"other-dataset", "repertoire_id":london,
-                "command_id":"wrong-dataset",
-            })
-        )["code"],
-        "stale_dataset"
-    );
-    assert_eq!(app.snapshot().unwrap(), before);
-    let accepted = content(&mut app, reset.clone());
-    assert_eq!(accepted["status"], "progress_reset", "{accepted}");
-    assert_eq!(content(&mut app, read), document);
-    let after = app.snapshot().unwrap();
-    let targets: Vec<_> = before.catalog.items.values().filter(|item|
-        matches!(&item.definition.kind, ContentKind::Repertoire { repertoire, .. } if repertoire == london))
-        .map(|item| &item.target).collect();
-    assert_eq!(targets.len(), 2);
-    assert_eq!(after.catalog, before.catalog);
-    assert_eq!(after.content_history, before.content_history);
-    for (target, state) in &after.learning {
-        if targets.contains(&target) {
-            assert_eq!(*state, LearningState::default());
-        } else {
-            assert_eq!(state, &before.learning[target]);
-        }
-    }
-    assert!(
-        after
-            .attempts
-            .values()
-            .all(|attempt| !targets.contains(&&attempt.attempt.target))
-    );
-    assert_eq!(after.assessments.len(), 1);
-    assert!(!targets.contains(&&after.assessments[0].target));
-    assert_eq!(study(&mut app, london_test)["code"], "unknown_attempt");
-    assert_eq!(study(&mut app, other_ack), other_result);
-    let mut conflicting = reset.clone();
-    conflicting["repertoire_id"] = json!(other);
-    assert_eq!(content(&mut app, conflicting)["code"], "command_conflict");
-
-    assert_eq!(import(&mut app, old_game.clone()), original_game);
-    let mut duplicate = old_game;
-    duplicate["command_id"] = json!("london-game-duplicate");
-    assert_eq!(
-        import(&mut app, duplicate)["results"][0]["effect"],
-        "recorded_only"
-    );
-    assert_eq!(
-        app.game_history().unwrap()["results"][0]["effect"],
-        "recorded_only"
-    );
-    assert_eq!(app.snapshot().unwrap(), after);
-
-    let lesson = study(&mut app, json!({"command":"next"}));
-    assert_eq!(lesson["exercise_name"], "London");
-    assert_eq!(lesson["lesson"]["move_uci"], "e2e4");
-    let mut ack = activity_command("acknowledge", &lesson, "learn-london-again");
-    ack["answer"] = json!({"uci":"e2e4"});
-    assert_eq!(study(&mut app, ack)["status"], "complete");
-    let learned_again = app.snapshot().unwrap();
-    drop(app);
-    let mut app = open(&db, day.clone(), limits, 1);
-    assert_eq!(content(&mut app, reset), accepted);
-    assert_eq!(app.snapshot().unwrap(), learned_again);
-
-    day.store(20_002, Ordering::Relaxed);
-    let new_game = dated_game(&mut app, london, "2024.10.05", "1. d4 d5", "12:00:00");
-    assert_eq!(new_game["results"][0]["effect"], "recorded_only");
-}
-
-fn date_only_import(app: &mut Tempo, id: &str, date: &str, moves: &str) -> Value {
-    let request = json!({
-        "learner": "learner", "command_id": id, "dataset_id": app.snapshot().unwrap().dataset,
-        "pgn": format!("[White \"Learner\"]\n[Black \"Other\"]\n[Date \"{date}\"]\n{moves} 1-0")
-    });
-    serde_json::to_value(
-        app.import_game_pgn(serde_json::from_value(request).unwrap())
-            .unwrap(),
-    )
-    .unwrap()
-}
-
-fn play_activity(app: &mut Tempo, activity: &Value, command: &str, id: &str, uci: &str) -> Value {
-    let mut answer = activity_command(command, activity, id);
-    answer["answer"] = json!({"uci": uci});
-    study(app, answer)
-}
-
-fn repair_context(app: &Tempo, activity: &Value) -> Value {
-    let dataset = activity["dataset_id"].as_str().unwrap().into();
-    let attempt = activity["attempt_id"].as_str().unwrap().into();
-    app.study_game_context(&dataset, &attempt).unwrap()["context"].clone()
-}
-
 #[test]
 fn study_progress_counts_pending_repairs_including_skips() {
     let directory = tempfile::tempdir().unwrap();
@@ -1502,6 +1325,30 @@ fn study_progress_counts_pending_repairs_including_skips() {
     assert_eq!(progress(&app).repairs_remaining, 0);
 }
 
+fn date_only_import(app: &mut Tempo, id: &str, date: &str, moves: &str) -> Value {
+    let request = json!({
+        "learner": "learner", "command_id": id, "dataset_id": app.snapshot().unwrap().dataset,
+        "pgn": format!("[White \"Learner\"]\n[Black \"Other\"]\n[Date \"{date}\"]\n{moves} 1-0")
+    });
+    serde_json::to_value(
+        app.import_game_pgn(serde_json::from_value(request).unwrap())
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn play_activity(app: &mut Tempo, activity: &Value, command: &str, id: &str, uci: &str) -> Value {
+    let mut answer = activity_command(command, activity, id);
+    answer["answer"] = json!({"uci": uci});
+    study(app, answer)
+}
+
+fn repair_context(app: &Tempo, activity: &Value) -> Value {
+    let dataset = activity["dataset_id"].as_str().unwrap().into();
+    let attempt = activity["attempt_id"].as_str().unwrap().into();
+    app.study_game_context(&dataset, &attempt).unwrap()["context"].clone()
+}
+
 #[test]
 fn repair_context_follows_the_issued_miss_and_preserves_study() {
     let directory = tempfile::tempdir().unwrap();
@@ -1512,8 +1359,7 @@ fn repair_context_follows_the_issued_miss_and_preserves_study() {
         tactics: 0,
     };
     let mut app = open(&db, day.clone(), limits, 0);
-    let (_, book) = preview_and_save(&mut app, "1. e4 e5 2. Nf3 *", "London", None);
-    let dataset = "opening-proof";
+    preview_and_save(&mut app, "1. e4 e5 2. Nf3 *", "London", None);
     date_only_import(&mut app, "first", "2024.10.06", "1. e4 e5 2. Bc4 Nc6");
     let first = study(&mut app, json!({"command":"next"}));
     assert_eq!(first["lesson"]["move_san"], "Nf3");
@@ -1555,19 +1401,11 @@ fn repair_context_follows_the_issued_miss_and_preserves_study() {
     let second = study(&mut app, json!({"command":"next"}));
     assert_eq!(repair_context(&app, &second)["played_san"], "Nc3");
 
-    let archive = app.export(&tempo::JsonSnapshotCodec).unwrap();
-    let mut restored = open(
-        &directory.path().join("restored.sqlite"),
-        day.clone(),
-        limits,
-        0,
-    );
-    restored
-        .restore("restored".into(), &archive, &tempo::JsonSnapshotCodec)
-        .unwrap();
-    let restored_repair = study(&mut restored, json!({"command":"next"}));
-    assert_eq!(restored_repair["corrective_repair"], true);
-    assert_eq!(repair_context(&restored, &restored_repair), Value::Null);
+    drop(app);
+    let mut app = open(&db, day.clone(), limits, 2);
+    let resumed = study(&mut app, json!({"command":"next"}));
+    assert_eq!(resumed["attempt_id"], second["attempt_id"]);
+    assert_eq!(repair_context(&app, &resumed)["played_san"], "Nc3");
 
     assert_eq!(
         play_activity(&mut app, &second, "acknowledge", "save-second", "g1f3")["assessment"],
@@ -1582,19 +1420,6 @@ fn repair_context_follows_the_issued_miss_and_preserves_study() {
     let blind = study(&mut app, json!({"command":"next"}));
     assert_eq!(blind["activity"], "test");
     assert_eq!(repair_context(&app, &blind), Value::Null);
-
-    let reset = content(
-        &mut app,
-        json!({"command":"reset_progress", "dataset_id":dataset,
-        "repertoire_id":book["repertoires"][0]["id"], "command_id":"reset-context"}),
-    );
-    assert_eq!(reset["status"], "progress_reset");
-    day.store(20_007, Ordering::Relaxed);
-    let game = date_only_import(&mut app, "after-reset", "2024.10.11", "1. e4 e5 2. d4 Nc6");
-    assert_eq!(game["results"][0]["effect"], "again_applied");
-    let fresh = study(&mut app, json!({"command":"next"}));
-    assert_eq!(repair_context(&app, &fresh)["played_san"], "d4");
-    assert_eq!(repair_context(&app, &first), Value::Null);
 }
 
 #[test]
@@ -1685,24 +1510,13 @@ fn date_only_game_again_restarts_exact_position_repair_and_three_day_recall() {
     drop(app);
     let mut app = open(&db, today.clone(), limits, 1);
 
-    let package = app.export(&tempo::JsonSnapshotCodec).unwrap();
-    let mut restored = open(
-        &directory.path().join("restored.sqlite"),
-        today.clone(),
-        limits,
-        0,
-    );
-    restored
-        .restore("restored".into(), &package, &tempo::JsonSnapshotCodec)
-        .unwrap();
+    let learning = app.snapshot().unwrap().learning[&target].clone();
     assert_eq!(
-        date_only_import(&mut restored, "restored-game", "2024.10.02", "1. d4 d5")["results"][0]["effect"],
+        date_only_import(&mut app, "duplicate-after-reopen", "2024.10.02", "1. d4 d5")["results"]
+            [0]["effect"],
         "already_addressed"
     );
-    assert_eq!(
-        restored.snapshot().unwrap().learning[&target],
-        app.snapshot().unwrap().learning[&target]
-    );
+    assert_eq!(app.snapshot().unwrap().learning[&target], learning);
 
     today.store(20_003, Ordering::Relaxed);
     let older = study(&mut app, json!({"command":"next"}));
@@ -1832,7 +1646,7 @@ fn combined_books_match_italian_play_and_repair_an_unstudied_position_at_zero_qu
 }
 
 #[test]
-fn a_saved_choice_selects_one_target_and_stays_resolved_after_reprocessing_and_restore() {
+fn ambiguous_game_import_still_records_evidence_without_admitting_choice() {
     let directory = tempfile::tempdir().unwrap();
     let today = Arc::new(AtomicI32::new(20_004));
     let db = directory.path().join("choices.sqlite");
@@ -1852,98 +1666,17 @@ fn a_saved_choice_selects_one_target_and_stays_resolved_after_reprocessing_and_r
         "ply":ply, "target_id":target["target_id"]
     })).unwrap()
     };
-    assert!(
-        app.choose_game_correction(request("wrong-ply", &targets[0], 2))
-            .is_err()
-    );
-    let choice = app
-        .choose_game_correction(request("choose", &targets[0], 1))
-        .unwrap();
+    let before = app.snapshot().unwrap();
     assert_eq!(
-        serde_json::to_value(&choice).unwrap()["results"][0]["effect"],
-        "again_applied"
+        app.choose_game_correction(request("choose", &targets[0], 1)).err().unwrap().code,
+        "retired_feature",
     );
-    assert_eq!(
-        serde_json::to_vec(&choice).unwrap(),
-        serde_json::to_vec(
-            &app.choose_game_correction(request("choose", &targets[0], 1))
-                .unwrap()
-        )
-        .unwrap()
-    );
-    assert!(
-        app.choose_game_correction(request("change-choice", &targets[1], 1))
-            .is_err()
-    );
-    let repair = study(&mut app, json!({"command":"next"}));
-    assert_eq!(repair["target_id"], targets[0]["target_id"]);
-    assert_eq!(repair_context(&app, &repair)["played_san"], "c4");
-    let start = 20_002_u64 * 86_400_000;
-    let reprocessed = app
-        .reprocess_games(
-            serde_json::from_value(json!({
-                "command_id":"saved-window","dataset_id":"opening-proof","learner":"learner",
-                "from_ms":start, "to_ms":start + 86_400_000
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    assert_eq!(reprocessed.fetched, 1);
-    assert!(reprocessed.results[0].summary.choices.is_empty());
-    let store = SqliteStore::open(&db).unwrap();
-    let dataset = app.snapshot().unwrap().dataset;
-    let relevance = store.game_relevance(&dataset, "").unwrap();
-    let selected = TargetId::from(targets[0]["target_id"].as_str().unwrap());
-    let other = TargetId::from(targets[1]["target_id"].as_str().unwrap());
-    assert_eq!(
-        (relevance[&selected].exposure, relevance[&selected].misses),
-        (1, 1)
-    );
-    assert_eq!(
-        (relevance[&other].exposure, relevance[&other].misses),
-        (1, 0)
-    );
-    let package = app.export(&tempo::JsonSnapshotCodec).unwrap();
-    let mut restored = open(
-        &directory.path().join("choices-restored.sqlite"),
-        today,
-        limits,
-        0,
-    );
-    restored
-        .restore("restored".into(), &package, &tempo::JsonSnapshotCodec)
-        .unwrap();
-    let duplicate = date_only_import(&mut restored, "same-game", "2024.10.06", "1. c4 e5");
-    assert_eq!(duplicate["results"][0]["effect"], "already_addressed");
-    assert!(duplicate["results"][0].get("choices").is_none());
-}
-
-#[test]
-fn reset_accepts_same_day_date_only_games_and_keeps_earlier_games_historical() {
-    let directory = tempfile::tempdir().unwrap();
-    let today = Arc::new(AtomicI32::new(20_000));
-    let mut app = open(
-        &directory.path().join("reset-day.sqlite"),
-        today,
-        IntroductionLimits::default(),
-        0,
-    );
-    let (_, saved) = preview_and_save(&mut app, "1. e4 *", "White", None);
-    let id = &saved["repertoires"][0]["id"];
-    let reset = content(
-        &mut app,
-        json!({"command":"reset_progress","dataset_id":"opening-proof",
-        "repertoire_id":id,"command_id":"reset-day"}),
-    );
-    assert_eq!(reset["status"], "progress_reset");
-    assert_eq!(
-        date_only_import(&mut app, "earlier", "2024.10.03", "1. d4 d5")["results"][0]["effect"],
-        "recorded_only"
-    );
-    assert_eq!(
-        date_only_import(&mut app, "same-day", "2024.10.04", "1. d4 d5")["results"][0]["effect"],
-        "again_applied"
-    );
+    assert_eq!(app.snapshot().unwrap(), before);
+    drop(app);
+    let mut app = open(&db, today, limits, 1);
+    let duplicate = date_only_import(&mut app, "same-game", "2024.10.06", "1. c4 e5");
+    assert_eq!(duplicate["results"][0]["effect"], "choice_required");
+    assert_eq!(app.snapshot().unwrap().learning, before.learning);
 }
 
 #[test]
@@ -2176,126 +1909,12 @@ fn pgn_batch_resolves_timing_in_either_order_and_rejects_conflicting_end_atomica
 }
 
 #[test]
-fn portable_restore_keeps_the_latest_reset_boundary_across_restarts() {
+fn persisted_legacy_review_stays_actionable_and_is_consumed_by_a_covering_test() {
     let directory = tempfile::tempdir().unwrap();
     let day = Arc::new(AtomicI32::new(20_000));
     let limits = IntroductionLimits::default();
-    let mut source = open(
-        &directory.path().join("reset-source.sqlite"),
-        day.clone(),
-        limits,
-        0,
-    );
-    let (_, saved) = preview_and_save(&mut source, "1. e4 *", "White", None);
-    for (day_number, id) in [(20_000, "first-reset"), (20_002, "latest-reset")] {
-        day.store(day_number, Ordering::Relaxed);
-        let response = content(
-            &mut source,
-            json!({
-                "command":"reset_progress", "dataset_id":"opening-proof",
-                "repertoire_id":saved["repertoires"][0]["id"], "command_id":id
-            }),
-        );
-        assert_eq!(response["status"], "progress_reset", "{response}");
-    }
-    let before = date_only_import(&mut source, "between", "2024.10.05", "1. d4 d5");
-    assert_eq!(before["results"][0]["effect"], "recorded_only");
-
-    let path = directory.path().join("reset-destination.sqlite");
-    let data = source.export(&tempo::JsonSnapshotCodec).unwrap();
-    let mut restored = open(&path, day.clone(), limits, 0);
-    restored
-        .restore("restored".into(), &data, &tempo::JsonSnapshotCodec)
-        .unwrap();
-    drop(restored);
-    let mut restored = open(&path, day, limits, 1);
-    let restored_data = restored.export(&tempo::JsonSnapshotCodec).unwrap();
-    assert_eq!(restored_data, data);
-    let retried = date_only_import(&mut restored, "between", "2024.10.05", "1. d4 d5");
-    assert_eq!(retried["results"][0]["effect"], "recorded_only");
-    assert_eq!(
-        restored.snapshot().unwrap().learning,
-        source.snapshot().unwrap().learning
-    );
-    let after = date_only_import(&mut restored, "qualifying", "2024.10.06", "1. d4 d5");
-    assert_eq!(after["results"][0]["effect"], "again_applied", "{after}");
-}
-
-#[test]
-fn portable_restore_keeps_a_choice_that_applied_no_new_again() {
-    let directory = tempfile::tempdir().unwrap();
-    let day = Arc::new(AtomicI32::new(20_004));
-    let limits = IntroductionLimits::default();
-    let mut source = open(
-        &directory.path().join("choice-source.sqlite"),
-        day.clone(),
-        limits,
-        0,
-    );
-    preview_and_save(&mut source, "1. e4 *", "First", None);
-    let first = date_only_import(&mut source, "automatic", "2024.10.06", "1. c4 e5");
-    assert_eq!(first["results"][0]["effect"], "again_applied");
-    let corrected = source
-        .snapshot()
-        .unwrap()
-        .learning
-        .into_iter()
-        .find(|(_, state)| state.correction.is_some())
-        .unwrap()
-        .0;
-
-    preview_and_save(&mut source, "1. d4 *", "Second", None);
-    let ambiguous = date_only_import(&mut source, "ambiguous", "2024.10.06", "1. c4 e5");
-    let result = &ambiguous["results"][0];
-    assert_eq!(result["effect"], "choice_required");
-    let before = source.snapshot().unwrap();
-    let accepted = source.choose_game_correction(serde_json::from_value(json!({
-        "command_id":"choose-previously-corrected", "dataset_id":"opening-proof", "learner":"learner",
-        "source":result["source"], "game_id":result["game_id"], "comparison_id":result["comparison_id"],
-        "ply":1, "target_id":corrected
-    })).unwrap()).unwrap();
-    assert_eq!(
-        serde_json::to_value(accepted).unwrap()["results"][0]["effect"],
-        "already_addressed"
-    );
-    assert_eq!(source.snapshot().unwrap().learning, before.learning);
-
-    let data = source.export(&tempo::JsonSnapshotCodec).unwrap();
-    let snapshot: Value = serde_json::from_str(&data).unwrap();
-    assert_eq!(snapshot["game_failures"].as_array().unwrap().len(), 1);
-    assert!(
-        snapshot["game_failures"][0]
-            .get("chosen_position")
-            .is_none()
-    );
-    let path = directory.path().join("choice-destination.sqlite");
-    let mut restored = open(&path, day.clone(), limits, 0);
-    restored
-        .restore("restored".into(), &data, &tempo::JsonSnapshotCodec)
-        .unwrap();
-    drop(restored);
-    let mut restored = open(&path, day, limits, 1);
-    assert_eq!(restored.export(&tempo::JsonSnapshotCodec).unwrap(), data);
-    let duplicate = date_only_import(&mut restored, "reimported", "2024.10.06", "1. c4 e5");
-    assert_eq!(
-        duplicate["results"][0]["effect"], "already_addressed",
-        "{duplicate}"
-    );
-    assert!(duplicate["results"][0].get("choices").is_none());
-    assert_eq!(restored.snapshot().unwrap().learning, before.learning);
-}
-
-#[test]
-fn portable_legacy_review_stays_actionable_and_is_consumed_by_a_covering_test() {
-    let directory = tempfile::tempdir().unwrap();
-    let day = Arc::new(AtomicI32::new(20_000));
-    let limits = IntroductionLimits::default();
-    let mut source = open(
-        &directory.path().join("review-source.sqlite"),
-        day.clone(),
-        limits,
-        0,
-    );
+    let path = directory.path().join("review-source.sqlite");
+    let mut source = open(&path, day.clone(), limits, 0);
     preview_and_save(&mut source, "1. e4 *", "White", None);
     let lesson = study(&mut source, json!({"command":"next"}));
     let target = lesson["target_id"].as_str().unwrap();
@@ -2303,24 +1922,17 @@ fn portable_legacy_review_stays_actionable_and_is_consumed_by_a_covering_test() 
     day.store(20_001, Ordering::Relaxed);
     let test = study(&mut source, json!({"command":"next"}));
     play_activity(&mut source, &test, "answer", "test-legacy", "e2e4");
-    let data = source.export(&tempo::JsonSnapshotCodec).unwrap();
-    let mut legacy: Value = serde_json::from_str(&data).unwrap();
-    legacy["schema_version"] = json!(2);
-    legacy["learning"][target]["due"] = json!(20_200);
-    legacy["learning"][target]["game_review"] = json!({
-        "answer_version":1, "occurred_by_ms":20_001_u64 * 86_400_000 + 1, "actionable_day":20_002
-    });
-
-    let path = directory.path().join("review-destination.sqlite");
-    let mut restored = open(&path, day.clone(), limits, 0);
-    restored
-        .restore(
-            "restored".into(),
-            &legacy.to_string(),
-            &tempo::JsonSnapshotCodec,
-        )
-        .unwrap();
-    drop(restored);
+    let mut state = source.snapshot().unwrap().learning[&TargetId::from(target)].clone();
+    state.due = Some(StudyDay(20_200));
+    state.restored_game_obligation = Some(tempo_learning::RestoredGameObligation::Review(
+        tempo_learning::GameReview {
+            answer_version: tempo_types::ContentVersion(1),
+            occurred_by_ms: 20_001_u64 * 86_400_000 + 1,
+            actionable_day: StudyDay(20_002),
+        },
+    ));
+    drop(source);
+    save_learning_fixture(&path, target, state);
     let mut restored = open(&path, day.clone(), limits, 1);
     restored.reconcile_legacy_game_requests().unwrap();
     assert_eq!(restored.study_progress(None).unwrap().unwrap().due, 0);
@@ -2339,50 +1951,46 @@ fn portable_legacy_review_stays_actionable_and_is_consumed_by_a_covering_test() 
     assert!(state.restored_game_obligation.is_none());
     assert!(state.correction.is_none());
     assert_eq!(state.scheduled_reviews, 2);
-    let portable: Value =
-        serde_json::from_str(&restored.export(&tempo::JsonSnapshotCodec).unwrap()).unwrap();
-    assert!(portable.get("game_failures").is_none());
+    assert!(
+        SqliteStore::open(&path)
+            .unwrap()
+            .game_failures(&after.dataset)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
-fn portable_legacy_teaching_relevance_prioritizes_an_eligible_route() {
+fn persisted_legacy_teaching_relevance_prioritizes_an_eligible_route() {
     let directory = tempfile::tempdir().unwrap();
     let day = Arc::new(AtomicI32::new(20_000));
     let limits = IntroductionLimits {
         repertoire: 1,
         tactics: 0,
     };
-    let mut source = open(
-        &directory.path().join("teach-source.sqlite"),
-        day.clone(),
-        limits,
-        0,
-    );
-    preview_and_save(&mut source, "1. e4 *", "First", None);
-    preview_and_save(&mut source, "1. d4 *", "Second", None);
-    let baseline = study(&mut source, json!({"command":"next"}));
+    let fixture = |path: &Path| {
+        let mut app = open(path, day.clone(), limits, 0);
+        preview_and_save(&mut app, "1. e4 *", "First", None);
+        preview_and_save(&mut app, "1. d4 *", "Second", None);
+        app
+    };
+    let mut baseline = fixture(&directory.path().join("teach-baseline.sqlite"));
+    let baseline = study(&mut baseline, json!({"command":"next"}));
     let baseline_id = TargetId::from(baseline["target_id"].as_str().unwrap());
-    let relevant = source
+
+    let path = directory.path().join("teach-source.sqlite");
+    let source = fixture(&path);
+    let (relevant, mut state) = source
         .snapshot()
         .unwrap()
         .learning
-        .into_keys()
-        .find(|target| target != &baseline_id)
+        .into_iter()
+        .find(|(target, _)| target != &baseline_id)
         .unwrap();
-
-    let mut legacy: Value =
-        serde_json::from_str(&source.export(&tempo::JsonSnapshotCodec).unwrap()).unwrap();
-    legacy["schema_version"] = json!(2);
-    legacy["learning"][&relevant.0]["game_teaching_relevance"] = json!(true);
-    let path = directory.path().join("teach-destination.sqlite");
-    let mut restored = open(&path, day, limits, 0);
-    restored
-        .restore(
-            "restored".into(),
-            &legacy.to_string(),
-            &tempo::JsonSnapshotCodec,
-        )
-        .unwrap();
+    state.restored_game_obligation = Some(tempo_learning::RestoredGameObligation::Teaching);
+    drop(source);
+    save_learning_fixture(&path, &relevant.0, state);
+    let mut restored = open(&path, day, limits, 1);
     let lesson = study(&mut restored, json!({"command":"next"}));
     assert_eq!(lesson["activity"], "teach", "{lesson}");
     assert_eq!(lesson["target_id"], relevant.0);
@@ -2398,47 +2006,18 @@ fn portable_legacy_teaching_relevance_prioritizes_an_eligible_route() {
     );
 }
 
-#[test]
-fn portable_restore_rejects_corrective_recall_on_the_game_assessment_day() {
-    let directory = tempfile::tempdir().unwrap();
-    let day = Arc::new(AtomicI32::new(20_004));
-    let limits = IntroductionLimits::default();
-    let mut source = open(
-        &directory.path().join("timing-source.sqlite"),
-        day.clone(),
-        limits,
-        0,
-    );
-    preview_and_save(&mut source, "1. e4 *", "White", None);
-    let game = date_only_import(&mut source, "miss", "2024.10.06", "1. c4 e5");
-    assert_eq!(game["results"][0]["effect"], "again_applied");
-    let package = source.export(&tempo::JsonSnapshotCodec).unwrap();
-    let mut invalid: Value = serde_json::from_str(&package).unwrap();
-    let state = invalid["learning"]
-        .as_object_mut()
-        .unwrap()
-        .values_mut()
-        .next()
-        .unwrap();
-    state["correction"]["awaiting_introduction"] = json!(false);
-    state["correction"]["next_recall_day"] = state["last_review_at"]["day"].clone();
-
-    let mut restored = open(
-        &directory.path().join("timing-destination.sqlite"),
-        day,
-        limits,
-        0,
-    );
-    let before = restored.snapshot().unwrap();
-    let rejected = restored.restore(
-        "restored".into(),
-        &invalid.to_string(),
-        &tempo::JsonSnapshotCodec,
-    );
-    assert_eq!(rejected.unwrap_err().code, "invalid_learning");
-    assert_eq!(restored.snapshot().unwrap(), before);
-    restored
-        .restore("restored".into(), &package, &tempo::JsonSnapshotCodec)
+fn save_learning_fixture(path: &Path, target: &str, state: tempo_learning::LearningState) {
+    let mut store = SqliteStore::open(path).unwrap();
+    let before = store.snapshot().unwrap();
+    store
+        .commit(tempo_store::Commit {
+            expected_dataset: before.dataset,
+            expected_revision: before.revision,
+            writes: vec![tempo_store::Write::Learning {
+                target: TargetId::from(target),
+                state,
+            }],
+        })
         .unwrap();
 }
 
@@ -2958,7 +2537,7 @@ fn marked_preview_returns_a_signed_save_for_a_large_document() {
 }
 
 #[test]
-fn a_saved_opening_uses_the_issued_definition_until_history_is_reset() {
+fn a_saved_opening_uses_the_issued_definition_after_repertoire_edit() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("saved-review.sqlite");
     let today = Arc::new(AtomicI32::new(20_000));
@@ -3000,32 +2579,6 @@ fn a_saved_opening_uses_the_issued_definition_until_history_is_reset() {
     assert_eq!(context["origin"]["fen"], lesson["prompt"]["fen"]);
     assert_eq!(context["origin"]["name"], "Before edit");
     assert_eq!(context["origin"]["prescribedUci"], "e2e4");
-    let reset = content(
-        &mut app,
-        json!({
-            "command": "reset_progress", "dataset_id": lesson["dataset_id"],
-            "repertoire_id": book_id, "command_id": "reset-after-mark",
-        }),
-    );
-    assert_eq!(reset["status"], "progress_reset", "{reset}");
-    let gone = app
-        .saved_study_reviews(serde_json::from_value(open_mark).unwrap())
-        .unwrap_err();
-    assert_eq!(gone.code, "unknown_review");
-    assert_eq!(
-        app.save_study_review(serde_json::from_value(save).unwrap())
-            .unwrap(),
-        saved
-    );
-    let page = app
-        .saved_study_reviews(
-            serde_json::from_value(json!({
-                "command": "list", "dataset_id": lesson["dataset_id"],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    assert_eq!(page["rows"], json!([]));
 }
 
 fn activity_change(repertoire: &str, command_id: &str, activity: &str) -> Value {
@@ -3282,7 +2835,7 @@ fn repertoire_suspension_leaves_another_books_signed_edit_valid() {
 }
 
 #[test]
-fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
+fn repertoire_suspension_preserves_historical_choice_candidates_without_admission() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("suspend-chosen-book.sqlite");
     let mut app = open(
@@ -3291,8 +2844,7 @@ fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
         IntroductionLimits::default(),
         0,
     );
-    let (_, created) = preview_and_save(&mut app, SHORT, "Italian", None);
-    let italian = created["repertoires"][0]["id"].as_str().unwrap();
+    preview_and_save(&mut app, SHORT, "Italian", None);
     let (_, books) = preview_and_save(&mut app, "1. d4 d5 2. Bf4 *", "London", None);
     let london = books["repertoires"]
         .as_array()
@@ -3316,7 +2868,6 @@ fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
             .unwrap();
         TargetId::from(id)
     };
-    let italian_target = target(italian);
     let london_target = target(london);
     assert_eq!(candidates.len(), 2, "{choice}");
 
@@ -3337,37 +2888,12 @@ fn repertoire_suspension_never_reattributes_a_saved_game_choice() {
     assert_eq!(content(&mut app, resume)["status"], "activity_set");
     assert!(app.game_history().unwrap()["results"][0]["correction_choice_status"].is_null());
 
-    app.choose_game_correction(serde_json::from_value(json!({
+    let before = app.snapshot().unwrap();
+    let choice = app.choose_game_correction(serde_json::from_value(json!({
         "command_id":"choose-london", "dataset_id":"opening-proof", "learner":"learner",
         "source":result["source"], "game_id":result["game_id"], "comparison_id":result["comparison_id"],
         "ply":choice["ply"], "target_id":london_target,
-    })).unwrap()).unwrap();
-    let store = SqliteStore::open(&db).unwrap();
-    let misses = || {
-        let facts = store
-            .game_relevance(&"opening-proof".into(), tempo_store::REACH_MODEL_KEY)
-            .unwrap();
-        (facts[&italian_target].misses, facts[&london_target].misses)
-    };
-    assert_eq!(misses(), (0, 1));
-    let before = app.snapshot().unwrap();
-    assert_eq!(
-        content(
-            &mut app,
-            activity_change(london, "suspend-chosen", "suspended")
-        )["status"],
-        "activity_set"
-    );
-    assert_eq!(app.reconcile_choice_encounters().unwrap().repaired, 0);
-    assert_eq!(misses(), (0, 1));
-    date_only_import(&mut app, "reprocess-suspended", "2024.10.01", played);
-    assert_eq!(misses(), (0, 1));
-    assert_eq!(
-        content(&mut app, activity_change(london, "resume-chosen", "active"))["status"],
-        "activity_set"
-    );
-    assert_eq!(misses(), (0, 1));
-    let after = app.snapshot().unwrap();
-    assert_eq!(after.assessments, before.assessments);
-    assert_eq!(after.learning, before.learning);
+    })).unwrap());
+    assert_eq!(choice.err().unwrap().code, "retired_feature");
+    assert_eq!(app.snapshot().unwrap(), before);
 }

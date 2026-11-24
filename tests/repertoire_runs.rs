@@ -265,3 +265,55 @@ fn connected_run_retirement_closes_legacy_warmup_without_a_grade() {
     assert_eq!(after.receipts, before.receipts);
     assert_eq!(after.repertoire_run, before.repertoire_run);
 }
+
+#[test]
+fn next_retires_legacy_practice_without_changing_accepted_work() {
+    let mut fixture = Fixture::new(LINE);
+    let old = fixture.seed_legacy_run(false);
+    let old_id = AttemptId(old["attempt_id"].as_str().unwrap().into());
+    let mut practice = fixture.app.snapshot().unwrap().attempts[&old_id].clone();
+    let stopped = fixture.command(address("skip", &old, "seed-legacy-practice", None));
+    assert_eq!(stopped["status"], "abandoned", "{stopped}");
+    let before_issue = fixture.app.snapshot().unwrap();
+    let practice_id = AttemptId::from("legacy-practice");
+    practice.attempt.id = practice_id.clone();
+    practice.mode = ActivityMode::Practice;
+    practice.issued_revision = Some(before_issue.revision);
+    practice.issued_work = None;
+    let mut store = SqliteStore::open(&fixture.db).unwrap();
+    store
+        .commit(Commit {
+            expected_dataset: before_issue.dataset,
+            expected_revision: before_issue.revision,
+            writes: vec![
+                Write::Issue(practice),
+                Write::Active(Some(practice_id.clone())),
+            ],
+        })
+        .unwrap();
+
+    let resumed = fixture.command(json!({"command": "resume", "attempt_id": practice_id}));
+    let answer = address("answer", &resumed, "accepted-practice-miss", Some("a2a3"));
+    let accepted = fixture.command(answer.clone());
+    assert_eq!(accepted["status"], "ready", "{accepted}");
+    assert_eq!(accepted["assessment"], "again");
+    let before = fixture.app.snapshot().unwrap();
+    assert_eq!(before.active_attempt.as_ref(), Some(&practice_id));
+    assert_eq!(before.assessments, before_issue.assessments);
+    let next = fixture.next();
+    assert_ne!(next["attempt_id"], practice_id.0);
+    let after = fixture.app.snapshot().unwrap();
+    assert_ne!(after.active_attempt.as_ref(), Some(&practice_id));
+    let retired = &after.attempts[&practice_id].attempt;
+    assert_eq!(retired.status, AttemptStatus::Abandoned);
+    assert_eq!(
+        retired.terminal,
+        before.attempts[&practice_id].attempt.terminal
+    );
+    assert_eq!(after.learning, before.learning);
+    assert_eq!(after.assessments, before.assessments);
+    assert_eq!(after.receipts, before.receipts);
+    assert_eq!(after.repertoire_run, before.repertoire_run);
+    assert_eq!(fixture.command(answer), accepted);
+    assert_eq!(fixture.app.snapshot().unwrap(), after);
+}

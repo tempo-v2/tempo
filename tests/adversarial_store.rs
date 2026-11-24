@@ -1,6 +1,5 @@
 use serde_json::{Value, json};
 use std::path::Path;
-use tempo::game_backfill::BackfillCoordinator;
 use tempo::{DailyComponents, FixedClock, IntroductionLimits, Tempo};
 use tempo_chess::{Catalog, LegalSequenceGrader};
 use tempo_learning::{DailyLearning, LearningPolicy};
@@ -57,7 +56,7 @@ fn import_correct_game(app: &mut Tempo, learner: &str) {
 }
 
 #[test]
-fn narrower_backfill_preserves_recognized_account_evidence_before_fetching() {
+fn archived_narrower_backfill_preserves_recognized_account_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("audit.sqlite");
     let mut app = app(&path);
@@ -91,24 +90,24 @@ fn narrower_backfill_preserves_recognized_account_evidence_before_fetching() {
         .0
         .clone();
     assert_eq!(store.opponent_gaps(&dataset).unwrap()[0].games, 2);
-    let mut coordinator = BackfillCoordinator::start(&app).unwrap();
-    coordinator
-        .begin(
-            &mut app,
-            serde_json::from_value(json!({
-                "command_id":"lichess-only", "dataset_id":"audit", "from_ms":NOW-3*DAY,
-                "to_ms":NOW-DAY, "lichess":"lichess-user", "chess_com":null
-            }))
-            .unwrap(),
+    let narrower = json!({"id":"lichess-only", "request":{
+        "command_id":"lichess-only", "dataset_id":"audit", "from_ms":NOW-3*DAY,
+        "to_ms":NOW-DAY, "lichess":"lichess-user", "chess_com":null
+    }, "resets":{}, "windows":[
+        {"source":"lichess", "learner":"lichess-user", "from_ms":NOW-3*DAY, "to_ms":NOW-DAY,
+         "attempt":1, "status":"pending", "received":0, "accepted":0, "split":false, "notes":[]},
+        {"source":"pgn", "learner":"lichess-user", "from_ms":NOW-3*DAY, "to_ms":NOW-DAY,
+         "attempt":1, "status":"complete", "received":1, "accepted":1, "split":false, "notes":[]}
+    ], "retries":["old-retry"]});
+    store
+        .save_game_backfill_state(
+            &dataset,
+            "lichess-only",
+            &narrower.to_string(),
+            Some(&[("lichess".into(), "lichess-user".into())]),
         )
         .unwrap();
     let after = store.game_relevance(&dataset, "").unwrap();
-    println!(
-        "Narrower job began, no poll or fetch: exposure {} -> {}, gap games 2 -> {}",
-        before[&target].exposure,
-        after[&target].exposure,
-        store.opponent_gaps(&dataset).unwrap()[0].games
-    );
     assert_eq!(after[&target].exposure, 2);
     assert_eq!(store.opponent_gaps(&dataset).unwrap()[0].games, 2);
     let state = store
@@ -116,6 +115,7 @@ fn narrower_backfill_preserves_recognized_account_evidence_before_fetching() {
         .unwrap()
         .unwrap();
     let state: Value = serde_json::from_str(&state).unwrap();
+    assert_eq!(state, narrower);
     let windows = state["windows"].as_array().unwrap();
     assert!(windows.iter().any(|window| window["source"] == "lichess"));
     assert!(windows.iter().any(|window| window["source"] == "pgn"));

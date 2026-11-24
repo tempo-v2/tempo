@@ -148,12 +148,11 @@ test("phone Study retains its shared commands and denies desktop routes after in
   assert.deepEqual(databaseRows(database), beforeAdmission);
   const before = databaseRows(database);
   const presence = { tab: "7a791296-6215-4d60-ae7c-58bab00ce975", sequence: 1, state: "active" };
-  assert.deepEqual(await send(host, "/api/study/presence", {
+  const retiredPresence = await send(host, "/api/study/presence", {
     method: "POST", headers: phoneHeaders, payload: presence,
-  }), { status: 204, body: "" });
-  assert.equal((await send(host, "/api/study/presence", {
-    method: "POST", headers: phoneHeaders, payload: { ...presence, sequence: 0 },
-  })).status, 400);
+  });
+  assert.equal(retiredPresence.status, 410);
+  assert.equal(JSON.parse(retiredPresence.body).code, "retired_feature");
   assert.equal((await send(host, "/api/study/presence", {
     method: "POST", headers: { ...phoneHeaders, Origin: "https://another.ts.net:8443" }, payload: presence,
   })).status, 403);
@@ -161,12 +160,17 @@ test("phone Study retains its shared commands and denies desktop routes after in
     ["/api/games/detectors", "GET"], ["/api/games/detection", "POST"],
     ["/api/games/detection-result", "POST"], ["/api/games/library", "POST"],
     ["/api/games/review", "POST"], ["/api/games/import", "POST"],
+    ["/api/games/job", "GET"], ["/api/games/refresh", "POST"],
+    ["/api/games/backfill", "GET"], ["/api/games/backfill", "POST"], ["/api/games/backfill/retry", "POST"],
     ["/api/repertoires", "GET"], ["/api/study/analysis-context", "POST"],
     ["/api/games/model", "POST"], ["/api/games/gaps", "GET"],
+    ["/api/games/tactics", "POST"], ["/api/games/tactics/command", "POST"],
     ["/api/games/gap-analysis", "GET"], ["/api/games/gap-explorer", "POST"],
     ["/api/study", "PUT"], ["/api/study", "GET"], ["/api/study/presence", "GET"],
   ]) assert.equal((await send(host, route, { method, headers: phoneHeaders, payload: {} })).status, 404, route);
-  for (const path of ["/api/games/gap-analysis", "/api/games/gap-analysis/status"]) {
+  for (const path of [
+    "/api/games/gap-analysis", "/api/games/gap-analysis/status", "/api/games/gap-line", "/api/games/gap-line/status",
+  ]) {
     const retired = await send(host, path, { method: "POST", headers: phoneHeaders, payload: {} });
     assert.equal(retired.status, 410);
     assert.equal(JSON.parse(retired.body).code, "retired_feature");
@@ -216,8 +220,11 @@ test("phone Study retains its shared commands and denies desktop routes after in
     "phone_build_only", command.command);
   const scopedGaps = await post("/api/games/gaps", { offset: 0, forecast_repertoire: repertoire_id }, phoneHeaders);
   assert.deepEqual(scopedGaps.gaps, []);
-  const scan = await post("/api/games/coverage/status", { dataset_id, repertoire_id }, phoneHeaders);
-  assert.equal(scan.status, "idle");
+  for (const path of ["/api/games/coverage", "/api/games/coverage/status"]) {
+    const retired = await send(host, path, { method: "POST", headers: phoneHeaders, payload: { dataset_id, repertoire_id } });
+    assert.equal(retired.status, 410);
+    assert.equal(JSON.parse(retired.body).code, "retired_feature");
+  }
   const issued = await post("/api/study", { command: "next" }, phoneHeaders);
   const resumeSql = new DatabaseSync(database, { timeout: 5000 });
   const { state: learningBeforeResume } = resumeSql.prepare(

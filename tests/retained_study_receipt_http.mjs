@@ -128,7 +128,7 @@ for (const priorAccepted of [true, false]) {
         assert.equal(completed.attempt_id, JSON.parse(pending).attempt_id);
         if (priorAccepted) assert.deepEqual(completed, accepted);
         const settled = readState(database, submission);
-        assert.equal(settled.schema, 25);
+        assert.equal(settled.schema, 27);
         assert.equal(settled.assessmentCount, before.assessmentCount);
         const acceptance = JSON.parse(settled.attempts[0].record).acceptance;
         assert.deepEqual(settled.days.map(day => ({ ...day })), [{
@@ -162,5 +162,170 @@ for (const priorAccepted of [true, false]) {
           assert.notDeepEqual(settled.learning, before.learning);
         }
       });
+    });
+}
+
+test("issued Skip defers only its exact obligation without a plan or summary", { timeout: 20000 },
+  async t => {
+    const candidate = binary("TEMPO_BINARY");
+    const root = await mkdtemp(join(tmpdir(), "tempo-exact-skip-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const database = join(root, "study.sqlite");
+    const ui = join(root, "ui");
+    await mkdir(join(ui, "assets"), { recursive: true });
+    await writeFile(join(ui, "index.html"), "<title>Exact Skip fixture</title>");
+    execFileSync(candidate, ["init", database]);
+    const submission_id = "prepared-skip";
+    let pending;
+    let issuedWork;
+    await serve(candidate, database, ui, async post => {
+      const { dataset_id } = await post("/api/repertoires", JSON.stringify({ command: "list" }));
+      const input = { dataset_id, name: "Skip fixture", learner_color: "white", pgn: "1. e4 *" };
+      const preview = await post("/api/repertoires", JSON.stringify({ ...input, command: "preview" }));
+      await post("/api/repertoires", JSON.stringify({ ...input, command: "save", token: preview.token }));
+      const issued = await post("/api/study", JSON.stringify({ command: "next" }));
+      pending = JSON.stringify({
+        command: "skip", dataset_id, attempt_id: issued.attempt_id,
+        expected_revision: issued.revision, submission_id,
+      });
+    });
+
+    // T21 will issue the token through prepared Next. Seed that persisted
+    // identity explicitly here to exercise the real Skip consumer before T21.
+    const sql = new DatabaseSync(database, { timeout: 5000 });
+    try {
+      const { attempt_id } = JSON.parse(pending);
+      const row = sql.prepare("SELECT record FROM attempts WHERE id=?").get(attempt_id);
+      const record = JSON.parse(row.record);
+      issuedWork = {
+        day: record.issued_at.day,
+        obligation: {
+          target: record.attempt.target,
+          version: record.attempt.content_version,
+          kind: "teach",
+          revision: record.issued_miss_revision,
+        },
+      };
+      sql.prepare("UPDATE attempts SET record=? WHERE id=?").run(
+        JSON.stringify({ ...record, issued_work: issuedWork }), attempt_id,
+      );
+      sql.exec("DELETE FROM study_projection_state");
+      sql.exec(`CREATE TRIGGER refuse_deferral BEFORE INSERT ON study_deferrals
+        BEGIN SELECT RAISE(ABORT, 'injected deferral failure'); END`);
+      await serve(candidate, database, ui, async post => {
+        const before = readState(database, submission_id);
+        assert.equal((await post("/api/study", pending)).status, "error");
+        assert.deepEqual(readState(database, submission_id), before);
+        sql.exec("DROP TRIGGER refuse_deferral");
+        const accepted = await post("/api/study", pending);
+        assert.notEqual(accepted.status, "error");
+        const settled = readState(database, submission_id);
+        assert.deepEqual(settled.learning, before.learning);
+        assert.equal(settled.assessmentCount, before.assessmentCount);
+        const row = sql.prepare(`SELECT target_id,work_kind,ordinal,hex(version) AS version,
+          hex(obligation_revision) AS revision FROM study_deferrals`).get();
+        const integerKey = n => BigInt(n).toString(16).toUpperCase().padStart(16, "0");
+        assert.deepEqual({ ...row }, {
+          target_id: issuedWork.obligation.target,
+          work_kind: "teach",
+          ordinal: 1,
+          version: integerKey(issuedWork.obligation.version),
+          revision: integerKey(issuedWork.obligation.revision),
+        });
+        assert.deepEqual(await post("/api/study", pending), accepted);
+        assert.deepEqual(readState(database, submission_id), settled);
+      });
+    } finally {
+      sql.close();
+    }
+  });
+
+for (const firstCommand of ["answer", "give_up"]) {
+  test(`prepared Test ${firstCommand} persists one correction across restart`, { timeout: 20000 },
+    async t => {
+      const candidate = binary("TEMPO_BINARY");
+      const root = await mkdtemp(join(tmpdir(), "tempo-human-correction-"));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const database = join(root, "study.sqlite");
+      const ui = join(root, "ui");
+      await mkdir(join(ui, "assets"), { recursive: true });
+      await writeFile(join(ui, "index.html"), "<title>Human correction fixture</title>");
+      execFileSync(candidate, ["init", database]);
+
+      const sql = new DatabaseSync(database, { timeout: 5000 });
+      const state = () => JSON.parse(sql.prepare("SELECT state FROM learning").get().state);
+      const readAttempt = id =>
+        JSON.parse(sql.prepare("SELECT record FROM attempts WHERE id=?").get(id).record);
+      let dataset_id;
+      let attempt_id;
+      let first;
+      let correction;
+      try {
+        await serve(candidate, database, ui, async post => {
+          ({ dataset_id } = await post("/api/repertoires", JSON.stringify({ command: "list" })));
+          const source = { dataset_id, name: "Correction", learner_color: "white", pgn: "1. e4 *" };
+          const preview = await post("/api/repertoires", JSON.stringify({ ...source, command: "preview" }));
+          await post("/api/repertoires", JSON.stringify({ ...source, command: "save", token: preview.token }));
+          const teach = await post("/api/study", JSON.stringify({ command: "next" }));
+          await post("/api/study", JSON.stringify({
+            command: "acknowledge", dataset_id, attempt_id: teach.attempt_id,
+            expected_revision: teach.revision, submission_id: "correction-teach",
+            answer: { uci: teach.lesson.move_uci },
+          }));
+          // Make existing introduced work due without changing the system clock.
+          sql.exec("UPDATE learning SET state=json_set(state,'$.due',0)");
+          const test = await post("/api/study", JSON.stringify({ command: "next" }));
+          attempt_id = test.attempt_id;
+          const issued = readAttempt(attempt_id);
+          assert.equal(issued.mode, "test");
+          // Exercise the real consumer before prepared Next becomes the issuer.
+          sql.prepare("UPDATE attempts SET record=? WHERE id=?").run(JSON.stringify({
+            ...issued,
+            issued_work: {
+              day: issued.issued_at.day,
+              obligation: {
+                target: issued.attempt.target, version: issued.attempt.content_version,
+                revision: issued.issued_miss_revision, kind: "test",
+              },
+            },
+          }), attempt_id);
+          sql.exec("DELETE FROM study_projection_state");
+          first = JSON.stringify({
+            command: firstCommand, dataset_id, attempt_id, expected_revision: test.revision,
+            submission_id: "correction-miss",
+            ...(firstCommand === "answer" && { answer: { uci: "e2e3" } }),
+          });
+          const missed = await post("/api/study", first);
+          assert.notEqual(missed.status, "error");
+          const opened = state();
+          assert.equal(opened.miss_revision, issued.issued_miss_revision + 1);
+          assert.equal(opened.correction.lifecycle, "human_test");
+          assert.equal(opened.scheduled_reviews, 1);
+          assert.equal(readState(database, "correction-miss").assessmentCount, 1);
+          assert.deepEqual(await post("/api/study", first), missed);
+          correction = JSON.stringify({
+            command: "answer", dataset_id, attempt_id, expected_revision: missed.revision,
+            submission_id: "correction-complete", answer: { uci: "e2e4" },
+          });
+        });
+        await serve(candidate, database, ui, async post => {
+          const opened = state();
+          assert.equal(opened.correction.lifecycle, "human_test");
+          const accepted = await post("/api/study", correction);
+          assert.equal(accepted.status, "complete");
+          const closed = state();
+          const { correction: removed, ...scheduledState } = opened;
+          assert.ok(removed);
+          const { correction: noCorrection, ...remainingState } = closed;
+          assert.equal(noCorrection ?? null, null);
+          assert.deepEqual(remainingState, scheduledState);
+          const settled = readState(database, "correction-complete");
+          assert.equal(settled.assessmentCount, 1);
+          assert.deepEqual(await post("/api/study", correction), accepted);
+          assert.deepEqual(readState(database, "correction-complete"), settled);
+        });
+      } finally {
+        sql.close();
+      }
     });
 }

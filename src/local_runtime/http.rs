@@ -1,16 +1,15 @@
 //! Serve public UI artifacts and serialize commands through a single Tempo app.
 mod ingress;
+mod read_context;
 
 use self::ingress::{Admission, Head, Header, MAX_REPLY_BYTES, Request, Response, Server};
+use self::read_context::ContextReader;
 use super::{LocalResult, tactic_settings};
 use crate::{
     AppError, SaveStudyReview, SavedStudyReviewCommand, Tempo,
-    diagnostics::Span,
-    game_backfill::{BackfillCoordinator, BackfillRequest, BackfillRetry},
-    game_detection::GameDetection,
-    game_evidence::{GameImport, GameJobs, GameRefresh},
-    game_model::{AuthoringSurface, GameModel, GapRequest, ModelRequest},
-    gap_explorer::{GapExplorer, GapExplorerRequest},
+    game_backfill::{BackfillRequest, BackfillRetry},
+    game_evidence::{GameImport, GameRefresh, ReprocessGames},
+    game_model::{AuthoringSurface, GapRequest},
     wire::{ErrorView, RepertoireCommand, StudyCommand, StudyView, TacticCaptureCommand},
 };
 use hyper::{
@@ -27,21 +26,17 @@ use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tempo_store::SqliteStore;
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_CONTENT_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn serve(
     app: &mut Tempo,
-    profile_store: &SqliteStore,
     database: &Path,
     ui: &Path,
     port: u16,
-    detection: GameDetection,
-    engine: Option<crate::tactical_engine::PayoffEngine>,
 ) -> LocalResult<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
     let address = listener.local_addr()?.to_string();
@@ -50,6 +45,7 @@ pub(super) fn serve(
         address,
         desktop: build_files(ui)?,
         phone: PhoneStudy::load(ui)?,
+        context: ContextReader::start(database)?,
     });
     let ingress_surfaces = surfaces.clone();
     let server = Server::start(listener, move |head| ingress_surfaces.admitted(head))?;
@@ -60,74 +56,11 @@ pub(super) fn serve(
             "listen_port": surfaces.address.rsplit(':').next().and_then(|port| port.parse::<u16>().ok())
         }),
     );
-    let explorer = std::sync::Arc::new(crate::explorer::ExplorerClient::new(database));
-    let detector = detection
-        .complete_decision_detector()
-        .unwrap_or("hanging-material");
-    let mut tactics = crate::tactical_jobs::TacticalJobs::new(&detection, &[detector]);
-    if let Some(engine) = engine {
-        tactics.enable_payoffs(engine);
-    }
-    let mut games = Games {
-        refresh: GameJobs::start()?,
-        detection,
-        tactics,
-        backfill: BackfillCoordinator::start(app)?,
-        model: GameModel::new(database)?,
-        coverage: crate::coverage_scan::CoverageScan::new(database, explorer.clone()),
-        gap_explorer: GapExplorer::with_client(explorer),
-    };
-    let mut model_marker = None;
-    let mut next_model_check = Instant::now();
     loop {
-        if let Some(request) = server.try_recv()? {
-            if let Err(error) = respond(app, profile_store, &mut games, request, &surfaces) {
-                eprintln!("Tempo HTTP: {error}");
-            }
-            continue;
-        }
-        if Instant::now() >= next_model_check {
-            let mut trace = crate::diagnostics::Span::new("loop.model_schedule");
-            let scheduled = (|| -> LocalResult<()> {
-                let marker = profile_store.game_comparison_marker()?;
-                if model_marker.as_ref() != Some(&marker) {
-                    games.model.project_cached(marker.0.clone())?;
-                    model_marker = Some(marker);
-                }
-                Ok(())
-            })();
-            if let Err(error) = scheduled {
-                eprintln!("Tempo model scheduling: {error}");
-                trace.set_outcome("error");
-                crate::diagnostics::emit(
-                    "runtime.error",
-                    serde_json::json!({
-                        "operation": "loop.model_schedule", "error_code": "model_scheduling_failed"
-                    }),
-                );
-            }
-            next_model_check = Instant::now() + Duration::from_millis(250);
-        }
-        {
-            let _trace = crate::diagnostics::Span::new("loop.refresh_apply");
-            games.refresh.poll(app);
-        }
-        {
-            let _trace = crate::diagnostics::Span::new("loop.detection_apply");
-            games.detection.poll(app);
-        }
-        {
-            let _trace = crate::diagnostics::Span::new("loop.tactics_apply");
-            games.tactics.poll(app, profile_store, &mut games.detection);
-        }
-        if !games.refresh.active() {
-            let _trace = crate::diagnostics::Span::new("loop.backfill_apply");
-            games.backfill.poll(app);
-        }
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
-        if let Err(error) = respond(app, profile_store, &mut games, request, &surfaces) {
+        if let Err(error) = respond(app, request) {
             eprintln!("Tempo HTTP: {error}");
             crate::diagnostics::emit(
                 "runtime.error",
@@ -137,16 +70,6 @@ pub(super) fn serve(
             );
         }
     }
-}
-
-struct Games {
-    refresh: GameJobs,
-    detection: GameDetection,
-    tactics: crate::tactical_jobs::TacticalJobs,
-    backfill: BackfillCoordinator,
-    model: GameModel,
-    coverage: crate::coverage_scan::CoverageScan,
-    gap_explorer: GapExplorer,
 }
 
 #[derive(serde::Deserialize)]
@@ -177,6 +100,7 @@ struct HttpSurfaces {
     origin: String,
     desktop: BTreeMap<String, Asset>,
     phone: Option<PhoneStudy>,
+    context: ContextReader,
 }
 
 impl HttpSurfaces {
@@ -203,12 +127,26 @@ impl HttpSurfaces {
             }
             AuthoringSurface::Desktop
         };
+        if head.method() == Method::GET {
+            if head.url() == "/api/context" {
+                return Ok(Admission::Context(self.context.clone()));
+            }
+            let path = asset_path(head.url());
+            if let Some(asset) = self.assets(surface).get(path) {
+                return Ok(Admission::Immediate(body(asset.mime, asset.bytes.clone()).with_header(
+                    field("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'"),
+                )));
+            }
+            if path.starts_with("/assets/") {
+                return Ok(Admission::Immediate(Response::empty(StatusCode::NOT_FOUND)));
+            }
+        }
         let body_bytes = (head.method() == Method::POST).then(|| match head.url() {
             "/api/study/presence" => 1024,
             "/api/repertoires" | "/api/tactics" | "/api/games/import" => MAX_CONTENT_COMMAND_BYTES,
             _ => MAX_COMMAND_BYTES,
         });
-        Ok(Admission {
+        Ok(Admission::Foreground {
             surface,
             body_bytes,
         })
@@ -288,16 +226,6 @@ impl PhoneStudy {
                     | "/api/study/review-mark"
                     | "/api/study/card-details"
                     | "/api/repertoires"
-                    | "/api/games/coverage"
-                    | "/api/games/coverage/status"
-                    | "/api/games/coverage/starting-line"
-                    | "/api/games/coverage/starting-line/save"
-                    | "/api/games/gaps"
-                    | "/api/games/gap-draft"
-                    | "/api/games/gap-line"
-                    | "/api/games/gap-line/status"
-                    | "/api/games/gap-analysis"
-                    | "/api/games/gap-analysis/status"
             ),
             _ => false,
         }
@@ -390,10 +318,7 @@ fn build_files(ui: &Path) -> LocalResult<BTreeMap<String, Asset>> {
 
 fn respond(
     app: &mut Tempo,
-    profile_store: &SqliteStore,
-    games: &mut Games,
     mut request: Request,
-    surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
     if !request.claim() {
         request.busy();
@@ -417,7 +342,7 @@ fn respond(
         },
     );
     trace.field("route", diagnostic_route(request.url()));
-    let result = respond_inner(app, profile_store, games, request, surfaces);
+    let result = respond_inner(app, request);
     trace.set_outcome(if result.is_ok() {
         "returned"
     } else {
@@ -428,119 +353,33 @@ fn respond(
 
 fn respond_inner(
     app: &mut Tempo,
-    profile_store: &SqliteStore,
-    games: &mut Games,
     request: Request,
-    surfaces: &HttpSurfaces,
 ) -> LocalResult<()> {
     let surface = request.surface();
-    let public = surfaces.assets(surface);
-    if request.method() == &Method::GET && request.url() == "/api/context" {
-        let (status, reply) = match profile_store.context_identity() {
-            Ok((dataset, schema_version)) => (
-                200,
-                serde_json::json!({
-                    "status": "ready",
-                    "dataset_id": dataset,
-                    "schema_version": schema_version,
-                }),
-            ),
-            Err(_) => (
-                503,
-                serde_json::json!({"status": "unavailable", "code": "storage_unavailable"}),
-            ),
-        };
-        respond_traced(
-            request,
-            body("application/json; charset=utf-8", json_bytes(&reply)?)
-                .with_status_code(status_code(status))
-                .with_header(field("Cache-Control", "no-store")),
-        )?;
-        return Ok(());
-    }
     // Older open tabs have strict v5 reply validators. The opt-in changes
     // display only, independent of submission identity and saved receipts.
     let move_details = header(&request, "X-Tempo-Move-Details") == Some("1");
     let opponent_context = header(&request, "X-Tempo-Study-Opponent-Moves") == Some("1");
     let tactic_explanation = header(&request, "X-Tempo-Study-Tactic-Explanation") == Some("1");
-    if request.method() == &Method::POST && request.url() == "/api/study/presence" {
-        let _trace = Span::new("study.presence");
-        let result = command(&request, 1024)
-            .and_then(|report| games.tactics.study_presence(report, &mut games.detection));
-        let status = if result.is_ok() { 204 } else { 400 };
-        respond_traced(request, Response::empty(status_code(status)))?;
-    } else if request.method() == &Method::POST && request.url() == "/api/games/tactics/command" {
-        let _trace = Span::new("tactics.command");
-        let result = command::<crate::tactical_jobs::TacticalCommand>(&request, MAX_COMMAND_BYTES)
-            .and_then(|intent| {
-                games
-                    .tactics
-                    .command(profile_store, &mut games.detection, intent)
-            });
-        let (status, value) = match result {
-            Ok(value) => (200, value),
-            Err(error) => (
-                400,
-                serde_json::json!({"code":error.code,"message":error.message}),
-            ),
-        };
-        respond_traced(
-            request,
-            body("application/json; charset=utf-8", json_bytes(&value)?)
-                .with_status_code(status_code(status)),
-        )?;
-    } else if request.method() == &Method::POST
+    if request.method() == &Method::POST
         && matches!(
             request.url(),
-            "/api/games/tactics/report" | "/api/games/tactics/position"
+            "/api/study/presence"
+                | "/api/games/tactics"
+                | "/api/games/tactics/command"
+                | "/api/games/tactics/report"
+                | "/api/games/tactics/position"
         )
     {
         let retired = serde_json::json!({
             "status": "error", "code": "retired_feature",
-            "message": "The personal tactics report has been retired.", "retryable": false,
+            "message": "Automatic tactical analysis and Study presence have been retired.",
+            "retryable": false,
         });
         respond_traced(
             request,
             body("application/json; charset=utf-8", json_bytes(&retired)?)
                 .with_status_code(StatusCode::GONE),
-        )?;
-    } else if request.url() == "/api/games/tactics" {
-        let _trace = Span::new("tactics.status");
-        let (status, value) = if request.method() == &Method::POST {
-            let wait_reason = header(&request, "X-Tempo-Analysis-Wait-Reason") == Some("1");
-            match command::<crate::tactical_jobs::TacticalRead>(&request, MAX_COMMAND_BYTES)
-                .and_then(|read| {
-                    if !games.tactics.has_complete_decisions() {
-                        return games.tactics.read(app, profile_store, read, wait_reason);
-                    }
-                    if app.game_dataset()? != read.dataset_id {
-                        return Err(AppError::new(
-                            "stale_dataset",
-                            "Reload the current game archive.",
-                        ));
-                    }
-                    Ok(serde_json::json!({
-                        "schema_version": 1, "dataset_id": read.dataset_id, "status": "unavailable",
-                        "message": "The personal tactics report has been retired.",
-                    }))
-                }) {
-                Ok(value) => (200, value),
-                Err(error) => (
-                    400,
-                    serde_json::json!({"schema_version":1,"status":"error","code":error.code,"message":error.message}),
-                ),
-            }
-        } else {
-            (
-                405,
-                serde_json::json!({"schema_version":1,"status":"error","code":"method_not_allowed"}),
-            )
-        };
-        respond_traced(
-            request,
-            body("application/json; charset=utf-8", json_bytes(&value)?)
-                .with_status_code(status_code(status))
-                .with_header(field("Cache-Control", "no-store")),
         )?;
     } else if matches!(
         (request.method(), request.url()),
@@ -588,28 +427,133 @@ fn respond_inner(
             body("application/json; charset=utf-8", json_bytes(&retired)?)
                 .with_status_code(StatusCode::GONE),
         )?;
+    } else if request.method() == &Method::POST
+        && matches!(
+            request.url(),
+            "/api/games/gap-line" | "/api/games/gap-line/status"
+        )
+    {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Automatic gap-line previews have been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
+    } else if matches!(
+        (request.method(), request.url()),
+        (
+            &Method::POST,
+            "/api/games/coverage" | "/api/games/coverage/status"
+        ) | (&Method::GET | &Method::POST, "/api/games/gap-explorer")
+    ) {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Coverage scans and gap Explorer have been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
+    } else if matches!(request.method(), &Method::GET | &Method::POST)
+        && request.url() == "/api/games/model"
+    {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Games model analysis has been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE)
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
+    } else if request.method() == &Method::POST && request.url() == "/api/games/choose" {
+        let (status, reply) = command::<crate::game_evidence::ChooseGameCorrection>(&request, MAX_COMMAND_BYTES)
+            .and_then(|intent| intent.replay(app))
+            .unwrap_or_else(|error| (400, serde_json::json!(ErrorView::for_content(error))));
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
+    } else if request.method() == &Method::POST && request.url() == "/api/games/reprocess" {
+        let (status, reply) = command::<ReprocessGames>(&request, MAX_COMMAND_BYTES)
+            .and_then(|intent| intent.replay(app))
+            .unwrap_or_else(|error| (400, serde_json::json!(ErrorView::for_content(error))));
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
+    } else if request.method() == &Method::GET && request.url() == "/api/games/job" {
+        let retired = serde_json::json!({
+            "status": "error", "code": "retired_feature",
+            "message": "Remote game refresh status has been retired.", "retryable": false,
+        });
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&retired)?)
+                .with_status_code(StatusCode::GONE),
+        )?;
+    } else if request.method() == &Method::POST && request.url() == "/api/games/refresh" {
+        let (status, reply) = command::<GameRefresh>(&request, MAX_COMMAND_BYTES)
+            .and_then(|intent| intent.replay(app))
+            .unwrap_or_else(|error| (400, serde_json::json!(ErrorView::for_content(error))));
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
+    } else if (request.method() == &Method::POST
+        && matches!(
+            request.url(),
+            "/api/games/backfill" | "/api/games/backfill/retry"
+        ))
+        || (request.method() == &Method::GET && request.url() == "/api/games/backfill")
+    {
+        let replay = match (request.method(), request.url()) {
+            (&Method::POST, "/api/games/backfill") => {
+                command::<BackfillRequest>(&request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| intent.replay(app))
+            }
+            (&Method::POST, "/api/games/backfill/retry") => {
+                command::<BackfillRetry>(&request, MAX_COMMAND_BYTES)
+                    .and_then(|intent| intent.replay(app))
+            }
+            _ => Ok((
+                410,
+                serde_json::json!({
+                    "status": "error", "code": "retired_feature", "retryable": false,
+                    "message": "Historical Games backfill status has been retired.",
+                }),
+            )),
+        };
+        let (status, reply) =
+            replay.unwrap_or_else(|error| (400, serde_json::json!(ErrorView::for_content(error))));
+        respond_traced(
+            request,
+            body("application/json; charset=utf-8", json_bytes(&reply)?)
+                .with_status_code(status_code(status))
+                .with_header(field("Cache-Control", "no-store")),
+        )?;
     } else if matches!(
         request.url(),
         "/api/games"
             | "/api/games/library"
-            | "/api/games/job"
             | "/api/games/import"
-            | "/api/games/refresh"
             | "/api/games/choose"
-            | "/api/games/reprocess"
-            | "/api/games/backfill"
-            | "/api/games/backfill/retry"
-            | "/api/games/model"
-            | "/api/games/coverage"
-            | "/api/games/coverage/status"
             | "/api/games/coverage/starting-line"
             | "/api/games/coverage/starting-line/save"
             | "/api/games/gaps"
             | "/api/games/gap-draft"
-            | "/api/games/gap-line"
-            | "/api/games/gap-line/status"
             | "/api/games/review"
-            | "/api/games/gap-explorer"
             | "/api/study/relevance"
             | "/api/study/game-context"
             | "/api/study/analysis-context"
@@ -623,34 +567,6 @@ fn respond_inner(
                     .and_then(|r| app.game_library(r)),
             ),
             (&Method::GET, "/api/games") => (200, app.game_history()),
-            (&Method::GET, "/api/games/job") => (200, Ok(games.refresh.poll(app))),
-            (&Method::GET, "/api/games/backfill") => (200, games.backfill.current_status(app)),
-            (&Method::POST, "/api/games/backfill") => (
-                202,
-                command::<BackfillRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.backfill.begin(app, intent)),
-            ),
-            (&Method::POST, "/api/games/backfill/retry") => (
-                202,
-                command::<BackfillRetry>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.backfill.retry(app, intent)),
-            ),
-            (&Method::GET, "/api/games/model") => (200, games.model.status(app)),
-            (&Method::POST, "/api/games/model") => (
-                202,
-                command::<ModelRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.model.start(app, intent)),
-            ),
-            (&Method::POST, "/api/games/coverage") => (
-                202,
-                command::<crate::coverage_scan::StartCoverage>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.start(app, intent)),
-            ),
-            (&Method::POST, "/api/games/coverage/status") => (
-                200,
-                command::<crate::coverage_scan::ReadCoverage>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.read(app, intent)),
-            ),
             (&Method::POST, "/api/games/coverage/starting-line") => (
                 200,
                 command::<crate::application::PreviousCoverageLineRequest>(
@@ -677,45 +593,18 @@ fn respond_inner(
             (&Method::POST, "/api/games/gaps") => (
                 200,
                 command::<GapPage>(&request, MAX_COMMAND_BYTES).and_then(|page| {
-                    if surface == AuthoringSurface::PhoneBuild
-                        && page
-                            .forecast_repertoire
-                            .as_deref()
-                            .is_none_or(str::is_empty)
-                    {
-                        return Err(AppError::new(
-                            "phone_build_only",
-                            "Choose a repertoire to view its coverage gaps.",
-                        ));
-                    }
                     app.opponent_gap_page(page.offset, page.forecast_repertoire.as_deref())
                 }),
-            ),
-            (&Method::GET, "/api/games/gap-explorer") => (200, Ok(games.gap_explorer.status())),
-            (&Method::POST, "/api/games/gap-explorer") => (
-                202,
-                command::<GapExplorerRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.gap_explorer.start(app, intent)),
             ),
             (&Method::POST, "/api/games/review") => (
                 200,
                 command::<crate::GameReviewRead>(&request, MAX_COMMAND_BYTES)
                     .and_then(|request| app.game_review(request)),
             ),
-            (&Method::POST, "/api/games/gap-line") => (
-                202,
-                command::<crate::coverage_scan::GapLineRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.start_line(app, intent, surface)),
-            ),
-            (&Method::POST, "/api/games/gap-line/status") => (
-                200,
-                command::<crate::coverage_scan::GapLineRead>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.coverage.read_line(app, intent, surface)),
-            ),
             (&Method::POST, "/api/games/gap-draft") => (
                 200,
                 command::<GapRequest>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| app.game_gap_draft_on(intent, surface)),
+                    .and_then(|intent| app.game_gap_draft(intent)),
             ),
             (&Method::POST, "/api/study/relevance") => (
                 200,
@@ -774,24 +663,6 @@ fn respond_inner(
                     .and_then(|intent| app.import_game_pgn(intent))
                     .map(|report| serde_json::json!(report)),
             ),
-            (&Method::POST, "/api/games/choose") => (
-                200,
-                command::<crate::game_evidence::ChooseGameCorrection>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| app.choose_game_correction(intent))
-                    .map(|report| serde_json::json!(report)),
-            ),
-            (&Method::POST, "/api/games/reprocess") => (
-                200,
-                command::<crate::game_evidence::ReprocessGames>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| app.reprocess_games(intent))
-                    .map(|report| serde_json::json!(report)),
-            ),
-            (&Method::POST, "/api/games/refresh") => (
-                202,
-                command::<GameRefresh>(&request, MAX_COMMAND_BYTES)
-                    .and_then(|intent| games.refresh.refresh(app, intent, !games.backfill.active()))
-                    .map(|reply| serde_json::json!(reply)),
-            ),
             _ => (
                 405,
                 Err(AppError::new(
@@ -815,7 +686,7 @@ fn respond_inner(
         )?;
     } else if request.method() == &Method::POST && request.url() == "/api/tactic-settings" {
         let reply = command(&request, MAX_COMMAND_BYTES)
-            .and_then(|intent| tactic_settings::handle(app, profile_store, intent))
+            .and_then(|intent| tactic_settings::handle(app, intent))
             .unwrap_or_else(|error| serde_json::json!(ErrorView::for_content(error)));
         respond_traced(
             request,
@@ -859,12 +730,7 @@ fn respond_inner(
         )?;
     } else if request.method() == &Method::POST && request.url() == "/api/study" {
         let reply = command::<StudyCommand>(&request, MAX_COMMAND_BYTES)
-            .map(|intent| {
-                if !matches!(intent, StudyCommand::StudyStatus) {
-                    games.tactics.study_activity(&mut games.detection);
-                }
-                app.handle(intent)
-            })
+            .map(|intent| app.handle(intent))
             .unwrap_or_else(Into::into);
         let reply = if move_details {
             reply
@@ -902,13 +768,7 @@ fn respond_inner(
             body("application/json; charset=utf-8", json_bytes(&reply)?),
         )?;
     } else if request.method() == &Method::GET {
-        if let Some(asset) = public.get(asset_path(request.url())) {
-            respond_traced(request, body(asset.mime, asset.bytes.clone()).with_header(
-                field("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'"),
-            ))?;
-        } else {
-            respond_traced(request, Response::empty(StatusCode::NOT_FOUND))?;
-        }
+        respond_traced(request, Response::empty(StatusCode::NOT_FOUND))?;
     } else {
         respond_traced(request, Response::empty(StatusCode::METHOD_NOT_ALLOWED))?;
     }
@@ -999,14 +859,12 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/study/review-mark" => "study_review_mark",
         "/api/study/card-details" => "study_card_details",
         "/api/study/saved-reviews" => "study_saved_reviews",
-        "/api/study/presence" => "study_presence",
         "/api/repertoires" => "repertoires",
         "/api/tactics" => "tactics",
         "/api/tactics-collection" => "tactics_collection",
         "/api/tactic-settings" => "tactic_settings",
         "/api/games" => "games",
         "/api/games/library" => "game_library",
-        "/api/games/job" => "game_refresh_status",
         "/api/games/import" => "game_import",
         "/api/games/refresh" => "game_refresh",
         "/api/games/choose" => "game_choose",
@@ -1014,18 +872,11 @@ fn diagnostic_route(url: &str) -> &'static str {
         "/api/games/backfill" => "game_backfill",
         "/api/games/backfill/retry" => "game_backfill_retry",
         "/api/games/model" => "game_model",
-        "/api/games/coverage" => "repertoire_coverage_start",
         "/api/games/coverage/starting-line/save" => "save_repertoire_coverage_starting_line",
         "/api/games/coverage/starting-line" => "repertoire_coverage_starting_line",
-        "/api/games/coverage/status" => "repertoire_coverage_status",
         "/api/games/gaps" => "game_gaps",
         "/api/games/gap-draft" => "game_gap_draft",
-        "/api/games/gap-line" => "game_gap_line",
-        "/api/games/gap-line/status" => "game_gap_line_status",
         "/api/games/review" => "game_review",
-        "/api/games/gap-explorer" => "game_gap_explorer",
-        "/api/games/tactics" => "tactics_status",
-        "/api/games/tactics/command" => "tactics_command",
         "/" | "/index.html" => "ui_index",
         path if path.starts_with("/assets/") => "ui_asset",
         _ => "other",
@@ -1055,6 +906,78 @@ fn respond_traced(request: Request, response: Response) -> std::io::Result<()> {
 #[cfg(test)]
 mod diagnostics_tests {
     use super::diagnostic_route;
+
+    #[test]
+    fn phone_build_routes_are_absent_from_the_authenticated_ingress() {
+        use super::*;
+        use hyper::http::HeaderMap;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("study.sqlite");
+        let phone_authority = "tempo.example.ts.net:8443";
+        let phone_origin = "https://tempo.example.ts.net:8443";
+        let login = "learner@example.test";
+        let surfaces = HttpSurfaces {
+            address: "127.0.0.1:3000".into(),
+            origin: "http://127.0.0.1:3000".into(),
+            desktop: BTreeMap::new(),
+            phone: Some(PhoneStudy {
+                origin: phone_origin.into(),
+                authority: phone_authority.into(),
+                login: login.into(),
+                assets: BTreeMap::new(),
+            }),
+            context: ContextReader::start(&database).unwrap(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("host", phone_authority.parse().unwrap());
+        headers.insert("x-forwarded-host", phone_authority.parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("tailscale-user-login", login.parse().unwrap());
+        headers.insert("origin", phone_origin.parse().unwrap());
+        for path in [
+            "/api/games/coverage",
+            "/api/games/coverage/status",
+            "/api/games/coverage/starting-line",
+            "/api/games/coverage/starting-line/save",
+            "/api/games/gaps",
+            "/api/games/gap-draft",
+            "/api/games/gap-line",
+            "/api/games/gap-line/status",
+            "/api/games/gap-analysis",
+            "/api/games/gap-analysis/status",
+        ] {
+            assert_eq!(
+                surfaces
+                    .admitted(&Head::fixture(Method::POST, path, headers.clone()))
+                    .err(),
+                Some(StatusCode::NOT_FOUND),
+                "{path}",
+            );
+        }
+        for path in ["/api/study", "/api/study-progress", "/api/repertoires"] {
+            assert!(matches!(
+                surfaces.admitted(&Head::fixture(Method::POST, path, headers.clone())),
+                Ok(Admission::Foreground {
+                    surface: AuthoringSurface::PhoneBuild,
+                    ..
+                }),
+            ));
+        }
+        assert!(matches!(
+            surfaces.admitted(&Head::fixture(Method::GET, "/api/context", headers)),
+            Ok(Admission::Context(_)),
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:3000".parse().unwrap());
+        assert!(matches!(
+            surfaces.admitted(&Head::fixture(Method::POST, "/api/repertoires", headers)),
+            Ok(Admission::Foreground {
+                surface: AuthoringSurface::Desktop,
+                ..
+            }),
+        ));
+    }
 
     #[test]
     fn routes_never_include_payloads_or_query_values() {

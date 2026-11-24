@@ -389,6 +389,35 @@ class RuntimeDiagnostics(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(saved)["status"], "repertoires")
 
+    def test_tactical_jobs_and_presence_retirement_do_no_work(self):
+        logs = self.root / "tactical-jobs-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            _, _, context, _ = server.request(None, path="/api/context", method="GET")
+            dataset = json.loads(context)["dataset_id"]
+            for path, command in (
+                ("/api/study/presence", {"tab": "7a791296-6215-4d60-ae7c-58bab00ce975", "sequence": 1, "state": "active"}),
+                ("/api/games/tactics", {"dataset_id": dataset}),
+                ("/api/games/tactics/command", {"action": "resume", "dataset_id": dataset}),
+                ("/api/games/tactics/command", {"action": "retry", "dataset_id": dataset}),
+            ):
+                status, _, payload, delivery = server.request(json.dumps(command).encode(), path=path)
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("tactics.", "detection.", "study.presence", "sqlite.", "app."))
+                    for e in events
+                ))
+
+            status, _, study, _ = server.request(json.dumps({"command": "next"}).encode())
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(study)["dataset_id"], dataset)
+            self.assertFalse(any(
+                e.get("operation") in ("loop.detection_apply", "loop.tactics_apply")
+                for e in log_events(logs)
+            ))
+
     def test_manual_detector_retirement_does_no_work_and_preserves_capture(self):
         logs = self.root / "manual-detector-retirement-logs"
         with Server(self.database, self.ui, logs) as server:
@@ -430,6 +459,149 @@ class RuntimeDiagnostics(unittest.TestCase):
             status, _, replayed, _ = server.request(save, path="/api/tactics")
             self.assertEqual(status, 200)
             self.assertEqual(replayed, reply)
+
+    def test_remote_refresh_status_does_no_work_and_unaccepted_request_retires(self):
+        logs = self.root / "remote-refresh-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            _, _, context, _ = server.request(None, path="/api/context", method="GET")
+            dataset = json.loads(context)["dataset_id"]
+            status, _, payload, delivery = server.request(None, path="/api/games/job", method="GET")
+            self.assertEqual(status, 410)
+            self.assertEqual(json.loads(payload)["code"], "retired_feature")
+            wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+            self.assertFalse(any(
+                e.get("operation", "").startswith(("refresh.", "provider.", "sqlite.", "app."))
+                for e in log_events(logs) if e.get("request_id") == delivery
+            ))
+
+            command = {"dataset_id": dataset, "command_id": "unaccepted", "source": "lichess",
+                       "account": "learner", "from_ms": 0, "to_ms": 86400000}
+            status, _, payload, delivery = server.request(json.dumps(command).encode(), path="/api/games/refresh")
+            self.assertEqual(status, 410)
+            retired = json.loads(payload)
+            self.assertEqual(retired["code"], "retired_feature")
+            self.assertEqual(retired["dataset_id"], dataset)
+            self.assertEqual(retired["command_id"], "unaccepted")
+            wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+            self.assertFalse(any(
+                e.get("operation", "").startswith(("refresh.", "provider.", "loop.refresh"))
+                for e in log_events(logs)
+            ))
+
+    def test_archived_backfill_is_addressed_readback_only(self):
+        logs = self.root / "historical-backfill-retirement-logs"
+        with sqlite3.connect(self.database) as connection:
+            dataset, = connection.execute("SELECT id FROM datasets").fetchone()
+            start = {"dataset_id": dataset, "command_id": "old-job", "lichess": "learner",
+                     "chess_com": None, "from_ms": 86400000, "to_ms": 172800000}
+            window = {"source": "lichess", "learner": "learner", "from_ms": start["from_ms"],
+                      "to_ms": start["to_ms"], "attempt": 2, "status": "pending",
+                      "received": 3, "accepted": 2, "split": False, "notes": []}
+            saved = {"id": "old-job", "request": start, "resets": {"opening": 2}, "windows": [window],
+                     "retries": ["old-retry"]}
+            connection.execute("INSERT INTO game_backfill_jobs VALUES (?, ?, ?)",
+                               (dataset, "old-job", json.dumps(saved)))
+            connection.execute("INSERT INTO game_learner_accounts VALUES (?, ?, ?)",
+                               (dataset, "lichess", "learner"))
+
+        def post(server, suffix, command, expected):
+            status, _, body, delivery = server.request(
+                json.dumps(command).encode(), path="/api/games/backfill" + suffix)
+            self.assertEqual(status, expected, body)
+            wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+            return json.loads(body)
+
+        with Server(self.database, self.ui, logs) as server:
+            status, _, body, delivery = server.request(None, path="/api/games/backfill", method="GET")
+            self.assertEqual(status, 410, body)
+            self.assertEqual(json.loads(body)["code"], "retired_feature")
+            wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+            self.assertFalse(any(e.get("request_id") == delivery and
+                                 e.get("operation", "").startswith(("app.", "sqlite.", "backfill."))
+                                 for e in log_events(logs)))
+            retry = {"dataset_id": dataset, "job_id": "old-job", "command_id": "old-retry"}
+            for suffix, command in (("", {**start, "lichess": " Learner "}), ("/retry", retry)):
+                receipt = post(server, suffix, command, 200)
+                self.assertEqual(receipt, {
+                    "status": "incomplete", "execution": "retired", "command_id": command["command_id"],
+                    "job_id": "old-job", "request": start, "windows": [window],
+                    "pending_windows": 1, "incomplete_windows": 0,
+                })
+                retired = post(server, suffix, {**command, "command_id": "undelivered"}, 410)
+                self.assertEqual(retired["code"], "retired_feature")
+                self.assertEqual(retired["dataset_id"], dataset)
+                self.assertEqual(retired["command_id"], "undelivered")
+                self.assertEqual(retired["job_id"], "old-job" if suffix else "undelivered")
+            self.assertEqual(post(server, "", {**start, "lichess": "other"}, 400)["code"],
+                             "invalid_backfill")
+            self.assertEqual(post(server, "/retry", {**retry, "dataset_id": "other"}, 400)["code"],
+                             "stale_dataset")
+            self.assertFalse(any(e.get("operation", "").startswith(("loop.backfill", "backfill.", "provider."))
+                                 for e in log_events(logs)))
+        with sqlite3.connect(self.database) as connection:
+            jobs = connection.execute("SELECT id, state FROM game_backfill_jobs").fetchall()
+            self.assertEqual(jobs, [("old-job", json.dumps(saved))])
+            self.assertEqual(connection.execute("SELECT source, learner FROM game_learner_accounts").fetchall(),
+                             [("lichess", "learner")])
+
+    def test_coverage_scan_and_explorer_retirement_preserves_starting_line_save(self):
+        logs = self.root / "coverage-scan-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            for method, path in (
+                ("POST", "/api/games/coverage"),
+                ("POST", "/api/games/coverage/status"),
+                ("GET", "/api/games/gap-explorer"),
+                ("POST", "/api/games/gap-explorer"),
+            ):
+                status, _, payload, delivery = server.request(
+                    None if method == "GET" else b"{}", method=method, path=path
+                )
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("coverage.", "explorer.", "sqlite.", "app."))
+                    for e in events
+                ))
+
+            def post(path, command):
+                status, _, payload, _ = server.request(json.dumps(command).encode(), path=path)
+                self.assertEqual(status, 200)
+                result = json.loads(payload)
+                self.assertNotEqual(result.get("status"), "error", result.get("code"))
+                return result
+
+            _, _, context, _ = server.request(None, path="/api/context", method="GET")
+            dataset = json.loads(context)["dataset_id"]
+            draft = {"dataset_id": dataset, "name": "Coverage save fixture", "learner_color": "white",
+                     "pgn": "1. e4 e5 2. Nf3 *"}
+            preview = post("/api/repertoires", {"command": "preview", **draft})
+            saved_book = post("/api/repertoires", {"command": "save", **draft, "token": preview["token"]})
+            repertoire = next(item["id"] for item in saved_book["repertoires"] if item["name"] == draft["name"])
+            old_command = {"dataset_id": dataset, "repertoire_id": repertoire,
+                           "candidate": ["e2e4"], "save_at_revision": 0}
+            old_route = "/api/games/coverage/starting-line"
+            saved = post(old_route, old_command)["saved"]
+            self.assertEqual(saved, {"revision": 1, "moves": ["e2e4"]})
+            self.assertEqual(post(old_route + "/save", old_command)["saved"], saved)
+            self.assertEqual(post(old_route, {
+                "dataset_id": dataset, "repertoire_id": repertoire, "candidate": None,
+            })["saved"], saved)
+
+    def test_gap_line_preview_retirement_does_no_work(self):
+        logs = self.root / "gap-line-retirement-logs"
+        with Server(self.database, self.ui, logs) as server:
+            for path in ("/api/games/gap-line", "/api/games/gap-line/status"):
+                status, _, payload, delivery = server.request(b"{}", path=path)
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(payload)["code"], "retired_feature")
+                wait_event(logs, lambda e: e.get("request_id") == delivery and e.get("event") == "http.response")
+                events = [e for e in log_events(logs) if e.get("request_id") == delivery]
+                self.assertFalse(any(
+                    e.get("operation", "").startswith(("gap_line.", "engine.", "sqlite.", "app."))
+                    for e in events
+                ))
 
     def test_standalone_gap_analysis_retirement_does_no_work(self):
         logs = self.root / "gap-analysis-retirement-logs"

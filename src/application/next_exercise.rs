@@ -7,18 +7,16 @@ impl Tempo {
     /// Resume the active attempt or issue the next daily activity.
     pub fn next_exercise(&mut self) -> Result<Option<AnswerResult>, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.next_exercise.next_exercise");
-        let scope = StudyScope {
+        if let Some(record) = self.active_next_record()? {
+            return super::resume::resume_result(&record).map(Some);
+        }
+        let snapshot = self.store.study_state(StudyScope {
             catalog: true,
             ..StudyScope::default()
-        };
-        let mut snapshot = self.store.study_state(scope)?;
-        if let Some(id) = &snapshot.active_attempt
-            && self.retire_active_warmup(&snapshot, id)?
-        {
-            snapshot = self.store.study_state(scope)?;
-        }
-        if let Some(id) = &snapshot.active_attempt {
-            return self.resume_from(&snapshot, id).map(Some);
+        })?;
+        if snapshot.active_attempt.is_some() {
+            let record = self.next_after_selection_race()?;
+            return super::resume::resume_result(&record).map(Some);
         }
         let at = self.components.clock.now();
         let extra = self.store.tactics_extra(&snapshot.dataset, at.day)?;

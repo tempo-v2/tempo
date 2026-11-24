@@ -1,9 +1,11 @@
 //! File-backed composition for the matched local study release.
 mod http;
 mod import;
+// Production capture must prove completeness before enabling apply turns.
+#[cfg(test)]
+mod study_plan_apply;
 pub(crate) mod tactic_settings;
 
-use crate::game_detection::{AnalysisOptions, DetectorRegistry, GameDetection};
 use crate::{AttemptIds, Clock, DailyComponents, IntroductionLimits, TacticThemes, Tempo};
 use chrono::{DateTime, NaiveDate};
 use chrono_tz::Tz;
@@ -73,73 +75,14 @@ pub fn import(path: &Path, puzzles: &Path) -> LocalResult<()> {
 }
 
 pub fn serve(database: &Path, ui: &Path, port: u16) -> LocalResult<()> {
-    let mut registry = DetectorRegistry::default();
-    let engine = match crate::tactical_engine::StockfishEvaluator::discover(database) {
-        Ok(evaluator) => {
-            let engine = evaluator.payoff_engine();
-            registry.register(tempo_chess::PersonalTacticsDetector(evaluator))?;
-            Some(engine)
-        }
-        Err(error) => {
-            eprintln!("Tempo tactical analysis unavailable: {}", error.message);
-            None
-        }
-    };
-    serve_runtime(
-        database,
-        ui,
-        port,
-        registry,
-        AnalysisOptions {
-            deadline: std::time::Duration::from_secs(120),
-            ..AnalysisOptions::default()
-        },
-        engine,
-    )
-}
-
-/// Serve the real daily app with an explicitly composed detector registry.
-pub fn serve_with_detectors(
-    database: &Path,
-    ui: &Path,
-    port: u16,
-    detectors: DetectorRegistry,
-    analysis_options: AnalysisOptions,
-) -> LocalResult<()> {
-    serve_runtime(database, ui, port, detectors, analysis_options, None)
-}
-
-fn serve_runtime(
-    database: &Path,
-    ui: &Path,
-    port: u16,
-    detectors: DetectorRegistry,
-    analysis_options: AnalysisOptions,
-    engine: Option<crate::tactical_engine::PayoffEngine>,
-) -> LocalResult<()> {
     if fs::canonicalize(database)?.starts_with(fs::canonicalize(ui)?) {
         return Err("place the study database outside the public UI build".into());
     }
     let _diagnostics = crate::diagnostics::init(database);
     let _startup = crate::diagnostics::Span::new("runtime.startup");
     let mut app = open(database)?;
-    app.bootstrap_model_inputs()?;
-    app.reconcile_legacy_game_requests()?;
-    let encounters = app.reconcile_choice_encounters()?;
-    eprintln!(
-        "Choice encounters examined={}, repaired={}, unresolved={}",
-        encounters.examined, encounters.repaired, encounters.unresolved
-    );
     drop(_startup);
-    http::serve(
-        &mut app,
-        &SqliteStore::open(database)?,
-        database,
-        ui,
-        port,
-        GameDetection::new(detectors, analysis_options)?,
-        engine,
-    )
+    http::serve(&mut app, database, ui, port)
 }
 
 fn stored_profile(store: &SqliteStore) -> LocalResult<String> {

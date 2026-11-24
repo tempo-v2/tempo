@@ -1,7 +1,6 @@
 //! Normalize game records and coordinate answer-safe comparison and persistence.
 
 use super::{Tempo, content_preview::source_id};
-use crate::adapters::public_games::FetchedGames;
 use crate::game_evidence::{GameImport, GameReport, GameResult, check_id, fingerprint};
 use crate::{AppError, app_error::domain};
 use chrono::{NaiveDate, NaiveDateTime};
@@ -18,10 +17,10 @@ use tempo_learning::{
     AssessmentInput, AssessmentSource, DailyLearning, GameReviewEffect, LearningState,
 };
 use tempo_store::{
-    AcceptedGameChoice, AcceptedGames, AssessmentRecord, ChoiceAttribution, Commit, ComparedGame,
-    ComparedRelevance, EncounterRepair, GameChoice, GameChoiceTarget, GameChoices,
-    GameComparisonBasis, GameEncounters, GameFailureKey, GameHistoryEntry, GameObservation,
-    GameReceipt, GameRecord, GameSummary, PgnTiming, RepertoireDisagreement, StoreError, Write,
+    AcceptedGames, AssessmentRecord, Commit, ComparedGame, ComparedRelevance, EncounterRepair,
+    GameChoice, GameChoiceTarget, GameChoices, GameComparisonBasis, GameEncounters, GameFailureKey,
+    GameHistoryEntry, GameObservation, GameReceipt, GameRecord, GameSummary, PgnTiming,
+    RepertoireDisagreement, StoreError, Write,
 };
 use tempo_types::{DatasetId, Grade, TargetId};
 
@@ -183,254 +182,86 @@ impl Tempo {
         if let Some(report) = self.replay_game(&request.dataset_id, &request.command_id, &key)? {
             return Ok(report);
         }
+        if self.game_dataset()? != request.dataset_id {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
+        }
+        let learner = request.learner.trim().to_lowercase();
+        if learner.is_empty() || learner.len() > 100 {
+            return Err(invalid("Choose the learner with their exact player name."));
+        }
         let records =
             parse_played_games(&request.pgn).map_err(|error| domain("invalid_game", error))?;
-        let fetched = records.len();
+        let mut report = GameReport {
+            fetched: records.len(),
+            ..GameReport::default()
+        };
         let at = self.components.clock.now().unix_ms;
-        let games = records
-            .into_iter()
-            .map(|record| {
-                let played = record.map_err(|error| error.to_string())?;
-                let mut game = uploaded_record(&played, at)?;
-                if let Some(url) = source_url(&played) {
-                    if let Some(verified) = self
-                        .store
-                        .verified_game(&request.dataset_id, &url, &game.mainline_signature)
-                        .map_err(|error| error.to_string())?
-                    {
-                        game = verified;
+        let mut games = Vec::new();
+        for (index, record) in records.into_iter().enumerate() {
+            let (game, url) = match record
+                .map_err(|error| error.to_string())
+                .and_then(|played| {
+                    let game = uploaded_record(&played, at)?;
+                    if learner_side(&game, &learner).is_none() {
+                        return Err("The learner does not identify exactly one player.".into());
                     }
+                    Ok((game, source_url(&played)))
+                }) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    report.errors.push(format!("Game {}: {error}", index + 1));
+                    continue;
                 }
-                Ok((game, played))
-            })
-            .collect();
-        self.compare_games(
+            };
+            let verified = match url {
+                Some(url) => {
+                    self.store
+                        .verified_game(&request.dataset_id, &url, &game.mainline_signature)?
+                }
+                None => None,
+            };
+            games.push(verified.unwrap_or(game));
+        }
+        let reply =
+            serde_json::to_string(&report).map_err(|error| domain("invalid_game_report", error))?;
+        let stored = self.store.apply_manual_games(
             &request.dataset_id,
-            (&request.command_id, &key),
-            &request.learner,
-            games,
-            GameReport {
-                fetched,
-                ..GameReport::default()
+            &games,
+            GameReceipt {
+                id: &request.command_id,
+                fingerprint: &key,
+                report: &reply,
             },
-            None,
-            None,
-            None,
-            None,
-        )
+        )?;
+        report_from_receipt(stored)
     }
 
-    pub(crate) fn ingest_provider_games(
-        &mut self,
-        dataset: &DatasetId,
-        command_id: &str,
-        fingerprint: &str,
-        learner: &str,
-        fetched: FetchedGames,
-        backfill: Option<&crate::game_backfill::BackfillJob>,
-    ) -> Result<GameReport, AppError> {
-        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.ingest_provider_games");
-        let at = self.components.clock.now().unix_ms;
-        let games = fetched
-            .games
-            .into_iter()
-            .map(|game| {
-                let mut records =
-                    parse_played_games(&game.pgn).map_err(|error| error.to_string())?;
-                if records.len() != 1 {
-                    return Err("Provider record must contain exactly one finished game.".into());
-                }
-                let played = records.pop().unwrap().map_err(|error| error.to_string())?;
-                if game.end_ms > at || game.start_ms.is_some_and(|start| start > game.end_ms) {
-                    return Err("Provider game has an invalid occurrence interval.".into());
-                }
-                let record = GameRecord {
-                    mainline_signature: mainline_signature(&played, &game.white, &game.black),
-                    source: game.provider.into(),
-                    id: game.id,
-                    url: Some(game.url),
-                    white: game.white,
-                    black: game.black,
-                    start_ms: game.start_ms,
-                    end_ms: Some(game.end_ms),
-                    fetched_ms: at,
-                    played_date_ms: None,
-                    pgn: game.pgn,
-                };
-                Ok((record, played))
-            })
-            .collect();
-        self.compare_games(
-            dataset,
-            (command_id, fingerprint),
-            learner,
-            games,
-            GameReport {
-                fetched: fetched.received,
-                errors: fetched.errors,
-                ..GameReport::default()
-            },
-            backfill.is_none().then_some(at),
-            None,
-            None,
-            backfill,
-        )
-    }
-
-    pub(crate) fn ingest_historical_pgns(
-        &mut self,
-        job: &crate::game_backfill::BackfillJob,
-        key: &str,
-        learner: &str,
-        games: Vec<GameRecord>,
-    ) -> Result<GameReport, AppError> {
-        let fetched = games.len();
-        self.compare_games(
-            &job.request.dataset_id,
-            (key, key),
-            learner,
-            games.into_iter().map(parse_stored_game).collect(),
-            GameReport {
-                fetched,
-                ..Default::default()
-            },
-            None,
-            None,
-            None,
-            Some(job),
-        )
-    }
-
+    /// Replay a previously accepted choice with the original fingerprint.
     pub fn choose_game_correction(
-        &mut self,
+        &self,
         request: crate::game_evidence::ChooseGameCorrection,
     ) -> Result<GameReport, AppError> {
         let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.choose_game_correction");
         check_id(&request.command_id)?;
+        if self.game_dataset()? != request.dataset_id {
+            return Err(AppError::new(
+                "stale_dataset",
+                "The active dataset changed.",
+            ));
+        }
         let fingerprint = fingerprint("choose_correction", &request)?;
         if let Some(report) =
             self.replay_game(&request.dataset_id, &request.command_id, &fingerprint)?
         {
             return Ok(report);
         }
-        let saved = self
-            .store
-            .game_comparison(&request.dataset_id, &request.comparison_id)?
-            .filter(|result| {
-                result.source == request.source
-                    && result.game_id == request.game_id
-                    && result.learner == request.learner
-            })
-            .ok_or_else(|| invalid("The comparison was not found."))?;
-        let choice = saved
-            .choices
-            .iter()
-            .find(|choice| {
-                choice.ply == request.ply
-                    && choice
-                        .candidates
-                        .iter()
-                        .any(|candidate| candidate.target_id == request.target_id)
-            })
-            .ok_or_else(|| invalid("Choose a target from the saved miss."))?;
-        if self
-            .store
-            .game_choices(&request.dataset_id, &request.source, &request.game_id)?
-            .contains_key(&choice.position)
-        {
-            return Err(invalid("This corrective position has already been chosen."));
-        }
-        let backfill = saved
-            .backfill_id
-            .as_deref()
-            .map(|id| self.read_backfill(&request.dataset_id, Some(id)))
-            .transpose()?
-            .flatten();
-        if saved.backfill_id.is_some() && backfill.is_none() {
-            return Err(invalid(
-                "The historical job for this choice is unavailable.",
-            ));
-        }
-        let chosen_version = choice
-            .candidates
-            .iter()
-            .find(|candidate| candidate.target_id == request.target_id)
-            .expect("choice checked")
-            .version;
-        let game = self
-            .store
-            .stored_game(&request.dataset_id, &request.source, &request.game_id)?
-            .ok_or_else(|| invalid("This game was not found."))?;
-        self.compare_games(
-            &request.dataset_id,
-            (&request.command_id, &fingerprint),
-            &request.learner,
-            vec![parse_stored_game(game)],
-            GameReport {
-                fetched: 1,
-                ..Default::default()
-            },
-            None,
-            Some(&SelectedCorrection {
-                comparison_id: request.comparison_id,
-                ply: request.ply,
-                target: request.target_id,
-                position: choice.position.clone(),
-                chosen_version,
-            }),
-            None,
-            backfill.as_ref(),
-        )
-    }
-
-    pub fn reprocess_games(
-        &mut self,
-        request: crate::game_evidence::ReprocessGames,
-    ) -> Result<GameReport, AppError> {
-        let _diagnostic = crate::diagnostics::Span::new("app.game_evidence.reprocess_games");
-        check_id(&request.command_id)?;
-        let fingerprint = fingerprint("reprocess", &request)?;
-        if let Some(report) =
-            self.replay_game(&request.dataset_id, &request.command_id, &fingerprint)?
-        {
-            return Ok(report);
-        }
-        if request.to_ms <= request.from_ms || request.to_ms - request.from_ms > 31 * 86_400_000 {
-            return Err(invalid("Choose a window of at most 31 days."));
-        }
-        let games =
-            self.store
-                .games_in_window(&request.dataset_id, request.from_ms, request.to_ms)?;
-        if games.len() > 500 {
-            return Err(invalid(
-                "This window contains more than 500 games. Choose a shorter window.",
-            ));
-        }
-        let learner = request.learner.trim().to_lowercase();
-        let games: Vec<_> = games
-            .into_iter()
-            .filter(|game| {
-                [&game.white, &game.black]
-                    .into_iter()
-                    .any(|player| player.to_lowercase() == learner)
-            })
-            .map(parse_stored_game)
-            .collect();
-        let fetched = games.len();
-        self.compare_games(
-            &request.dataset_id,
-            (&request.command_id, &fingerprint),
-            &request.learner,
-            games,
-            GameReport {
-                fetched,
-                ..Default::default()
-            },
-            None,
-            None,
-            None,
-            None,
-        )
+        Err(AppError::new(
+            "retired_feature",
+            "This choice was not accepted. Corrective Games choices have been retired.",
+        ))
     }
 
     /// Upgrade only outstanding legacy obligations backed by stored evidence.
@@ -507,8 +338,6 @@ impl Tempo {
                     fetched: 1,
                     ..Default::default()
                 },
-                None,
-                None,
                 Some(&plies),
                 None,
             )?;
@@ -621,8 +450,6 @@ impl Tempo {
         learner: &str,
         mut games: Vec<Result<(GameRecord, PlayedGame), String>>,
         mut report: GameReport,
-        refresh_at: Option<u64>,
-        selection: Option<&SelectedCorrection>,
         legacy_plies: Option<&BTreeSet<usize>>,
         backfill: Option<&crate::game_backfill::BackfillJob>,
     ) -> Result<GameReport, AppError> {
@@ -754,12 +581,6 @@ impl Tempo {
                 repertoires,
                 backfill.map(|job| &job.id)
             ]));
-            if let Some(selection) = selection
-                && selection.comparison_id != comparison_id
-                && selection.comparison_id != previous_comparison_id
-            {
-                return Err(invalid("The comparison changed. Compare the game again."));
-            }
             let mut summary = GameSummary {
                 source: game.source.clone(),
                 game_id: game.id.clone(),
@@ -799,7 +620,6 @@ impl Tempo {
             let mut observations = Vec::new();
             let mut failures = Vec::new();
             let mut choice_groups = BTreeSet::new();
-            let mut resolved = false;
             for decision in &decisions {
                 for observation in decision
                     .observations
@@ -833,23 +653,7 @@ impl Tempo {
                     }
                     continue;
                 }
-                let candidate = if let Some(selection) = selection {
-                    if decision.ply != selection.ply || decision.position.0 != selection.position {
-                        continue;
-                    }
-                    if candidates.len() <= 1 {
-                        return Err(invalid("This miss has no unresolved choice."));
-                    }
-                    let chosen = candidates
-                        .iter()
-                        .find(|obs| {
-                            obs.target == selection.target
-                                && obs.version == selection.chosen_version
-                        })
-                        .ok_or_else(|| invalid("Choose a current target from the comparison."))?;
-                    resolved = true;
-                    chosen
-                } else if let [only] = candidates.as_slice() {
+                let candidate = if let [only] = candidates.as_slice() {
                     only
                 } else {
                     let eligible: Vec<_> = candidates
@@ -874,11 +678,6 @@ impl Tempo {
                 };
                 let repertoire = repertoire_of(&candidate.target);
                 if !may_apply(&repertoire) {
-                    if selection.is_some() {
-                        return Err(invalid(
-                            "The repertoire reset prevents further learning from this comparison.",
-                        ));
-                    }
                     continue;
                 }
                 observations.push(GameObservation {
@@ -893,7 +692,7 @@ impl Tempo {
                     game_id: game.id.clone(),
                     target: candidate.target.clone(),
                     version: candidate.version,
-                    chosen_position: selection.map(|selection| selection.position.clone()),
+                    chosen_position: None,
                 };
                 if self.store.game_failed(&snapshot.dataset, &key)?
                     || !accepted.insert((
@@ -946,24 +745,7 @@ impl Tempo {
                 });
                 summary.correction_effect = Some(GameReviewEffect::AgainApplied);
             }
-            if selection.is_some() && !resolved {
-                return Err(invalid("This miss is no longer available."));
-            }
-            let resolved_choice = selection.map(|selection| AcceptedGameChoice {
-                comparison_id: selection.comparison_id.clone(),
-                ply: selection.ply,
-                position: selection.position.clone(),
-                attribution: ChoiceAttribution {
-                    target: selection.target.clone(),
-                    answer_version: selection.chosen_version,
-                },
-            });
-            let mut projection_choices = relevance.prior_choices.clone();
-            if let Some(choice) = &resolved_choice {
-                projection_choices
-                    .insert(choice.position.clone(), Some(choice.attribution.clone()));
-            }
-            relevance.encounters = encounter_projection(&decisions, &projection_choices);
+            relevance.encounters = encounter_projection(&decisions, &relevance.prior_choices);
             summary.disagreements = disagreements
                 .into_iter()
                 .map(|(repertoire_id, plies)| RepertoireDisagreement {
@@ -974,17 +756,13 @@ impl Tempo {
             if !summary.choices.is_empty() {
                 summary.correction_effect = Some(GameReviewEffect::ChoiceRequired);
             }
-            let id = selection.map_or_else(
-                || comparison_id.clone(),
-                |selection| hash(&json!([comparison_id, selection.ply, selection.target])),
-            );
             comparisons.push(ComparedGame {
                 game,
-                id,
+                id: comparison_id,
                 summary,
                 observations,
                 failures,
-                resolved_choice,
+                resolved_choice: None,
                 relevance: legacy_plies.is_none().then_some(relevance),
             });
         }
@@ -1013,7 +791,7 @@ impl Tempo {
                     .collect(),
             },
             &comparisons,
-            refresh_at.filter(|_| report.errors.is_empty()),
+            None,
             GameReceipt {
                 id: command_id,
                 fingerprint,
@@ -1233,15 +1011,6 @@ fn hash(value: &Value) -> String {
     blake3::hash(value.to_string().as_bytes())
         .to_hex()
         .to_string()
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
-pub struct SelectedCorrection {
-    pub comparison_id: String,
-    pub ply: usize,
-    pub target: TargetId,
-    pub position: String,
-    pub chosen_version: tempo_types::ContentVersion,
 }
 
 fn mainline_signature(game: &PlayedGame, white: &str, black: &str) -> String {
