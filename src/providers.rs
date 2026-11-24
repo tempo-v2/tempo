@@ -3,8 +3,21 @@ use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Datelike};
 use reqwest::blocking::{Client, Response};
 use serde::Deserialize;
-use std::{io::Read, time::Duration};
+use std::{
+    io::Read,
+    time::{Duration, Instant},
+};
 const MAX_DOWNLOAD: usize = 32 * 1024 * 1024;
+fn request(
+    client: &Client,
+    url: &str,
+    deadline: Instant,
+) -> Result<reqwest::blocking::RequestBuilder> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    ensure!(!remaining.is_zero(), "Provider turn timed out.");
+    Ok(client.get(url).timeout(remaining))
+}
+
 fn response_text(response: Response) -> Result<String> {
     let mut response = response.error_for_status()?.take((MAX_DOWNLOAD + 1) as u64);
     let mut text = String::new();
@@ -64,14 +77,17 @@ impl Provider {
             .build()?)
     }
 
-    pub fn first_date(self, client: &Client, user: &str) -> Result<i64> {
+    pub fn first_date(self, client: &Client, user: &str, deadline: Instant) -> Result<i64> {
         match self {
             Self::ChessCom => Ok(0),
             Self::Lichess => {
                 let text = response_text(
-                    client
-                        .get(format!("https://lichess.org/api/user/{user}"))
-                        .send()?,
+                    request(
+                        client,
+                        &format!("https://lichess.org/api/user/{user}"),
+                        deadline,
+                    )?
+                    .send()?,
                 )?;
                 Ok(serde_json::from_str::<LichessProfile>(&text)?.created_at)
             }
@@ -84,10 +100,12 @@ impl Provider {
         user: &str,
         from: i64,
         through: i64,
+        deadline: Instant,
     ) -> Result<Vec<String>> {
         let urls = if matches!(self, Self::ChessCom) {
             let root = format!("https://api.chess.com/pub/player/{user}/games/");
-            let list = response_text(client.get(format!("{root}archives")).send()?)?;
+            let list =
+                response_text(request(client, &format!("{root}archives"), deadline)?.send()?)?;
             let mut months = serde_json::from_str::<ChessComArchives>(&list)?.archives;
             months.sort();
             months
@@ -111,6 +129,7 @@ impl Provider {
             let mut month = month_start(from)?;
             let mut urls = vec![];
             while epoch(month) <= through {
+                ensure!(Instant::now() < deadline, "Provider turn timed out.");
                 let next = month
                     .checked_add_months(chrono::Months::new(1))
                     .context("invalid next month")?;
@@ -124,19 +143,12 @@ impl Provider {
         Ok(urls)
     }
 
-    pub fn supply(
-        client: &Client,
-        user: &str,
-        window: &str,
-        accept: impl FnMut(games::Game) -> Result<()>,
-    ) -> Result<usize> {
-        let pgn = response_text(
-            client
-                .get(window)
+    pub fn download(client: &Client, window: &str, deadline: Instant) -> Result<String> {
+        response_text(
+            request(client, window, deadline)?
                 .header("Accept", "application/x-chess-pgn")
                 .send()?,
-        )?;
-        supply_pgn(&pgn, user, accept)
+        )
     }
 }
 
@@ -153,97 +165,51 @@ pub fn upload_record<R: std::io::Read + std::io::Seek>(
     }))
 }
 
-pub fn supply_pgn(
-    pgn: &str,
-    user: &str,
-    mut accept: impl FnMut(games::Game) -> Result<()>,
-) -> Result<usize> {
-    if pgn.trim().is_empty() {
-        return Ok(0);
-    }
-    let mut rejected = 0;
-    chess::read_pgn(pgn, false, |parsed| {
-        match parsed.and_then(|game| games::archive_game(game, user)) {
-            Ok(game) => accept(game)?,
-            Err(_) => rejected += 1,
-        }
-        Ok(())
-    })?;
-    Ok(rejected)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn replacement_http_feed_uses_the_archive_intake() -> Result<()> {
-        use crate::{game_pipeline, queue_store, review, study::Next, writer::Writer};
-        use rusqlite::Connection;
+    fn provider_body_reads_share_the_turn_deadline() -> Result<()> {
         use std::{io::Write, net::TcpListener};
-
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let endpoint = format!("http://{}/games.pgn", listener.local_addr()?);
-        let serve = std::thread::spawn(move || -> Result<()> {
+        let server = std::thread::spawn(move || -> Result<()> {
             let (mut stream, _) = listener.accept()?;
             let mut request = [0; 4096];
             ensure!(stream.read(&mut request)? > 0, "provider request was empty");
-            let pgn = "[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0";
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{pgn}",
-                pgn.len()
-            )?;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na")?;
+            // The request has begun but its body outlives the turn.
+            std::thread::sleep(Duration::from_millis(350));
+            let _ = stream.write_all(b"bc");
             Ok(())
         });
-
-        let mut db = Connection::open_in_memory()?;
-        for schema in [
-            include_str!("schema.sql"),
-            include_str!("opening_policy.sql"),
-            include_str!("opening_order.sql"),
-            include_str!("game_pipeline.sql"),
-            include_str!("prepared_queue.sql"),
-        ] {
-            db.execute_batch(schema)?;
-        }
-        db.execute("INSERT INTO metadata VALUES ('fixture')", [])?;
-        db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('fixture','Learner','all','running')", [])?;
-        queue_store::seed_batch(&mut db)?;
-        let writer = Writer::start(db, None)?;
         let client = Provider::client()?;
-        assert_eq!(
-            Provider::supply(&client, "Learner", &endpoint, |game| writer
-                .background(move |db| game_pipeline::archive_import(db, &game, 1)))?,
-            0
+        let result = Provider::download(
+            &client,
+            &endpoint,
+            Instant::now() + Duration::from_millis(100),
         );
-        serve.join().expect("fixture server panicked")?;
-        writer.background(|db| {
-            assert_eq!(
-                db.query_row("SELECT count(*) FROM games", [], |row| row
-                    .get::<_, usize>(0))?,
-                1
-            );
-            assert_eq!(
-                db.query_row(
-                    "SELECT count(*) FROM jobs WHERE operation='scan_new'",
-                    [],
-                    |row| row.get::<_, usize>(0)
-                )?,
-                1
-            );
-            assert!(
-                review::next(
-                    db,
-                    Next {
-                        after: None,
-                        dataset: None
-                    }
-                )?
-                .is_none()
-            );
-            Ok(())
-        })
+        server.join().expect("fixture server panicked")?;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_variant_skips_the_whole_physical_game() -> Result<()> {
+        let pgn = concat!(
+            "[Variant \"Atomic\"]\n[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n",
+            "[White \"Learner\"]\n[Black \"Other\"]\n[Result \"1-0\"]\n\n1. d4 d5 1-0\n",
+        );
+        let (rejected, next) = upload_record(std::io::Cursor::new(pgn), 0, "Learner")?
+            .context("unsupported variant")?;
+        assert!(rejected.is_none());
+        let (accepted, end) = upload_record(std::io::Cursor::new(pgn), next, "Learner")?
+            .context("next physical game")?;
+        assert!(accepted.is_some());
+        assert!(upload_record(std::io::Cursor::new(pgn), end, "Learner")?.is_none());
+        Ok(())
     }
 
     #[test]

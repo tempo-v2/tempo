@@ -283,6 +283,9 @@ pub fn pgn_record<R: std::io::Read + std::io::Seek>(
         ensure!(offset != 0, "PGN has no games");
         return Ok(None);
     };
+    // An early visitor result leaves the rest of the physical game pending.
+    // Complete that skip before recording a restart checkpoint.
+    reader.has_more()?;
     let buffered = reader.buffer().len() as u64;
     let next = reader
         .get_mut()

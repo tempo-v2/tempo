@@ -20,6 +20,7 @@ pub struct OpeningInput {
 pub struct Opening {
     pub id: String,
     pub repertoire_id: String,
+    pub repertoire_example: String,
     pub name: String,
     pub color: String,
     pub route: Route,
@@ -46,7 +47,10 @@ pub fn name(value: &str) -> Result<&str> {
 
 pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
     let mut q = db.prepare(
-        "SELECT id,repertoire_id,name,color,route,start_at FROM openings WHERE id>?1 ORDER BY id LIMIT 100",
+        "SELECT o.id,o.repertoire_id,r.example_line,o.name,o.color,o.route,o.start_at
+         FROM openings o CROSS JOIN repertoire_choices r
+         ON r.repertoire_id=o.repertoire_id AND r.color=o.color
+         WHERE o.id>?1 ORDER BY o.id LIMIT 100",
     )?;
     let rows = q.query_map([after], |r| {
         Ok((
@@ -54,15 +58,17 @@ pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
             r.get(1)?,
             r.get(2)?,
             r.get(3)?,
-            r.get::<_, String>(4)?,
-            r.get(5)?,
+            r.get(4)?,
+            r.get::<_, String>(5)?,
+            r.get(6)?,
         ))
     })?;
     rows.map(|r| {
-        let (id, repertoire_id, name, color, route, start_at) = r?;
+        let (id, repertoire_id, repertoire_example, name, color, route, start_at) = r?;
         Ok(Opening {
             id,
             repertoire_id,
+            repertoire_example,
             name,
             color,
             route: serde_json::from_str(&route)?,
@@ -79,13 +85,12 @@ pub struct Repertoire {
     pub color: String,
 }
 
-pub fn repertoires(db: &Connection) -> Result<Vec<Repertoire>> {
+pub fn repertoires(db: &Connection, after: &str, color: &str) -> Result<Vec<Repertoire>> {
     let mut q = db.prepare(
-        "SELECT repertoire_id,name,color FROM openings
-        WHERE rowid IN (SELECT min(rowid) FROM openings GROUP BY repertoire_id,color)
-        ORDER BY name,repertoire_id",
+        "SELECT repertoire_id,example_line,color FROM repertoire_choices
+        WHERE (repertoire_id,color) > (?1,?2) ORDER BY repertoire_id,color LIMIT 50",
     )?;
-    Ok(q.query_map([], |r| {
+    Ok(q.query_map((after, color), |r| {
         Ok(Repertoire {
             id: r.get(0)?,
             example_line: r.get(1)?,
@@ -98,7 +103,7 @@ pub fn repertoires(db: &Connection) -> Result<Vec<Repertoire>> {
 pub fn existing_repertoire(db: &Connection, id: &str, color: &str) -> Result<()> {
     ensure!(
         db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM openings WHERE repertoire_id=?1 AND color=?2)",
+            "SELECT EXISTS(SELECT 1 FROM repertoire_choices WHERE repertoire_id=?1 AND color=?2)",
             params![id, color],
             |row| row.get::<_, bool>(0),
         )?,
@@ -227,6 +232,12 @@ pub fn apply_opening(
         &plan.start_at.to_string(),
     ]);
     let repertoire = inherited_book.unwrap_or(&id);
+    let new_choice = inherited_book.is_none()
+        && !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repertoire_choices WHERE repertoire_id=?1 AND color=?2)",
+            (repertoire, &plan.color),
+            |row| row.get::<_, bool>(0),
+        )?;
     let mut pending = std::collections::HashMap::new();
     for card in &plan.cards {
         let card_id = chess::id(&["opening-card-v1", repertoire, &card.position, &card.version]);
@@ -255,8 +266,11 @@ pub fn apply_opening(
             }
         } else {
             pending.insert(card.position.clone(), (card_id, card));
-            // One authoritative card and one prepared entry, plus the authored line.
-            ensure!(!online || pending.len() * 2 < 128, OverBudget);
+            // One card and one prepared entry per position, plus the line and new choice.
+            ensure!(
+                !online || pending.len() * 2 + 1 + usize::from(new_choice) <= 128,
+                OverBudget
+            );
         }
     }
     for (card_id, card) in pending.into_values() {

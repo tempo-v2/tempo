@@ -123,13 +123,25 @@ impl Writer {
         background: bool,
         apply: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<Admission<T>> {
+        self.submit_before(background, Instant::now() + WAIT_LIMIT, apply)
+    }
+
+    fn submit_before<T: Send + 'static>(
+        &self,
+        background: bool,
+        deadline: Instant,
+        apply: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<Admission<T>> {
         let (send, receive) = oneshot::channel();
-        let deadline = Instant::now() + WAIT_LIMIT;
         let (lock, ready) = &*self.0;
         let mut state = lock.lock().unwrap();
         state
             .foreground
             .retain(|proposal| proposal.claim.load(Ordering::Acquire) != EXPIRED);
+        state
+            .background
+            .retain(|proposal| proposal.claim.load(Ordering::Acquire) != EXPIRED);
+        ensure!(Instant::now() < deadline, Unavailable);
         ensure!(
             state.foreground.len() + state.background.len() < WAITING,
             Unavailable
@@ -164,6 +176,35 @@ impl Writer {
         })
     }
 
+    /// The Games worker uses the service timer while waiting for admission.
+    /// A claimed transaction resolves before the caller can retry.
+    pub fn background_until<T: Send + 'static>(
+        &self,
+        deadline: Instant,
+        apply: impl FnMut(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let timer = tokio::runtime::Handle::current();
+        let apply = Arc::new(Mutex::new(apply));
+        loop {
+            let now = Instant::now();
+            ensure!(now < deadline, Unavailable);
+            let work = apply.clone();
+            let result = self.submit_before(true, (now + WAIT_LIMIT).min(deadline), move |db| {
+                (work.lock().unwrap())(db)
+            });
+            match result.and_then(|admission| timer.block_on(admission.wait())) {
+                Err(error) if error.is::<Unavailable>() => {
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(50)),
+                    );
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub fn background<T: Send + 'static>(
         &self,
         mut apply: impl FnMut(&mut Connection) -> Result<T> + Send + 'static,
@@ -189,6 +230,38 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_deadline_expires_unclaimed_apply() -> Result<()> {
+        let timer = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()?;
+        let _runtime = timer.enter();
+        let writer = Writer::start(Connection::open_in_memory()?, None)?;
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let blocker = writer.submit(false, move |db| {
+            db.execute_batch("CREATE TABLE records(id INTEGER)")?;
+            entered.send(())?;
+            gate.recv()?;
+            Ok(())
+        })?;
+        started.recv()?;
+        let expired = writer.background_until(Instant::now() + Duration::from_millis(40), |db| {
+            db.execute("INSERT INTO records VALUES (1)", [])?;
+            Ok(())
+        });
+        release.send(())?;
+        blocker.reply.blocking_recv()??;
+        assert!(expired.unwrap_err().is::<Unavailable>());
+        writer.background(|db| {
+            let count = db.query_row("SELECT count(*) FROM records", [], |row| {
+                row.get::<_, usize>(0)
+            })?;
+            assert_eq!(0, count);
+            Ok(())
+        })
+    }
 
     #[test]
     fn limits_waiting_work_and_reserves_a_background_turn() -> Result<()> {

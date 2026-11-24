@@ -1,3 +1,4 @@
+use std::time::Instant;
 // Application orchestration. Games archives, the scanner compares, and Tactics publishes.
 use crate::{
     catalog, chess,
@@ -36,15 +37,29 @@ fn enqueue(db: &Connection, parent: i64, operation: &str, game: &str) -> Result<
     Ok(())
 }
 
-pub fn archive_import(db: &mut Connection, game: &Game, job: i64) -> Result<()> {
-    archive_game(db, game, job, None)
+pub fn archive_staged_record(
+    db: &mut Connection,
+    game: &Game,
+    job: i64,
+    offset: u64,
+) -> Result<()> {
+    archive_game(db, game, job, |tx| {
+        job_store::staged_record(tx, job, offset, false)
+    })
 }
 
 pub fn archive_upload(db: &mut Connection, game: &Game, job: i64, offset: u64) -> Result<()> {
-    archive_game(db, game, job, Some(offset))
+    archive_game(db, game, job, |tx| {
+        job_store::yield_turn(tx, job, Some(&offset.to_string()), 0)
+    })
 }
 
-fn archive_game(db: &mut Connection, game: &Game, job: i64, offset: Option<u64>) -> Result<()> {
+fn archive_game(
+    db: &mut Connection,
+    game: &Game,
+    job: i64,
+    checkpoint: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+) -> Result<()> {
     let tx = db.transaction_with_behavior(Immediate)?;
     let added = games::accept_game(&tx, game)?;
     if tx.execute(
@@ -60,9 +75,7 @@ fn archive_game(db: &mut Connection, game: &Game, job: i64, offset: Option<u64>)
             enqueue(&tx, job, "scan_new", &game.id)?;
         }
     }
-    if let Some(offset) = offset {
-        job_store::yield_turn(&tx, job, Some(&offset.to_string()), 0)?;
-    }
+    checkpoint(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -77,7 +90,12 @@ pub fn pending_game(db: &Connection, job: i64) -> Result<Option<String>> {
         .optional()?)
 }
 
-pub fn scan_findings(db: &Connection, job: i64, game: &str) -> Result<Option<scanner::Findings>> {
+pub fn scan_findings(
+    db: &Connection,
+    job: i64,
+    game: &str,
+    deadline: Instant,
+) -> Result<Option<scanner::Findings>> {
     let snapshot = db.unchecked_transaction()?;
     if snapshot
         .query_row(
@@ -95,7 +113,10 @@ pub fn scan_findings(db: &Connection, job: i64, game: &str) -> Result<Option<sca
         &archived.id,
         &archived.route,
         &archived.learner_color,
-        |position, color| catalog::answers_at(&snapshot, position, color),
+        |position, color| {
+            ensure!(Instant::now() < deadline, "Games turn timed out.");
+            catalog::answers_at(&snapshot, position, color)
+        },
     )?;
     snapshot.commit()?;
     Ok(Some(results))
@@ -279,7 +300,12 @@ mod tests {
     use super::*;
 
     fn scan_game(db: &mut Connection, job: i64, game: &str) -> Result<()> {
-        if let Some(found) = scan_findings(db, job, game)? {
+        if let Some(found) = scan_findings(
+            db,
+            job,
+            game,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )? {
             save_findings(db, job, game, &found.mismatches, &found.captures)?;
             finish_scan(db, job, game, None)?;
         }
@@ -306,8 +332,8 @@ mod tests {
         db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('pgn','Learner','upload','done')", [])?;
         let text = "[White \"Learner\"]\n[Black \"Opponent\"]\n[Result \"1/2-1/2\"]\n[SetUp \"1\"]\n[FEN \"4k3/8/8/3n4/8/8/8/3RK3 w - - 0 1\"]\n\n1. Ke2 1/2-1/2";
         let game = games::archive_game(chess::parse_pgn(text, false, 1)?.remove(0)?, "Learner")?;
-        archive_import(&mut db, &game, 1)?;
-        archive_import(&mut db, &game, 1)?;
+        archive_upload(&mut db, &game, 1, 10)?;
+        archive_upload(&mut db, &game, 1, 20)?;
         let scan = stage(&db, 1, "scan_new")?;
         assert_eq!(pending_game(&db, scan)?.as_deref(), Some(game.id.as_str()));
         scan_game(&mut db, scan, &game.id)?;

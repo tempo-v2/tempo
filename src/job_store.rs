@@ -9,6 +9,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 pub fn settings(db: &Connection) -> Result<std::collections::BTreeMap<String, String>> {
     let mut q = db.prepare("SELECT provider,username FROM settings")?;
@@ -125,10 +126,23 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-pub fn next(db: &mut Connection) -> Result<Option<Job>> {
+#[derive(Clone)]
+pub struct FailedTurn {
+    pub job_id: i64,
+    pub message: String,
+}
+
+/// Record a failed turn with the next claim. A refused admission leaves both untouched.
+pub fn next(db: &mut Connection, failed: Option<&FailedTurn>) -> Result<Option<Job>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let job = tx.query_row("SELECT id,provider,username,operation,cursor FROM jobs INDEXED BY jobs_ready_order WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
-        |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,cursor:r.get(4)? })).optional()?;
+    if let Some(failed) = failed {
+        tx.execute(
+            "UPDATE jobs SET status='failed',error=?2 WHERE id=?1 AND status='running'",
+            params![failed.job_id, failed.message],
+        )?;
+    }
+    let job = tx.query_row("SELECT id,provider,username,operation,window_offset,window_rejected,replay_upload FROM jobs INDEXED BY jobs_ready_order WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
+        |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,window_offset:r.get(4)?,window_rejected:r.get(5)?,replay_upload:r.get(6)? })).optional()?;
     if let Some(job) = &job {
         tx.execute("UPDATE jobs SET status='running' WHERE id=?1", [job.id])?;
     }
@@ -142,14 +156,6 @@ pub fn recover_running(db: &mut Connection) -> Result<usize> {
         (SELECT id FROM jobs WHERE status='running' ORDER BY id LIMIT 128)",
         [],
     )?)
-}
-
-pub fn fail(db: &Connection, id: i64, error: &str) -> Result<()> {
-    db.execute(
-        "UPDATE jobs SET status='failed',error=?2 WHERE id=?1",
-        params![id, error],
-    )?;
-    Ok(())
 }
 
 pub fn complete(
@@ -167,7 +173,8 @@ pub fn complete(
     }
     tx.execute(
         "UPDATE jobs SET status='done',payload=NULL,upload_file=NULL,error=NULL,
-          rejected=max(rejected,?2) WHERE id=?1",
+          rejected=CASE WHEN replay_upload=1 THEN window_rejected ELSE max(rejected,?2) END,
+          replay_upload=0,window_offset=0,window_rejected=0 WHERE id=?1",
         params![id, checkpoint.map_or(0, |(_, rejected)| rejected)],
     )?;
     tx.commit()?;
@@ -196,6 +203,47 @@ pub fn yield_turn(
     Ok(())
 }
 
+/// Rotate after acquiring or finishing a provider window. The file and cursor change together.
+pub fn checkpoint_provider_window(
+    db: &mut Connection,
+    id: i64,
+    cursor: &str,
+    upload: Option<&str>,
+    rejected: usize,
+) -> Result<()> {
+    let tx = db.transaction()?;
+    ensure!(
+        tx.execute(
+            "UPDATE jobs SET upload_file=?2,window_offset=0,window_rejected=0
+             WHERE id=?1 AND status='running'",
+            params![id, upload],
+        )? == 1,
+        "provider window is no longer active"
+    );
+    yield_turn(&tx, id, Some(cursor), rejected)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn staged_record(tx: &Transaction<'_>, id: i64, next: u64, rejected: bool) -> Result<()> {
+    ensure!(
+        tx.execute(
+            "UPDATE jobs SET window_offset=?2,window_rejected=window_rejected+?3
+             WHERE id=?1 AND status='running' AND window_offset<?2",
+            params![id, next, rejected],
+        )? == 1,
+        "staged byte checkpoint did not advance"
+    );
+    yield_turn(tx, id, None, 0)
+}
+
+pub fn reject_staged_record(db: &mut Connection, id: i64, next: u64) -> Result<()> {
+    let tx = db.transaction()?;
+    staged_record(&tx, id, next, true)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// The staged bytes are durable before replacing the old inline representation.
 pub fn stage_inline_upload(db: &mut Connection, id: i64, file: &str) -> Result<()> {
     let tx = db.transaction()?;
@@ -215,7 +263,27 @@ pub fn stage_inline_upload(db: &mut Connection, id: i64, file: &str) -> Result<(
 pub struct JobReads(Connection);
 impl JobReads {
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self(Database::read(path)?))
+        Ok(Self(Database::read_with_busy_timeout(
+            path,
+            Duration::ZERO,
+        )?))
+    }
+
+    pub fn within_turn<T>(&self, deadline: Instant, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.0.busy_timeout(Duration::ZERO)?;
+        self.0
+            .progress_handler(1_000, Some(move || Instant::now() >= deadline));
+        let result = work();
+        self.0.progress_handler(0, None::<fn() -> bool>);
+        result
+    }
+
+    pub fn cursor(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .query_row("SELECT cursor FROM jobs WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
     }
 
     pub fn upload(&self, id: i64) -> Result<Option<String>> {
@@ -264,8 +332,13 @@ impl JobReads {
             .optional()?)
     }
 
-    pub fn findings(&self, job: i64, game: &str) -> Result<Option<scanner::Findings>> {
-        game_pipeline::scan_findings(&self.0, job, game)
+    pub fn findings(
+        &self,
+        job: i64,
+        game: &str,
+        deadline: Instant,
+    ) -> Result<Option<scanner::Findings>> {
+        game_pipeline::scan_findings(&self.0, job, game, deadline)
     }
 
     pub fn pending_game(&self, job: i64) -> Result<Option<String>> {
@@ -298,26 +371,35 @@ mod tests {
              ('archive','','scan','queued')",
         )?;
         db.execute_batch(include_str!("job_turns.sql"))?;
+        db.execute_batch(include_str!("operation_bounds.sql"))?;
         assert_eq!(recover_running(&mut db)?, 1);
 
-        assert_eq!(next(&mut db)?.unwrap().id, 1);
+        assert_eq!(next(&mut db, None)?.unwrap().id, 1);
         let tx = db.transaction()?;
         yield_turn(&tx, 1, Some("checkpoint"), 1)?;
         tx.commit()?;
-        assert_eq!(next(&mut db)?.unwrap().id, 2);
-        fail(&db, 2, "fixture")?;
+        assert_eq!(next(&mut db, None)?.unwrap().id, 2);
+        let failed = FailedTurn {
+            job_id: 2,
+            message: "fixture".into(),
+        };
+        assert_eq!(next(&mut db, Some(&failed))?.unwrap().id, 3);
         retry(&mut db, 2)?;
-        assert_eq!(next(&mut db)?.unwrap().id, 3);
         complete(&mut db, 3, "archive", "", None)?;
 
-        let resumed = next(&mut db)?.unwrap();
+        let resumed = next(&mut db, None)?.unwrap();
         assert_eq!(resumed.id, 1);
-        assert_eq!(resumed.cursor.as_deref(), Some("checkpoint"));
+        assert_eq!(
+            db.query_row("SELECT cursor FROM jobs WHERE id=?1", [resumed.id], |row| {
+                row.get::<_, String>(0)
+            })?,
+            "checkpoint"
+        );
         assert_eq!(
             views(&db)?.iter().find(|job| job.id == 1).unwrap().rejected,
             1
         );
-        assert_eq!(next(&mut db)?.unwrap().id, 2);
+        assert_eq!(next(&mut db, None)?.unwrap().id, 2);
         Ok(())
     }
 

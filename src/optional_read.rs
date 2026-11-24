@@ -24,6 +24,7 @@ pub enum Reader {
     Counts,
     StudyContext,
     GamesStatus,
+    Repertoires,
 }
 
 pub async fn read<T: Send + 'static>(
@@ -34,10 +35,12 @@ pub async fn read<T: Send + 'static>(
     static COUNTS: Semaphore = Semaphore::const_new(1);
     static STUDY_CONTEXT: Semaphore = Semaphore::const_new(1);
     static GAMES_STATUS: Semaphore = Semaphore::const_new(1);
+    static REPERTOIRES: Semaphore = Semaphore::const_new(1);
     let slot = match reader {
         Reader::Counts => &COUNTS,
         Reader::StudyContext => &STUDY_CONTEXT,
         Reader::GamesStatus => &GAMES_STATUS,
+        Reader::Repertoires => &REPERTOIRES,
     };
     run(slot, DEADLINE, move |deadline| {
         let mut db = Database::read_with_busy_timeout(&database, Duration::ZERO)?;
