@@ -1,5 +1,6 @@
 import React, { useMemo, useRef, useState } from "react";
 import { Board } from "@tempo-v2/core-components";
+import { createPortal } from "react-dom";
 import { Chess } from "chess.js";
 import { moveCue } from "./sounds.js";
 
@@ -13,7 +14,7 @@ export function position(route, ply = route.moves.length) {
   return game;
 }
 
-export function ChessBoard({ game, legal = [], orientation, identity, onMove, onRejectedMove, lastMove, shapes, locked = false }) {
+export function ChessBoard({ game, legal = [], orientation, identity, onMove, onRejectedMove, lastMove, shapes, promotionTarget, locked = false }) {
   const [promotion, setPromotion] = useState(null);
   const ref = useRef(null);
   const fen = game.fen();
@@ -30,6 +31,13 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
   const key = identity + fen;
   const choices = promotion?.key === key ? promotion.choices : null;
   const turn = game.turn() === "w" ? "white" : "black";
+  const promotionControls = choices && <div className="promotion" role="group" aria-label="Piece to promote to">
+    {choices.map((move) => <button key={move} onClick={() => {
+      setPromotion(null);
+      onMove(move);
+    }}>{{ q: "Queen", r: "Rook", b: "Bishop", n: "Knight" }[move[4]]}</button>)}
+    <button onClick={() => { setPromotion(null); ref.current?.clearInput(); }}>Cancel</button>
+  </div>;
   return <div className="board-shell">
     <Board ref={ref} positionIdentity={key} positionRevision={0} fen={fen}
       orientation={orientation} turn={turn} check={game.isCheck() ? turn : false} lastMove={lastMove} shapes={shapes}
@@ -43,13 +51,7 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
         if (choices.length === 1) onMove(choices[0]);
         if (choices.length > 1) setPromotion({ key, choices });
       } : undefined} />
-    {choices && <div className="promotion" role="group" aria-label="Piece to promote to">
-      {choices.map((move) => <button key={move} onClick={() => {
-        setPromotion(null);
-        onMove(move);
-      }}>{{ q: "Queen", r: "Rook", b: "Bishop", n: "Knight" }[move[4]]}</button>)}
-      <button onClick={() => { setPromotion(null); ref.current?.clearInput(); }}>Cancel</button>
-    </div>}
+    {promotionControls && (promotionTarget ? createPortal(promotionControls, promotionTarget) : promotionControls)}
   </div>;
 }
 
