@@ -40,6 +40,8 @@ export function Study({ openGame, sounds }) {
   const [submitted, setSubmitted] = useState(null);
   const waiting = useRef(false);
   const retry = useRef(null);
+  const nextButton = useRef(null);
+  const [promotionTarget, setPromotionTarget] = useState(null);
   const [epoch, setEpoch] = useState(0);
   const [advanceAfter, setAdvanceAfter] = useState(null);
   const mounted = useRef(true);
@@ -116,6 +118,21 @@ export function Study({ openGame, sounds }) {
     return () => clearTimeout(timer);
   }, [advanceAfter]);
 
+  useEffect(() => {
+    function advanceOnSpace(event) {
+      const button = nextButton.current;
+      if (!button || button.disabled || event.defaultPrevented || event.isComposing ||
+          event.code !== "Space" || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const target = event.target;
+      if (target instanceof HTMLElement && target !== button &&
+          (target.isContentEditable || target.closest("button, a[href], input, select, textarea, summary, [role=button]"))) return;
+      event.preventDefault();
+      if (!event.repeat) button.click();
+    }
+    window.addEventListener("keydown", advanceOnSpace);
+    return () => window.removeEventListener("keydown", advanceOnSpace);
+  }, []);
+
   function answer(played) {
     const submission = { attempt: card.attempt, dataset: card.dataset, played };
     run(async () => {
@@ -147,34 +164,40 @@ export function Study({ openGame, sounds }) {
     : (opponent?.key === attemptKey ? opponent?.move : undefined);
   const shapes = [...markedMove(previous, "red"), ...markedMove(played, "green")];
   if (boardMove) play(game, boardMove);
-  return <section aria-label="Study">
-    <h1>Study</h1>
-    {error && <div className="error" role="alert">{error} <button onClick={() => run(retry.current)}>Retry</button></div>}
-    {!loaded && !error && <p>Loading your deck…</p>}
-    {loaded && !card && <><p>No cards are ready. Add an opening or tactic to get started.</p>
-      <button onClick={() => next()} disabled={pending}>Check deck</button></>}
-    {card && <>
-      <h2>{card.result ? card.title : card.kind === "opening" ? (openingPlaying ? "Playing opening moves" : "Play your opening response") : "Find the tactic"}</h2>
-      <ChessBoard game={game} legal={openingPlaying ? undefined : card.legal} orientation={card.color}
+  return <section className="study" aria-label="Study">
+    <div className="study-board">
+      {card && <ChessBoard game={game} legal={openingPlaying ? undefined : card.legal} orientation={card.color}
         identity={`study-${card.attempt}-${epoch}`} locked={openingPlaying || pending || Boolean(error) || Boolean(card.result) || Boolean(awaitingResult)}
         lastMove={lastMove}
         shapes={shapes}
+        promotionTarget={promotionTarget}
         onRejectedMove={() => sounds.play("illegal")}
-        onMove={openingPlaying || card.result || awaitingResult ? undefined : answer} />
-      <div className="controls">
-        {card.result ? <>
-          <strong role="status">{card.result.rating}</strong>
-          <button className="primary" disabled={pending} onClick={() => next(card.attempt)}>Next card</button>
-        </> : openingPlaying
-          ? <button onClick={() => setOpeningProgress({ key: attemptKey, ply: lastPly })}>Skip to your move</button>
-          : <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>}
-      </div>
-      {card.result && <div className="feedback">
-        <p>Answer: {card.result.answers.map((move) => play(new Chess(card.fen), move).san).join(" or ")}</p>
-        {(card.result.played_in_game || source?.played) &&
-          <p>In the game you played {play(new Chess(card.fen), card.result.played_in_game || source.played).san}.</p>}
-        {source?.game_id && <button onClick={() => openGame(source.game_id, source.ply)}>View source game</button>}
-      </div>}
-    </>}
+        onMove={openingPlaying || card.result || awaitingResult ? undefined : answer} />}
+    </div>
+    <div className="study-panel">
+      <h1>Study</h1>
+      {error && <div className="error" role="alert">{error} <button onClick={() => run(retry.current)}>Retry</button></div>}
+      {!loaded && !error && <p>Loading your deck…</p>}
+      {loaded && !card && <><p>No cards are ready. Add an opening or tactic to get started.</p>
+        <button onClick={() => next()} disabled={pending}>Check deck</button></>}
+      {card && <>
+        <h2>{card.result ? card.title : card.kind === "opening" ? (openingPlaying ? "Playing opening moves" : "Play your opening response") : "Find the tactic"}</h2>
+        <div ref={setPromotionTarget} />
+        <div className="controls">
+          {card.result ? <>
+            <strong role="status">{card.result.rating}</strong>
+            <button ref={nextButton} className="primary" aria-keyshortcuts="Space" title="Next card (Space)" disabled={pending} onClick={() => next(card.attempt)}>Next card</button>
+          </> : openingPlaying
+            ? <button onClick={() => setOpeningProgress({ key: attemptKey, ply: lastPly })}>Skip to your move</button>
+            : <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>}
+        </div>
+        {card.result && <div className="feedback">
+          <p>Answer: {card.result.answers.map((move) => play(new Chess(card.fen), move).san).join(" or ")}</p>
+          {(card.result.played_in_game || source?.played) &&
+            <p>In the game you played {play(new Chess(card.fen), card.result.played_in_game || source.played).san}.</p>}
+          {source?.game_id && <button onClick={() => openGame(source.game_id, source.ply)}>View source game</button>}
+        </div>}
+      </>}
+    </div>
   </section>;
 }
