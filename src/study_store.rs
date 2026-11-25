@@ -131,7 +131,7 @@ pub fn begin_answer(db: &Connection, input: &AnswerIntentV1) -> Result<AnswerSta
     );
     let (card, submission, accepted, fen, answers, played_in_game): IssuedRow = db
         .query_row(
-            "SELECT a.card_id,a.submission,a.result,c.fen,c.answers,c.played_move
+            "SELECT a.card_id,a.submission,a.result,c.fen,coalesce(a.issued_answers,c.answers),c.played_move
              FROM attempts a JOIN cards c ON c.id=a.card_id WHERE a.id=?1",
             [input.attempt],
             |r| {

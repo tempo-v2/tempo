@@ -278,7 +278,7 @@ pub fn seed_batch(db: &mut Connection) -> Result<bool> {
     };
     let mut insert = tx.prepare_cached(
         "INSERT OR IGNORE INTO prepared_queue(card_id,kind,active,due_at,rank,reserved)
-         SELECT c.id,c.kind,NOT c.quarantined,l.due_at,o.rank,d.card_id IS NOT NULL OR EXISTS(SELECT 1 FROM repeat_obligation r WHERE r.card_id=c.id)
+         SELECT c.id,c.kind,NOT (c.quarantined OR c.retired),l.due_at,o.rank,d.card_id IS NOT NULL OR EXISTS(SELECT 1 FROM repeat_obligation r WHERE r.card_id=c.id)
          FROM cards c LEFT JOIN learning l ON l.card_id=c.id
          LEFT JOIN opening_order o ON o.card_id=c.id LEFT JOIN deck d ON d.card_id=c.id
          WHERE c.id=?1",
@@ -423,6 +423,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("card_availability.sql"),
             include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {
@@ -542,6 +543,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("card_availability.sql"),
             include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {
@@ -633,6 +635,7 @@ mod tests {
             )?;
         }
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("card_availability.sql"))?;
         db.execute_batch(include_str!("lichess_packs.sql"))?;
         db.execute_batch(include_str!("coverage_order.sql"))?;
         assert!(!seed_batch(&mut db)?);
@@ -664,6 +667,7 @@ mod tests {
         db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("card_availability.sql"))?;
         db.execute_batch(include_str!("lichess_packs.sql"))?;
         db.execute_batch(include_str!("coverage_order.sql"))?;
         db.execute_batch(
@@ -728,6 +732,7 @@ mod tests {
             include_str!("opening_policy.sql"),
             include_str!("opening_order.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("card_availability.sql"),
             include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {

@@ -17,7 +17,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rusqlite = { version = "0.32", features = ["bundled", "backup", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tempfile = "3.27.0"
 
