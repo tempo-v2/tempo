@@ -43,7 +43,16 @@ export function Gaps() {
       } while(page.length===50);
       setBooks(options);
       const saved=restore();
-      if(saved.report) setReport(await api("coverage/"+saved.report,undefined,ctrl.signal));
+      if(saved.report) {
+        const result=await api("coverage/"+saved.report,undefined,ctrl.signal);
+        // Recover an editor opened on a later page without fetching all intervening pages.
+        if(saved.index>=result.gaps.length && saved.index<result.total) {
+          const offset=Math.floor(saved.index/30)*30;
+          const page=await api("coverage/"+saved.report+"?offset="+offset,undefined,ctrl.signal);
+          result.selectedGap=page.gaps[saved.index-offset];
+        }
+        setReport(result);
+      }
     }
     load().catch(e=>{if(!ctrl.signal.aborted)setError(e.message);});
     return ()=>ctrl.abort();
@@ -67,7 +76,7 @@ export function Gaps() {
     return {repertoire:book.id,color:book.color,through:Number(draft.through??10),
       route:{fen:history[0]?.before??game.fen(),moves:history.map(m=>m.lan)}};
   }
-  const gap=report?.gaps[draft.index];
+  const gap=report?.gaps[draft.index]??report?.selectedGap;
   function open(index) {
     const link=lead(report,report.gaps[index]);
     window.open(link.url,"_blank","noopener,noreferrer");
@@ -87,6 +96,7 @@ export function Gaps() {
     }
     if(receipt?.command!==command.command || !Array.isArray(receipt.lines) || !receipt.lines.length)
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
+    setReport(old=>({...old,stale:true}));
     setMessage("Continuation saved. Refreshing coverage…");
     update({pending:null,previous:report.authored});setPreview(null);
     await scan(report.scan,report.authored);
@@ -127,8 +137,11 @@ export function Gaps() {
           <button disabled={locked||preview.responses.some(r=>r.status==="conflict")} onClick={()=>run(()=>save({draft:edit,command:preview.command}))}>Save to repertoire</button></>}
         {draft.pending && <button disabled={busy} onClick={()=>run(()=>save(draft.pending))}>Retry same save</button>}
       </section>}
-      <ol>{report.gaps.slice(0,draft.visible??30).map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
-      {report.gaps.length>(draft.visible??30) && <button onClick={()=>update({visible:(draft.visible??30)+30})}>Show more gaps</button>}
+      <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
+      {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
+        const page=await api("coverage/"+report.id+"?offset="+report.gaps.length);
+        setReport({...page,selectedGap:report.selectedGap,gaps:[...report.gaps,...page.gaps]});
+      })}>Show more gaps</button>}
     </>}
   </section>;
 }

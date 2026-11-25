@@ -165,19 +165,55 @@ pub async fn start(State(app): State<App>, Json(mut scan): Json<Scan>) -> ApiRes
     .await
 }
 
-pub async fn read(State(app): State<App>, Path(id): Path<String>) -> ViewResult {
-    optional_view(app, optional_read::Reader::Coverage,move|c|{
-        let tx=c.transaction()?;
-        let (scan,rev,forecast)=load(&tx,&id)?;
-        let mut seen=HashSet::new();
-        let mut q=tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM learning WHERE card_id=?1)")?;
-        for card in forecast.paths.iter().flat_map(|(path,_)|path).collect::<HashSet<_>>() {
-            if q.query_row([card],|r|r.get::<_,bool>(0))? {seen.insert(card);}
+#[derive(Default, Deserialize)]
+pub struct Page {
+    #[serde(default)]
+    offset: usize,
+}
+pub async fn read(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    axum::extract::Query(page): axum::extract::Query<Page>,
+) -> ViewResult {
+    optional_view(app, optional_read::Reader::Coverage, move |c| {
+        let tx = c.transaction()?;
+        let (scan, rev, forecast) = load(&tx, &id)?;
+        let mut seen = HashSet::new();
+        let mut query =
+            tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM learning WHERE card_id=?1)")?;
+        for card in forecast
+            .paths
+            .iter()
+            .flat_map(|(path, _)| path)
+            .collect::<HashSet<_>>()
+        {
+            if query.query_row([card], |r| r.get::<_, bool>(0))? {
+                seen.insert(card);
+            }
         }
-        let studied:f64=forecast.paths.iter().filter(|(p,_)|p.iter().all(|id|seen.contains(id))).map(|(_,m)|m).sum();
-        let authored:f64=forecast.paths.iter().map(|(_,m)|m).sum();
-        Ok(json!({"id":id,"stale":revision(&tx,&scan.repertoire)?!=rev,"scan":scan,"authored":authored,"studied":studied,"ended":forecast.ended,"conflict":forecast.conflict,"unresolved":forecast.unresolved,"gaps":forecast.gaps}))
-    }).await
+        let mut authored = 0.0;
+        let mut studied = 0.0;
+        for (path, mass) in &forecast.paths {
+            authored += mass;
+            if path.iter().all(|card| seen.contains(card)) {
+                studied += mass;
+            }
+        }
+        let total = forecast.gaps.len();
+        let gaps: Vec<_> = forecast
+            .gaps
+            .into_iter()
+            .skip(page.offset)
+            .take(30)
+            .collect();
+        Ok(json!({
+            "id":id, "stale":revision(&tx,&scan.repertoire)?!=rev, "scan":scan,
+            "authored":authored, "studied":studied, "ended":forecast.ended,
+            "conflict":forecast.conflict, "unresolved":forecast.unresolved,
+            "gaps":gaps, "total":total
+        }))
+    })
+    .await
 }
 
 pub fn selected(c: &Connection, id: &str, index: usize) -> Result<(Scan, i64, Gap)> {
