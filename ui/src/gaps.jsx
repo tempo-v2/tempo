@@ -27,6 +27,7 @@ export function Gaps() {
   const [busy,setBusy] = useState(false);
   const [error,setError] = useState("");
   const [message,setMessage] = useState("");
+  const [reload, setReload] = useState(0);
   function update(patch) {
     const next={...restore(),...patch};
       localStorage.setItem(storage, JSON.stringify(next));
@@ -34,34 +35,42 @@ export function Gaps() {
   }
   useEffect(() => {
     const ctrl=new AbortController();
-    async function load() {
-      let options=[], page;
+    async function loadBooks() {
+      let options = [], page;
       do {
-        const tail=options.at(-1);
-        page=await api("openings/repertoires"+(tail?"?"+new URLSearchParams({after:tail.id,color:tail.color}):""),undefined,ctrl.signal);
-        options=options.concat(page);
-      } while(page.length===50);
+        const tail = options.at(-1);
+        const query = tail ? "?" + new URLSearchParams({ after: tail.id, color: tail.color }) : "";
+        page = await api("openings/repertoires" + query, undefined, ctrl.signal);
+        options = options.concat(page);
+      } while (page.length === 50);
       setBooks(options);
-      const saved=restore();
-      if(saved.report) {
-        const result=await api("coverage/"+saved.report,undefined,ctrl.signal);
-        // Recover an editor opened on a later page without fetching all intervening pages.
-        if(saved.index>=result.gaps.length && saved.index<result.total) {
-          const offset=Math.floor(saved.index/30)*30;
-          const page=await api("coverage/"+saved.report+"?offset="+offset,undefined,ctrl.signal);
-          result.selectedGap=page.gaps[saved.index-offset];
-        }
-        setReport(result);
-      }
     }
-    load().catch(e=>{if(!ctrl.signal.aborted)setError(e.message);});
-    return ()=>ctrl.abort();
-  },[]);
+    async function loadReport() {
+      const saved = restore();
+      const reportId = saved.pending?.draft.report ?? saved.report;
+      if (!reportId) return;
+      const result = await api("coverage/" + reportId, undefined, ctrl.signal);
+      // Recover an editor opened on a later page without fetching intervening pages.
+      const index = saved.pending?.draft.gap ?? saved.index;
+      if (index >= result.gaps.length && index < result.total) {
+        const offset = Math.floor(index / 30) * 30;
+        const page = await api("coverage/" + reportId + "?offset=" + offset, undefined, ctrl.signal);
+        result.selectedGap = page.gaps[index - offset];
+      }
+      const latest = restore();
+      if ((latest.pending?.draft.report ?? latest.report) === reportId) setReport(result);
+    }
+    setError("");
+    const failed = e => { if (!ctrl.signal.aborted) setError(e.message); };
+    void loadBooks().catch(failed);
+    void loadReport().catch(failed);
+    return () => ctrl.abort();
+  }, [reload]);
   async function run(fn) {
     setBusy(true);setError("");
     try { await fn(); } catch(e){setError(e.message);} finally {setBusy(false);}
   }
-  const book=books.find(b=>b.id+"/"+b.color===draft.book) ?? books[0];
+  const book = draft.book ? books.find(b => b.id + "/" + b.color === draft.book) : books[0];
   async function scan(request, previous) {
     const {id}=await api("coverage",request);
     const next=await api("coverage/"+id);
@@ -76,14 +85,14 @@ export function Gaps() {
     return {repertoire:book.id,color:book.color,through:Number(draft.through??10),
       route:{fen:history[0]?.before??game.fen(),moves:history.map(m=>m.lan)}};
   }
-  const gap=report?.gaps[draft.index]??report?.selectedGap;
+  const gap=report?.gaps[draft.pending?.draft.gap ?? draft.index]??report?.selectedGap;
   function open(index) {
     const link=lead(report,report.gaps[index]);
     window.open(link.url,"_blank","noopener,noreferrer");
     setPreview(null);setMessage("");update({index,pgn:"",pending:null});
   }
   async function save(command) {
-    update({pending:command});
+    update({pending:command,report:command.draft.report,index:command.draft.gap,pgn:command.draft.pgn});
     let receipt;
     try {
       receipt=await api("coverage/save",command,undefined,{requireJson:true});
@@ -117,11 +126,13 @@ export function Gaps() {
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
+      {!book && <option value="" disabled>Select a repertoire</option>}
       {books.map(b=><option key={b.id+b.color} value={b.id+"/"+b.color}>{b.example_line} ({b.color})</option>)}</select></label>
       <label>Starting line (PGN) <input placeholder="1. e4 e5 2. Nf3 Nc6 3. Bc4" value={draft.line??""} onChange={e=>update({line:e.target.value})}/></label>
       <label>Through my move <input type="number" min="1" max="100" value={draft.through??10} onChange={e=>update({through:e.target.value})}/></label>
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
-    {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}{message && <p role="status">{message}</p>}
+    {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
+    {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{message && <p role="status">{message}</p>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · Maia-2 Rapid 1500/1500</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
