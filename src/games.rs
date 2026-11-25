@@ -229,9 +229,14 @@ fn decode(row: StoredGame) -> Result<Game> {
     })
 }
 
+const DISPLAY_FIELDS: &str = "CASE WHEN length(CAST(source_url AS BLOB))<=2048 THEN source_url END,
+    substr(played_on,1,64)";
+const BROWSE_FIELDS: &str =
+    "id,substr(white,1,256),substr(black,1,256),learner_color,game_ir,occurrence,outcome";
+
 pub fn archive(db: &Connection, after: &str, limit: usize) -> Result<Vec<Replay>> {
     let mut query = db.prepare(&format!(
-        "SELECT {FIELDS},source_url,played_on FROM games WHERE id>?1 ORDER BY id LIMIT ?2",
+        "SELECT {BROWSE_FIELDS},{DISPLAY_FIELDS} FROM games WHERE id>?1 ORDER BY id LIMIT ?2",
     ))?;
     let mut rows = query.query(params![after, limit])?;
     let mut replays = Vec::new();
@@ -249,9 +254,13 @@ pub fn archive(db: &Connection, after: &str, limit: usize) -> Result<Vec<Replay>
 }
 
 pub fn read(db: &Connection, id: &str) -> Result<Game> {
+    read_fields(db, id, FIELDS)
+}
+
+fn read_fields(db: &Connection, id: &str, fields: &str) -> Result<Game> {
     let row = db
         .query_row(
-            &format!("SELECT {FIELDS} FROM games WHERE id=?1"),
+            &format!("SELECT {fields} FROM games WHERE id=?1"),
             [id],
             stored,
         )
@@ -262,9 +271,9 @@ pub fn read(db: &Connection, id: &str) -> Result<Game> {
 
 pub fn replay(db: &Connection, id: &str) -> Result<Replay> {
     let snapshot = db.unchecked_transaction()?;
-    let game = read(&snapshot, id)?;
+    let game = read_fields(&snapshot, id, BROWSE_FIELDS)?;
     let (source_url, played_on) = snapshot.query_row(
-        "SELECT source_url,played_on FROM games WHERE id=?1",
+        &format!("SELECT {DISPLAY_FIELDS} FROM games WHERE id=?1"),
         [id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;

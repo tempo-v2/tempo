@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
-import { api } from "./api.js";
+import { api, readView } from "./api.js";
 import {
   answerIntent, answerPayload, importPredecessorAnswer, isMove, nextSavedAnswer, resolveAnswer, saveAnswer,
 } from "./answer-journal.js";
@@ -122,6 +122,17 @@ export function Study({ openGame, sounds }) {
   const retry = useRef(null);
   const nextButton = useRef(null);
   const opponentRead = useRef(null);
+  const currentRead = useRef(null);
+  async function loadCurrent() {
+    currentRead.current?.abort();
+    const request = new AbortController();
+    currentRead.current = request;
+    try {
+      return await readView("study", request.signal);
+    } finally {
+      if (currentRead.current === request) currentRead.current = null;
+    }
+  }
   const [promotionTarget, setPromotionTarget] = useState(null);
   const [epoch, setEpoch] = useState(0);
   const [advanceAfter, setAdvanceAfter] = useState(null);
@@ -168,17 +179,23 @@ export function Study({ openGame, sounds }) {
       while ((intent = await nextSavedAnswer(intent))) {
         await deliverAnswer(intent);
       }
-      const active = await api("study");
+      if (!mounted.current) return;
+      const active = await loadCurrent();
+      if (!mounted.current) return;
       setCard(active ?? await api("study/next", { after: null }));
       setLoaded(true);
       invalidateCounts.current?.();
     });
-    return () => { mounted.current = false; sounds.cancel(); };
+    return () => {
+      mounted.current = false;
+      currentRead.current?.abort();
+      sounds.cancel();
+    };
   }, []);
   useEffect(() => {
     if (!attemptKey || card.kind === "opening") return;
     const request = new AbortController();
-    opponentRead.current = api(`study/${card.attempt}/opponent-move`, undefined, request.signal)
+    opponentRead.current = readView(`study/${card.attempt}/opponent-move`, request.signal)
       .then((move) => {
         if (!request.signal.aborted && move) {
           setOpponent({ key: attemptKey, move: [move.slice(0, 2), move.slice(2, 4)] });
@@ -196,7 +213,7 @@ export function Study({ openGame, sounds }) {
     const request = new AbortController();
     Promise.resolve(opponentRead.current).then(async () => {
       if (request.signal.aborted) return;
-      const result = await api(`study/${card.attempt}/context`, undefined, request.signal);
+      const result = await readView(`study/${card.attempt}/context`, request.signal);
       if (!request.signal.aborted) setSource({ key: attemptKey, result });
     }).catch(() => {});
     return () => request.abort();
@@ -232,8 +249,14 @@ export function Study({ openGame, sounds }) {
       if (!mounted.current) return;
       if (!result) {
         setSubmitted(null);
-        setCard(await api("study"));
-        invalidateCounts.current?.();
+        async function refreshCurrent() {
+          const current = await loadCurrent();
+          if (!mounted.current) return;
+          setCard(current);
+          invalidateCounts.current?.();
+        }
+        retry.current = refreshCurrent;
+        await refreshCurrent();
         return;
       }
       setCard((old) => ({ ...old, result }));

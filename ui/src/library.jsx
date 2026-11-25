@@ -1,30 +1,75 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
-import { api, fileText } from "./api.js";
+import { api, fileText, readView } from "./api.js";
 import { ChessBoard, Replay, play, position } from "./board.jsx";
 import { moveCue } from "./sounds.js";
 
 export function useList(endpoint) {
   const [rows, setRows] = useState([]);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [more, setMore] = useState(false);
-  async function load(append = false) {
-    setBusy(true);
-    try {
-      const page = await api(endpoint + (append ? "?after=" + rows.at(-1).id : ""));
-      setRows(append ? [...rows, ...page] : page);
-      setMore(page.length === (endpoint === "games" ? 50 : 100));
-      setError("");
-    } catch (error) { setError(error.message); }
-    finally { setBusy(false); }
-  }
-  useEffect(() => { load(); }, [endpoint]);
+  const controller = useRef(null);
+  const load = useCallback((append = false) => controller.current?.(append), []);
+
+  useEffect(() => {
+    let active = true;
+    let request;
+    let refresh = true;
+    let tail;
+    async function read(append = false) {
+      if (!active) return;
+      if (!append) refresh = true;
+      if (request || document.hidden || (append && !tail)) return;
+      const current = new AbortController();
+      request = current;
+      const appendPage = append && !refresh;
+      refresh = false;
+      setBusy(true);
+      try {
+        const query = appendPage ? "?" + new URLSearchParams({ after: tail }) : "";
+        const page = await readView(endpoint + query, current.signal);
+        if (!active || current.signal.aborted || refresh) return;
+        tail = page.at(-1)?.id;
+        setRows((prior) => appendPage ? [...prior, ...page] : page);
+        setMore(page.length === (endpoint === "games" ? 50 : 100));
+        setError(null);
+      } catch (failure) {
+        if (active && !current.signal.aborted && !refresh) {
+          setError({ message: failure.message, append: appendPage });
+        }
+      } finally {
+        request = undefined;
+        if (active) {
+          setBusy(false);
+          if (refresh && !document.hidden) void read();
+        }
+      }
+    }
+    function visibilityChanged() {
+      if (document.hidden) {
+        if (request) refresh = true;
+        request?.abort();
+      } else if (refresh) {
+        void read();
+      }
+    }
+    controller.current = read;
+    document.addEventListener("visibilitychange", visibilityChanged);
+    void read();
+    return () => {
+      active = false;
+      controller.current = null;
+      request?.abort();
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
+  }, [endpoint]);
   return { rows, busy, more, error, load };
 }
 
 export function More({ list }) {
-  return <>{list.error && <p className="error" role="alert">{list.error}</p>}
+  return <>{list.error && <p className="error" role="alert">{list.error.message}{" "}
+    <button disabled={list.busy} onClick={() => list.load(list.error.append)}>Retry list</button></p>}
     {list.more && <button disabled={list.busy} onClick={() => list.load(true)}>Load more</button>}</>;
 }
 
@@ -53,6 +98,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const choices = saveDestination && !repertoires.some((entry) => choiceKey(entry) === choiceKey(saveDestination))
     ? [saveDestination, ...repertoires] : repertoires;
   async function loadRepertoires(append = false) {
+    if (document.hidden) return;
     if (repertoireRequest.current) {
       if (append) return;
       repertoireRequest.current.abort();
@@ -63,7 +109,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
     const tail = append ? repertoires.at(-1) : null;
     const cursor = tail ? "?" + new URLSearchParams({ after: tail.id, color: tail.color }) : "";
     try {
-      const page = await api("openings/repertoires" + cursor, undefined, request.signal);
+      const page = await readView("openings/repertoires" + cursor, request.signal);
       if (request.signal.aborted) return;
       setRepertoires((rows) => append ? [...rows, ...page] : page);
       setMoreRepertoires(page.length === 50);
@@ -78,8 +124,14 @@ export function Openings({ fromGame, onSaved, sounds }) {
     }
   }
   useEffect(() => {
+    function visibilityChanged() {
+      if (document.hidden) repertoireRequest.current?.abort();
+      else loadRepertoires();
+    }
+    document.addEventListener("visibilitychange", visibilityChanged);
     loadRepertoires();
     return () => {
+      document.removeEventListener("visibilitychange", visibilityChanged);
       repertoireRequest.current?.abort();
       repertoireRequest.current = null;
     };

@@ -158,6 +158,27 @@ def verify_games(binary, database):
     print("Manual and both provider turns share game identity. Detector failure, sealed retry, fresh rescan and Tactics verified.")
 
 
+def verify_browse(binary, database):
+    with serve(binary, database) as api:
+        archive = pgn(
+            '[Round "1"]\n[Date "' + 'x' * 80 + '"]\n'
+            '[Link "https://lichess.org/' + 'x' * 2050 + '"]\n'
+        ).replace('Opponent', 'x' * 270)
+        job = wait_until(lambda: api("games/uploads", {"username": "Learner", "pgn": archive}))
+        wait_until(lambda: sql(database, "SELECT status FROM jobs WHERE id=?", [job["id"]]) == [("done",)])
+        game, = api("games")
+        assert game == api("games/archive/" + game["id"])
+        assert len(game["black"]) == 256 and len(game["played_on"]) == 64
+        assert game["source_url"] is None and game["route"]["moves"]
+        assert sql(database, "SELECT length(black),length(played_on),length(source_url) FROM games") == [(270, 80, 2070)]
+        assert api("games?after=" + game["id"]) == []
+        assert api("openings") == [] and api("openings/repertoires") == []
+        assert api("settings") == {} and api("settings/new-openings")
+        assert api("study") is None
+        assert sql(database, "SELECT count(*) FROM attempts") == [(0,)]
+    print("Interactive reads retained pagination, addressed replay, and original oversized archive metadata.")
+
+
 def verify_interrupted_upload(binary, predecessor, database):
     payload = pgn('[Round "11"]\n') + pgn('[Round "12"]\n', move='Kd2')
     with serve(predecessor, database, worker=False) as api:
@@ -232,3 +253,4 @@ if __name__ == "__main__":
         if options.predecessor_binary:
             verify_interrupted_upload(options.binary.resolve(), options.predecessor_binary.resolve(), root / "unfinished.sqlite3")
         verify_games(options.binary.resolve(), root / "games.sqlite3")
+        verify_browse(options.binary.resolve(), root / "browse.sqlite3")

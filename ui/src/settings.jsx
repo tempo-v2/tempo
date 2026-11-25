@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { api } from "./api.js";
+import { api, readView, visibleRead } from "./api.js";
 
 const labels = { chesscom: "Chess.com", lichess: "Lichess" };
 
@@ -8,10 +8,19 @@ export function Settings({ sounds }) {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [ready, setReady] = useState(false);
-  useEffect(() => {
-    api("settings").then((values) => { setNames((n) => ({ ...n, ...values })); setReady(true); })
-      .catch((error) => setError(error.message));
-  }, []);
+  const [readAttempt, retryRead] = useState(0);
+  useEffect(() => visibleRead(async (signal) => {
+    try {
+      const values = await readView("settings", signal);
+      if (signal.aborted) return;
+      setNames((n) => ({ ...n, ...values }));
+      setReady(true);
+      setReadError("");
+    } catch (failure) {
+      if (!signal.aborted) setReadError(failure.message);
+    }
+  }), [readAttempt]);
+  const [readError, setReadError] = useState("");
   return <section><h1>Settings</h1>
     <label className="board-sound-setting">
       <input type="checkbox" defaultChecked={sounds.enabled} onChange={(event) => sounds.setEnabled(event.target.checked)} />
@@ -30,6 +39,8 @@ export function Settings({ sounds }) {
       <button className="primary" disabled={!ready}>Save settings</button>
     </form>
     {message && <p role="status">{message}</p>}
+    {readError && <p className="error" role="alert">{readError}{" "}
+      <button onClick={() => retryRead((n) => n + 1)}>Retry usernames</button></p>}
     {error && <p className="error" role="alert">{error}</p>}
   </section>;
 }
@@ -40,9 +51,18 @@ function NewOpeningSettings() {
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    api("settings/new-openings").then(setSettings).catch((error) => setError(error.message));
-  }, []);
+  const [readAttempt, retryRead] = useState(0);
+  const [readError, setReadError] = useState("");
+  useEffect(() => visibleRead(async (signal) => {
+    try {
+      const values = await readView("settings/new-openings", signal);
+      if (signal.aborted) return;
+      setSettings(values);
+      setReadError("");
+    } catch (failure) {
+      if (!signal.aborted) setReadError(failure.message);
+    }
+  }), [readAttempt]);
 
   async function save(event) {
     event.preventDefault();
@@ -78,6 +98,8 @@ function NewOpeningSettings() {
       <button className="primary" disabled={saving}>Save opening settings</button>
     </form>}
     {message && <p role="status">{message}</p>}
+    {readError && <p className="error" role="alert">{readError}{" "}
+      <button onClick={() => retryRead((n) => n + 1)}>Retry opening preferences</button></p>}
     {error && <p className="error" role="alert">{error}</p>}
   </section>;
 }
