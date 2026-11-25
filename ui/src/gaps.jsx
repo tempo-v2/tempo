@@ -4,8 +4,26 @@ import { api } from "./api.js";
 import { position } from "./board.jsx";
 
 const storage = "tempo-lean-gap-draft-v1";
+function stored(key) {
+  try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
+}
 function restore() {
-  try { return JSON.parse(localStorage.getItem(storage)) ?? {}; } catch { return {}; }
+  return { ...stored(storage), pending: stored(storage + ".save") };
+}
+async function claimSave(command) {
+  return navigator.locks.request(storage + ".save", () => {
+    const key = storage + ".save";
+    const current = stored(key);
+    if (current) return current.command === command.command;
+    localStorage.setItem(key, JSON.stringify(command));
+    return true;
+  });
+}
+async function clearSave(command) {
+  await navigator.locks.request(storage + ".save", () => {
+    const key = storage + ".save";
+    if (stored(key)?.command === command.command) localStorage.removeItem(key);
+  });
 }
 function notation(game) {
   return game.history({verbose:true}).map(m => (m.color === "w" ? m.before.split(" ")[5] + ". " : "") + m.san).join(" ");
@@ -29,7 +47,7 @@ export function Gaps() {
   const [message,setMessage] = useState("");
   const [reload, setReload] = useState(0);
   function update(patch) {
-    const next={...restore(),...patch};
+    const next={...stored(storage),...patch};
       localStorage.setItem(storage, JSON.stringify(next));
     setDraft(next);
   }
@@ -93,19 +111,19 @@ export function Gaps() {
     setPreview(null);setMessage("");update({index,pgn:""});
   }
   async function save(command) {
-    const current = restore().pending;
-    if (current && current.command !== command.command) {
+    if (!await claimSave(command)) {
       setDraft(restore());
       setReload(n => n + 1);
       return;
     }
-    update({pending:command});
+    setDraft(restore());
     let receipt;
     try {
       receipt=await api("coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
       if(e.code==="stale_gap") {
-        if (restore().pending?.command === command.command) update({pending:null});
+        await clearSave(command);
+        setDraft(restore());
         setPreview(null);
         setReport(old=>({...old,stale:true}));
       }
@@ -115,7 +133,8 @@ export function Gaps() {
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
     setReport(old=>({...old,stale:true}));
     setMessage("Continuation saved. Refreshing coverage…");
-    if (restore().pending?.command === command.command) update({pending:null,previous:report.authored});
+    await clearSave(command);
+    update({previous:report.authored});
     setPreview(null);
     await scan(report.scan,report.authored);
   }
