@@ -475,11 +475,12 @@ export function Gaps() {
   const blocked = locked || report?.stale || Boolean(saved);
   const blockedSelection = locked || Boolean(saved);
   const reviewStart = requestedReview?.report === reportId && requestedReview?.index === gapIndex ? requestedReview : null;
+  const hasGap = Boolean(gap);
   useEffect(() => {
-    if (!reviewStart || !gapHeading.current) return;
+    if (!reviewStart || !hasGap || !gapHeading.current) return;
     gapHeading.current.focus({ preventScroll: true });
     gapHeading.current.scrollIntoView({ block: "start" });
-  }, [reviewStart, gap]);
+  }, [reviewStart, hasGap]);
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
       {!book && <option value="" disabled>Select a repertoire</option>}
