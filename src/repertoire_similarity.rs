@@ -130,18 +130,18 @@ enum Terminal {
 }
 
 #[derive(Serialize)]
-struct Candidate {
-    first_move: String,
-    san: String,
-    distance: u32,
-    example: Example,
+pub struct Candidate {
+    pub first_move: String,
+    pub san: String,
+    pub distance: u32,
+    pub example: Example,
 }
 
 #[derive(Serialize)]
-struct Example {
-    position_id: String,
-    fen: String,
-    answer_version: String,
+pub struct Example {
+    pub position_id: String,
+    pub fen: String,
+    pub answer_version: String,
 }
 
 fn distance(position: &Chess, example: &Chess) -> u32 {
@@ -171,7 +171,7 @@ pub fn analyze(
 }
 
 pub fn analyze_until(
-    PositionIr(board): PositionIr,
+    position: PositionIr,
     repertoire: RepertoireIr,
     options: Options,
     cancelled: impl Fn() -> bool,
@@ -179,6 +179,29 @@ pub fn analyze_until(
     if !(1..=10).contains(&options.count) {
         return Err(Error::InvalidRequest);
     }
+    let mut analysis = analyze_all(position, repertoire, cancelled)?;
+    if let Outcome::Ranked { moves } = &mut analysis.outcome {
+        moves.truncate(options.count);
+    }
+    Ok(analysis)
+}
+
+pub fn all_candidates(
+    position: PositionIr,
+    repertoire: RepertoireIr,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<Candidate>, Error> {
+    match analyze_all(position, repertoire, cancelled)?.outcome {
+        Outcome::Ranked { moves } => Ok(moves),
+        Outcome::OpponentToMove | Outcome::Terminal { .. } => Ok(Vec::new()),
+    }
+}
+
+fn analyze_all(
+    PositionIr(board): PositionIr,
+    repertoire: RepertoireIr,
+    cancelled: impl Fn() -> bool,
+) -> Result<Analysis, Error> {
     if repertoire.schema_version != 1
         || !matches!(repertoire.basis.color.as_str(), "white" | "black")
         || repertoire.basis.dataset.is_empty()
@@ -262,7 +285,6 @@ pub fn analyze_until(
     } else {
         let mut moves: Vec<_> = best.into_values().collect();
         moves.sort_by(|a, b| (a.distance, &a.first_move).cmp(&(b.distance, &b.first_move)));
-        moves.truncate(options.count);
         Outcome::Ranked { moves }
     };
     Ok(Analysis {

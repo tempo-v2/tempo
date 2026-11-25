@@ -180,6 +180,7 @@ pub fn backfill_views(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub mod review;
 mod scan;
 pub use catalog::authored_reply_revision as revision;
 pub use scan::{ScanFailure, start};

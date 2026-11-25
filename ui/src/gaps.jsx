@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api } from "./api.js";
-import { position } from "./board.jsx";
+import { play, position } from "./board.jsx";
+import { GapReview } from "./gap_review.jsx";
 
 const storage = "tempo-lean-gap-draft-v1";
 function stored(key) {
@@ -58,11 +59,33 @@ async function settleCommand(kind, command, acknowledgement) {
 function notation(game) {
   return game.history({verbose:true}).map(m => (m.color === "w" ? m.before.split(" ")[5] + ". " : "") + m.san).join(" ");
 }
-function lead(report, gap) {
+function lead(report, gap, reply) {
   const route = report.scan.route;
   const board = position({fen:route.fen, moves:[...route.moves, ...gap.moves]});
-  const pgn = board.pgn().replaceAll("+", "");
-  return { text:notation(board) || board.fen(), url:"https://lichess.org/analysis/pgn/" + encodeURIComponent(pgn) + "?color=" + report.scan.color };
+  if (reply) {
+    const positionFields = fen => fen.split(" ").slice(0, 4).join(" ");
+    if (positionFields(board.fen()) !== positionFields(gap.fen)) {
+      throw new Error("The recorded line no longer reaches this gap.");
+    }
+    play(board, reply);
+  }
+  const pgn = board.pgn();
+  return {
+    pgn,
+    text:notation(board) || board.fen(),
+    url:"https://lichess.org/analysis/pgn/" + encodeURIComponent(pgn.replaceAll("+", "")) + "?color=" + report.scan.color,
+  };
+}
+
+function stagedLead(report, gap, index, draft) {
+  const staged = draft.stagedReply;
+  if (staged?.report !== report.id || staged?.gap !== index) return null;
+  try {
+    const line = lead(report, gap, staged.movement);
+    return draft.pgn === line.pgn ? line : null;
+  } catch {
+    return null;
+  }
 }
 const percent = n => (100*n).toLocaleString(undefined,{maximumFractionDigits:2}) + "%";
 const range = (value, unknown) => percent(value) + (unknown > 0.000001 ? " – " + percent(Math.min(1,value+unknown)) : "");
@@ -142,6 +165,7 @@ export function Gaps() {
   const [message,setMessage] = useState("");
   const [commandFeedback, setCommandFeedback] = useState(null);
   const [reload, setReload] = useState(0);
+  const [requestedReview, setRequestedReview] = useState(null);
   function refreshJournal() {
     const current = restore();
     if (scanOwner.current && scanOwner.current.view !== viewIdentity(current)) {
@@ -246,7 +270,8 @@ export function Gaps() {
         stored(storage + ".save") || stored(storage + ".apply")) return;
     setReport(next);clearPreview();
     if (reportId === id) setSummaryRetry(n => n + 1);
-    update({report:id,index:null,pgn:"",replacements:noReplacements,previous:null,savedReport:null});
+    setRequestedReview(null);
+    update({report:id,index:null,pgn:"",stagedReply:null,replacements:noReplacements,previous:null,savedReport:null});
     if(previous!=null)setMessage("Saved. Authored coverage moved from "+percent(previous)+" to "+percent(next.authored)+".");
   }
   function inputScan() {
@@ -257,9 +282,29 @@ export function Gaps() {
       route:{fen:history[0]?.before??game.fen(),moves:history.map(m=>m.lan)}};
   }
   function open(index) {
-    const link=lead(report,report.gaps[index]);
-    window.open(link.url,"_blank","noopener,noreferrer");
-    clearPreview();setMessage("");update({index,pgn:"",replacements:noReplacements});
+    const latest = restore();
+    if (latest.report !== report.id || latest.pending || latest.applyCommand ||
+        latest.saveAcknowledgement?.report === report.id || latest.savedReport === report.id) return;
+    if (latest.index !== index) {
+      clearPreview();setMessage("");
+      update({index,pgn:"",stagedReply:null,replacements:noReplacements});
+    }
+    setRequestedReview({ report: report.id, index });
+  }
+
+  function stageReply(movement) {
+    const latest = restore();
+    if (blocked || latest.report !== report.id || latest.index !== gapIndex ||
+        latest.pending || latest.applyCommand || latest.saveAcknowledgement?.report === report.id ||
+        latest.savedReport === report.id || Object.keys(latest.replacements ?? noReplacements).length ||
+        (latest.pgn?.trim() && !stagedLead(report, gap, gapIndex, latest))) return;
+    try {
+      const { pgn } = lead(report, gap, movement);
+      clearPreview();
+      update({ pgn, stagedReply: { report: report.id, gap: gapIndex, movement } });
+    } catch (failure) {
+      setError(failure.message);
+    }
   }
   function save(command, batched) {
     return run(() => sendSave(command, batched), { command: command.command });
@@ -370,7 +415,7 @@ export function Gaps() {
   async function applyCorrection(correction) {
     if (!isCurrent(correction.draft, correction.choices)) return;
     const next = { ...correction.draft, pgn: correction.pgn };
-    update({ pgn: next.pgn, replacements: correction.nextChoices });
+    update({ pgn: next.pgn, stagedReply: null, replacements: correction.nextChoices });
     await previewDraft(next, correction.nextChoices);
   }
   async function correct(conflict, reply) {
@@ -417,6 +462,9 @@ export function Gaps() {
   const alert = error || pendingFeedback?.error;
   const status = pendingFeedback?.message || (!draft.pending && saved && savedMessage) || message;
   const blocked = locked || report?.stale || Boolean(saved);
+  const blockedSelection = locked || Boolean(saved);
+  const staged = gap && report ? stagedLead(report, gap, gapIndex, draft) : null;
+  const reviewStart = requestedReview?.report === reportId && requestedReview?.index === gapIndex ? requestedReview : null;
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
       {!book && <option value="" disabled>Select a repertoire</option>}
@@ -437,10 +485,19 @@ export function Gaps() {
       {report.model_superseded && <p>Rescan with the current model before using these probabilities to set your opening order.</p>}
       {(report.model_superseded||report.stale||error||saved||previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : previous))}>Retry scan</button>}
       <button disabled={blocked||report.model_superseded} onClick={()=>applyOrder({ report: report.id, command: crypto.randomUUID() })}>Apply to opening order</button>
-      {report.gaps.length>0 && <button disabled={blocked} onClick={()=>open(0)}>Work on next gap</button>}
+      {report.gaps.length>0 && <button disabled={blockedSelection} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
-        <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
-        <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value});}}/></label>
+        {!draft.pending && !draft.applyCommand && !saved && <GapReview
+          key={JSON.stringify([viewIdentity(draft), gapIndex])}
+          report={report.id} index={gapIndex} fen={gap.fen} color={report.scan.color}
+          start={reviewStart} staged={staged ? draft.stagedReply.movement : null}
+          canStage={!blocked && !hasReplacements && (!draft.pgn?.trim() || !!staged)}
+          canRescan={!locked} onStage={stageReply}
+          onRescan={() => run(() => scan(report.scan))} />}
+        <a href={(staged ?? lead(report,gap)).url} target="_blank" rel="noreferrer">
+          {staged ? "Extend staged reply in Lichess" : "Open line in Lichess"}
+        </a>
+        <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value,stagedReply:null});}}/></label>
         <div className="controls">
           <button disabled={blocked || !edit.pgn}
             onClick={() => run(() => previewDraft(edit, replacements))}>Preview</button>
@@ -488,7 +545,7 @@ export function Gaps() {
           </div>}
         </section>}
       </section>}
-      <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={blocked} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
+      <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={blockedSelection} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
       {report.gaps.length < report.total && <button disabled={busy} onClick={showMoreGaps}>Show more gaps</button>}
     </>}
   </section>;

@@ -10,6 +10,21 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, net::UnixStream, sync::Semaphore, time::timeout};
 
+// Scores on the private engine interface are relative to White. Consumers
+// compare them from the side to move, keeping mate distance separate from CP.
+impl wire::Score {
+    pub(crate) fn order(self, side: wire::Side) -> (i8, i64) {
+        match self {
+            Self::Centipawns { white } => (
+                0,
+                i64::from(white) * if side == wire::Side::White { 1 } else { -1 },
+            ),
+            Self::Mate { winner, moves } if winner == side => (1, -i64::from(moves)),
+            Self::Mate { moves, .. } => (-1, i64::from(moves)),
+        }
+    }
+}
+
 static SLOT: Semaphore = Semaphore::const_new(1);
 
 pub struct Endpoint {
@@ -37,17 +52,33 @@ impl Endpoint {
     }
 }
 
-pub async fn browse(
-    State(app): State<App>,
-    Json(request): Json<wire::EngineRequest>,
-) -> ViewResult {
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowseRequest {
+    fen: String,
+}
+
+pub async fn browse(State(app): State<App>, Json(request): Json<BrowseRequest>) -> ViewResult {
     PositionIr::parse(&request.fen).map_err(|error| ApiError(error.into()))?;
-    let unavailable = || Json(wire::EngineReply::Unavailable).into_response();
+    Ok(Json(
+        evaluate(
+            &app,
+            wire::EngineRequest {
+                fen: request.fen,
+                mode: wire::EngineMode::TopFive,
+            },
+        )
+        .await,
+    )
+    .into_response())
+}
+
+pub async fn evaluate(app: &App, request: wire::EngineRequest) -> wire::EngineReply {
     let Some(endpoint) = &app.opening_engine else {
-        return Ok(unavailable());
+        return wire::EngineReply::Unavailable;
     };
     let Ok(_permit) = SLOT.try_acquire() else {
-        return Ok(Json(wire::EngineReply::Busy).into_response());
+        return wire::EngineReply::Busy;
     };
     let result = timeout(Duration::from_secs(5), async {
         let mut stream = endpoint.connect().await?;
@@ -57,8 +88,8 @@ pub async fn browse(
         wire::read::<wire::EngineReply>(&mut stream).await
     })
     .await;
-    Ok(match result {
-        Ok(Ok(reply)) => Json(reply).into_response(),
-        _ => unavailable(),
-    })
+    match result {
+        Ok(Ok(reply)) => reply,
+        _ => wire::EngineReply::Unavailable,
+    }
 }

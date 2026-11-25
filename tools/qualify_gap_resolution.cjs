@@ -22,8 +22,8 @@ function sql(db, command) {
 }
 
 const quoted = value => "'" + String(value).replaceAll("'", "''") + "'";
-function seedReport(db, id, repertoire, fen, moves) {
-  const scan = JSON.stringify({ repertoire, color: "white", route: { fen: start, moves: [] }, through: 6 });
+function seedReport(db, id, repertoire, fen, moves, route = { fen: start, moves: [] }) {
+  const scan = JSON.stringify({ repertoire, color: "white", route, through: 6 });
   const gaps = JSON.stringify([{ fen, moves, probability: 1 }]);
   const header = JSON.stringify({ model: "Maia-3", model_superseded: false, authored: 0, ended: 0, conflict: 0, unresolved: 0, total: 1 });
   const modelId = "maia3-5m-1500-history-v1";
@@ -415,10 +415,24 @@ async function laterGapAcrossTabs(browser) {
       await openGaps(observer, origin);
       await openGaps(author, origin);
       await author.getByRole("button", { name: "Show more gaps" }).click();
+      let holdReview, reachedReview;
+      const heldReview = new Promise(resolve => { holdReview = resolve; });
+      const reviewRequested = new Promise(resolve => { reachedReview = resolve; });
+      await author.route("**/api/coverage/gaps/review", async route => {
+        const address = route.request().postDataJSON();
+        if (address.gap !== 31) return route.continue();
+        reachedReview();
+        await heldReview;
+        await route.fulfill({ json: { ...address, status: "covered", san: "Obsolete review" } }).catch(() => {});
+      });
       await author.getByRole("button", { name: /^42%/ }).click();
+      await reviewRequested;
       await observer.getByRole("link", { name: "Open line in Lichess" }).waitFor();
       await observer.waitForFunction(() => document.querySelector("a[href*='e4']"));
       await author.getByRole("button", { name: /^43%/ }).click();
+      holdReview();
+      await author.getByRole("button", { name: "Retry review" }).waitFor();
+      assert.equal(await author.getByText("Obsolete review", { exact: false }).count(), 0);
       await observer.waitForFunction(() => document.querySelector("a[href*='Nf3']"));
       const editor = author.getByRole("textbox", { name: "Paste PGN from Lichess" });
       await editor.fill("1. Nf3 Nc6 2. d4 *");
@@ -531,6 +545,71 @@ async function waitFor(predicate) {
   throw new Error("Timed out waiting for the disposable model process");
 }
 
+async function reviewWinningMoves(browser, stockfish) {
+  const db = path.join(folder, "review.sqlite3");
+  const mate = "7k/8/5KQ1/8/8/8/8/8 w - - 0 1";
+  await withServer(candidate, db, async (origin, api) => {
+    const repertoire = await addOpening(api, "Mate review", ["e2e4"]);
+    seedReport(db, "review", repertoire, mate, [], { fen: mate, moves: [] });
+    const page = await browser.newPage();
+    let popups = 0;
+    page.on("popup", () => popups++);
+    await page.context().route("https://lichess.org/**", route => route.fulfill({ body: "Lichess fixture" }));
+    await page.route(origin + "/api/coverage", async route => route.fulfill({
+      status: 503, json: { error: "Coverage model unavailable" },
+    }));
+    await page.addInitScript(key => localStorage.setItem(key, JSON.stringify({ report: "review", index: 0, pgn: "" })), journal);
+
+    await openGaps(page, origin);
+    await page.getByRole("button", { name: "Work on next gap" }).click();
+    await page.getByRole("button", { name: "Retry review" }).waitFor();
+    assert.equal(popups, 0);
+    assert.equal(await page.getByRole("textbox", { name: "Paste PGN from Lichess" }).inputValue(), "");
+
+    const worker = spawn(path.join(path.dirname(candidate), "tempo-tactic-worker"),
+      ["watch", db, stockfish], { stdio: ["ignore", "ignore", "inherit"] });
+    try {
+      await waitFor(() => fs.existsSync(db.replace(/\.sqlite3$/, ".tq/engine")));
+      const receive = page.waitForResponse(response => response.url().endsWith("/coverage/gaps/review") && response.status() === 200);
+      await page.getByRole("button", { name: "Retry review" }).click();
+      const reply = await (await receive).json();
+      assert.equal(reply.status, "ranked");
+      assert.equal(reply.winning_mate, true);
+      assert.ok(reply.choices.length >= 2);
+      assert.equal(reply.choices[0].score.moves, 1);
+      assert.ok(reply.choices.every(choice => choice.score.winner === "white" && choice.example === null));
+
+      const last = reply.choices.at(-1);
+      const table = page.getByRole("table", { name: "Candidate replies" });
+      await table.getByText("Recommended", { exact: false }).waitFor();
+      await table.getByRole("button", { name: last.san, exact: true }).click();
+      await page.getByRole("button", { name: "Use reply", exact: true }).click();
+      const draft = await page.getByRole("textbox", { name: "Paste PGN from Lichess" }).inputValue();
+      assert.ok(draft.includes(mate) && draft.includes(last.san));
+      assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "0");
+      const optional = page.getByRole("link", { name: "Extend staged reply in Lichess" });
+      assert.ok(decodeURIComponent(await optional.getAttribute("href")).includes(last.san.replaceAll("+", "")));
+      assert.equal(popups, 0);
+      const opened = page.waitForEvent("popup");
+      await optional.click();
+      await (await opened).close();
+
+      await page.getByRole("button", { name: "Preview", exact: true }).click();
+      await page.getByRole("button", { name: "Save to repertoire", exact: true }).click();
+      await page.getByText("Continuation saved.", { exact: true }).waitFor();
+      assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
+      assert.equal((await api("coverage/gaps/review", { report: "review", gap: 0 })).status, "covered");
+    } finally {
+      if (worker.exitCode === null && worker.signalCode === null) {
+        const stopped = once(worker, "exit");
+        worker.kill();
+        await stopped;
+      }
+      await page.close();
+    }
+  });
+}
+
 async function previousCommands() {
   const db = path.join(folder, "predecessor.sqlite3");
   const commands = await withServer(predecessor, db, async (_origin, api) => {
@@ -578,6 +657,9 @@ async function previousCommands() {
     await laterGapAcrossTabs(browser);
     await browserFlow(browser);
     await cancelledScans(browser);
+    if (process.env.TEMPO_QUALIFY_STOCKFISH) {
+      await reviewWinningMoves(browser, process.env.TEMPO_QUALIFY_STOCKFISH);
+    }
     await previousCommands();
     console.log("Chromium conflict resolution, confirmed replacement retry, and installed predecessor command replay passed.");
   } finally {

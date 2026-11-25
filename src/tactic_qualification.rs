@@ -8,32 +8,10 @@ use std::{cmp::Ordering, collections::HashSet};
 pub const DEPTH: u8 = 10;
 const EQUIVALENT_CP: i64 = 30;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Side {
-    White,
-    Black,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Score {
-    Centipawns { white: i32 },
-    Mate { winner: Side, moves: u32 },
-}
+use crate::tactic_worker_protocol::Side;
+pub use crate::tactic_worker_protocol::{Root, Score};
 
 impl Score {
-    fn order(self, side: Side) -> (i8, i64) {
-        match self {
-            Self::Centipawns { white } => (
-                0,
-                i64::from(white) * if side == Side::White { 1 } else { -1 },
-            ),
-            Self::Mate { winner, moves } if winner == side => (1, -i64::from(moves)),
-            Self::Mate { moves, .. } => (-1, i64::from(moves)),
-        }
-    }
-
     fn equivalent_to(self, other: Self) -> bool {
         match (self, other) {
             (Self::Centipawns { white: a }, Self::Centipawns { white: b }) => {
@@ -43,12 +21,6 @@ impl Score {
             _ => false,
         }
     }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Root {
-    pub first_move: String,
-    pub score: Score,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

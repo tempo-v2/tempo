@@ -805,6 +805,7 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .route("/api/coverage/{id}", get(coverage::read))
         .route("/api/coverage/{id}/gaps", get(coverage::gaps))
         .route("/api/coverage/{id}/studied", get(coverage::studied))
+        .route("/api/coverage/gaps/review", post(coverage::review::review))
         .route("/api/coverage/{id}/apply", post(coverage::apply))
         .route(
             "/api/coverage/preview",
