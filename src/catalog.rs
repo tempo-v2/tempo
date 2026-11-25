@@ -352,8 +352,8 @@ pub fn save_opening(
 
 pub fn tactics(db: &Connection, after: &str) -> Result<Vec<Tactic>> {
     let mut q = db.prepare(
-        "SELECT t.id,t.name,t.route,t.game_id,t.game_ply FROM tactics t
-         JOIN active_cards c ON c.id=t.id WHERE t.id>?1 ORDER BY t.id LIMIT 100",
+        "SELECT id,name,route,game_id,game_ply FROM tactics
+         WHERE id>?1 AND retired=0 ORDER BY id LIMIT 100",
     )?;
     let rows = q.query_map([after], |r| {
         Ok((
@@ -456,7 +456,7 @@ pub fn apply_tactic(db: &Connection, plan: &TacticPlan) -> Result<String> {
             (Some(game), Some(ply), Some(played))
         });
     db.execute(
-        "INSERT OR IGNORE INTO tactics VALUES (?1,?2,?3,?4,?5)",
+        "INSERT OR IGNORE INTO tactics(id,name,route,game_id,game_ply) VALUES (?1,?2,?3,?4,?5)",
         params![plan.id, plan.name, plan.route, game, ply],
     )?;
     db.execute(
@@ -524,7 +524,7 @@ pub fn qualify_game_tactic(
         "Published tactic position changed"
     );
     let Some(answer) = answer else {
-        db.execute("UPDATE cards SET retired=1 WHERE id=?1", [&id])?;
+        db.execute("UPDATE tactics SET retired=1 WHERE id=?1", [&id])?;
         db.execute("DELETE FROM deck WHERE card_id=?1", [&id])?;
         db.execute("DELETE FROM repeat_obligation WHERE card_id=?1", [&id])?;
         return Ok("removed");
@@ -573,4 +573,34 @@ pub fn visit_answers_at(
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tactics_pages_skip_retired_ids_using_the_filtered_index() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let db = crate::db::Database::init(&directory.path().join("tactics"))?;
+        let route = serde_json::to_string(&Route {
+            fen: "".into(),
+            moves: vec!["e2e4".into()],
+        })?;
+        db.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10000)
+             INSERT INTO tactics(id,name,route,retired) SELECT printf('a%05d',i),'Old',?1,1 FROM n",
+            [&route],
+        )?;
+        db.execute(
+            "INSERT INTO tactics(id,name,route) VALUES ('b','New',?1)",
+            [&route],
+        )?;
+        db.progress_handler(256, Some(|| true));
+        let page = tactics(&db, "")?;
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "b");
+        assert!(tactics(&db, "b")?.is_empty());
+        Ok(())
+    }
 }
