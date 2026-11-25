@@ -104,10 +104,12 @@ struct Movetext {
     variations: Vec<Route>,
     terminal_outcome: Option<pgn_reader::Outcome>,
     moves_read: usize,
+    expanded_work: usize,
 }
 
 struct Parser {
     branches: bool,
+    max_expanded_work: Option<usize>,
 }
 
 impl Visitor for Parser {
@@ -156,6 +158,7 @@ impl Visitor for Parser {
                 variations: vec![],
                 terminal_outcome: None,
                 moves_read: 0,
+                expanded_work: 0,
             }),
             Err(error) => ControlFlow::Break(Err(error)),
         }
@@ -212,6 +215,14 @@ impl Visitor for Parser {
     fn end_variation(&mut self, text: &mut Movetext) -> ControlFlow<Self::Output> {
         if let Some(parent) = text.stack.pop() {
             let branch = std::mem::replace(&mut text.current, parent);
+            // The authoring planner may store a route prefix for each response.
+            text.expanded_work += branch.moves.len().pow(2);
+            if self
+                .max_expanded_work
+                .is_some_and(|max| text.expanded_work > max)
+            {
+                return ControlFlow::Break(Err(ExpandedPgn.into()));
+            }
             text.variations.push(Route {
                 fen: text.fen.clone(),
                 moves: branch.moves,
@@ -232,6 +243,11 @@ impl Visitor for Parser {
     }
 
     fn end_game(&mut self, text: Movetext) -> Self::Output {
+        ensure!(
+            self.max_expanded_work
+                .is_none_or(|max| text.expanded_work + text.current.moves.len().pow(2) <= max),
+            ExpandedPgn
+        );
         ensure!(!text.current.moves.is_empty(), "PGN has no moves");
         ensure!(text.stack.is_empty(), "unclosed PGN variation");
         let finished = text
@@ -271,7 +287,10 @@ fn read_pgn_from(
     mut visit: impl FnMut(Result<Pgn>) -> Result<()>,
 ) -> Result<()> {
     let mut reader = Reader::new(input);
-    let mut parser = Parser { branches };
+    let mut parser = Parser {
+        branches,
+        max_expanded_work: None,
+    };
     let first = reader.read_game(&mut parser)?.context("PGN has no games")?;
     visit(first)?;
     while let Some(game) = reader.read_game(&mut parser)? {
@@ -298,7 +317,10 @@ pub fn pgn_record<R: std::io::Read + std::io::Seek>(
 ) -> Result<Option<(Result<Pgn>, u64)>> {
     input.seek(std::io::SeekFrom::Start(offset))?;
     let mut reader = Reader::new(input);
-    let mut parser = Parser { branches: false };
+    let mut parser = Parser {
+        branches: false,
+        max_expanded_work: None,
+    };
     let Some(game) = reader.read_game(&mut parser)? else {
         ensure!(offset != 0, "PGN has no games");
         return Ok(None);
@@ -324,6 +346,29 @@ pub fn parse_pgn(text: &str, branches: bool, limit: usize) -> Result<Vec<Result<
         Ok(())
     })?;
     Ok(games)
+}
+
+#[derive(Debug)]
+pub struct ExpandedPgn;
+impl std::fmt::Display for ExpandedPgn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This PGN expands to too many variation prefixes.")
+    }
+}
+impl std::error::Error for ExpandedPgn {}
+
+pub fn parse_gap_pgn(text: &str, online: bool) -> Result<Pgn> {
+    let mut reader = Reader::new(text.as_bytes());
+    let mut parser = Parser {
+        branches: true,
+        // Conservatively bounds both expanded route storage and card contexts.
+        max_expanded_work: Some(if online { 2_000_000 } else { 8_000_000 }),
+    };
+    let game = reader
+        .read_game(&mut parser)?
+        .context("PGN has no games")??;
+    ensure!(!reader.has_more()?, "Paste exactly one PGN game.");
+    Ok(game)
 }
 
 fn value(role: Role) -> u8 {
@@ -371,6 +416,32 @@ pub fn missed_captures(board: &Chess, played: Move) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gap_preview_bounds_expanded_variations_but_offline_can_parse_them() -> Result<()> {
+        let mut pgn = String::new();
+        for move_number in (1..301).step_by(2) {
+            pgn.push_str(&format!(
+                "{move_number}. Nf3 Nf6 {}. Ng1 Ng8 ",
+                move_number + 1
+            ));
+        }
+        pgn.push_str("301. e4 ");
+        for _ in 0..8 {
+            pgn.push_str("(301. d4) ");
+        }
+        pgn.push('*');
+        let error = parse_gap_pgn(&pgn, true).unwrap_err();
+        assert!(error.is::<ExpandedPgn>());
+        assert_eq!(parse_gap_pgn(&pgn, false)?.variations.len(), 8);
+        pgn.pop();
+        for _ in 0..16 {
+            pgn.push_str("(301. d4) ");
+        }
+        pgn.push('*');
+        assert!(parse_gap_pgn(&pgn, false).unwrap_err().is::<ExpandedPgn>());
+        Ok(())
+    }
 
     #[test]
     fn clean_capture_and_recapture_are_distinct() -> Result<()> {

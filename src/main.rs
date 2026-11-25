@@ -79,6 +79,13 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if self.0.is::<gap_edit::OfflineRequired>() {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"code":"gap_offline_required","error":self.0.to_string()})),
+            )
+                .into_response();
+        }
         if self.0.is::<catalog::OverBudget>() {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -741,11 +748,18 @@ async fn main() -> Result<()> {
                         false,
                     )?
                 }
+                "gap" => {
+                    println!(
+                        "{}",
+                        gap_edit::import(&mut database, serde_json::from_reader(input)?)?
+                    );
+                    return Ok(());
+                }
                 "tactic" => apply_puzzle(
                     &mut database,
                     &prepare_puzzle(serde_json::from_reader(input)?)?,
                 )?,
-                _ => anyhow::bail!("choose opening or tactic"),
+                _ => anyhow::bail!("choose opening, tactic, or gap"),
             };
             println!("{id}");
             Ok(())
