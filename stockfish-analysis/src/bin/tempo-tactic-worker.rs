@@ -16,7 +16,7 @@ use tokio::{
 };
 use wire::{Failure, Request as Message, Work};
 
-async fn request(path: &Path, message: Message) -> Result<Value> {
+async fn request(path: &Path, message: &Message) -> Result<Value> {
     let deadline = if matches!(message, Message::Status) {
         Duration::from_millis(250)
     } else {
@@ -24,7 +24,7 @@ async fn request(path: &Path, message: Message) -> Result<Value> {
     };
     timeout(deadline, async {
         let mut stream = UnixStream::connect(path).await?;
-        wire::send(&mut stream, &message).await?;
+        wire::send(&mut stream, message).await?;
         Ok(wire::read(&mut stream).await?)
     })
     .await?
@@ -51,14 +51,14 @@ fn failure(error: Error) -> Failure {
 }
 
 async fn report(path: &Path) -> Result<()> {
-    let reply = request(path, Message::Status).await?;
+    let reply = request(path, &Message::Status).await?;
     accepted(&reply)?;
     println!("{}", reply["counts"]);
     Ok(())
 }
 
-async fn turn(path: &Path, engine: &Stockfish, watch: bool) -> Result<bool> {
-    let mut reply = request(path, Message::Next).await?;
+async fn turn(path: &Path, engine: &Stockfish) -> Result<bool> {
+    let mut reply = request(path, &Message::Next).await?;
     accepted(&reply)?;
     let Some(work) = serde_json::from_value::<Option<Work>>(reply["work"].take())? else {
         return Ok(false);
@@ -84,34 +84,29 @@ async fn turn(path: &Path, engine: &Stockfish, watch: bool) -> Result<bool> {
                     .context("Invalid scored root")?
                     .remove("variation");
             }
-            // While this process remains up, uncertain delivery keeps the same evidence.
-            let reply = loop {
-                match request(
-                    path,
-                    Message::Submit {
-                        work: work.clone(),
-                        evidence: evidence.clone(),
-                    },
-                )
-                .await
-                {
-                    Ok(reply) if reply["status"] != "unavailable" => break reply,
-                    Ok(_) | Err(_) if !watch => {
-                        anyhow::bail!("Tactic submission unavailable; restart drain to resume")
-                    }
-                    Ok(_) | Err(_) => sleep(Duration::from_secs(2)).await,
-                }
+            // Both worker modes keep the original token and analysis until a definitive reply.
+            let submission = Message::Submit {
+                work: work.clone(),
+                evidence,
             };
-            if accepted(&reply).is_ok() {
-                return Ok(true);
-            }
-            Message::Retry {
-                work,
-                error: if reply["status"] == "invalid_evidence" {
-                    Failure::InvalidEvidence
-                } else {
-                    Failure::Protocol
-                },
+            loop {
+                let reply = request(path, &submission).await;
+                match reply
+                    .and_then(|value| Ok(serde_json::from_value::<wire::SubmitReply>(value)?))
+                {
+                    Ok(wire::SubmitReply::Ok { outcome }) => {
+                        let _ = outcome;
+                        return Ok(true);
+                    }
+                    Ok(wire::SubmitReply::StaleWork) => return Ok(true),
+                    Ok(wire::SubmitReply::InvalidEvidence) => {
+                        break Message::Retry {
+                            work,
+                            error: Failure::InvalidEvidence,
+                        };
+                    }
+                    Err(_) => sleep(Duration::from_secs(2)).await,
+                }
             }
         }
         Ok(Analysis::Terminal { .. }) => Message::Retry {
@@ -124,7 +119,7 @@ async fn turn(path: &Path, engine: &Stockfish, watch: bool) -> Result<bool> {
             error: failure(error),
         },
     };
-    accepted(&request(path, message).await?)?;
+    accepted(&request(path, &message).await?)?;
     Ok(true)
 }
 
@@ -156,7 +151,7 @@ async fn main() -> Result<()> {
         .context("Another tactic worker owns this database")?;
     let engine = Stockfish::new(executable);
     loop {
-        match turn(&path, &engine, operation == "watch").await {
+        match turn(&path, &engine).await {
             Ok(true) => {}
             Ok(false) if operation == "drain" => return report(&status).await,
             Err(err) if operation == "drain" => return Err(err),

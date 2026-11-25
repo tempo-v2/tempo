@@ -114,6 +114,16 @@ impl Database {
             tx.execute_batch(include_str!("opening_replacement.sql"))?;
             if version < 15 {
                 upgrade_views(&tx)?;
+            } else {
+                tx.execute_batch(
+                    "
+                    ALTER TABLE coverage_view ADD COLUMN model_id TEXT NOT NULL DEFAULT 'null';
+                    UPDATE coverage_view SET model_id=(
+                        SELECT json_quote(coalesce(json_extract(report,'$.model'), 'Maia2'))
+                        FROM coverage_report WHERE id=report_id
+                    );
+                ",
+                )?;
             }
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
