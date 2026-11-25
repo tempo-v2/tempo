@@ -278,9 +278,9 @@ pub fn seed_batch(db: &mut Connection) -> Result<bool> {
     };
     let mut insert = tx.prepare_cached(
         "INSERT OR IGNORE INTO prepared_queue(card_id,kind,active,due_at,rank,reserved)
-         SELECT c.id,c.kind,NOT (c.quarantined OR c.retired),l.due_at,o.rank,d.card_id IS NOT NULL OR EXISTS(SELECT 1 FROM repeat_obligation r WHERE r.card_id=c.id)
-         FROM cards c LEFT JOIN learning l ON l.card_id=c.id
-         LEFT JOIN opening_order o ON o.card_id=c.id LEFT JOIN deck d ON d.card_id=c.id
+         SELECT c.id,c.kind,active.id IS NOT NULL,l.due_at,o.rank,d.card_id IS NOT NULL OR EXISTS(SELECT 1 FROM repeat_obligation r WHERE r.card_id=c.id)
+         FROM cards c LEFT JOIN active_cards active ON active.id=c.id
+         LEFT JOIN learning l ON l.card_id=c.id LEFT JOIN opening_order o ON o.card_id=c.id LEFT JOIN deck d ON d.card_id=c.id
          WHERE c.id=?1",
     )?;
     for id in &ids {

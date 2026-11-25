@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 15;
+const SCHEMA: i32 = 16;
 
 pub struct Database;
 
@@ -62,6 +62,7 @@ impl Database {
         db.execute_batch(include_str!("detectors.sql"))?;
         db.execute_batch(include_str!("card_availability.sql"))?;
         db.execute_batch(include_str!("tactic_qualification.sql"))?;
+        db.execute_batch(include_str!("opening_replacement.sql"))?;
         upgrade_views(&db)?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
@@ -110,7 +111,10 @@ impl Database {
                 tx.execute_batch(include_str!("card_availability.sql"))?;
                 tx.execute_batch(include_str!("tactic_qualification.sql"))?;
             }
-            upgrade_views(&tx)?;
+            tx.execute_batch(include_str!("opening_replacement.sql"))?;
+            if version < 15 {
+                upgrade_views(&tx)?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -148,6 +152,7 @@ impl Database {
         tx.execute_batch(include_str!("lichess_start_revision.sql"))?;
         tx.execute_batch(include_str!("card_availability.sql"))?;
         tx.execute_batch(include_str!("tactic_qualification.sql"))?;
+        tx.execute_batch(include_str!("opening_replacement.sql"))?;
         upgrade_views(&tx)?;
         let valid: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",

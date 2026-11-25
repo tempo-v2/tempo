@@ -7,6 +7,7 @@ mod game_ir;
 mod game_pipeline;
 mod games;
 mod gap_edit;
+mod gap_pgn;
 mod job_store;
 mod jobs;
 mod learning;
@@ -14,6 +15,7 @@ mod legacy;
 mod lichess_catalog;
 mod lichess_play;
 mod opening_rank;
+mod opening_replacement;
 mod optional_read;
 mod providers;
 mod queue;
@@ -96,6 +98,13 @@ impl IntoResponse for ApiError {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({"code":"gap_save_interrupted","error":self.0.to_string()})),
+            )
+                .into_response();
+        }
+        if self.0.is::<opening_replacement::OverBudget>() {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"code":"replacement_over_budget","error":self.0.to_string()})),
             )
                 .into_response();
         }
@@ -745,6 +754,14 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .route(
             "/api/coverage/preview",
             post(gap_edit::preview).layer(DefaultBodyLimit::max(800 * 1024)),
+        )
+        .route(
+            "/api/coverage/correct",
+            post(gap_edit::correct).layer(DefaultBodyLimit::max(800 * 1024)),
+        )
+        .route(
+            "/api/coverage/replace",
+            post(gap_edit::replace).layer(DefaultBodyLimit::max(800 * 1024)),
         )
         .route(
             "/api/coverage/save",

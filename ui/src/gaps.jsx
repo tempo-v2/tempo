@@ -37,14 +37,62 @@ function lead(report, gap) {
 const percent = n => (100*n).toLocaleString(undefined,{maximumFractionDigits:2}) + "%";
 const range = (value, unknown) => percent(value) + (unknown > 0.000001 ? " – " + percent(Math.min(1,value+unknown)) : "");
 
+const noReplacements = Object.freeze({});
+
+function ConflictDetails({ conflict, disabled, correct }) {
+  const { saved, proposed } = conflict;
+  const turn = conflict.turn === "white" ? "White" : "Black";
+  return <li className="gap-conflict">
+    <h4>{turn} to move, move {conflict.number}{conflict.transposition && " · Same position by transposition"}</h4>
+    <dl>
+      <dt>In your repertoire</dt>
+      <dd>{saved ? (saved.line ?? `${saved.reply} (saved route unavailable)`) :
+        conflict.unresolved ? "Saved replies are unresolved at this position." : "No saved reply."}</dd>
+      <dt>In the pasted PGN</dt>
+      {proposed.map(reply => <React.Fragment key={reply.movement}>
+        <dd>{reply.line}</dd>
+        {reply.alternate_line && <dd>{reply.alternate_line}</dd>}
+      </React.Fragment>)}
+    </dl>
+    {saved ? <div className="gap-conflict-actions">
+      <button className="gap-recommended" disabled={disabled} onClick={() => correct(conflict)}>
+        Use repertoire reply · {saved.reply} <span className="gap-recommendation">Recommended</span>
+      </button>
+      {proposed.filter(reply => reply.movement !== saved.movement).map(reply =>
+        <button key={reply.movement} disabled={disabled} onClick={() => correct(conflict, reply)}>
+          Use new reply in both · {reply.reply}
+        </button>)}
+      {proposed.some(reply => reply.movement !== saved.movement) && <small>Using a new reply changes saved repertoire lines after confirmation.</small>}
+    </div> : <p>Edit the pasted PGN to resolve the competing replies.</p>}
+  </li>;
+}
+
+function ReplacementImpact({ impact }) {
+  return <ul className="gap-conflict-list">{impact.map((line, index) => <li key={index}>
+    <strong>{line.name}</strong>
+    <dl>
+      <dt>Before</dt><dd>{line.before}</dd>
+      <dt>After</dt><dd>{line.after ?? "Archived without an active continuation."}</dd>
+    </dl>
+    {line.stopped_at && <p>{line.stopped_at}</p>}
+  </li>)}</ul>;
+}
+
 export function Gaps() {
   const [draft, setDraft] = useState(restore);
   const form = useRef(stored(storage));
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const [books, setBooks] = useState([]);
   const [report,setReport] = useState(null);
   const [summary, setSummary] = useState(null);
   const [summaryRetry, setSummaryRetry] = useState(0);
   const [preview,setPreview] = useState(null);
+  const [trim,setTrim] = useState(null);
+  const [confirmation,setConfirmation] = useState(null);
   const [busy,setBusy] = useState(false);
   const [error,setError] = useState("");
   const [message,setMessage] = useState("");
@@ -108,9 +156,9 @@ export function Gaps() {
   async function scan(request, previous) {
     const {id}=await api("coverage",request);
     const next=await api("coverage/"+id+"/gaps");
-    setReport(next);setPreview(null);
+    setReport(next);clearPreview();
     if (reportId === id) setSummaryRetry(n => n + 1);
-    update({report:id,index:null,pgn:"",previous:null});
+    update({report:id,index:null,pgn:"",replacements:noReplacements,previous:null});
     if(previous!=null)setMessage("Saved. Authored coverage moved from "+percent(previous)+" to "+percent(next.authored)+".");
   }
   function inputScan() {
@@ -125,7 +173,7 @@ export function Gaps() {
   function open(index) {
     const link=lead(report,report.gaps[index]);
     window.open(link.url,"_blank","noopener,noreferrer");
-    setPreview(null);setMessage("");update({index,pgn:""});
+    clearPreview();setMessage("");update({index,pgn:"",replacements:noReplacements});
   }
   async function save(command, batched) {
     setMessage(batched ? "Saving continuation in batches…" : "Saving continuation…");
@@ -136,7 +184,7 @@ export function Gaps() {
     }
     refreshJournal();
     const progress = new AbortController();
-    const timer = setInterval(async () => {
+    const timer = command.replacements ? null : setInterval(async () => {
       try {
         const state = await api("coverage/save/" + command.command, undefined, progress.signal);
         if (state && !progress.signal.aborted) setMessage(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
@@ -144,13 +192,13 @@ export function Gaps() {
     }, 750);
     let receipt;
     try {
-      receipt=await api("coverage/save",command,undefined,{requireJson:true});
+      receipt=await api(command.replacements ? "coverage/replace" : "coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
       const stale = e.code === "stale_gap" || e.code === "gap_save_interrupted";
-      if(stale || e.code==="opening_reply_conflict") {
+      if(stale || e.code==="opening_reply_conflict" || e.code==="replacement_over_budget") {
         await clearCommand("save", command);
         refreshJournal();
-        setPreview(null);
+        clearPreview();
         if (stale) setReport(old=>({...old,stale:true}));
       }
       setMessage("");
@@ -162,11 +210,11 @@ export function Gaps() {
     if(receipt?.command!==command.command || !Array.isArray(receipt.lines) || !receipt.lines.length)
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
     setReport(old=>({...old,stale:true}));
-    setMessage("Continuation saved.");
+    setMessage(command.replacements ? "Repertoire changes and continuation saved." : "Continuation saved.");
     await clearCommand("save", command);
     const previous = report.model_superseded ? null : report.authored;
     update({previous});
-    setPreview(null);
+    clearPreview();
     await scan(report.scan,previous);
   }
   async function applyOrder(pending) {
@@ -191,8 +239,53 @@ export function Gaps() {
   }
   const locked=busy || !!draft.pending || !!draft.applyCommand;
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
-  const currentPreview = preview && preview.draft.report === edit.report &&
-    preview.draft.gap === edit.gap && preview.draft.pgn === edit.pgn ? preview : null;
+  const replacements = draft.replacements ?? noReplacements;
+  const hasReplacements = Object.keys(replacements).length > 0;
+
+  function clearPreview() {
+    setPreview(null);
+    setTrim(null);
+    setConfirmation(null);
+  }
+  function isCurrent(candidate, choices) {
+    return mounted.current && form.current?.report === candidate.report && form.current?.index === candidate.gap &&
+      form.current?.pgn === candidate.pgn &&
+      JSON.stringify(form.current?.replacements ?? noReplacements) === JSON.stringify(choices);
+  }
+  async function previewDraft(candidate, choices) {
+    clearPreview();
+    const view = await api("coverage/preview", { ...candidate, replacements: choices }, undefined, { requireJson: true });
+    if (isCurrent(candidate, choices)) setPreview({ ...view, draft: candidate, choices });
+  }
+  async function applyCorrection(correction) {
+    if (!isCurrent(correction.draft, correction.choices)) return;
+    const next = { ...correction.draft, pgn: correction.pgn };
+    update({ pgn: next.pgn, replacements: correction.nextChoices });
+    await previewDraft(next, correction.nextChoices);
+  }
+  async function correct(conflict, reply) {
+    setTrim(null);
+    setConfirmation(null);
+    const correction = await api("coverage/correct", {
+      draft: edit, position: conflict.position, movement: reply?.movement,
+    }, undefined, { requireJson: true });
+    if (!isCurrent(edit, replacements)) return;
+    const nextChoices = reply ? { ...replacements, [conflict.position]: reply.movement } : replacements;
+    const outcome = { ...correction, draft: edit, choices: replacements, nextChoices };
+    if (outcome.trims.length) setTrim(outcome);
+    else await applyCorrection(outcome);
+  }
+  async function removeChoice(position) {
+    const next = { ...replacements };
+    delete next[position];
+    update({ replacements: next });
+    await previewDraft(edit, next);
+  }
+  const currentPreview = preview && isCurrent(preview.draft, preview.choices) ? preview : null;
+  const conflicts = currentPreview?.conflicts ?? [];
+  const replacement = currentPreview?.replacement;
+  const confirming = replacement && confirmation === replacement.command;
+  const blocked = locked || report?.stale;
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
       {!book && <option value="" disabled>Select a repertoire</option>}
@@ -214,16 +307,53 @@ export function Gaps() {
       {report.gaps.length>0 && <button disabled={locked||report.stale} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
-        <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{setPreview(null);update({pgn:e.target.value});}}/></label>
+        <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value});}}/></label>
         <div className="controls">
-          <button disabled={locked || report.stale || !edit.pgn}
-            onClick={() => run(async () => setPreview({ ...await api("coverage/preview", edit), draft: edit }))}>Preview</button>
+          <button disabled={blocked || !edit.pgn}
+            onClick={() => run(() => previewDraft(edit, replacements))}>Preview</button>
           {pendingSave
             ? <button disabled={busy} onClick={() => run(() => save(pendingSave))}>Retry same save</button>
-            : <button disabled={locked || report.stale || !currentPreview || currentPreview.responses.some(r => r.status === "conflict")}
-                onClick={() => run(() => save({ draft: currentPreview.draft, command: currentPreview.command }, currentPreview.batched))}>Save to repertoire</button>}
+            : hasReplacements
+              ? <button disabled={blocked || !!trim || !replacement || replacement.over_budget || confirming}
+                  onClick={() => setConfirmation(replacement.command)}>Review repertoire changes</button>
+              : <button disabled={blocked || !!trim || !currentPreview || conflicts.length > 0 ||
+                    currentPreview.responses.some(reply => reply.status === "conflict")}
+                  onClick={() => run(() => save({ draft: currentPreview.draft, command: currentPreview.command }, currentPreview.batched))}>Save to repertoire</button>}
         </div>
-        {currentPreview && <ul>{currentPreview.responses.map(r => <li key={r.position}>{r.move} · {r.status}</li>)}</ul>}
+        {currentPreview && <p role="status">{currentPreview.new_replies} new {currentPreview.new_replies === 1 ? "reply" : "replies"} · {conflicts.length ? `${conflicts.length} ${conflicts.length === 1 ? "conflict" : "conflicts"}` : "No remaining conflicts"}</p>}
+        {!!conflicts.length && <ol className="gap-conflict-list">{conflicts.map(conflict =>
+          <ConflictDetails key={conflict.position} conflict={conflict} disabled={blocked || !!trim}
+            correct={(item, reply) => run(() => correct(item, reply))} />)}</ol>}
+        {trim && <section className="gap-confirmation" aria-label="Review PGN trims">
+          <h4>These branches would lose later moves</h4>
+          <ul>{trim.trims.map((item, i) => <li key={i}>Stops before {item.first_removed} in {item.line}</li>)}</ul>
+          <div className="controls">
+            <button disabled={blocked} onClick={() => run(() => applyCorrection(trim))}>Keep legal moves</button>
+            <button disabled={locked} onClick={() => setTrim(null)}>Keep editing</button>
+          </div>
+        </section>}
+        {currentPreview?.staged?.length > 0 && <section aria-label="Staged repertoire changes">
+          <h4>Staged repertoire changes</h4>
+          <ul>{currentPreview.staged.map(choice => <li key={choice.position}>
+            {choice.valid ? `${choice.old} → ${choice.new}` : `${choice.new} no longer matches this draft`}{" "}
+            <button disabled={blocked || !!trim} onClick={() => run(() => removeChoice(choice.position))}>Remove change</button>
+          </li>)}</ul>
+        </section>}
+        {!currentPreview && hasReplacements && <div className="controls">
+          <button disabled={locked} onClick={() => { clearPreview(); update({ replacements: noReplacements }); }}>Clear staged repertoire changes</button>
+        </div>}
+        {replacement && <section className={confirming ? "gap-confirmation" : undefined} aria-label="Saved line changes">
+          <h4>{confirming ? "Confirm changes to your saved repertoire" : "Affected saved lines"}</h4>
+          {replacement.impact.length ? <ReplacementImpact impact={replacement.impact} /> : <p>The saved reply will change at the selected position.</p>}
+          {replacement.over_budget && <p>This change is too large to save at once. Split the PGN and preview again.</p>}
+          {confirming && <div className="controls">
+            <button disabled={blocked} onClick={() => setConfirmation(null)}>Cancel</button>
+            <button disabled={blocked} onClick={() => run(() => save({
+              draft: currentPreview.draft, replacements, command: replacement.command, revision: replacement.revision,
+              line_revision: replacement.line_revision,
+            }))}>Confirm repertoire changes and save</button>
+          </div>}
+        </section>}
       </section>}
       <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
       {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
