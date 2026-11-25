@@ -199,13 +199,20 @@ pub async fn apply(
     Path(id): Path<String>,
     Json(input): Json<Apply>,
 ) -> ApiResult {
-    write_db(app, move |c| {
-        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (scan, rev, forecast) = load(&tx, &id)?;
+    static APPLY: Semaphore = Semaphore::const_new(1);
+    let permit = APPLY
+        .try_acquire()
+        .map_err(|_| ApiError(crate::writer::Unavailable.into()))?;
+    let reply = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let _permit = permit;
         ensure!(
             input.command.len() == 36 && input.command.is_ascii(),
             "Invalid apply command"
         );
+        let mut db = Database::read(&app.database)?;
+        let tx = db.transaction()?;
+        let (scan, rev, forecast) = load(&tx, &id)?;
+        let reply = json!({"id":id,"command":input.command,"cards":forecast.reach.len()});
         let prior: Option<String> = tx
             .query_row(
                 "SELECT report FROM applied_forecast WHERE command=?1",
@@ -215,19 +222,36 @@ pub async fn apply(
             .optional()?;
         if let Some(prior) = prior {
             ensure!(prior == id, "Apply identity already used");
-        } else {
+            return Ok(reply);
+        }
+        ensure!(
+            revision(&tx, &scan.repertoire)? == rev,
+            crate::gap_edit::Stale
+        );
+        let order = crate::opening_rank::StagedOrder::prepare(&tx, &id, &forecast.reach)?;
+        tx.commit()?;
+        let bank = order.stage(&app.writer)?;
+        app.writer.background(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             ensure!(
                 revision(&tx, &scan.repertoire)? == rev,
                 crate::gap_edit::Stale
             );
-            crate::opening_rank::apply_forecast(&tx, &id, &forecast.reach)?;
+            tx.execute(
+                "UPDATE forecast_order_state SET bank=?1 WHERE singleton=1",
+                [bank],
+            )?;
             tx.execute(
                 "INSERT INTO applied_forecast VALUES(?1,?2)",
                 (&input.command, &id),
             )?;
-        }
-        tx.commit()?;
-        Ok(json!({"id":id,"command":input.command,"cards":forecast.reach.len()}))
+            tx.commit()?;
+            Ok(())
+        })?;
+        Ok(reply)
     })
     .await
+    .map_err(|e| ApiError(e.into()))?
+    .map_err(ApiError)?;
+    Ok(Json(reply))
 }

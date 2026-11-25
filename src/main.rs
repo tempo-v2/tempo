@@ -656,7 +656,7 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         )
         .route("/api/coverage", post(coverage::start))
         .route("/api/coverage/{id}", get(coverage::read))
-        .route("/api/coverage/{id}/apply",post(coverage::apply))
+        .route("/api/coverage/{id}/apply", post(coverage::apply))
         .route(
             "/api/coverage/preview",
             post(gap_edit::preview).layer(DefaultBodyLimit::max(800 * 1024)),
