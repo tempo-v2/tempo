@@ -84,6 +84,20 @@ function downloadOpeningDraft(draft) {
 
 const initial = { fen: new Chess().fen(), moves: [], start_at: 0 };
 
+function decodeOpeningPreview(body) {
+  const incomplete = "The opening preview reply was incomplete. Try again.";
+  if (typeof body?.fen !== "string" || !body.fen || !Array.isArray(body.moves)) {
+    throw new Error(incomplete);
+  }
+  const route = { fen: body.fen, moves: body.moves };
+  try {
+    position(route);
+  } catch {
+    throw new Error(incomplete);
+  }
+  return route;
+}
+
 export function Openings({ fromGame, onSaved, sounds }) {
   const list = useList("openings");
   const [draft, setDraft] = useState(fromGame ?? initial);
@@ -145,50 +159,69 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const [error, setError] = useState("");
   const [offlineDraft, setOfflineDraft] = useState(null);
   const [busy, setBusy] = useState(false);
-  const previewRequest = useRef(null);
+  const sourceRequest = useRef(null);
   const game = position(draft);
   const legal = game.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? ""));
 
-  function cancelPreview() {
-    previewRequest.current?.abort();
-    previewRequest.current = null;
+  function cancelSource() {
+    sourceRequest.current?.abort();
+    sourceRequest.current = null;
   }
-  useEffect(() => () => previewRequest.current?.abort(), []);
+  useEffect(() => () => sourceRequest.current?.abort(), []);
+
+  function beginSource() {
+    cancelSource();
+    const request = new AbortController();
+    sourceRequest.current = request;
+    return request;
+  }
+
+  function finishSource(request) {
+    if (sourceRequest.current === request) sourceRequest.current = null;
+  }
 
   function editDraft(next) {
-    cancelPreview();
+    cancelSource();
     setDraft(next);
   }
   function changeStartingText(text) {
-    cancelPreview();
+    cancelSource();
     setStartingText(text);
+  }
+  async function readStartingFile(event) {
+    if (!event.target.files?.length) return;
+    const request = beginSource();
+    try {
+      await fileText(event, setStartingText, setError, request.signal);
+    } finally {
+      finishSource(request);
+    }
   }
 
   async function chooseStart(useExistingMoves = false) {
-    cancelPreview();
-    const request = new AbortController();
-    previewRequest.current = request;
+    const request = beginSource();
     setError("");
     try {
       let route;
       try { route = { fen: new Chess(startingText.trim()).fen(), moves: [] }; }
       catch {
-        route = await api("openings/pgn", { pgn: startingText }, request.signal, { requireJson: true });
+        const body = await api("openings/pgn", { pgn: startingText }, request.signal, { requireJson: true });
+        if (request.signal.aborted) return;
+        route = decodeOpeningPreview(body);
       }
-      if (request.signal.aborted) return;
       setDraft({ ...draft, ...route, start_at: useExistingMoves ? 0 : route.moves.length });
       setOpening(null);
       setNotice("Position loaded. Play your continuation.");
     } catch (error) {
       if (!request.signal.aborted) setError(error.message);
     } finally {
-      if (previewRequest.current === request) previewRequest.current = null;
+      finishSource(request);
     }
   }
   async function save(event) {
     event.preventDefault();
     if (!destination) return;
-    cancelPreview();
+    cancelSource();
     setError("");
     setNotice("");
     setBusy(true);
@@ -272,17 +305,14 @@ export function Openings({ fromGame, onSaved, sounds }) {
         {offlineDraft && <button onClick={() => downloadOpeningDraft(offlineDraft)}>Download for offline import</button>}
         <details><summary>Start from PGN or FEN</summary>
           <textarea aria-label="Opening PGN or FEN" value={startingText} onChange={(e) => changeStartingText(e.target.value)} />
-          <label>Upload opening PGN<input type="file" accept=".pgn,text/plain" onChange={(e) => {
-            cancelPreview();
-            fileText(e, changeStartingText, setError);
-          }} /></label>
+          <label>Upload opening PGN<input type="file" accept=".pgn,text/plain" onChange={readStartingFile} /></label>
           <button disabled={!startingText.trim()} onClick={() => chooseStart()}>Load position</button>
           <button disabled={!startingText.trim()} onClick={() => chooseStart(true)}>Use these moves as the line</button>
         </details>
         <h2>Saved openings</h2>
-        {opening && <button onClick={() => { cancelPreview(); setOpening(null); }}>Back to editor</button>}
+        {opening && <button onClick={() => { cancelSource(); setOpening(null); }}>Back to editor</button>}
         <ul className="items">{list.rows.map((line) => <li key={line.id}>
-          <button onClick={() => { cancelPreview(); setOpening(line); setPly(0); }}>{line.name} <small>{line.color}</small></button>
+          <button onClick={() => { cancelSource(); setOpening(line); setPly(0); }}>{line.name} <small>{line.color}</small></button>
         </li>)}</ul>
         <More list={list} />
       </div>

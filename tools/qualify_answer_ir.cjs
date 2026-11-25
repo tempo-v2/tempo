@@ -597,6 +597,8 @@ async function openingPreview(browser, db) {
   const page = await browser.newPage();
   try {
     await serve(candidate, db, await unusedPort(), async (origin) => {
+      const errors = [];
+      page.on("pageerror", error => errors.push(error.message));
       await page.goto(origin);
       await page.getByRole("button", { name: "Openings", exact: true }).click();
       await page.getByText("Start from PGN or FEN", { exact: true }).click();
@@ -629,16 +631,62 @@ async function openingPreview(browser, db) {
       await stale().catch(() => {});
       assert.equal(await page.getByText("0 continuation plies", { exact: true }).isVisible(), true);
 
-      const current = await holdPreview("1. d4 d5 1-0");
+      const olderPgn = "1. c4 e5 1-0";
+      const newerPgn = "1. d4 d5 1-0";
+      await page.evaluate(() => {
+        const text = File.prototype.text;
+        File.prototype.text = function () {
+          return new Promise((resolve, reject) => {
+            window.finishOpeningFileRead = async (fail) => {
+              delete window.finishOpeningFileRead;
+              if (fail) reject(new Error("Superseded file failure"));
+              else resolve(await text.call(this));
+            };
+          });
+        };
+      });
+      async function selectOpeningFile(name) {
+        await page.getByLabel("Upload opening PGN").setInputFiles({
+          name, mimeType: "text/plain", buffer: Buffer.from(olderPgn),
+        });
+        await page.waitForFunction(() => typeof window.finishOpeningFileRead === "function");
+      }
+
+      await selectOpeningFile("old.pgn");
+      const current = await holdPreview(newerPgn);
+      await page.evaluate(() => window.finishOpeningFileRead(false));
+      assert.equal(await input.inputValue(), newerPgn);
       await page.getByRole("textbox", { name: "Opening name" }).fill("Edited name");
       await current();
-      await page.getByText("2 continuation plies", { exact: true }).waitFor();
+      const draft = page.getByText("2 continuation plies", { exact: true });
+      await draft.waitFor();
+
+      await selectOpeningFile("failed.pgn");
+      await input.fill("1. e4 e5 1-0");
+      await page.evaluate(() => window.finishOpeningFileRead(true));
+      assert.equal(await page.getByText("Superseded file failure").isVisible(), false);
+      await selectOpeningFile("current.pgn");
+      await page.evaluate(() => window.finishOpeningFileRead(false));
+      assert.equal(await input.inputValue(), olderPgn);
+
+      for (const malformed of [
+        { fen: "invalid", moves: [] },
+        { fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", moves: ["a1a8"] },
+      ]) {
+        await page.route(previewPattern, route => route.fulfill({ json: malformed }), { times: 1 });
+        const reply = page.waitForResponse(response => response.url().endsWith("/api/openings/pgn"));
+        await useLine.click();
+        await reply;
+        await page.getByText("The opening preview reply was incomplete. Try again.").waitFor();
+        assert.equal(await draft.isVisible(), true);
+      }
       const query = sql => execFileSync("sqlite3", ["-readonly", db, sql], { encoding: "utf8" }).trim();
       assert.equal(query("SELECT count(*) FROM openings"), "0");
       await page.getByRole("button", { name: "Save opening" }).click();
       await page.getByText("Opening saved. Its responses are ready in Study.", { exact: true }).waitFor();
       assert.equal(query("SELECT name FROM openings"), "Edited name");
       assert.deepEqual(JSON.parse(query("SELECT route FROM openings")).moves, ["d2d4", "d7d5"]);
+      assert.deepEqual(errors, []);
     });
   } finally {
     await page.context().close();
@@ -672,7 +720,7 @@ async function openingPreview(browser, db) {
     }
     await incompleteStartupNext(browser, path.join(root, "startup-next.db"));
     await openingPreview(browser, path.join(root, "preview.db"));
-    console.log("Malformed Answer feedback retained the original journal and one durable grade. Opening preview respected replacement and kept name edits independent.");
+    console.log("Malformed Answer feedback retained the original journal and one durable grade. Superseded files and invalid previews kept the draft intact, and name edits left the current preview applicable.");
     console.log("Malformed Next replies preserved saved manual and automatic results. Retry reused the issued attempt and the startup retry accepted real null.");
     console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, incomplete reply replay, and Next-only retry passed.");
   } finally {
