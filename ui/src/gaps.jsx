@@ -75,7 +75,7 @@ export function Gaps() {
     const {id}=await api("coverage",request);
     const next=await api("coverage/"+id);
     setReport(next);setPreview(null);
-    update({report:id,index:null,pgn:"",pending:null,previous:null});
+    update({report:id,index:null,pgn:"",previous:null});
     if(previous!=null)setMessage("Saved. Authored coverage moved from "+percent(previous)+" to "+percent(next.authored)+".");
   }
   function inputScan() {
@@ -85,20 +85,28 @@ export function Gaps() {
     return {repertoire:book.id,color:book.color,through:Number(draft.through??10),
       route:{fen:history[0]?.before??game.fen(),moves:history.map(m=>m.lan)}};
   }
-  const gap=report?.gaps[draft.pending?.draft.gap ?? draft.index]??report?.selectedGap;
+  const pendingSave = draft.pending?.draft.report === report?.id ? draft.pending : null;
+  const gap=report?.gaps[pendingSave?.draft.gap ?? draft.index]??report?.selectedGap;
   function open(index) {
     const link=lead(report,report.gaps[index]);
     window.open(link.url,"_blank","noopener,noreferrer");
-    setPreview(null);setMessage("");update({index,pgn:"",pending:null});
+    setPreview(null);setMessage("");update({index,pgn:""});
   }
   async function save(command) {
-    update({pending:command,report:command.draft.report,index:command.draft.gap,pgn:command.draft.pgn});
+    const current = restore().pending;
+    if (current && current.command !== command.command) {
+      setDraft(restore());
+      setReload(n => n + 1);
+      return;
+    }
+    update({pending:command});
     let receipt;
     try {
       receipt=await api("coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
       if(e.code==="stale_gap") {
-        update({pending:null});setPreview(null);
+        if (restore().pending?.command === command.command) update({pending:null});
+        setPreview(null);
         setReport(old=>({...old,stale:true}));
       }
       throw e;
@@ -107,7 +115,8 @@ export function Gaps() {
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
     setReport(old=>({...old,stale:true}));
     setMessage("Continuation saved. Refreshing coverage…");
-    update({pending:null,previous:report.authored});setPreview(null);
+    if (restore().pending?.command === command.command) update({pending:null,previous:report.authored});
+    setPreview(null);
     await scan(report.scan,report.authored);
   }
   const locked=busy || !!draft.pending;
@@ -121,6 +130,7 @@ export function Gaps() {
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
     {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
     {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{message && <p role="status">{message}</p>}
+    {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · Maia-2 Rapid 1500/1500</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
@@ -133,7 +143,7 @@ export function Gaps() {
         <button disabled={locked||report.stale||!edit.pgn} onClick={()=>run(async()=>setPreview(await api("coverage/preview",edit)))}>Preview</button>
         {preview && <><ul>{preview.responses.map(r=><li key={r.position}>{r.move} · {r.status}</li>)}</ul>
           <button disabled={locked||preview.responses.some(r=>r.status==="conflict")} onClick={()=>run(()=>save({draft:edit,command:preview.command}))}>Save to repertoire</button></>}
-        {draft.pending && <button disabled={busy} onClick={()=>run(()=>save(draft.pending))}>Retry same save</button>}
+        {pendingSave && <button disabled={busy} onClick={()=>run(()=>save(pendingSave))}>Retry same save</button>}
       </section>}
       <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
       {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
