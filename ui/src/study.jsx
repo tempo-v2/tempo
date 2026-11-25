@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api } from "./api.js";
 import {
-  answerIntent, answerPayload, importPredecessorAnswer, nextSavedAnswer, resolveAnswer, saveAnswer,
+  answerIntent, answerPayload, importPredecessorAnswer, isMove, nextSavedAnswer, resolveAnswer, saveAnswer,
 } from "./answer-journal.js";
 import { ChessBoard, play } from "./board.jsx";
 import { moveCue } from "./sounds.js";
@@ -88,10 +88,19 @@ function useStudyCounts() {
 async function deliverAnswer(intent) {
   let result;
   try {
-    result = await api("study/answer", answerPayload(intent));
-    if (!["Good", "Again"].includes(result?.rating)) {
+    const body = await api("study/answer", answerPayload(intent));
+    if (!["Good", "Again"].includes(body?.rating) ||
+        !Array.isArray(body.answers) || !body.answers.length || !body.answers.every(isMove) ||
+        !(body.repeat_after === null || Number.isInteger(body.repeat_after) &&
+          body.repeat_after >= 0 && body.repeat_after <= 255)) {
       throw new Error("The Answer reply was incomplete. Retry.");
     }
+    result = {
+      ...body,
+      display_move: isMove(body.display_move) && body.answers.includes(body.display_move)
+        ? body.display_move : body.answers[0],
+      played_in_game: isMove(body.played_in_game) ? body.played_in_game : null,
+    };
   } catch (error) {
     if (!["stale_dataset", "stale_attempt", "answer_conflict"].includes(error.code)) throw error;
   }
@@ -250,6 +259,13 @@ export function Study({ openGame, sounds }) {
   const previous = card?.kind === "opening"
     ? (frame?.movedBy !== learner ? frame?.lastMove : undefined)
     : (opponent?.key === attemptKey ? opponent?.move : undefined);
+  let playedInGame;
+  const gameMove = card?.result?.played_in_game ?? source?.played;
+  if (isMove(gameMove)) {
+    try {
+      playedInGame = play(new Chess(card.fen), gameMove).san;
+    } catch { /* Optional context can be unavailable for the issued position. */ }
+  }
   const shapes = [...markedMove(previous, "red"), ...markedMove(played, "green")];
   if (boardMove) play(game, boardMove);
   return <section className="study" aria-label="Study">
@@ -282,8 +298,7 @@ export function Study({ openGame, sounds }) {
         </div>
         {card.result && <div className="feedback">
           <p>Answer: {card.result.answers.map((move) => play(new Chess(card.fen), move).san).join(" or ")}</p>
-          {(card.result.played_in_game || source?.played) &&
-            <p>In the game you played {play(new Chess(card.fen), card.result.played_in_game || source.played).san}.</p>}
+          {playedInGame && <p>In the game you played {playedInGame}.</p>}
           {source?.game_id && <button onClick={() => openGame(source.game_id, source.ply)}>View source game</button>}
         </div>}
       </>}

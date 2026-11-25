@@ -33,9 +33,11 @@ async function journal(stores, mode, operation) {
   }
 }
 
+export const isMove = value => typeof value === "string" && /^[a-h][1-8][a-h][1-8][nbrq]?$/.test(value);
+
 export function answerIntent({ dataset, attempt, played }) {
   if (typeof dataset !== "string" || !dataset || !Number.isSafeInteger(attempt) ||
-      attempt <= 0 || !(played === null || (typeof played === "string" && /^[a-h][1-8][a-h][1-8][nbrq]?$/.test(played)))) {
+      attempt <= 0 || !(played === null || isMove(played))) {
     throw new Error("The saved Answer is invalid.");
   }
   return {

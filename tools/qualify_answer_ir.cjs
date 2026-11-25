@@ -172,15 +172,94 @@ async function twoTabs(browser, db) {
   });
 }
 
+async function incompleteReply(browser, db) {
+  const page = await browser.newPage();
+  try {
+    await serve(candidate, db, await unusedPort(), async (origin, api) => {
+      await seed(api);
+      let original;
+      await page.route(answerPattern, route => {
+        original = route.request().postDataJSON();
+        return route.fulfill({ json: { rating: "Again" } });
+      }, { times: 1 });
+      await page.goto(origin);
+      await reveal(page).click();
+      await retry(page).waitFor();
+      assert.equal(grades(db), 0);
+      const replay = page.waitForRequest(request => request.url().endsWith("/api/study/answer"));
+      await page.reload();
+      assert.deepEqual((await replay).postDataJSON(), original);
+      await next(page).waitFor();
+      assert.equal(grades(db), 1);
+    });
+  } finally {
+    await page.context().close();
+  }
+}
+
+async function titleInvariance(browser, root) {
+  const baseline = path.join(root, "title-baseline.db");
+  await serve(candidate, baseline, await unusedPort(), async (_origin, api) => {
+    await api("tactics", { name: "Original", pgn: "1. e4 e5 1-0" });
+  });
+  for (const good of [true, false]) {
+    let expected;
+    for (const title of ["Original", "Renamed", ""]) {
+      const db = path.join(root, "title-" + good + "-" + title + ".db");
+      execFileSync("sqlite3", [baseline, ".backup " + db]);
+      execFileSync("sqlite3", [db, "UPDATE cards SET title='" + title + "'"]);
+      const page = await browser.newPage();
+      try {
+        await serve(candidate, db, await unusedPort(), async (origin) => {
+          const commands = [];
+          page.on("request", request => {
+            if (request.method() === "POST") {
+              commands.push([new URL(request.url()).pathname, request.postDataJSON()]);
+            }
+          });
+          await page.goto(origin);
+          await reveal(page).waitFor();
+          if (good) {
+            const board = await page.locator("cg-board").boundingBox();
+            const x = board.x + 4.5 * board.width / 8;
+            await page.mouse.click(x, board.y + 6.5 * board.height / 8);
+            await page.mouse.click(x, board.y + 4.5 * board.height / 8);
+            await page.getByText("No cards are ready.", { exact: false }).waitFor();
+          } else {
+            await reveal(page).click();
+            await next(page).click();
+            await reveal(page).waitFor();
+          }
+          const effects = execFileSync("sqlite3", ["-readonly", db, `
+            SELECT id,card_id,submission,result FROM attempts ORDER BY id;
+            SELECT card_id,stability,difficulty,due_at-last_at FROM learning ORDER BY card_id;
+            SELECT slot,card_id FROM deck ORDER BY slot;
+            SELECT active,last_kind FROM study;
+          `], { encoding: "utf8" });
+          const actual = { commands, effects };
+          if (expected) assert.deepEqual(actual, expected);
+          expected = actual;
+        });
+      } finally {
+        await page.context().close();
+      }
+    }
+    assert.equal(expected.commands.filter(([route]) => route.endsWith("/answer")).length, 1);
+  }
+  console.log("Mounted Study: original, renamed and blank titles preserved exact Good/Again commands, receipt, relative schedule and continuation.");
+}
+
 (async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tempo-answer-ir-"));
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true, timeout: 15000 });
+    await titleInvariance(browser, root);
+    await incompleteReply(browser, path.join(root, "truncated.db"));
     await predecessorRecovery(browser, path.join(root, "accepted.db"), true);
     await predecessorRecovery(browser, path.join(root, "undelivered.db"), false);
     await twoTabs(browser, path.join(root, "concurrent.db"));
-    console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, and Next-only retry passed.");
+    console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, incomplete reply replay, and Next-only retry passed.");
   } finally {
     if (browser) await browser.close();
     fs.rmSync(root, { recursive: true, force: true });

@@ -193,91 +193,25 @@ fn color(value: &str) -> Result<Color> {
     }
 }
 
-type ArchiveRow = (
-    String,
-    String,
-    String,
-    String,
-    Vec<u8>,
-    Option<String>,
-    Option<String>,
-    String,
-    String,
-);
-const FIELDS: &str = "id,white,black,learner_color,game_ir,source_url,played_on,occurrence,outcome";
+type StoredGame = (String, String, String, String, Vec<u8>, String, String);
+const FIELDS: &str = "id,white,black,learner_color,game_ir,occurrence,outcome";
 
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveRow> {
+fn stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredGame> {
     Ok((
-        r.get(0)?,
-        r.get(1)?,
-        r.get(2)?,
-        r.get(3)?,
-        r.get(4)?,
-        r.get(5)?,
-        r.get(6)?,
-        r.get(7)?,
-        r.get(8)?,
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
     ))
 }
 
-fn decode(row: ArchiveRow) -> Result<Candidate> {
-    let (id, white, black, learner, ir, source_url, played_on, occurrence, outcome) = row;
-    Ok(Candidate {
-        game: Game {
-            id,
-            mainline: Mainline::decode(&ir)?,
-            learner: color(&learner)?,
-            players: [white, black],
-            occurrence: serde_json::from_str(&occurrence)?,
-            outcome: outcome.parse()?,
-        },
-        source_url,
-        played_on,
-    })
-}
-
-pub fn archive(db: &Connection, after: &str, limit: usize) -> Result<Vec<Replay>> {
-    let mut q = db.prepare(&format!(
-        "SELECT {FIELDS} FROM games WHERE id>?1 ORDER BY id LIMIT ?2"
-    ))?;
-    q.query_map(params![after, limit], row)?
-        .map(|r| Ok(decode(r?)?.replay()))
-        .collect()
-}
-
-fn addressed(db: &Connection, id: &str) -> Result<Candidate> {
-    decode(
-        db.query_row(
-            &format!("SELECT {FIELDS} FROM games WHERE id=?1"),
-            [id],
-            row,
-        )
-        .optional()?
-        .context("game not found")?,
-    )
-}
-
-pub fn read(db: &Connection, id: &str) -> Result<Game> {
-    type AnalysisRow = (String, String, String, Vec<u8>, String, String);
-    let (white, black, learner, ir, occurrence, outcome): AnalysisRow = db
-        .query_row(
-            "SELECT white,black,learner_color,game_ir,occurrence,outcome FROM games WHERE id=?1",
-            [id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            },
-        )
-        .optional()?
-        .context("game not found")?;
+fn decode(row: StoredGame) -> Result<Game> {
+    let (id, white, black, learner, ir, occurrence, outcome) = row;
     Ok(Game {
-        id: id.to_owned(),
+        id,
         mainline: Mainline::decode(&ir)?,
         learner: color(&learner)?,
         players: [white, black],
@@ -286,8 +220,52 @@ pub fn read(db: &Connection, id: &str) -> Result<Game> {
     })
 }
 
+pub fn archive(db: &Connection, after: &str, limit: usize) -> Result<Vec<Replay>> {
+    let mut query = db.prepare(&format!(
+        "SELECT {FIELDS},source_url,played_on FROM games WHERE id>?1 ORDER BY id LIMIT ?2",
+    ))?;
+    let mut rows = query.query(params![after, limit])?;
+    let mut replays = Vec::new();
+    while let Some(row) = rows.next()? {
+        replays.push(
+            Candidate {
+                game: decode(stored(row)?)?,
+                source_url: row.get(7)?,
+                played_on: row.get(8)?,
+            }
+            .replay(),
+        );
+    }
+    Ok(replays)
+}
+
+pub fn read(db: &Connection, id: &str) -> Result<Game> {
+    let row = db
+        .query_row(
+            &format!("SELECT {FIELDS} FROM games WHERE id=?1"),
+            [id],
+            stored,
+        )
+        .optional()?
+        .context("game not found")?;
+    decode(row)
+}
+
 pub fn replay(db: &Connection, id: &str) -> Result<Replay> {
-    Ok(addressed(db, id)?.replay())
+    let snapshot = db.unchecked_transaction()?;
+    let game = read(&snapshot, id)?;
+    let (source_url, played_on) = snapshot.query_row(
+        "SELECT source_url,played_on FROM games WHERE id=?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    snapshot.commit()?;
+    Ok(Candidate {
+        game,
+        source_url,
+        played_on,
+    }
+    .replay())
 }
 
 pub enum Acceptance {
@@ -489,22 +467,11 @@ pub(crate) fn upgrade(db: &Connection) -> Result<()> {
          ) WITHOUT ROWID, STRICT;
          CREATE INDEX game_occurrence_id ON game_occurrence(game_id);",
     )?;
-    let mut scan = db.prepare(&format!("SELECT rowid,{FIELDS} FROM games ORDER BY rowid"))?;
+    let mut scan = db.prepare(&format!("SELECT {FIELDS},rowid FROM games ORDER BY rowid"))?;
     let mut rows = scan.query([])?;
-    while let Some(r) = rows.next()? {
-        let ordinal: i64 = r.get(0)?;
-        let candidate = decode((
-            r.get(1)?,
-            r.get(2)?,
-            r.get(3)?,
-            r.get(4)?,
-            r.get(5)?,
-            r.get(6)?,
-            r.get(7)?,
-            r.get(8)?,
-            r.get(9)?,
-        ))?;
-        let game = candidate.game;
+    while let Some(row) = rows.next()? {
+        let ordinal: i64 = row.get(7)?;
+        let game = decode(stored(row)?)?;
         let fingerprint = game.fingerprint(&game.mainline.encode());
         index_game(db, &game.id, ordinal, &fingerprint, &game.occurrence)?;
     }

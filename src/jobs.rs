@@ -211,10 +211,10 @@ fn read_detector_batch(
 ) -> Result<(Vec<Observation>, u64, bool)> {
     let mut input = BufReader::new(staging.open(file, deadline)?);
     input.seek(SeekFrom::Start(offset))?;
-    let mut findings = Vec::with_capacity(120);
+    let mut findings = Vec::with_capacity(game_pipeline::MAX_FINDINGS_PER_APPLY);
     let mut after = offset;
     let mut line = Vec::new();
-    for _ in 0..120 {
+    for _ in 0..game_pipeline::MAX_FINDINGS_PER_APPLY {
         line.clear();
         let read = (&mut input).take(64 * 1024).read_until(b'\n', &mut line)?;
         if read == 0 {

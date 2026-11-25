@@ -178,6 +178,10 @@ pub fn seal_detector(db: &mut Connection, job: i64, game: &str, file: &str) -> R
     Ok(())
 }
 
+// Final capture apply can write eleven additional rows, including ready-order triggers.
+pub const MAX_FINDINGS_PER_APPLY: usize = 117;
+const MAX_APPLY_ROWS: u64 = 128;
+
 pub struct DetectorBatch {
     pub job: i64,
     pub detector: Detector,
@@ -192,12 +196,16 @@ pub struct DetectorBatch {
 }
 
 pub fn apply_detector(db: &mut Connection, batch: &DetectorBatch) -> Result<()> {
-    ensure!(batch.findings.len() <= 120, "scan batch exceeds row budget");
+    ensure!(
+        batch.findings.len() <= MAX_FINDINGS_PER_APPLY,
+        "scan batch exceeds row budget"
+    );
     ensure!(
         batch.file.is_some() || (batch.finished && batch.findings.is_empty()),
         "only empty work can skip sealing"
     );
     let tx = db.transaction_with_behavior(Immediate)?;
+    let before = tx.total_changes();
     let sealed_game = batch.file.as_ref().map(|_| &batch.game);
     ensure!(
         tx.execute(
@@ -301,6 +309,10 @@ pub fn apply_detector(db: &mut Connection, batch: &DetectorBatch) -> Result<()> 
     }
     let cursor = batch.cursor.as_deref().filter(|_| batch.finished);
     job_store::yield_turn(&tx, batch.job, cursor, 0)?;
+    ensure!(
+        tx.total_changes() - before <= MAX_APPLY_ROWS,
+        "scan apply exceeds row budget"
+    );
     tx.commit()?;
     Ok(())
 }
@@ -437,9 +449,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn retry_publication_uses_saved_capture_and_leaves_archive_and_scan_complete() -> Result<()> {
-        let mut db = Connection::open_in_memory()?;
+    fn initialize_fixture(db: &Connection) -> Result<()> {
         db.execute_batch(include_str!("schema.sql"))?;
         db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("game_pipeline.sql"))?;
@@ -447,8 +457,70 @@ mod tests {
         db.execute_batch(include_str!("prepared_queue.sql"))?;
         db.execute_batch(include_str!("job_turns.sql"))?;
         db.execute_batch(include_str!("operation_bounds.sql"))?;
-        games::upgrade(&db)?;
+        games::upgrade(db)?;
         db.execute_batch(include_str!("detectors.sql"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn final_capture_turn_counts_index_trigger_and_progress_writes_in_the_budget() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        initialize_fixture(&db)?;
+        let mut db = db;
+        let game = games::archive_game(
+            chess::parse_pgn(
+                "[White \"Learner\"]\n[Black \"Opponent\"]\n\n1. e4 e5 1-0",
+                false,
+                1,
+            )?
+            .remove(0)?,
+            "Learner",
+        )?;
+        let Acceptance::Added(game) = games::accept_game(&db, &game)? else {
+            panic!("new fixture game")
+        };
+        db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('archive','','scan','running')", [])?;
+        let parent = db.last_insert_rowid();
+        start_scan(&mut db, parent, "fixture-cursor")?;
+        let comparison = stage(&db, parent, Detector::Repertoire.job(true))?;
+        let capture = stage(&db, parent, Detector::Capture.job(true))?;
+        complete(&db, comparison, &game)?;
+        db.execute("UPDATE jobs SET status='running' WHERE id=?1", [capture])?;
+        seal_detector(&mut db, capture, &game, "fixture")?;
+        db.execute("UPDATE jobs SET status='running' WHERE id=?1", [capture])?;
+        let findings = (0..MAX_FINDINGS_PER_APPLY)
+            .map(|ply| Observation::Capture {
+                ply,
+                position: "fixture".into(),
+                fen: "fixture".into(),
+                played: "e2e4".into(),
+                captures: vec!["d1d5".into()],
+            })
+            .collect();
+        let before = db.total_changes();
+        apply_detector(
+            &mut db,
+            &DetectorBatch {
+                job: capture,
+                detector: Detector::Capture,
+                version: 1,
+                game,
+                file: Some("fixture".into()),
+                before: 0,
+                after: 1,
+                findings,
+                finished: true,
+                cursor: Some("advanced".into()),
+            },
+        )?;
+        assert_eq!(db.total_changes() - before, MAX_APPLY_ROWS);
+        Ok(())
+    }
+
+    #[test]
+    fn retry_publication_uses_saved_capture_and_leaves_archive_and_scan_complete() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        initialize_fixture(&db)?;
         db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('pgn','Learner','upload','done')", [])?;
         let text = "[White \"Learner\"]\n[Black \"Opponent\"]\n[Result \"1/2-1/2\"]\n[SetUp \"1\"]\n[FEN \"4k3/8/8/n2n4/8/8/8/R2RK3 w - - 0 1\"]\n\n1. Ke2 1/2-1/2";
         let game = games::archive_game(chess::parse_pgn(text, false, 1)?.remove(0)?, "Learner")?;
