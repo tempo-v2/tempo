@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    io,
+    fs, io,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -10,6 +11,21 @@ const LIMIT: usize = 64 * 1024;
 
 pub fn socket_path(database: &Path) -> PathBuf {
     database.with_extension("tq").join("io")
+}
+
+/// Check the configured worker directory and return the expected peer UID.
+pub fn private_directory_owner(database: &Path) -> io::Result<u32> {
+    let work = socket_path(database);
+    let directory = fs::symlink_metadata(work.parent().expect("worker path has a parent"))?;
+    let owner = fs::metadata(database)?.uid();
+    if directory.is_dir() && directory.mode() & 0o777 == 0o700 && directory.uid() == owner {
+        Ok(owner)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unsafe tactic worker directory",
+        ))
+    }
 }
 
 pub fn status_path(database: &Path) -> PathBuf {
@@ -96,4 +112,23 @@ pub async fn send<T: Serialize>(
     }
     stream.write_all(&bytes).await?;
     stream.shutdown().await
+}
+
+pub fn engine_path(database: &Path) -> PathBuf {
+    socket_path(database).with_file_name("engine")
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineRequest {
+    pub fen: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EngineReply {
+    Ranked { first_moves: Vec<String> },
+    Terminal,
+    Busy,
+    Unavailable,
 }

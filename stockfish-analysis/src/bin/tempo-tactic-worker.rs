@@ -6,13 +6,16 @@ use fs2::FileExt;
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
+    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     time::Duration,
 };
 use tempo_stockfish_analysis::{Analysis, Coverage, Error, Options, Request, Stockfish};
 use tokio::{
-    net::UnixStream,
-    time::{sleep, timeout},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    net::{UnixListener, UnixStream},
+    sync::Semaphore,
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use wire::{Failure, Request as Message, Work};
 
@@ -57,7 +60,8 @@ async fn report(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn turn(path: &Path, engine: &Stockfish) -> Result<bool> {
+async fn turn(path: &Path, engine: &Stockfish, admission: &Semaphore) -> Result<bool> {
+    let permit = admission.acquire().await?;
     let mut reply = request(path, &Message::Next).await?;
     accepted(&reply)?;
     let Some(work) = serde_json::from_value::<Option<Work>>(reply["work"].take())? else {
@@ -72,6 +76,7 @@ async fn turn(path: &Path, engine: &Stockfish) -> Result<bool> {
             },
         })
         .await;
+    drop(permit);
     let message = match evidence {
         Ok(analysis @ Analysis::Evaluated { .. }) => {
             let mut evidence = serde_json::to_value(analysis)?;
@@ -123,6 +128,70 @@ async fn turn(path: &Path, engine: &Stockfish) -> Result<bool> {
     Ok(true)
 }
 
+fn bind_engine(database: &Path) -> Result<UnixListener> {
+    let path = wire::engine_path(database);
+    wire::private_directory_owner(database)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(&path)?,
+        Ok(_) => anyhow::bail!("Opening engine path is occupied"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(UnixListener::bind(path)?)
+}
+
+async fn serve_engine(
+    mut stream: UnixStream,
+    engine: &Stockfish,
+    admission: &Semaphore,
+) -> Result<()> {
+    use wire::EngineReply;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut reader = BufReader::new(&mut stream);
+    let mut input = Vec::new();
+    // The request is one line. The client keeps its write side open so EOF
+    // during search signals abandonment, including an HTTP disconnect.
+    timeout_at(
+        deadline,
+        (&mut reader).take(1025).read_until(b'\n', &mut input),
+    )
+    .await??;
+    ensure!(
+        input.len() <= 1024 && input.last() == Some(&b'\n'),
+        "Invalid opening analysis frame"
+    );
+    let request: wire::EngineRequest = serde_json::from_slice(&input)?;
+    let reply = match admission.try_acquire() {
+        Err(_) => EngineReply::Busy,
+        Ok(_permit) => {
+            let result = engine
+                .analyze_until(
+                    Request {
+                        fen: request.fen,
+                        options: Options {
+                            coverage: Coverage::Top { count: 5 },
+                            ..Options::default()
+                        },
+                    },
+                    async {
+                        let _ = timeout_at(deadline, reader.read_u8()).await;
+                    },
+                )
+                .await;
+            match result {
+                Ok(Analysis::Evaluated { lines, .. }) => EngineReply::Ranked {
+                    first_moves: lines.into_iter().map(|line| line.first_move).collect(),
+                },
+                Ok(Analysis::Terminal { .. }) => EngineReply::Terminal,
+                Err(Error::Busy) => EngineReply::Busy,
+                Err(_) => EngineReply::Unavailable,
+            }
+        }
+    };
+    timeout_at(deadline, wire::send(&mut stream, &reply)).await??;
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -150,8 +219,23 @@ async fn main() -> Result<()> {
         .try_lock_exclusive()
         .context("Another tactic worker owns this database")?;
     let engine = Stockfish::new(executable);
+    let admission = std::sync::Arc::new(Semaphore::new(1));
+    if operation == "watch" {
+        match bind_engine(&database) {
+            Ok(listener) => {
+                let engine = engine.clone();
+                let admission = admission.clone();
+                tokio::spawn(async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        let _ = serve_engine(stream, &engine, &admission).await;
+                    }
+                });
+            }
+            Err(error) => eprintln!("Opening analysis unavailable: {error:#}"),
+        }
+    }
     loop {
-        match turn(&path, &engine).await {
+        match turn(&path, &engine, &admission).await {
             Ok(true) => {}
             Ok(false) if operation == "drain" => return report(&status).await,
             Err(err) if operation == "drain" => return Err(err),

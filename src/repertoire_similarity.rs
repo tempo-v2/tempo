@@ -357,3 +357,63 @@ pub fn cli(input: impl Read) -> Result<Analysis, Error> {
     } = serde_json::from_slice(&bytes).map_err(|_| Error::InvalidRequest)?;
     analyze(PositionIr::parse(&fen)?, repertoire, options)
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowseRequest {
+    fen: String,
+    repertoire_id: String,
+    color: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Coverage {
+    Gap,
+    Saved { first_move: String },
+    Conflict,
+}
+
+#[derive(Serialize)]
+struct BrowseReply {
+    #[serde(flatten)]
+    analysis: Analysis,
+    coverage: Coverage,
+}
+
+pub async fn browse(
+    axum::extract::State(app): axum::extract::State<crate::App>,
+    axum::Json(request): axum::Json<BrowseRequest>,
+) -> crate::ViewResult {
+    use axum::response::IntoResponse;
+    let position =
+        PositionIr::parse(&request.fen).map_err(|error| crate::ApiError(error.into()))?;
+    let bytes = crate::optional_read::read_until(
+        crate::optional_read::Reader::RepertoireSimilarity,
+        app.database.clone(),
+        move |db, stopped| {
+            let tx = db.transaction()?;
+            let snapshot = snapshot(&tx, &request.repertoire_id, &request.color)?;
+            let id = chess::position_id(&position.0);
+            let coverage = match catalog::current_opening_reply(&tx, &request.repertoire_id, &id)? {
+                None => Coverage::Gap,
+                Some(reply) if reply.quarantined => Coverage::Conflict,
+                Some(reply) => {
+                    let [first_move]: [String; 1] =
+                        serde_json::from_str(&reply.answers).map_err(|_| Error::InvalidSnapshot)?;
+                    Coverage::Saved { first_move }
+                }
+            };
+            drop(tx);
+            let analysis = analyze_until(position, snapshot, Options::default(), stopped)?;
+            Ok(BrowseReply { analysis, coverage })
+        },
+    )
+    .await
+    .map_err(crate::ApiError)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response())
+}

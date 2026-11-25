@@ -14,6 +14,7 @@ mod learning;
 mod legacy;
 mod lichess_catalog;
 mod lichess_play;
+mod opening_engine;
 mod opening_rank;
 mod opening_replacement;
 mod optional_read;
@@ -59,6 +60,7 @@ use tower_http::services::{ServeDir, ServeFile};
 type App = Arc<Runtime>;
 struct Runtime {
     database: PathBuf,
+    opening_engine: Option<opening_engine::Endpoint>,
     writer: writer::Writer,
     staging: uploads::Staging,
     content_preparation: Arc<Semaphore>,
@@ -69,6 +71,7 @@ impl Runtime {
     fn new(database: PathBuf, writer: writer::Writer, staging: uploads::Staging) -> Self {
         Self {
             database,
+            opening_engine: None,
             writer,
             staging,
             content_preparation: Arc::new(Semaphore::new(2)),
@@ -81,6 +84,26 @@ type ApiResult = std::result::Result<Json<Value>, ApiError>;
 struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Some(error) = self.0.downcast_ref::<repertoire_similarity::Error>() {
+            use repertoire_similarity::Error::*;
+            let (status, message) = match error {
+                InvalidRequest => (StatusCode::BAD_REQUEST, "Invalid position or repertoire."),
+                InvalidSnapshot => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "The saved repertoire could not be read.",
+                ),
+                WorkLimit => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "This repertoire exceeds the similarity search limit.",
+                ),
+                Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Similar moves are temporarily unavailable.",
+                ),
+            };
+            return (status, Json(json!({"code":error,"error":message}))).into_response();
+        }
+
         if self.0.is::<gap_edit::Stale>() {
             return (
                 StatusCode::CONFLICT,
@@ -742,10 +765,14 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
                 }
             })?;
     }
-    if let Err(error) = tactic_worker_socket::start(&db, writer.clone()) {
-        eprintln!("Tactic worker handoff unavailable: {error:#}");
+    let mut runtime = Runtime::new(db, writer, staging);
+    match tactic_worker_socket::start(&runtime.database, runtime.writer.clone()) {
+        Ok(owner) => {
+            runtime.opening_engine = Some(opening_engine::Endpoint::new(&runtime.database, owner));
+        }
+        Err(error) => eprintln!("Tactic worker handoff unavailable: {error:#}"),
     }
-    let app = router(&path, port, Arc::new(Runtime::new(db, writer, staging)));
+    let app = router(&path, port, Arc::new(runtime));
     println!("Tempo at http://127.0.0.1:{port}");
     axum::serve(listener, app).await?;
     Ok(())
@@ -782,6 +809,11 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .route("/api/coverage/save/{command}", get(gap_edit::progress))
         .route("/api/openings", get(openings).post(save_opening))
         .route("/api/openings/repertoires", get(repertoires))
+        .route(
+            "/api/openings/similar-moves",
+            post(repertoire_similarity::browse),
+        )
+        .route("/api/openings/engine-moves", post(opening_engine::browse))
         .route(
             "/api/openings/pgn",
             post(preview_opening).layer(pgn_body_limit),
