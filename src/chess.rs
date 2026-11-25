@@ -108,12 +108,16 @@ pub fn score_puzzle_move(route: &Route, ply: usize, played: Option<&str>) -> Res
         &board,
         route.moves.get(ply).context("No solver move at this ply")?,
     )?;
-    let Some(played) = played else {
+    let Some(submitted) = played else {
         return Ok(PuzzleMove::Again);
     };
-    let Ok(played) = parse_move(&board, played) else {
+    let Ok(played) = parse_move(&board, submitted) else {
         return Ok(PuzzleMove::Illegal);
     };
+    // Parsing can normalize a malformed input into a legal move.
+    if uci(played) != submitted {
+        return Ok(PuzzleMove::Illegal);
+    }
     if played == expected {
         let next = (ply + 2).min(route.moves.len());
         return Ok(if next == route.moves.len() {

@@ -142,6 +142,12 @@ async function startRecovery(db) {
     assert.equal(finish.result.rating, "Good");
     assert.deepEqual(await api("tactics/plays", current.start), finish);
     assert.equal(grades(db), 2);
+    const { play: enPassant } = await openPuzzle(api, "07Duy");
+    const capture = { dataset: enPassant.dataset, play: enPassant.play, step: enPassant.step };
+    await assert.rejects(api("tactics/plays/move", { ...capture, played: "b4c3q" }), /illegal_move/);
+    assert.deepEqual(await api(`tactics/plays/${enPassant.play}`), enPassant);
+    const legalCapture = await api("tactics/plays/move", { ...capture, played: "b4c3" });
+    assert.ok(legalCapture.step > enPassant.step);
   });
   console.log("Schema-12 Start and Move recovery preserved the original play and receipt. New Starts fence their catalog revision.");
 }
@@ -904,6 +910,17 @@ async function openingPreview(browser, db) {
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true, timeout: 15000 });
+    if (process.env.TEMPO_QUALIFY_PACKS_ONLY === "1") {
+      assert.ok(retainedDatabase && packArtifact && legacyStudyClient, "Provide all predecessor inputs");
+      for (const accepted of [true, false]) {
+        const copy = path.join(root, `retained-${accepted}.db`);
+        execFileSync("sqlite3", ["-readonly", retainedDatabase, ".backup " + copy]);
+        await predecessorRecovery(browser, copy, accepted, { retained: true });
+      }
+      await fullLineRecovery(browser, path.join(root, "legacy-full-line.db"));
+      await startRecovery(path.join(root, "pack-schema12.db"));
+      return;
+    }
     const rookFen = "4k3/n7/8/8/8/8/8/R3K3 w - - 0 1";
     for (const [name, move] of Object.entries({
       capture: { fen: rookFen, solution: "Rxa7", from: "a1", to: "a7", piece: "rook", retryLost: true },
