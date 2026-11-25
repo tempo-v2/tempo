@@ -20,6 +20,7 @@ mod optional_read;
 mod providers;
 mod queue;
 mod queue_store;
+mod repertoire_similarity;
 mod review;
 mod scanner;
 mod study;
@@ -828,6 +829,18 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .with_state(app)
 }
 
+fn print_similarity(result: Result<impl Serialize, repertoire_similarity::Error>) -> Result<()> {
+    let value = match result {
+        Ok(value) => serde_json::to_string(&value)?,
+        Err(error) => {
+            println!("{}", json!({"status":"error","error":error}));
+            std::process::exit(1);
+        }
+    };
+    println!("{value}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -886,6 +899,19 @@ async fn main() -> Result<()> {
             println!("{id}");
             Ok(())
         }
+        [command] if command == "repertoire-similarity" => {
+            print_similarity(repertoire_similarity::cli(io::stdin().lock()))
+        }
+        [command, db, repertoire, color] if command == "repertoire-similarity-input" => {
+            print_similarity(
+                repertoire_similarity::export(Path::new(db), repertoire, color).map_err(|error| {
+                    error
+                        .downcast_ref()
+                        .copied()
+                        .unwrap_or(repertoire_similarity::Error::Unavailable)
+                }),
+            )
+        }
         [command, db] if command == "opening-rank-input" => {
             let database = Database::read(Path::new(db))?;
             let snapshot = database.unchecked_transaction()?;
@@ -900,7 +926,7 @@ async fn main() -> Result<()> {
             opening_rank::replace(&mut database, snapshot)
         }
         _ => anyhow::bail!(
-            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT"
+            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT | tempo repertoire-similarity | tempo repertoire-similarity-input DB REPERTOIRE COLOR"
         ),
     }
 }
