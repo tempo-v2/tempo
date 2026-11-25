@@ -143,11 +143,8 @@ export function Gaps() {
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
     {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
     {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{message && <p role="status">{message}</p>}
-<<<<<<< HEAD
     {draft.applyCommand && <button disabled={busy} onClick={() => run(applyOrder)}>Retry applying order</button>}
-=======
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
->>>>>>> feat/lean-repertoire-gaps
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · Maia-2 Rapid 1500/1500</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
