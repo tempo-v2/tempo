@@ -96,7 +96,9 @@ Use the same database and rescan if the repertoire has changed since the
 original report. The command imports matching branches together, enforces the
 same conflict rules as online Save, and replays the saved receipt on retry.
 For PGNs whose expanded variations exceed the preview limit, the offline
-import performs the full validation before writing.
+import performs the full validation before writing. An exceptionally large
+expanded tree can also exceed the offline limit. In that case, split it
+into smaller continuations and rescan before previewing each part.
 Restart Tempo and rescan to see the new coverage.
 
 A service backup that must resume queued PGN uploads includes the SQLite

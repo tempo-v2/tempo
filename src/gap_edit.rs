@@ -44,7 +44,7 @@ fn build(c: &Connection, draft: Draft, online: bool) -> Result<Edit> {
     let target = chess::position_id(&chess::position(&gap.fen)?);
     let game = match chess::parse_gap_pgn(&draft.pgn, online) {
         Ok(game) => game,
-        Err(error) if error.is::<chess::ExpandedPgn>() => {
+        Err(error) if online && error.is::<chess::ExpandedPgn>() => {
             return Ok(Edit {
                 repertoire: scan.repertoire,
                 revision,
@@ -56,6 +56,11 @@ fn build(c: &Connection, draft: Draft, online: bool) -> Result<Edit> {
                     "validation_deferred":true
                 }),
             });
+        }
+        Err(error) if error.is::<chess::ExpandedPgn>() => {
+            anyhow::bail!(
+                "This PGN exceeds the offline variation limit. Split it into smaller continuations, then rescan and preview each part."
+            );
         }
         Err(error) => return Err(error),
     };

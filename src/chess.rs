@@ -352,7 +352,7 @@ pub fn parse_pgn(text: &str, branches: bool, limit: usize) -> Result<Vec<Result<
 pub struct ExpandedPgn;
 impl std::fmt::Display for ExpandedPgn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Too many expanded variation prefixes to preview online.")
+        f.write_str("This PGN expands to too many variation prefixes.")
     }
 }
 impl std::error::Error for ExpandedPgn {}
@@ -362,7 +362,7 @@ pub fn parse_gap_pgn(text: &str, online: bool) -> Result<Pgn> {
     let mut parser = Parser {
         branches: true,
         // Conservatively bounds both expanded route storage and card contexts.
-        max_expanded_work: online.then_some(2_000_000),
+        max_expanded_work: Some(if online { 2_000_000 } else { 8_000_000 }),
     };
     let game = reader
         .read_game(&mut parser)?
@@ -434,6 +434,12 @@ mod tests {
         let error = parse_gap_pgn(&pgn, true).unwrap_err();
         assert!(error.is::<ExpandedPgn>());
         assert_eq!(parse_gap_pgn(&pgn, false)?.variations.len(), 8);
+        pgn.pop();
+        for _ in 0..16 {
+            pgn.push_str("(301. d4) ");
+        }
+        pgn.push('*');
+        assert!(parse_gap_pgn(&pgn, false).unwrap_err().is::<ExpandedPgn>());
         Ok(())
     }
 
