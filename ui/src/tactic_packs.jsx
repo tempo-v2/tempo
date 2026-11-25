@@ -33,7 +33,13 @@ export function TacticPacks({ sounds }) {
   const retry = useRef(null);
   const [refresh, setRefresh] = useState(0);
 
-  async function readIndex() { setIndex(await api(packsUrl)); }
+  async function readIndex() {
+    const next = await api(packsUrl);
+    if (index && index.revision !== next.revision) {
+      setSelected(null); setPacks(null); setMorePacks(false); setMembers(null);
+    }
+    setIndex(next);
+  }
   async function resume(id) { return decodePuzzle(await api(`${playsUrl}/${id}`), "tactics"); }
   async function readPending(after = 0) {
     const page = await api(`${playsUrl}?after=${after}`);
@@ -65,8 +71,8 @@ export function TacticPacks({ sounds }) {
     async function load() {
       const next = await api(`${packsUrl}/${encodeURIComponent(theme)}`, undefined, request.signal);
       if (next.revision !== index.revision) { await readIndex(); return; }
-      setPacks(next.packs);
-      setMorePacks(next.packs.length === 50);
+      setPacks((old) => [...next.packs, ...(old ?? []).filter((pack) => pack.band > next.packs.at(-1)?.band)]);
+      if (!packs || packs.length <= 50) setMorePacks(next.packs.length === 50);
       await readPending();
     }
     load().catch((error) => {
@@ -95,6 +101,9 @@ export function TacticPacks({ sounds }) {
   function showView(next) {
     setView(next);
     if (next.mode !== "first" || !next.result) return;
+    if (members?.some((item) => item.puzzle === next.puzzle && !item.done)) {
+      setPacks((old) => old?.map((pack) => pack.band === selected ? { ...pack, done: pack.done + 1 } : pack));
+    }
     setMembers((old) => old?.map((item) => item.puzzle === next.puzzle ? { ...item, done: true, resume: false } : item));
     setPendingPlays((old) => old.filter((item) => item.play !== next.play));
   }
@@ -118,12 +127,22 @@ export function TacticPacks({ sounds }) {
   const following = members?.find((item) => item.puzzle !== view?.puzzle && item.resume && !item.done)
     ?? members?.find((item) => item.puzzle !== view?.puzzle && !item.done);
   const recommended = packs?.find((pack) => pack.done < 20);
+  const selectedPack = packs?.find((pack) => pack.band === selected);
+  const nextPack = selectedPack && packs.find((pack) => pack.band > selected && pack.done < 20);
+  function openNextPack() {
+    setView(null);
+    choose(nextPack);
+    setRefresh((value) => value + 1);
+  }
+  const nextPackButton = nextPack && <button disabled={busy} onClick={openNextPack}>Open next pack {band(nextPack)}</button>;
   if (view) return <section aria-label="Play puzzle">
-    <button disabled={busy} onClick={() => { setView(null); setRefresh((value) => value + 1); }}>Back to packs</button>
+    <button disabled={busy} onClick={() => { setView(null); setRefresh((value) => value + 1); }}>{selectedPack ? "Back to pack" : "Back to packs"}</button>
     <h2>Lichess puzzle</h2>
     <PuzzleBoard key={view.play} view={view} scope="tactics" sounds={sounds} onView={showView}
       onRefresh={async () => showView(await resume(view.play))}
-      continuation={following && view.result && view.mode === "first" && <button disabled={busy} onClick={() => tryPuzzle(following)}>Next puzzle</button>} />
+      continuation={view.result && view.mode === "first" && members && (following
+        ? <button disabled={busy} onClick={() => tryPuzzle(following)}>Next puzzle</button>
+        : nextPackButton)} />
     {issue && <p role="alert">{issue} <button disabled={busy} onClick={() => run(retry.current)}>Retry</button></p>}
   </section>;
   return <section aria-label="Puzzle packs">
@@ -135,22 +154,27 @@ export function TacticPacks({ sounds }) {
       }}>
         {index.themes.map(({ key }) => <option key={key} value={key}>{name(key)}</option>)}
       </select></label>
-      <ul className="items">{packs?.map((pack) => <li key={pack.band}>
-        <button aria-pressed={selected === pack.band} onClick={() => choose(pack)}>
-          {band(pack)} <small>{pack.done}/20</small>
-        </button>
-      </li>)}</ul>
-      {morePacks && <button disabled={busy} onClick={() => run(loadMorePacks)}>More packs</button>}
-      {selected === null && recommended && <button onClick={() => choose(recommended)}>Open recommended pack {band(recommended)}</button>}
-      {members && <div>
-        {nextMember && <button disabled={busy} onClick={() => tryPuzzle(nextMember)}>{nextMember.resume ? "Resume puzzle" : "Play next puzzle"}</button>}
-        <ul className="items">{members.map((member, position) => <li key={member.puzzle}>
-          <button disabled={busy || (!member.done && member.puzzle !== nextMember?.puzzle)}
-            onClick={() => tryPuzzle(member)}>
-            Puzzle {position + 1} <small>{member.rating}{member.done ? " · Practice" : ""}</small>
-          </button>
+      {selectedPack ? <div>
+        <button onClick={() => { setSelected(null); setMembers(null); }}>All packs</button>
+        <h2>{band(selectedPack)}</h2>
+        {members && <>
+          {nextMember
+            ? <button disabled={busy} onClick={() => tryPuzzle(nextMember)}>{nextMember.resume ? "Resume puzzle" : "Play next puzzle"}</button>
+            : nextPackButton}
+          <ul className="items">{members.map((member, position) => <li key={member.puzzle}>
+            <button disabled={busy || (!member.done && member.puzzle !== nextMember?.puzzle)}
+              onClick={() => tryPuzzle(member)}>
+              Puzzle {position + 1} <small>{member.rating}{member.done ? " · Practice" : ""}</small>
+            </button>
+          </li>)}</ul>
+        </>}
+      </div> : <>
+        {recommended && <button onClick={() => choose(recommended)}>Open recommended pack {band(recommended)}</button>}
+        <ul className="items">{packs?.map((pack) => <li key={pack.band}>
+          <button onClick={() => choose(pack)}>{band(pack)} <small>{pack.done}/20</small></button>
         </li>)}</ul>
-      </div>}
+        {morePacks && <button disabled={busy} onClick={() => run(loadMorePacks)}>More packs</button>}
+      </>}
       {pendingPlays.length > 0 && <>
         <h2>In progress</h2>
         <ul className="items">{pendingPlays.map((item) => <li key={item.play}>
