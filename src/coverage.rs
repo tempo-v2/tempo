@@ -211,7 +211,7 @@ fn snapshot(path: &std::path::Path, scan: &Scan) -> Result<(String, i64, Value)>
         &rev.to_string(),
         &serde_json::to_string(scan)?,
     ]);
-    let mut query=tx.prepare("SELECT id,fen,answers,quarantined FROM cards WHERE kind='opening' AND repertoire_id=?1 AND color=?2")?;
+    let mut query=tx.prepare("SELECT id,fen,answers,quarantined FROM cards WHERE kind='opening' AND opening_retired=0 AND repertoire_id=?1 AND color=?2")?;
     let mut rows = query.query((&scan.repertoire, &scan.color))?;
     let mut cards = vec![];
     while let Some(r) = rows.next()? {

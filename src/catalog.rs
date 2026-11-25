@@ -50,7 +50,7 @@ pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
         "SELECT o.id,o.repertoire_id,r.example_line,o.name,o.color,o.route,o.start_at
          FROM openings o CROSS JOIN repertoire_choices r
          ON r.repertoire_id=o.repertoire_id AND r.color=o.color
-         WHERE o.id>?1 ORDER BY o.id LIMIT 100",
+         WHERE o.id>?1 AND o.archived=0 ORDER BY o.id LIMIT 100",
     )?;
     let rows = q.query_map([after], |r| {
         Ok((
@@ -126,7 +126,7 @@ impl std::error::Error for OpeningConflict {}
 pub fn branch_repertoire(db: &Connection, source: &str, color: &str) -> Result<String> {
     let (repertoire, saved_color): (String, String) = db
         .query_row(
-            "SELECT repertoire_id,color FROM openings WHERE id=?1",
+            "SELECT repertoire_id,color FROM openings WHERE id=?1 AND archived=0",
             [source],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -155,24 +155,16 @@ pub struct OpeningPlan {
     moves: String,
     route: String,
     start_at: usize,
-    cards: Vec<OpeningCard>,
+    pub(crate) cards: Vec<OpeningCard>,
 }
 
-struct OpeningCard {
+pub(crate) struct OpeningCard {
     ply: std::num::NonZeroU32,
-    position: String,
-    version: String,
-    fen: String,
-    answers: String,
-    context: String,
-}
-
-impl OpeningPlan {
-    pub fn responses(&self) -> impl Iterator<Item = (&str, &str, &str)> {
-        self.cards
-            .iter()
-            .map(|c| (c.position.as_str(), c.version.as_str(), c.answers.as_str()))
-    }
+    pub(crate) position: String,
+    pub(crate) version: String,
+    pub(crate) fen: String,
+    pub(crate) answers: String,
+    pub(crate) context: String,
 }
 
 pub fn prepare_opening(input: &OpeningInput) -> Result<OpeningPlan> {
@@ -288,7 +280,7 @@ fn apply_opening_cards(
     for card in cards {
         let card_id = chess::id(&["opening-card-v1", repertoire, &card.position, &card.version]);
         let prior = db.query_row(
-            "SELECT id,quarantined FROM cards WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2
+            "SELECT id,quarantined FROM cards WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2 AND opening_retired=0
              ORDER BY quarantined LIMIT 1",
             params![repertoire,card.position],
             |row| Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?)),
@@ -322,13 +314,15 @@ fn apply_opening_cards(
     for (card_id, card) in pending.into_values() {
         db.execute(
             "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,repertoire_id,answer_version,context)
-             VALUES (?1,'opening',?2,?3,?4,?5,?6,?7,?8,?9)",
+             VALUES (?1,'opening',?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET opening_retired=0 WHERE cards.opening_retired=1",
             params![card_id,plan.name,plan.color,card.fen,card.position,card.answers,repertoire,card.version,card.context],
         )?;
     }
     if finish_line {
         db.execute(
-            "INSERT OR IGNORE INTO openings VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO openings(id,repertoire_id,name,color,route,start_at) VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(id) DO UPDATE SET archived=0 WHERE openings.archived=1",
             params![
                 id,
                 repertoire,
