@@ -101,6 +101,13 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if self.0.is::<opening_replacement::OverBudget>() {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"code":"replacement_over_budget","error":self.0.to_string()})),
+            )
+                .into_response();
+        }
         if self.0.is::<catalog::OverBudget>() {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,

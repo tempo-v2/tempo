@@ -49,7 +49,10 @@ function ConflictDetails({ conflict, disabled, correct }) {
       <dd>{saved ? (saved.line ?? `${saved.reply} (saved route unavailable)`) :
         conflict.unresolved ? "Saved replies are unresolved at this position." : "No saved reply."}</dd>
       <dt>In the pasted PGN</dt>
-      {proposed.map(reply => <dd key={reply.movement}>{reply.line}</dd>)}
+      {proposed.map(reply => <React.Fragment key={reply.movement}>
+        <dd>{reply.line}</dd>
+        {reply.alternate_line && <dd>{reply.alternate_line}</dd>}
+      </React.Fragment>)}
     </dl>
     {saved ? <div className="gap-conflict-actions">
       <button className="gap-recommended" disabled={disabled} onClick={() => correct(conflict)}>
@@ -78,6 +81,11 @@ function ReplacementImpact({ impact }) {
 export function Gaps() {
   const [draft, setDraft] = useState(restore);
   const form = useRef(stored(storage));
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const [books, setBooks] = useState([]);
   const [report,setReport] = useState(null);
   const [summary, setSummary] = useState(null);
@@ -187,7 +195,7 @@ export function Gaps() {
       receipt=await api(command.replacements ? "coverage/replace" : "coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
       const stale = e.code === "stale_gap" || e.code === "gap_save_interrupted";
-      if(stale || e.code==="opening_reply_conflict") {
+      if(stale || e.code==="opening_reply_conflict" || e.code==="replacement_over_budget") {
         await clearCommand("save", command);
         refreshJournal();
         clearPreview();
@@ -240,7 +248,7 @@ export function Gaps() {
     setConfirmation(null);
   }
   function isCurrent(candidate, choices) {
-    return form.current?.report === candidate.report && form.current?.index === candidate.gap &&
+    return mounted.current && form.current?.report === candidate.report && form.current?.index === candidate.gap &&
       form.current?.pgn === candidate.pgn && (form.current?.replacements ?? noReplacements) === choices;
   }
   async function previewDraft(candidate, choices) {

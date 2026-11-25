@@ -19,6 +19,7 @@ pub struct Replacement {
     pub line_revision: i64,
     pub impact: Vec<ChangedLine>,
     pub over_budget: bool,
+    base_writes: usize,
     archived: Vec<String>,
     retired: Vec<String>,
     rewritten: Vec<catalog::OpeningPlan>,
@@ -304,31 +305,50 @@ pub fn plan(
     }
     let mut writes =
         1 + 3 * (archived.len() + rewritten.len() + incoming.len()) + 5 * retired.len();
-    let mut repeats = db.prepare_cached(
-        "SELECT count(*) FROM (SELECT 1 FROM repeat_obligation WHERE card_id=?1 LIMIT 43)",
-    )?;
-    for card in &retired {
-        writes += 3 * repeats.query_row([card], |row| row.get::<_, usize>(0))?;
-    }
     for (position, version) in installed {
         if !active(&position)?.is_some_and(|(_, current)| current == version) {
             writes += 3;
         }
     }
+    let retired = retired.into_iter().collect::<Vec<_>>();
     Ok(Replacement {
         line_revision: revision(db, repertoire)?,
         impact,
-        over_budget: writes > 128,
+        over_budget: !fits_budget(db, writes, &retired)?,
+        base_writes: writes,
         archived,
         rewritten,
-        retired: retired.into_iter().collect(),
+        retired,
     })
 }
 
+fn fits_budget(db: &Connection, mut writes: usize, retired: &[String]) -> Result<bool> {
+    let mut repeats = db.prepare_cached(
+        "SELECT count(*) FROM (SELECT 1 FROM repeat_obligation WHERE card_id=?1 LIMIT 43)",
+    )?;
+    for card in retired {
+        if writes > 128 {
+            return Ok(false);
+        }
+        writes += 3 * repeats.query_row([card], |row| row.get::<_, usize>(0))?;
+    }
+    Ok(writes <= 128)
+}
+
+#[derive(Debug)]
+pub struct OverBudget;
+
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str("This replacement exceeds the atomic save limit. Split the continuation and preview again.")
+    }
+}
+impl std::error::Error for OverBudget {}
+
 pub fn apply(db: &Connection, repertoire: &str, replacement: &Replacement) -> Result<Vec<String>> {
     ensure!(
-        !replacement.over_budget,
-        "This replacement exceeds the atomic save limit. Split the continuation and preview again."
+        fits_budget(db, replacement.base_writes, &replacement.retired)?,
+        OverBudget
     );
     ensure!(
         revision(db, repertoire)? == replacement.line_revision,

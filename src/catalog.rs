@@ -100,6 +100,57 @@ pub fn repertoires(db: &Connection, after: &str, color: &str) -> Result<Vec<Repe
     .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Current authored routes for the requested reply versions in this repertoire.
+pub fn reply_contexts(
+    db: &Connection,
+    repertoire: &str,
+    color: &str,
+    mut wanted: std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, Route>> {
+    let mut found = std::collections::BTreeMap::new();
+    if wanted.is_empty() {
+        return Ok(found);
+    }
+    let mut query = db.prepare(
+        "SELECT route,start_at FROM openings
+         WHERE repertoire_id=?1 AND color=?2 AND archived=0 ORDER BY id LIMIT 2000",
+    )?;
+    let mut rows = query.query((repertoire, color))?;
+    let mut moves_left = 100_000usize;
+    while let Some(row) = rows.next()? {
+        let route: Route = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        let start_at: usize = row.get(1)?;
+        let Some(remaining) = moves_left.checked_sub(route.moves.len()) else {
+            break;
+        };
+        moves_left = remaining;
+        let mut board = chess::position(&route.fen)?;
+        for (ply, played) in route.moves.iter().enumerate() {
+            let movement = chess::parse_move(&board, played)?;
+            if ply >= start_at && chess::color_name(board.turn()) == color {
+                let position = chess::position_id(&board);
+                if wanted.get(&position).is_some_and(|version| {
+                    version == &chess::id(&["answer-v1", &chess::uci(movement)])
+                }) {
+                    wanted.remove(&position);
+                    found.insert(
+                        position,
+                        Route {
+                            fen: route.fen.clone(),
+                            moves: route.moves[..ply].to_vec(),
+                        },
+                    );
+                    if wanted.is_empty() {
+                        return Ok(found);
+                    }
+                }
+            }
+            board.play_unchecked(movement);
+        }
+    }
+    Ok(found)
+}
+
 pub fn existing_repertoire(db: &Connection, id: &str, color: &str) -> Result<()> {
     ensure!(
         db.query_row(
@@ -306,7 +357,7 @@ fn apply_opening_cards(
             pending.insert(card.position.clone(), (card_id, card));
             // Each new card writes its prepared entry and repertoire revision.
             ensure!(
-                !online || pending.len() * 3 + 1 + usize::from(new_choice) <= 128,
+                !online || pending.len() * 3 + 2 + usize::from(new_choice) <= 128,
                 OverBudget
             );
         }

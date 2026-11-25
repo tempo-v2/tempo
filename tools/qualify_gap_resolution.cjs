@@ -10,11 +10,12 @@ const net = require("node:net");
 
 const [candidate, predecessor] = process.argv.slice(2).map(value => path.resolve(value));
 const chrome = process.env.TEMPO_QUALIFY_CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const folder = fs.mkdtempSync(path.join(os.tmpdir(), "tempo-gap-resolution-"));
+const folder = fs.mkdtempSync(path.join(os.tmpdir(), "tgr-"));
 const journal = "tempo-lean-gap-draft-v1";
 const start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const anchor = "r1bqkbnr/pppppppp/2n5/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 2 2";
 const originalPgn = "1. Nf3 Nc6 2. e4 e5 3. Nc3 Nf6 4. d4 exd4 5. Nxd4 *";
+const twoConflicts = originalPgn.replace("2. e4 e5", "2. e4 e5 (2... e6 3. d4)");
 
 function sql(db, command) {
   return execFileSync("sqlite3", [db, command], { encoding: "utf8" }).trim();
@@ -83,36 +84,61 @@ async function browserFlow(browser) {
     const line = ["e2e4", "e7e5", "g1f3", "b8c6", "b1c3", "g8f6", "f1b5"];
     const repertoire = await addOpening(api, "Main reply", [...line, "a7a6", "b5c6"]);
     await addOpening(api, "Keep legal tail", [...line, "h7h6", "a2a3"], repertoire);
+    await addOpening(api, "Other conflict", ["e2e4", "e7e6", "g1f3", "b8c6", "b1c3"], repertoire);
     seedReport(db, "browser", repertoire, anchor, ["g1f3", "b8c6"]);
     const page = await browser.newPage({ viewport: { width: 820, height: 800 } });
     await page.addInitScript(({ key, pgn }) => {
       if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({ report: "browser", index: 0, pgn }));
-    }, { key: journal, pgn: originalPgn });
+    }, { key: journal, pgn: twoConflicts });
     await openGaps(page, origin);
 
     const editor = page.getByRole("textbox", { name: "Paste PGN from Lichess" });
     const preview = page.getByRole("button", { name: "Preview", exact: true });
     const save = page.getByRole("button", { name: "Save to repertoire", exact: true });
     await preview.click();
-    await page.getByText("Same position by transposition", { exact: false }).waitFor();
-    assert.equal(await page.locator(".gap-conflict").count(), 1);
+    await page.getByRole("heading", { name: /move 4.*Same position by transposition/ }).waitFor();
+    assert.equal(await page.locator(".gap-conflict").count(), 2);
     assert.equal(await save.isDisabled(), true);
-    const recommended = page.getByRole("button", { name: /Use repertoire reply.*Recommended/ });
+    const recommended = page.getByRole("button", { name: /Use repertoire reply.*Bb5.*Recommended/ });
     assert.equal(await recommended.evaluate(button => getComputedStyle(button).backgroundColor), "rgb(33, 77, 54)");
     await recommended.focus();
     await page.keyboard.press("Enter");
     await page.getByRole("heading", { name: "These branches would lose later moves" }).waitFor();
-    assert.equal(await editor.inputValue(), originalPgn);
+    assert.equal(await editor.inputValue(), twoConflicts);
     await page.getByRole("button", { name: "Keep editing" }).click();
-    assert.equal(await editor.inputValue(), originalPgn);
+    assert.equal(await editor.inputValue(), twoConflicts);
     await recommended.click();
     await page.getByRole("button", { name: "Keep legal moves" }).click();
-    await page.getByText("1 new reply · No remaining conflicts", { exact: true }).waitFor();
+    await page.getByText("1 new reply · 1 conflict", { exact: true }).waitFor();
     assert.match(await editor.inputValue(), /4\. Bb5/);
+    assert.equal(await save.isDisabled(), true);
+    await editor.fill(originalPgn.replace("4. d4 exd4 5. Nxd4", "4. Bb5"));
+    await preview.click();
+    await page.getByText("1 new reply · No remaining conflicts", { exact: true }).waitFor();
     assert.equal(await save.isEnabled(), true);
 
     await editor.fill(originalPgn);
     assert.equal(await save.isDisabled(), true);
+    await preview.click();
+    let release;
+    let received;
+    const held = new Promise(resolve => { release = resolve; });
+    const responseHeld = new Promise(resolve => { received = resolve; });
+    await page.route("**/api/coverage/correct", async route => {
+      const response = await route.fetch();
+      received();
+      await held;
+      await route.fulfill({ response });
+    }, { times: 1 });
+    await page.getByRole("button", { name: /Use new reply in both/ }).click();
+    await responseHeld;
+    await page.getByRole("button", { name: "Games", exact: true }).click();
+    const delivered = page.waitForResponse("**/api/coverage/correct");
+    release();
+    await delivered;
+    await page.getByRole("button", { name: "Openings", exact: true }).click();
+    assert.equal(await editor.inputValue(), originalPgn);
+    assert.equal(await page.getByText("Staged repertoire changes", { exact: true }).count(), 0);
     await preview.click();
     await page.getByRole("button", { name: /Use new reply in both/ }).click();
     await page.getByRole("heading", { name: "Affected saved lines" }).waitFor();
@@ -150,13 +176,16 @@ async function browserFlow(browser) {
 
 async function previousCommands() {
   const db = path.join(folder, "predecessor.sqlite3");
-  const commands = await withServer(predecessor, db, async (origin, api) => {
+  const commands = await withServer(predecessor, db, async (_origin, api) => {
     const repertoire = await addOpening(api, "Original", ["e2e4", "e7e5", "g1f3"]);
     const board = await api("study/next", {});
     assert.equal(board.kind, "opening");
     const expectedMove = JSON.parse(sql(db, "SELECT c.answers FROM cards c JOIN attempts a ON a.card_id=c.id WHERE a.id=(SELECT active FROM study);"))[0];
     const study = { attempt: board.attempt, dataset: board.dataset, played: expectedMove };
     const answer = await api("study/answer", study);
+    const next = await api("study/next", { after: board.attempt, dataset: board.dataset });
+    const nextMove = JSON.parse(sql(db, "SELECT c.answers FROM cards c JOIN attempts a ON a.card_id=c.id WHERE a.id=(SELECT active FROM study);"))[0];
+    const pendingStudy = { attempt: next.attempt, dataset: next.dataset, played: nextMove };
     seedReport(db, "accepted", repertoire, anchor, ["g1f3", "b8c6"]);
     const draft = { report: "accepted", gap: 0, pgn: "1. Nf3 Nc6 2. d4 *" };
     const { command } = await api("coverage/preview", draft);
@@ -165,14 +194,17 @@ async function previousCommands() {
     seedReport(db, "pending", repertoire, anchor, ["g1f3", "b8c6"]);
     const pendingDraft = { report: "pending", gap: 0, pgn: "1. Nf3 Nc6 2. d4 d5 3. Nc3 *" };
     const pending = { draft: pendingDraft, command: (await api("coverage/preview", pendingDraft)).command };
-    return { accepted, receipt, pending, study, answer };
+    return { accepted, receipt, pending, study, answer, pendingStudy };
   });
   execFileSync(candidate, ["migrate-games", db]);
   assert.equal(sql(db, "PRAGMA integrity_check;"), "ok");
   assert.equal(sql(db, "PRAGMA foreign_key_check;"), "");
-  await withServer(candidate, db, async (origin, api) => {
+  await withServer(candidate, db, async (_origin, api) => {
     assert.deepEqual(await api("coverage/save", commands.accepted), commands.receipt);
     assert.deepEqual(await api("study/answer", commands.study), commands.answer);
+    const pendingAnswer = await api("study/answer", commands.pendingStudy);
+    assert.equal(pendingAnswer.rating, "Good");
+    assert.deepEqual(await api("study/answer", commands.pendingStudy), pendingAnswer);
     const accepted = await api("coverage/save", commands.pending);
     assert.deepEqual(await api("coverage/save", commands.pending), accepted);
     assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt;"), "2");

@@ -86,31 +86,33 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
     );
     let mut responses = BTreeMap::<String, Vec<&catalog::OpeningCard>>::new();
     for card in plans.iter().flat_map(|plan| &plan.cards) {
-        let replies = responses.entry(card.position.clone()).or_default();
-        if !replies.iter().any(|prior| prior.version == card.version) {
-            replies.push(card);
-        }
+        responses
+            .entry(card.position.clone())
+            .or_default()
+            .push(card);
     }
     let mut rows = vec![];
-    let mut conflicts = BTreeMap::new();
+    let mut pending_conflicts = Vec::new();
+    let mut wanted_contexts = BTreeMap::new();
     let mut new_responses = 0;
     for (position, cards) in responses {
         let prior = saved_reply(c, &scan.repertoire, &position)?;
+        let unanimous = cards.iter().all(|card| card.version == cards[0].version);
         let status = match &prior {
-            None if cards.len() == 1 => {
+            None if unanimous => {
                 new_responses += 1;
                 "new"
             }
-            Some(prior)
-                if !prior.quarantined && cards.len() == 1 && prior.version == cards[0].version =>
-            {
+            Some(prior) if !prior.quarantined && unanimous && prior.version == cards[0].version => {
                 "existing"
             }
             _ => {
-                conflicts.insert(
-                    position.clone(),
-                    describe_conflict(&position, &cards, prior.as_ref())?,
-                );
+                if let Some(saved) = &prior
+                    && !saved.quarantined
+                {
+                    wanted_contexts.insert(position.clone(), saved.version.clone());
+                }
+                pending_conflicts.push((position.clone(), prior, cards.clone()));
                 "conflict"
             }
         };
@@ -118,7 +120,20 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
             json!({"move":first_reply(&cards[0].answers)?,"status":status,"position":position}),
         );
     }
-    let batched = 1 + plans.len() + 3 * new_responses > 128 || has_checkpoint(c, &command)?;
+    let mut contexts = catalog::reply_contexts(c, &scan.repertoire, &scan.color, wanted_contexts)?;
+    let conflicts = pending_conflicts
+        .into_iter()
+        .map(|(position, saved, cards)| {
+            let conflict = describe_conflict(
+                &position,
+                &cards,
+                saved.as_ref(),
+                contexts.remove(&position),
+            )?;
+            Ok((position, conflict))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let batched = 1 + 2 * plans.len() + 3 * new_responses > 128 || has_checkpoint(c, &command)?;
     let preview = json!({
         "command":command, "responses":rows, "batched":batched,
         "new_replies":new_responses, "conflicts":conflicts.values().collect::<Vec<_>>(),
@@ -140,12 +155,11 @@ struct SavedReply {
     version: String,
     quarantined: bool,
     answers: String,
-    context: Option<String>,
 }
 
 fn saved_reply(c: &Connection, repertoire: &str, position: &str) -> Result<Option<SavedReply>> {
     Ok(c.query_row(
-        "SELECT answer_version,quarantined,answers,context FROM cards
+        "SELECT answer_version,quarantined,answers FROM cards
          WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2 AND opening_retired=0
          ORDER BY quarantined LIMIT 1",
         (repertoire, position),
@@ -154,7 +168,6 @@ fn saved_reply(c: &Connection, repertoire: &str, position: &str) -> Result<Optio
                 version: row.get(0)?,
                 quarantined: row.get(1)?,
                 answers: row.get(2)?,
-                context: row.get(3)?,
             })
         },
     )
@@ -171,11 +184,10 @@ fn first_reply(answers: &str) -> Result<String> {
 
 #[derive(Serialize)]
 struct Reply {
-    #[serde(skip)]
-    route: Option<chess::Route>,
     movement: String,
     reply: String,
     line: Option<String>,
+    alternate_line: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -189,66 +201,70 @@ struct Conflict {
     unresolved: bool,
 }
 
+fn same_route(a: &chess::Route, b: &chess::Route) -> Result<bool> {
+    Ok(a.moves == b.moves
+        && chess::position_id(&chess::position(&a.fen)?)
+            == chess::position_id(&chess::position(&b.fen)?))
+}
+
 fn describe_conflict(
     position: &str,
     cards: &[&catalog::OpeningCard],
     saved: Option<&SavedReply>,
+    saved_route: Option<chess::Route>,
 ) -> Result<Conflict> {
     let board = chess::position(&cards[0].fen)?;
-    let mut proposed = Vec::new();
+    let mut transposition = false;
+    let mut proposals = BTreeMap::<&str, (Reply, bool)>::new();
     for card in cards {
-        let route = serde_json::from_str(&card.context)?;
+        let route: chess::Route = serde_json::from_str(&card.context)?;
+        let different = saved_route
+            .as_ref()
+            .map(|saved| same_route(saved, &route))
+            .transpose()?
+            .is_some_and(|same| !same);
+        transposition |= different;
+        if let Some((reply, first_is_different)) = proposals.get_mut(card.version.as_str()) {
+            if different && !*first_is_different && reply.alternate_line.is_none() {
+                reply.alternate_line = Some(gap_pgn::line_text(&route, position, &reply.movement)?);
+            }
+            continue;
+        }
         let movement = first_reply(&card.answers)?;
-        proposed.push(Reply {
+        let reply = Reply {
             line: Some(gap_pgn::line_text(&route, position, &movement)?),
             reply: gap_pgn::reply_text(&chess::position(&card.fen)?, &movement)?,
             movement,
-            route: Some(route),
-        });
+            alternate_line: None,
+        };
+        proposals.insert(&card.version, (reply, different));
     }
     let unresolved = saved.is_some_and(|saved| saved.quarantined);
     let saved = saved
         .filter(|saved| !saved.quarantined)
-        .map(|saved| -> Result<_> {
+        .map(|saved| -> Result<Reply> {
             let movement = first_reply(&saved.answers)?;
-            let route = saved
-                .context
-                .as_deref()
-                .and_then(|text| serde_json::from_str::<chess::Route>(text).ok());
-            let line = route
+            let position_board = saved_route
                 .as_ref()
-                .and_then(|route| gap_pgn::line_text(route, position, &movement).ok());
+                .map(|route| chess::board_at(route, route.moves.len()))
+                .transpose()?;
             Ok(Reply {
-                reply: gap_pgn::reply_text(&board, &movement)?,
+                reply: gap_pgn::reply_text(position_board.as_ref().unwrap_or(&board), &movement)?,
+                line: saved_route
+                    .as_ref()
+                    .map(|route| gap_pgn::line_text(route, position, &movement))
+                    .transpose()?,
                 movement,
-                route: route.filter(|_| line.is_some()),
-                line,
+                alternate_line: None,
             })
         })
         .transpose()?;
-    let transposition = saved
-        .as_ref()
-        .and_then(|reply| reply.route.as_ref())
-        .is_some_and(|saved_route| {
-            proposed
-                .iter()
-                .filter_map(|reply| reply.route.as_ref())
-                .any(|route| {
-                    route.moves != saved_route.moves
-                        || chess::position(&route.fen)
-                            .ok()
-                            .map(|b| chess::position_id(&b))
-                            != chess::position(&saved_route.fen)
-                                .ok()
-                                .map(|b| chess::position_id(&b))
-                })
-        });
     Ok(Conflict {
         position: position.into(),
         turn: chess::color_name(board.turn()),
         number: board.fullmoves().get(),
         saved,
-        proposed,
+        proposed: proposals.into_values().map(|(reply, _)| reply).collect(),
         transposition,
         unresolved,
     })
@@ -791,6 +807,55 @@ fn receipt(c: &Connection, id: &str) -> Result<Option<Value>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn repeated_pasted_reply_keeps_the_transposed_route_visible() -> Result<()> {
+        let authored = chess::parse_gap_pgn("1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. Bb5 *")?.main;
+        let canonical = chess::position_id(&chess::board_at(&authored, 6)?);
+        let same = chess::parse_gap_pgn("1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. d4 *")?.main;
+        let other = chess::parse_gap_pgn("1. Nf3 Nc6 2. e4 e5 3. Nc3 Nf6 4. d4 *")?.main;
+        let plan = |route| {
+            catalog::prepare_opening(&catalog::OpeningInput {
+                name: "Fixture".into(),
+                color: "white".into(),
+                route,
+                start_at: 6,
+            })
+        };
+        let saved = plan(authored.clone())?;
+        let same = plan(same)?;
+        let other = plan(other)?;
+        let conflict = describe_conflict(
+            &canonical,
+            &[&same.cards[0], &other.cards[0]],
+            Some(&SavedReply {
+                version: saved.cards[0].version.clone(),
+                quarantined: false,
+                answers: saved.cards[0].answers.clone(),
+            }),
+            Some(chess::Route {
+                fen: authored.fen,
+                moves: authored.moves[..6].to_vec(),
+            }),
+        )?;
+        assert_eq!(conflict.proposed.len(), 1);
+        assert!(conflict.transposition);
+        assert!(
+            conflict.proposed[0]
+                .line
+                .as_deref()
+                .unwrap()
+                .starts_with("1. e4")
+        );
+        assert!(
+            conflict.proposed[0]
+                .alternate_line
+                .as_deref()
+                .unwrap()
+                .starts_with("1. Nf3")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn preview_and_replace_transposed_reply_preserves_history_and_replays() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -815,6 +880,20 @@ mod tests {
                 name: "Retained suffix".into(),
                 color: "white".into(),
                 route: sibling,
+                start_at: 0,
+            },
+            Some(&repertoire),
+        )?;
+        let independent = chess::Route {
+            fen: chess::fen(&chess::board_at(&original, 8)?),
+            moves: vec!["b5c6".into()],
+        };
+        catalog::save_opening(
+            &c,
+            &catalog::OpeningInput {
+                name: "Same reply from a separate setup".into(),
+                color: "white".into(),
+                route: independent.clone(),
                 start_at: 0,
             },
             Some(&repertoire),
@@ -949,7 +1028,7 @@ mod tests {
                 [],
                 |row| row.get::<_, usize>(0)
             )?,
-            4
+            5
         );
         assert_eq!(
             saved_reply(&c, &repertoire, &old_position)?
@@ -970,6 +1049,16 @@ mod tests {
             )?,
             2
         );
+        let surviving_position = chess::position_id(&chess::position(&independent.fen)?);
+        let surviving = saved_reply(&c, &repertoire, &surviving_position)?.unwrap();
+        assert_eq!(surviving.answers, r#"["b5c6"]"#);
+        let routes = catalog::reply_contexts(
+            &c,
+            &repertoire,
+            "white",
+            BTreeMap::from([(surviving_position.clone(), surviving.version)]),
+        )?;
+        assert!(routes[&surviving_position].moves.is_empty());
         let input = json!({"dataset":dataset,"attempt":attempt,"played":"f1b5"});
         let intent: crate::study::AnswerWire = serde_json::from_value(input)?;
         let study = crate::review::answer(&mut c, intent.into())?;
