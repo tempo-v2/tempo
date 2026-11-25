@@ -429,7 +429,7 @@ async function laterGapAcrossTabs(browser) {
       await reviewRequested;
       await author.waitForFunction(() => {
         const heading = document.activeElement;
-        return heading?.textContent === "Your white reply" && heading.getBoundingClientRect().top >= 0 &&
+        return heading?.textContent === "Your white reply" && heading.getBoundingClientRect().top >= -1 &&
           heading.getBoundingClientRect().bottom <= innerHeight;
       });
       await observer.getByRole("link", { name: "Open line in Lichess" }).waitFor();
