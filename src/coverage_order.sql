@@ -6,4 +6,4 @@ CREATE TRIGGER prepare_card AFTER INSERT ON cards BEGIN
 END;
 CREATE INDEX prepared_forecast_due ON prepared_queue(forecast_group,rank,card_id,due_at)
  WHERE active=1 AND reserved=0 AND due_at IS NOT NULL AND forecast_group IS NOT NULL;
-CREATE TABLE applied_forecast(report TEXT PRIMARY KEY REFERENCES coverage_report(id)) STRICT;
+CREATE TABLE applied_forecast(command TEXT PRIMARY KEY,report TEXT NOT NULL REFERENCES coverage_report(id)) STRICT;

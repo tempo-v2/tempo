@@ -190,24 +190,44 @@ pub fn selected(c: &Connection, id: &str, index: usize) -> Result<(Scan, i64, Ga
     Ok((scan, rev, gap))
 }
 
-pub async fn apply(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+#[derive(Deserialize)]
+pub struct Apply {
+    command: String,
+}
+pub async fn apply(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<Apply>,
+) -> ApiResult {
     write_db(app, move |c| {
         let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (scan, rev, forecast) = load(&tx, &id)?;
-        if !tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM applied_forecast WHERE report=?1)",
-            [&id],
-            |r| r.get::<_, bool>(0),
-        )? {
+        ensure!(
+            input.command.len() == 36 && input.command.is_ascii(),
+            "Invalid apply command"
+        );
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT report FROM applied_forecast WHERE command=?1",
+                [&input.command],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior {
+            ensure!(prior == id, "Apply identity already used");
+        } else {
             ensure!(
                 revision(&tx, &scan.repertoire)? == rev,
-                "The repertoire changed. Rescan before applying."
+                crate::gap_edit::Stale
             );
             crate::opening_rank::apply_forecast(&tx, &id, &forecast.reach)?;
-            tx.execute("INSERT INTO applied_forecast VALUES(?1)", [&id])?;
+            tx.execute(
+                "INSERT INTO applied_forecast VALUES(?1,?2)",
+                (&input.command, &id),
+            )?;
         }
         tx.commit()?;
-        Ok(json!({"id":id,"cards":forecast.reach.len()}))
+        Ok(json!({"id":id,"command":input.command,"cards":forecast.reach.len()}))
     })
     .await
 }

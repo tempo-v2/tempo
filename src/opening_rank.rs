@@ -96,6 +96,10 @@ pub fn replace(db: &mut Connection, snapshot: RankSnapshot) -> Result<()> {
             "opening order contains an unknown or duplicate card"
         );
     }
+    tx.execute(
+        "UPDATE prepared_queue SET forecast_group=NULL WHERE forecast_group IS NOT NULL",
+        [],
+    )?;
     tx.execute("DELETE FROM opening_order", [])?;
     {
         let mut insert = tx.prepare("INSERT INTO opening_order(rank,card_id) VALUES (?1,?2)")?;

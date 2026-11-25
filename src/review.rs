@@ -117,6 +117,7 @@ mod tests {
                 include_str!("opening_order.sql"),
                 include_str!("game_pipeline.sql"),
                 include_str!("prepared_queue.sql"),
+                include_str!("coverage_order.sql"),
             ] {
                 db.execute_batch(schema)?;
             }
@@ -204,6 +205,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
         }
@@ -257,6 +259,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
         }

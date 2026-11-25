@@ -317,6 +317,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
         }
@@ -434,6 +435,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
         }
@@ -523,6 +525,7 @@ mod tests {
             )?;
         }
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("coverage_order.sql"))?;
         assert!(!seed_batch(&mut db)?);
         assert!(!prepared(&db)?);
         db.execute("INSERT INTO learning VALUES ('0001',1,1,1,9)", [])?;
@@ -552,6 +555,7 @@ mod tests {
         db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("coverage_order.sql"))?;
         db.execute_batch(
             "INSERT INTO cards (id,kind,title,color,fen,position_id,answers) VALUES
                 ('a','opening','First by id','white','','a','[]'),
