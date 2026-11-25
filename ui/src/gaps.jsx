@@ -96,6 +96,7 @@ export function Gaps() {
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
       {(report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,draft.previous))}>Retry scan</button>}
+      <button disabled={locked||report.stale} onClick={()=>run(async()=>{const result=await api("coverage/"+report.id+"/apply",{}); setMessage("Applied opening order for "+result.cards+" reached cards.");})}>Apply to opening order</button>
       {report.gaps.length>0 && <button disabled={locked||report.stale} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>

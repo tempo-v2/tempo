@@ -51,6 +51,7 @@ pub fn select(
         || new_opening_settings(db),
         |kind, candidates| {
             Ok(match candidates {
+                Candidates::Due if kind==CardKind::Opening => return due_opening(db,now),
                 Candidates::Due => db
                     .prepare_cached(&format!(
                         "SELECT card_id {PREPARED_DUE} ORDER BY due_at,card_id LIMIT 1"
@@ -73,6 +74,30 @@ pub fn select(
         },
     )?;
     Ok(chosen.map(|(id, kind)| (id, kind.as_str().to_owned())))
+}
+
+// The earliest due slot determines which applied forecast, if any, can reorder it.
+fn due_opening(db: &Connection, now: i64) -> Result<Option<String>> {
+    let head: Option<(String, Option<String>)> = db
+        .prepare_cached(&format!(
+            "SELECT card_id,forecast_group {PREPARED_DUE} ORDER BY due_at,card_id LIMIT 1"
+        ))?
+        .query_row(params!["opening", now], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((id, group)) = head else {
+        return Ok(None);
+    };
+    let Some(group) = group else {
+        return Ok(Some(id));
+    };
+    Ok(Some(
+        db.prepare_cached(
+            "SELECT card_id FROM prepared_queue
+        WHERE forecast_group=?1 AND active=1 AND reserved=0 AND due_at IS NOT NULL AND due_at<=?2
+        ORDER BY rank,card_id LIMIT 1",
+        )?
+        .query_row(params![group, now], |r| r.get(0))?,
+    ))
 }
 
 pub fn can_repeat(db: &Connection, card: &str) -> Result<bool> {
@@ -218,7 +243,7 @@ pub fn seed_batch(db: &mut Connection) -> Result<bool> {
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut insert = tx.prepare_cached(
-        "INSERT OR IGNORE INTO prepared_queue
+        "INSERT OR IGNORE INTO prepared_queue(card_id,kind,active,due_at,rank,reserved)
          SELECT c.id,c.kind,NOT c.quarantined,l.due_at,o.rank,d.card_id IS NOT NULL
          FROM cards c LEFT JOIN learning l ON l.card_id=c.id
          LEFT JOIN opening_order o ON o.card_id=c.id LEFT JOIN deck d ON d.card_id=c.id

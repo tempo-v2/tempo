@@ -1,7 +1,7 @@
 // Offline rankers consume this catalogue snapshot and return only a ranked list of IDs.
 use crate::{chess, db};
 use anyhow::{Result, ensure};
-use rusqlite::{Connection, TransactionBehavior::Immediate, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -104,5 +104,48 @@ pub fn replace(db: &mut Connection, snapshot: RankSnapshot) -> Result<()> {
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+// Reorder only the reached cards' existing slots. Unranked reached cards get
+// fresh slots after the saved order. The surrounding writer transaction also
+// publishes the prepared due-review membership and the application receipt.
+pub fn apply_forecast(
+    db: &Connection,
+    report: &str,
+    reach: &std::collections::HashMap<String, f64>,
+) -> Result<()> {
+    let mut q = db.prepare("SELECT rank FROM opening_order WHERE card_id=?1")?;
+    let mut next: i64 =
+        db.query_row("SELECT coalesce(max(rank),0) FROM opening_order", [], |r| {
+            r.get(0)
+        })?;
+    let mut cards: Vec<_> = reach.keys().collect();
+    cards.sort();
+    let mut ranked = vec![];
+    for card in cards {
+        let rank = q.query_row([card], |r| r.get::<_, i64>(0)).optional()?;
+        let slot = rank.unwrap_or_else(|| {
+            next += 1;
+            next
+        });
+        ranked.push((card, slot, reach[card]));
+    }
+    let mut slots: Vec<_> = ranked.iter().map(|(_, slot, _)| *slot).collect();
+    slots.sort_unstable();
+    ranked.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    for (card, _, _) in &ranked {
+        db.execute("DELETE FROM opening_order WHERE card_id=?1", [card])?;
+    }
+    for ((card, _, _), slot) in ranked.into_iter().zip(slots) {
+        db.execute("INSERT INTO opening_order VALUES(?1,?2)", (slot, card))?;
+        ensure!(
+            db.execute(
+                "UPDATE prepared_queue SET forecast_group=?1 WHERE card_id=?2",
+                (report, card)
+            )? == 1,
+            "Study is preparing. Retry after preparation completes."
+        );
+    }
     Ok(())
 }
