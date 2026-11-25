@@ -28,12 +28,35 @@ pub struct PositionIr(Chess);
 
 impl PositionIr {
     pub fn parse(fen: &str) -> Result<Self, Error> {
-        if fen.len() > 256 || fen.split_ascii_whitespace().count() != 6 {
+        let fields = fen.split_ascii_whitespace();
+        if fen.len() > 256
+            || !fen
+                .bytes()
+                .all(|byte| byte == b' ' || (byte.is_ascii_graphic() && byte != b'_'))
+            || fields.clone().count() != 6
+        {
             return Err(Error::InvalidRequest);
         }
-        chess::position(fen)
-            .map(Self)
-            .map_err(|_| Error::InvalidRequest)
+        let mut counters = fields.clone().rev();
+        let fullmove = counters.next().unwrap_or_default();
+        let halfmove = counters.next().unwrap_or_default();
+        if !fullmove.bytes().all(|byte| byte.is_ascii_digit())
+            || !fullmove.bytes().any(|byte| byte != b'0')
+            || !halfmove.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let board = chess::position(fen).map_err(|_| Error::InvalidRequest)?;
+        // The generic parser also accepts variant FEN and normalizes its fields.
+        let standard = chess::fen(&board);
+        if fields
+            .step_by(2)
+            .take(2)
+            .ne(standard.split_ascii_whitespace().step_by(2).take(2))
+        {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(Self(board))
     }
 }
 
