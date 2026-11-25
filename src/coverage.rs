@@ -186,13 +186,7 @@ pub fn backfill_views(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn revision(c: &Connection, rep: &str) -> Result<i64> {
-    Ok(c.query_row(
-        "SELECT COALESCE((SELECT revision FROM coverage_revision WHERE repertoire=?1),0)",
-        [rep],
-        |r| r.get(0),
-    )?)
-}
+pub use catalog::authored_reply_revision as revision;
 
 pub fn load(c: &Connection, id: &str) -> Result<(Scan, i64, Forecast)> {
     let (request, rev, report): (String, i64, String) = c

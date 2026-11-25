@@ -209,6 +209,14 @@ pub fn reply_contexts(
     Ok(found)
 }
 
+pub fn authored_reply_revision(c: &Connection, rep: &str) -> Result<i64> {
+    Ok(c.query_row(
+        "SELECT COALESCE((SELECT revision FROM coverage_revision WHERE repertoire=?1),0)",
+        [rep],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn existing_repertoire(db: &Connection, id: &str, color: &str) -> Result<()> {
     ensure!(
         db.query_row(

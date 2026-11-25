@@ -164,3 +164,16 @@ highest-ranked eligible review when the next due opening belongs to that
 group. The command preserves committed attempts, Again placement and FSRS due
 times. Rank preparation runs outside the writer and activates in one commit
 after bounded staging turns.
+
+### Repertoire move similarity
+
+Export one repertoire's active replies with
+`tempo repertoire-similarity-input DATABASE REPERTOIRE COLOR`.
+Pass that JSON as `repertoire` in a request with the complete position `fen`
+to `tempo repertoire-similarity` on stdin. Optional `options.count` accepts
+1–10 and defaults to 5. The reply gives the closest saved example for each
+distinct legal move, using the repertoire's practice side. Distance compares
+piece placement, castling rights and legally available en passant. Zero
+distance means the same chess position. A ranked result can be empty.
+Terminal and opponent-turn results have their own statuses. Errors are JSON
+and exit nonzero. These commands leave the repertoire and Study data untouched.

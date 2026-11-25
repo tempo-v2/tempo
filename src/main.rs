@@ -20,6 +20,7 @@ mod optional_read;
 mod providers;
 mod queue;
 mod queue_store;
+mod repertoire_similarity;
 mod review;
 mod scanner;
 mod study;
@@ -886,6 +887,19 @@ async fn main() -> Result<()> {
             println!("{id}");
             Ok(())
         }
+        [command] if command == "repertoire-similarity" => {
+            match repertoire_similarity::cli(io::stdin().lock()) {
+                Ok(result) => println!("{}", serde_json::to_string(&result)?),
+                Err(error) => {
+                    println!("{}", json!({"status":"error","error":error}));
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        }
+        [command, db, repertoire, color] if command == "repertoire-similarity-input" => {
+            repertoire_similarity::export(Path::new(db), repertoire, color)
+        }
         [command, db] if command == "opening-rank-input" => {
             let database = Database::read(Path::new(db))?;
             let snapshot = database.unchecked_transaction()?;
@@ -900,7 +914,7 @@ async fn main() -> Result<()> {
             opening_rank::replace(&mut database, snapshot)
         }
         _ => anyhow::bail!(
-            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT"
+            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT | tempo repertoire-similarity | tempo repertoire-similarity-input DB REPERTOIRE COLOR"
         ),
     }
 }
