@@ -8,21 +8,41 @@ function stored(key) {
   try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
 }
 function restore() {
-  return { ...stored(storage), pending: stored(storage + ".save"), applyCommand: stored(storage + ".apply") };
+  return {
+    ...stored(storage),
+    pending: stored(storage + ".save"),
+    applyCommand: stored(storage + ".apply"),
+    saveAcknowledgement: stored(storage + ".saved"),
+    applyAcknowledgement: stored(storage + ".applied"),
+  };
 }
+const journalChanged = storage + ".changed";
+const acknowledgementKey = kind => storage + (kind === "save" ? ".saved" : ".applied");
+
 async function claimCommand(kind, command) {
   return navigator.locks.request(storage + "." + kind, () => {
     const key = storage + "." + kind;
     const current = stored(key);
     if (current) return current.command === command.command;
+    if (stored(acknowledgementKey(kind))?.command === command.command) return false;
     localStorage.setItem(key, JSON.stringify(command));
+    window.dispatchEvent(new Event(journalChanged));
     return true;
   });
 }
-async function clearCommand(kind, command) {
-  await navigator.locks.request(storage + "." + kind, () => {
+
+async function settleCommand(kind, command, acknowledgement) {
+  return navigator.locks.request(storage + "." + kind, () => {
     const key = storage + "." + kind;
-    if (stored(key)?.command === command.command) localStorage.removeItem(key);
+    if (stored(key)?.command !== command.command) return false;
+    if (acknowledgement) {
+      localStorage.setItem(acknowledgementKey(kind), JSON.stringify({
+        command: command.command, ...acknowledgement,
+      }));
+    }
+    localStorage.removeItem(key);
+    window.dispatchEvent(new Event(journalChanged));
+    return true;
   });
 }
 function notation(game) {
@@ -86,7 +106,18 @@ export function Gaps() {
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; scanOwner.current?.abort(); };
+    const storageChanged = event => {
+      if (event.key === null || event.key === storage || event.key.startsWith(storage + ".")) refreshJournal();
+    };
+    window.addEventListener(journalChanged, refreshJournal);
+    window.addEventListener("storage", storageChanged);
+    refreshJournal();
+    return () => {
+      mounted.current = false;
+      scanOwner.current?.abort();
+      window.removeEventListener(journalChanged, refreshJournal);
+      window.removeEventListener("storage", storageChanged);
+    };
   }, []);
   const [books, setBooks] = useState([]);
   const [report,setReport] = useState(null);
@@ -100,13 +131,15 @@ export function Gaps() {
   const [message,setMessage] = useState("");
   const [reload, setReload] = useState(0);
   function refreshJournal() {
-    setDraft({ ...form.current, pending: stored(storage + ".save"), applyCommand: stored(storage + ".apply") });
+    const current = restore();
+    form.current = current;
+    setDraft(current);
   }
   function update(patch) {
-    form.current = { ...form.current, ...patch };
-    localStorage.setItem(storage, JSON.stringify(form.current));
+    localStorage.setItem(storage, JSON.stringify({ ...stored(storage), ...patch }));
     refreshJournal();
   }
+  const requestedReport = draft.pending?.draft.report ?? draft.report;
   useEffect(() => {
     const ctrl=new AbortController();
     async function loadBooks() {
@@ -119,6 +152,12 @@ export function Gaps() {
       } while (page.length === 50);
       setBooks(options);
     }
+    setError("");
+    void loadBooks().catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
+    return () => ctrl.abort();
+  }, [reload]);
+  useEffect(() => {
+    const ctrl = new AbortController();
     async function loadReport() {
       const saved = { ...form.current, pending: stored(storage + ".save") };
       const reportId = saved.pending?.draft.report ?? saved.report;
@@ -131,15 +170,14 @@ export function Gaps() {
         const page = await api("coverage/" + reportId + "/gaps?offset=" + offset, undefined, ctrl.signal);
         result.selectedGap = page.gaps[index - offset];
       }
-      const latest = { ...form.current, pending: stored(storage + ".save") };
-      if ((latest.pending?.draft.report ?? latest.report) === reportId) setReport(result);
+      const latest = restore();
+      if (!ctrl.signal.aborted && (latest.pending?.draft.report ?? latest.report) === reportId) setReport(result);
     }
-    setError("");
-    const failed = e => { if (!ctrl.signal.aborted) setError(e.message); };
-    void loadBooks().catch(failed);
-    void loadReport().catch(failed);
+    if (requestedReport !== report?.id || reload) {
+      void loadReport().catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
+    }
     return () => ctrl.abort();
-  }, [reload]);
+  }, [reload, requestedReport]);
   const reportId = report?.id;
   useEffect(() => {
     if (!reportId) return;
@@ -161,9 +199,16 @@ export function Gaps() {
     const controller = new AbortController();
     scanOwner.current = controller;
     const signal = controller.signal;
+    const scanDraft = localStorage.getItem(storage);
+    const acceptedSave = localStorage.getItem(acknowledgementKey("save"));
+    const acceptedApply = localStorage.getItem(acknowledgementKey("apply"));
     const {id}=await api("coverage",request,signal,{requireJson:true});
     const next=await api("coverage/"+id+"/gaps",undefined,signal);
     signal.throwIfAborted();
+    if (localStorage.getItem(storage) !== scanDraft ||
+        localStorage.getItem(acknowledgementKey("save")) !== acceptedSave ||
+        localStorage.getItem(acknowledgementKey("apply")) !== acceptedApply ||
+        stored(storage + ".save") || stored(storage + ".apply")) return;
     setReport(next);clearPreview();
     if (reportId === id) setSummaryRetry(n => n + 1);
     update({report:id,index:null,pgn:"",replacements:noReplacements,previous:null,savedReport:null});
@@ -204,7 +249,7 @@ export function Gaps() {
     } catch(e) {
       const stale = e.code === "stale_gap" || e.code === "gap_save_interrupted";
       if(stale || e.code==="opening_reply_conflict" || e.code==="replacement_over_budget" || e.code==="replacement_preview_unavailable") {
-        await clearCommand("save", command);
+        await settleCommand("save", command);
         refreshJournal();
         clearPreview();
         if (stale) setReport(old=>({...old,stale:true}));
@@ -217,13 +262,13 @@ export function Gaps() {
     }
     if(receipt?.command!==command.command || !Array.isArray(receipt.lines) || !receipt.lines.length)
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
-    setReport(old=>({...old,stale:true}));
-    setMessage(command.replacements ? "Repertoire changes and continuation saved." : "Continuation saved.");
-    await clearCommand("save", command);
     const previous = report.model_superseded ? null : report.authored;
-    update({previous,savedReport:command.draft.report});
+    const accepted = await settleCommand("save", command, {
+      report: command.draft.report, replacement: Boolean(command.replacements), previous,
+    });
+    setMessage("");
     clearPreview();
-    await scan(report.scan,previous);
+    if (accepted && stored(storage)?.report === command.draft.report) await scan(report.scan, previous);
   }
   async function applyOrder(pending) {
     if (!await claimCommand("apply", pending)) {
@@ -234,12 +279,10 @@ export function Gaps() {
     try {
       const reply = await api("coverage/" + pending.report + "/apply", { command: pending.command });
       if(reply?.command!==pending.command || reply.id!==pending.report)throw new Error("Retry applying the opening order.");
-      await clearCommand("apply", pending);
-      refreshJournal();
-      setMessage("Applied opening order for "+reply.cards+" reached cards. New cards use this order when Maia is selected in Settings.");
+      await settleCommand("apply", pending, { report: reply.id, cards: reply.cards });
     } catch(e) {
       if (e.code === "stale_gap" || e.code === "coverage_model_superseded") {
-        await clearCommand("apply", pending);
+        await settleCommand("apply", pending);
         refreshJournal();
       }
       throw e;
@@ -293,7 +336,14 @@ export function Gaps() {
   const conflicts = currentPreview?.conflicts ?? [];
   const replacement = currentPreview?.replacement;
   const confirming = replacement && confirmation === replacement.command;
-  const blocked = locked || report?.stale;
+  const saveAcknowledgement = draft.saveAcknowledgement?.report === reportId ? draft.saveAcknowledgement : null;
+  const applyAcknowledgement = draft.applyAcknowledgement?.report === reportId ? draft.applyAcknowledgement : null;
+  const saved = saveAcknowledgement || (draft.savedReport && draft.savedReport === reportId);
+  const previous = saveAcknowledgement ? saveAcknowledgement.previous : draft.previous;
+  const savedMessage = saveAcknowledgement?.replacement ? "Repertoire changes and continuation saved." : "Continuation saved.";
+  const appliedMessage = applyAcknowledgement && "Applied opening order for "+applyAcknowledgement.cards+" reached cards. New cards use this order when Maia is selected in Settings.";
+  const status = message || (!draft.pending && saved && savedMessage);
+  const blocked = locked || report?.stale || Boolean(saved);
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
       {!book && <option value="" disabled>Select a repertoire</option>}
@@ -302,7 +352,8 @@ export function Gaps() {
       <label>Through my move <input type="number" min="1" max="100" value={draft.through??10} onChange={e=>update({through:e.target.value})}/></label>
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
     {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
-    {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{(message || (draft.savedReport && draft.savedReport === report?.id)) && <p role="status">{message || "Continuation saved."}</p>}
+    {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{status && <p role="status">{status}</p>}
+    {!draft.applyCommand && appliedMessage && <p role="status">{appliedMessage}</p>}
     {draft.applyCommand && <button disabled={busy} onClick={() => run(() => applyOrder(draft.applyCommand))}>Retry applying order</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
@@ -310,9 +361,9 @@ export function Gaps() {
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {currentSummary?.unavailable ? <button onClick={() => setSummaryRetry(n => n + 1)}>Retry summary</button> : currentSummary ? range(currentSummary.studied,report.unresolved) : "Loading…"}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
       {report.model_superseded && <p>Rescan with the current model before using these probabilities to set your opening order.</p>}
-      {(report.model_superseded||report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : draft.previous))}>Retry scan</button>}
-      <button disabled={locked||report.stale||report.model_superseded} onClick={()=>run(() => applyOrder({ report: report.id, command: crypto.randomUUID() }))}>Apply to opening order</button>
-      {report.gaps.length>0 && <button disabled={locked||report.stale} onClick={()=>open(0)}>Work on next gap</button>}
+      {(report.model_superseded||report.stale||error||saved||previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : previous))}>Retry scan</button>}
+      <button disabled={blocked||report.model_superseded} onClick={()=>run(() => applyOrder({ report: report.id, command: crypto.randomUUID() }))}>Apply to opening order</button>
+      {report.gaps.length>0 && <button disabled={blocked} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
         <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value});}}/></label>
@@ -363,7 +414,7 @@ export function Gaps() {
           </div>}
         </section>}
       </section>}
-      <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
+      <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={blocked} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
       {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
         const page=await api("coverage/"+report.id+"/gaps?offset="+report.gaps.length);
         setReport({...page,selectedGap:report.selectedGap,gaps:[...report.gaps,...page.gaps]});

@@ -34,6 +34,9 @@ function seedReport(db, id, repertoire, fen, moves) {
     VALUES (${quoted(id)},${quoted(repertoire)}, (SELECT revision FROM coverage_revision WHERE repertoire=${quoted(repertoire)}),${quoted(scan)},${quoted(report)});
     INSERT INTO coverage_view VALUES (${quoted(id)},${quoted(header)},'{"cards":[],"paths":[]}'${projectedModel});
     INSERT INTO coverage_gap_page VALUES (${quoted(id)},0,${quoted(gaps)});`);
+  if (sql(db, "SELECT count(*) FROM sqlite_schema WHERE name='coverage_rank_input'") === "1") {
+    sql(db, `INSERT INTO coverage_rank_input VALUES (${quoted(id)},'{}',0);`);
+  }
 }
 
 async function withServer(binary, db, operation, env = process.env) {
@@ -188,11 +191,147 @@ async function browserFlow(browser) {
     assert.ok(request);
     await page.reload();
     await openGaps(page, origin);
+    let replayed;
+    let deliverReplay;
+    const holdReplay = new Promise(resolve => { deliverReplay = resolve; });
+    const replayReady = new Promise(resolve => { replayed = resolve; });
+    await page.route("**/api/coverage/replace", async route => {
+      const response = await route.fetch();
+      replayed({ request: route.request().postDataJSON(), accepted: response.ok() });
+      await holdReplay;
+      await route.fulfill({ response });
+    }, { times: 1 });
     await page.getByRole("button", { name: "Retry same save" }).click();
-    await page.getByText("Repertoire changes and continuation saved.", { exact: true }).waitFor();
+    try {
+      assert.deepEqual(await replayReady, { request, accepted: true });
+      await page.getByRole("button", { name: "Games", exact: true }).click();
+      await page.getByRole("button", { name: "Openings", exact: true }).click();
+      await page.getByRole("button", { name: "Retry same save" }).waitFor();
+      deliverReplay();
+      await page.getByText("Repertoire changes and continuation saved.", { exact: true }).waitFor();
+      assert.equal(await page.getByRole("button", { name: "Retry same save" }).count(), 0);
+    } finally {
+      deliverReplay();
+    }
     assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt;"), "1");
     assert.equal(sql(db, "SELECT count(*) FROM openings WHERE archived=1;"), "2");
     await page.close();
+  });
+}
+
+async function saveReplyAcrossRemount(browser) {
+  const db = path.join(folder, "save-remount.sqlite3");
+  await withServer(candidate, db, async (origin, api) => {
+    const repertoire = await addOpening(api, "Save remount", ["e2e4", "e7e5", "g1f3"]);
+    seedReport(db, "saved-report", repertoire, anchor, ["g1f3", "b8c6"]);
+    const page = await browser.newPage();
+    await page.addInitScript(key => {
+      if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({
+        report: "saved-report", index: 0, pgn: "1. Nf3 Nc6 2. d4 *"
+      }));
+    }, journal);
+    let saves = 0;
+    let scans = 0;
+    let committed;
+    let deliver;
+    const heldReply = new Promise(resolve => { deliver = resolve; });
+    const saved = new Promise(resolve => { committed = resolve; });
+    await page.route("**/api/coverage/save", async route => {
+      saves++;
+      const response = await route.fetch();
+      committed(response.ok());
+      await heldReply;
+      await route.fulfill({ response });
+    });
+    await page.route("**/api/coverage", async route => {
+      scans++;
+      await route.abort();
+    });
+    try {
+      await openGaps(page, origin);
+      await page.getByRole("button", {name:"Preview", exact:true}).click();
+      await page.getByRole("button", {name:"Save to repertoire", exact:true}).click();
+      assert.equal(await saved, true);
+      assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
+      await page.getByRole("button", {name:"Games", exact:true}).click();
+      await page.getByRole("button", {name:"Openings", exact:true}).click();
+      const retry = page.getByRole("button", {name:"Retry same save"});
+      await retry.waitFor();
+      deliver();
+      await page.getByText("Continuation saved.", {exact:true}).waitFor({timeout:3000});
+      assert.equal(await retry.count(), 0);
+      assert.equal(scans, 0);
+      await page.getByRole("button", {name:"Retry scan", exact:true}).click();
+      await page.getByRole("alert").waitFor();
+      assert.equal(scans, 1);
+      assert.equal(saves, 1);
+      assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
+    } finally {
+      deliver();
+      await page.close();
+    }
+  });
+}
+
+async function applyReplyAcrossViews(browser) {
+  const db = path.join(folder, "apply-remount.sqlite3");
+  await withServer(candidate, db, async (origin, api) => {
+    const repertoire = await addOpening(api, "Apply remount", ["e2e4", "e7e5", "g1f3"]);
+    seedReport(db, "apply-report", repertoire, anchor, ["g1f3", "b8c6"]);
+    const context = await browser.newContext();
+    await context.addInitScript(key => {
+      if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({
+        report: "apply-report", index: 0, pgn: "1. Nf3 Nc6 2. d4 *"
+      }));
+    }, journal);
+    const page = await context.newPage();
+    const second = await context.newPage();
+    let deliver;
+    let committed;
+    const held = new Promise(resolve => { deliver = resolve; });
+    const ready = new Promise(resolve => { committed = resolve; });
+    await page.route("**/api/coverage/apply-report/apply", async route => {
+      const response = await route.fetch();
+      committed(response.ok());
+      await held;
+      await route.fulfill({ response });
+    }, { times: 1 });
+    try {
+      await openGaps(page, origin);
+      await page.getByRole("button", { name: "Apply to opening order" }).click();
+      assert.equal(await ready, true);
+      await page.getByRole("button", { name: "Games", exact: true }).click();
+      await page.getByRole("button", { name: "Openings", exact: true }).click();
+      await page.getByRole("button", { name: "Retry applying order" }).waitFor();
+      await openGaps(second, origin);
+      // The second tab resolves the exact replay, then starts a newer command.
+      await second.getByRole("button", { name: "Retry applying order" }).click();
+      await second.getByText(/Applied opening order for 0 reached cards/).waitFor();
+      const editor = second.getByRole("textbox", { name: "Paste PGN from Lichess" });
+      await editor.fill("1. Nf3 Nc6 2. e4 *");
+      let nextCommand;
+      await second.route("**/api/coverage/apply-report/apply", async route => {
+        nextCommand = route.request().postDataJSON();
+        await route.abort();
+      }, { times: 1 });
+      await second.getByRole("button", { name: "Apply to opening order" }).click();
+      await second.getByRole("alert").waitFor();
+      const delivered = page.waitForResponse("**/api/coverage/apply-report/apply");
+      deliver();
+      await delivered;
+      await page.getByRole("button", { name: "Retry applying order" }).waitFor();
+      assert.equal(await editor.inputValue(), "1. Nf3 Nc6 2. e4 *");
+      assert.deepEqual(await page.evaluate(key => JSON.parse(localStorage.getItem(key)), journal + ".apply"),
+        { ...nextCommand, report: "apply-report" });
+      assert.equal(sql(db, "SELECT count(*) FROM applied_forecast"), "1");
+      await second.getByRole("button", { name: "Retry applying order" }).click();
+      await page.getByText(/Applied opening order for 0 reached cards/).waitFor();
+      assert.equal(await page.getByRole("button", { name: "Retry applying order" }).count(), 0);
+      assert.equal(sql(db, "SELECT count(*) FROM applied_forecast"), "2");
+    } finally {
+      deliver();
+      await context.close();
+    }
   });
 }
 
@@ -288,6 +427,8 @@ async function previousCommands() {
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true });
+    await saveReplyAcrossRemount(browser);
+    await applyReplyAcrossViews(browser);
     await browserFlow(browser);
     await cancelledScans(browser);
     await previousCommands();
