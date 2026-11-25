@@ -202,9 +202,20 @@ struct Conflict {
 }
 
 fn same_route(a: &chess::Route, b: &chess::Route) -> Result<bool> {
-    Ok(a.moves == b.moves
-        && chess::position_id(&chess::position(&a.fen)?)
-            == chess::position_id(&chess::position(&b.fen)?))
+    let mut board = chess::position(&a.fen)?;
+    if a.moves.len() != b.moves.len()
+        || chess::position_id(&board) != chess::position_id(&chess::position(&b.fen)?)
+    {
+        return Ok(false);
+    }
+    for (left, right) in a.moves.iter().zip(&b.moves) {
+        let movement = chess::parse_move(&board, left)?;
+        if chess::parse_move(&board, right).ok() != Some(movement) {
+            return Ok(false);
+        }
+        board.play_unchecked(movement);
+    }
+    Ok(true)
 }
 
 fn describe_conflict(
@@ -898,6 +909,16 @@ mod tests {
             },
             Some(&repertoire),
         )?;
+        let context_only = catalog::save_opening(
+            &c,
+            &catalog::OpeningInput {
+                name: "Historical lead-in only".into(),
+                color: "white".into(),
+                route: original.clone(),
+                start_at: 8,
+            },
+            Some(&repertoire),
+        )?;
         let old_position = chess::position_id(&chess::board_at(&original, 6)?);
         let old_id: String = c.query_row(
             "SELECT id FROM cards WHERE position_id=?1 AND repertoire_id=?2",
@@ -1028,7 +1049,7 @@ mod tests {
                 [],
                 |row| row.get::<_, usize>(0)
             )?,
-            5
+            6
         );
         assert_eq!(
             saved_reply(&c, &repertoire, &old_position)?
@@ -1058,7 +1079,19 @@ mod tests {
             "white",
             BTreeMap::from([(surviving_position.clone(), surviving.version)]),
         )?;
-        assert!(routes[&surviving_position].moves.is_empty());
+        let surviving_route = &routes[&surviving_position];
+        assert_eq!(
+            chess::position_id(&chess::board_at(
+                surviving_route,
+                surviving_route.moves.len()
+            )?),
+            surviving_position
+        );
+        assert!(!c.query_row(
+            "SELECT archived FROM openings WHERE id=?1",
+            [&context_only],
+            |row| row.get::<_, bool>(0)
+        )?);
         let input = json!({"dataset":dataset,"attempt":attempt,"played":"f1b5"});
         let intent: crate::study::AnswerWire = serde_json::from_value(input)?;
         let study = crate::review::answer(&mut c, intent.into())?;

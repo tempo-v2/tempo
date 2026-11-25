@@ -89,18 +89,26 @@ impl Rules<'_> {
         let mut result = Rewritten::default();
         let mut board = chess::position(&input.route.fen)?;
         let mut original_board = board.clone();
+        let mut changed = false;
         for (ply, original) in input.route.moves.iter().enumerate() {
             let position = chess::position_id(&board);
-            let played = self.selected.get(&position).unwrap_or(original);
-            let Ok(movement) = chess::parse_move(&board, played) else {
+            let original_move = chess::parse_move(&board, original).ok();
+            let owned = ply >= input.start_at && chess::color_name(board.turn()) == input.color;
+            let movement = match self.selected.get(&position).filter(|_| owned) {
+                Some(selected) => chess::parse_move(&board, selected).ok(),
+                None => original_move,
+            };
+            let Some(movement) = movement else {
                 result.stopped_at = Some(format!(
                     "{} becomes illegal.",
                     gap_pgn::reply_text(&original_board, original)?
                 ));
                 break;
             };
-            if ply >= input.start_at && chess::color_name(board.turn()) == input.color {
-                let version = chess::id(&["answer-v1", played]);
+            let canonical = chess::uci(movement);
+            changed |= Some(movement) != original_move;
+            if owned && changed {
+                let version = chess::id(&["answer-v1", &canonical]);
                 let mut lookup = self.db.prepare_cached(
                     "SELECT answer_version,quarantined FROM cards
                      WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2 AND opening_retired=0
@@ -116,7 +124,7 @@ impl Rules<'_> {
                     .get(&position)
                     .or_else(|| self.proposed.get(&position))
                 {
-                    Some(expected) => expected != played,
+                    Some(expected) => *expected != canonical,
                     None => {
                         current
                             .as_ref()
@@ -124,22 +132,23 @@ impl Rules<'_> {
                             || self.competing.contains(&position)
                     }
                 };
-                // Legacy lines may already contain disagreements. Only a changed path
-                // is subject to the replacement's continuation checks.
-                if result.moves != input.route.moves[..ply] || played != original {
-                    if incompatible {
-                        result.stopped_at = Some(format!(
-                            "{} would introduce another reply conflict.",
-                            gap_pgn::reply_text(&board, played)?
-                        ));
-                        break;
-                    }
-                    if current.is_none() && !self.proposed.contains_key(&position) {
-                        result.new_replies.push((position, played.clone()));
-                    }
+                if incompatible {
+                    result.stopped_at = Some(format!(
+                        "{} would introduce another reply conflict.",
+                        gap_pgn::reply_text(&board, &canonical)?
+                    ));
+                    break;
+                }
+                if current.is_none() && !self.proposed.contains_key(&position) {
+                    result.new_replies.push((position, canonical.clone()));
                 }
             }
-            result.moves.push(played.clone());
+            let stored = if original_move == Some(movement) {
+                original.clone()
+            } else {
+                canonical
+            };
+            result.moves.push(stored);
             board.play_unchecked(movement);
             let old = chess::parse_move(&original_board, original)?;
             original_board.play_unchecked(old);
@@ -367,4 +376,40 @@ pub fn apply(db: &Connection, repertoire: &str, replacement: &Replacement) -> Re
         .iter()
         .map(|line| catalog::apply_opening(db, line, Some(repertoire), true))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_a_castle_when_its_uci_spelling_differs() -> Result<()> {
+        let files = tempfile::tempdir()?;
+        let db = crate::Database::init(&files.path().join("test.sqlite3"))?;
+        let mut route =
+            chess::parse_gap_pgn("1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. Bb5 a6 5. O-O *")?.main;
+        route.moves[8] = "e1h1".into();
+        let position = chess::position_id(&chess::board_at(&route, 6)?);
+        let selected = Choices::from([(position, "f1c4".into())]);
+        let redirected =
+            chess::parse_gap_pgn("1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. Bc4 a6 5. O-O *")?.main;
+        let castle = chess::position_id(&chess::board_at(&redirected, 8)?);
+        let proposed = Choices::from([(castle, "e1g1".into())]);
+        let rules = Rules {
+            db: &db,
+            repertoire: "fixture",
+            proposed: &proposed,
+            selected: &selected,
+            competing: &BTreeSet::new(),
+        };
+        let rewrite = rules.rewrite(&catalog::OpeningInput {
+            name: "Fixture".into(),
+            color: "white".into(),
+            route,
+            start_at: 0,
+        })?;
+        assert!(rewrite.stopped_at.is_none());
+        assert_eq!(rewrite.moves[8], "e1h1");
+        Ok(())
+    }
 }

@@ -249,7 +249,8 @@ export function Gaps() {
   }
   function isCurrent(candidate, choices) {
     return mounted.current && form.current?.report === candidate.report && form.current?.index === candidate.gap &&
-      form.current?.pgn === candidate.pgn && (form.current?.replacements ?? noReplacements) === choices;
+      form.current?.pgn === candidate.pgn &&
+      JSON.stringify(form.current?.replacements ?? noReplacements) === JSON.stringify(choices);
   }
   async function previewDraft(candidate, choices) {
     clearPreview();
