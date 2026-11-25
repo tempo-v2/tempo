@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    io,
+    fs, io,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -10,6 +11,21 @@ const LIMIT: usize = 64 * 1024;
 
 pub fn socket_path(database: &Path) -> PathBuf {
     database.with_extension("tq").join("io")
+}
+
+/// Check the configured worker directory and return the expected peer UID.
+pub fn private_directory_owner(database: &Path) -> io::Result<u32> {
+    let work = socket_path(database);
+    let directory = fs::symlink_metadata(work.parent().expect("worker path has a parent"))?;
+    let owner = fs::metadata(database)?.uid();
+    if directory.is_dir() && directory.mode() & 0o777 == 0o700 && directory.uid() == owner {
+        Ok(owner)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unsafe tactic worker directory",
+        ))
+    }
 }
 
 pub fn status_path(database: &Path) -> PathBuf {

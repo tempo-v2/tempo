@@ -60,6 +60,7 @@ use tower_http::services::{ServeDir, ServeFile};
 type App = Arc<Runtime>;
 struct Runtime {
     database: PathBuf,
+    opening_engine: Option<opening_engine::Endpoint>,
     writer: writer::Writer,
     staging: uploads::Staging,
     content_preparation: Arc<Semaphore>,
@@ -70,6 +71,7 @@ impl Runtime {
     fn new(database: PathBuf, writer: writer::Writer, staging: uploads::Staging) -> Self {
         Self {
             database,
+            opening_engine: None,
             writer,
             staging,
             content_preparation: Arc::new(Semaphore::new(2)),
@@ -763,10 +765,14 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
                 }
             })?;
     }
-    if let Err(error) = tactic_worker_socket::start(&db, writer.clone()) {
-        eprintln!("Tactic worker handoff unavailable: {error:#}");
+    let mut runtime = Runtime::new(db, writer, staging);
+    match tactic_worker_socket::start(&runtime.database, runtime.writer.clone()) {
+        Ok(owner) => {
+            runtime.opening_engine = Some(opening_engine::Endpoint::new(&runtime.database, owner));
+        }
+        Err(error) => eprintln!("Tactic worker handoff unavailable: {error:#}"),
     }
-    let app = router(&path, port, Arc::new(Runtime::new(db, writer, staging)));
+    let app = router(&path, port, Arc::new(runtime));
     println!("Tempo at http://127.0.0.1:{port}");
     axum::serve(listener, app).await?;
     Ok(())

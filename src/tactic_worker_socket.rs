@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, DirBuilder},
     io::ErrorKind,
-    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt},
+    os::unix::fs::{DirBuilderExt, FileTypeExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -21,7 +21,7 @@ use tokio::{
 
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 
-pub fn start(database: &Path, writer: Writer) -> Result<()> {
+pub fn start(database: &Path, writer: Writer) -> Result<u32> {
     let path = wire::socket_path(database);
     let directory = path.parent().context("Missing tactic worker directory")?;
     match DirBuilder::new().mode(0o700).create(directory) {
@@ -29,13 +29,7 @@ pub fn start(database: &Path, writer: Writer) -> Result<()> {
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
         Err(err) => return Err(err.into()),
     }
-    let metadata = fs::symlink_metadata(directory)?;
-    ensure!(
-        metadata.is_dir()
-            && metadata.mode() & 0o777 == 0o700
-            && metadata.uid() == fs::metadata(database)?.uid(),
-        "Unsafe tactic worker directory"
-    );
+    let owner = wire::private_directory_owner(database)?;
     // The caller holds the exclusive database lock through shutdown.
     let work = bind(&path)?;
     listen(work, database.to_owned(), writer.clone(), false);
@@ -43,7 +37,7 @@ pub fn start(database: &Path, writer: Writer) -> Result<()> {
         Ok(status) => listen(status, database.to_owned(), writer, true),
         Err(error) => eprintln!("Tactic worker status unavailable: {error:#}"),
     }
-    Ok(())
+    Ok(owner)
 }
 
 fn bind(path: &Path) -> Result<UnixListener> {

@@ -6,7 +6,7 @@ use fs2::FileExt;
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
-    os::unix::fs::{FileTypeExt, MetadataExt},
+    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -130,13 +130,7 @@ async fn turn(path: &Path, engine: &Stockfish, admission: &Semaphore) -> Result<
 
 fn bind_engine(database: &Path) -> Result<UnixListener> {
     let path = wire::engine_path(database);
-    let directory = fs::symlink_metadata(path.parent().context("Missing worker directory")?)?;
-    ensure!(
-        directory.is_dir()
-            && directory.mode() & 0o777 == 0o700
-            && directory.uid() == fs::metadata(database)?.uid(),
-        "Unsafe worker directory"
-    );
+    wire::private_directory_owner(database)?;
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(&path)?,
         Ok(_) => anyhow::bail!("Opening engine path is occupied"),
