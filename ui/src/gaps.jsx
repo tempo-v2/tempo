@@ -142,8 +142,7 @@ export function Gaps() {
     setPreview(null);
     await scan(report.scan,report.authored);
   }
-  async function applyOrder() {
-    const pending = restore().applyCommand ?? { report: report.id, command: crypto.randomUUID() };
+  async function applyOrder(pending) {
     if (!await claimCommand("apply", pending)) {
       refreshJournal();
       return;
@@ -176,14 +175,14 @@ export function Gaps() {
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
     {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
     {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{message && <p role="status">{message}</p>}
-    {draft.applyCommand && <button disabled={busy} onClick={() => run(applyOrder)}>Retry applying order</button>}
+    {draft.applyCommand && <button disabled={busy} onClick={() => run(() => applyOrder(draft.applyCommand))}>Retry applying order</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · Maia-2 Rapid 1500/1500</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
       {(report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,draft.previous))}>Retry scan</button>}
-      <button disabled={locked||report.stale} onClick={()=>run(applyOrder)}>Apply to opening order</button>
+      <button disabled={locked||report.stale} onClick={()=>run(() => applyOrder({ report: report.id, command: crypto.randomUUID() }))}>Apply to opening order</button>
       {report.gaps.length>0 && <button disabled={locked||report.stale} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
