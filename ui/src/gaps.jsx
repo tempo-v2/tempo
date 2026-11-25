@@ -149,11 +149,12 @@ export function Gaps() {
     if(receipt?.command!==command.command || !Array.isArray(receipt.lines) || !receipt.lines.length)
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
     setReport(old=>({...old,stale:true}));
-    setMessage("Continuation saved. Refreshing coverage…");
+    setMessage("Continuation saved.");
     await clearCommand("save", command);
-    update({previous:report.authored});
+    const previous = report.model_superseded ? null : report.authored;
+    update({previous});
     setPreview(null);
-    await scan(report.scan,report.authored);
+    await scan(report.scan,previous);
   }
   async function applyOrder(pending) {
     if (!await claimCommand("apply", pending)) {
@@ -168,7 +169,7 @@ export function Gaps() {
       refreshJournal();
       setMessage("Applied opening order for "+reply.cards+" reached cards. New cards use this order when Maia is selected in Settings.");
     } catch(e) {
-      if (e.code === "stale_gap") {
+      if (e.code === "stale_gap" || e.code === "coverage_model_superseded") {
         await clearCommand("apply", pending);
         refreshJournal();
       }
@@ -191,11 +192,12 @@ export function Gaps() {
     {draft.applyCommand && <button disabled={busy} onClick={() => run(() => applyOrder(draft.applyCommand))}>Retry applying order</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
-      <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · Maia-2 Rapid 1500/1500</p>
+      <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · {report.model}</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
-      {(report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,draft.previous))}>Retry scan</button>}
-      <button disabled={locked||report.stale} onClick={()=>run(() => applyOrder({ report: report.id, command: crypto.randomUUID() }))}>Apply to opening order</button>
+      {report.model_superseded && <p>Rescan with the current model before using these probabilities to set your opening order.</p>}
+      {(report.model_superseded||report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : draft.previous))}>Retry scan</button>}
+      <button disabled={locked||report.stale||report.model_superseded} onClick={()=>run(() => applyOrder({ report: report.id, command: crypto.randomUUID() }))}>Apply to opening order</button>
       {report.gaps.length>0 && <button disabled={locked||report.stale} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
