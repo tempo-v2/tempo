@@ -141,8 +141,8 @@ the same SQL budget as other optional reads.
 ### Repertoire coverage
 
 On the Tempo host, run `tools/setup-coverage.sh` once (requires uv). It provisions
-Maia-2 Rapid on CPU. Scans use the same 1500/1500 profile as the installed
-opening rank. In Openings → Gaps, choose a repertoire, starting PGN and horizon.
+Maia-3 5M on CPU. Scans use 1500/1500 Elo and include the available recent
+move history. In Openings → Gaps, choose a repertoire, starting PGN and horizon.
 The forecast follows your saved responses and branches on Maia's opponent move
 probabilities. Authored coverage counts complete paths through your chosen move.
 Personally studied coverage requires a completed review on each current response.
@@ -156,7 +156,9 @@ transpositions and variations. Save commits those lines together. Scanning and
 previewing leave the repertoire and learning history untouched.
 
 After a scan, **Apply to opening order** ranks reached opening cards by their
-estimated chance of occurring. New cards use the saved order when Settings →
+estimated chance of occurring. An older Maia-2 report can still be read and
+its PGN edits retried. Rescan before applying its order. New cards use the saved
+order when Settings →
 New openings uses Maia. Within an applied group, the due selector chooses the
 highest-ranked eligible review when the next due opening belongs to that
 group. The command preserves committed attempts, Again placement and FSRS due

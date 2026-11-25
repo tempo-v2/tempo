@@ -1,7 +1,7 @@
 """Coverage arithmetic with explicit conditional opponent distributions."""
 import unittest
 import chess
-from coverage import forecast
+from coverage import forecast, key, recent_positions
 
 
 class CoverageTest(unittest.TestCase):
@@ -35,6 +35,48 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(dict(report["paths"]), {("g3", "shared"): .7, ("nf3", "shared"): .3})
         bounded = forecast(data, predict, limit=4)
         self.assertAlmostEqual(sum(m for _, m in bounded["paths"]) + bounded["unresolved"], 1.)
+
+    def test_prediction_history_distinguishes_transpositions(self):
+        def play(moves):
+            board = chess.Board()
+            for move in moves:
+                board.push_uci(move)
+            return board
+
+        left = play(["g1f3", "d7d5", "g2g3"])
+        right = play(["g2g3", "d7d5", "g1f3"])
+        self.assertEqual(key(left), key(right))
+        self.assertNotEqual(
+            [key(position) for position in recent_positions(left, 8)],
+            [key(position) for position in recent_positions(right, 8)],
+        )
+        self.assertEqual(
+            [key(position) for position in recent_positions(left, 2)],
+            [key(play(["g1f3", "d7d5"])), key(left)],
+        )
+        self.assertEqual(len(left.move_stack), 3)
+
+    def test_retreat_uses_conditional_move_probability(self):
+        board = chess.Board()
+        board.push_san("e4")
+        card = board.copy()
+        card.push_san("Nc6")
+        data = dict(route=dict(fen=chess.STARTING_FEN, moves=["e2e4"]),
+                    color="white", through=3,
+                    cards=[dict(fen=card.fen(), id="nf3", answers=["g1f3"], quarantined=False)])
+
+        def predict(position):
+            moves = dict.fromkeys((move.uci() for move in position.legal_moves), 0.)
+            if len(position.move_stack) == 1:
+                moves.update(b8c6=.2, e7e5=.8)
+            else:
+                moves.update(c6b8=.1, e7e5=.9)
+            return moves
+
+        report = forecast(data, predict)
+        gaps = {tuple(gap["moves"]): gap["probability"] for gap in report["gaps"]}
+        self.assertAlmostEqual(gaps["b8c6", "g1f3", "c6b8"], .02)
+        self.assertAlmostEqual(sum(gaps.values()) + report["unresolved"], 1.)
 
     def test_white_horizon_conflict_and_terminal(self):
         board = chess.Board()

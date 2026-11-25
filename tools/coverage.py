@@ -12,43 +12,56 @@ import sys
 
 import chess
 
-DIGEST = "65aae8465eed5e65df66a24ea7370715579f9e5435098d06fe18bdb1e267e997"
+MODEL = "maia3-5m-1500-history-v1"
+WEIGHTS_SHA256 = "ba14208b2992d85502f5fb501934abf6aaaeb355e9f3fdf90e326911f562524f"
+RATING = 1500
 
 
 def key(board):
     return " ".join(board.fen().split()[:4])
 
 
+def recent_positions(board, count):
+    """Current position and its predecessors, oldest first, without changing board."""
+    recent = board.copy(stack=count - 1)
+    positions = [recent.copy(stack=False)]
+    while recent.move_stack:
+        recent.pop()
+        positions.append(recent.copy(stack=False))
+    return positions[::-1]
+
+
 def maia(root):
     import torch
-    from maia2 import inference, model
-    from maia2.utils import mirror_move
+    from maia3.dataset import get_historical_tokens, tokenize_board
+    from maia3.uci import load_model, parse_args
+    from maia3.utils import get_all_possible_moves, mirror_move
 
-    weights = root / "weights" / "rapid_model.pt"
-    if hashlib.sha256(weights.read_bytes()).hexdigest() != DIGEST:
-        raise ValueError("Maia Rapid weights failed verification")
+    weights = root / "weights" / "maia3-5m.pt"
+    if hashlib.sha256(weights.read_bytes()).hexdigest() != WEIGHTS_SHA256:
+        raise ValueError("Maia-3 5M weights failed verification")
     torch.set_num_threads(2)
-    network = model.from_pretrained("rapid", device="cpu", save_root=str(weights.parent))
-    network.eval()
-    moves, ratings, decoded = inference.prepare()
-    cache = sqlite3.connect(root / ("coverage-1500-" + DIGEST + ".sqlite3"))
-    cache.execute("create table if not exists prediction(position text primary key, moves text not null)")
+    cfg = parse_args(["--model", "5m", "--device", "cpu", "--checkpoint-path", str(weights)])
+    network = load_model(cfg)
+    ratings = torch.tensor([RATING])
+    indices = {move: index for index, move in enumerate(get_all_possible_moves())}
+    cache = sqlite3.connect(root / f"coverage-5m-{RATING}-{WEIGHTS_SHA256}-v1.sqlite3")
+    cache.execute("create table if not exists prediction(history text primary key, moves text not null)")
 
     def predict(board):
-        position = key(board)
-        row = cache.execute("select moves from prediction where position=?", (position,)).fetchone()
+        positions = recent_positions(board, cfg.history)
+        history = "|".join(key(position) for position in positions)
+        row = cache.execute("select moves from prediction where history=?", (history,)).fetchone()
         if row:
             return json.loads(row[0])
-        tensor, own, opponent, mask = inference.preprocessing(board.fen(), 1500, 1500, ratings, moves)
+        moves = sorted(move.uci() for move in board.legal_moves)
+        legal = [indices[move if board.turn else mirror_move(move)] for move in moves]
         with torch.inference_mode():
-            logits, _, _ = network(tensor.unsqueeze(0), torch.tensor([own]), torch.tensor([opponent]))
-            legal = mask.nonzero().flatten()
+            tokens = get_historical_tokens([tokenize_board(pos) for pos in positions], cfg, 0., 0., 0., 0.)
+            logits, _, _ = network(tokens.unsqueeze(0), ratings, ratings)
             probabilities = torch.softmax(logits[0, legal].double(), dim=0).tolist()
-        distribution = {}
-        for index, probability in zip(legal.tolist(), probabilities):
-            move = decoded[index]
-            distribution[move if board.turn else mirror_move(move)] = probability
-        cache.execute("insert or replace into prediction values (?,?)", (position, json.dumps(distribution)))
+        distribution = dict(zip(moves, probabilities))
+        cache.execute("insert or replace into prediction values (?,?)", (history, json.dumps(distribution)))
         cache.commit()
         return distribution
     return predict
@@ -114,4 +127,5 @@ if __name__ == "__main__":
     root = pathlib.Path(sys.argv[1])
     with contextlib.redirect_stdout(sys.stderr):
         report = forecast(json.load(sys.stdin), maia(root))
+    report["model"] = MODEL
     print(json.dumps(report, allow_nan=False))

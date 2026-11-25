@@ -81,6 +81,13 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if self.0.is::<coverage::SupersededModel>() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"code":"coverage_model_superseded","error":self.0.to_string()})),
+            )
+                .into_response();
+        }
         if self.0.is::<gap_edit::Interrupted>() {
             return (
                 StatusCode::CONFLICT,
