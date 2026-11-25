@@ -115,6 +115,16 @@ async function fullLineRecovery(browser, db) {
       page.on("request", request => {
         if (request.method() === "POST") commands.push([new URL(request.url()).pathname, request.postDataJSON()]);
       });
+      const showSolution = page.getByRole("button", { name: "Show solution", exact: true });
+      const backToResult = page.getByRole("button", { name: "Back to result", exact: true });
+      await showSolution.focus();
+      await page.keyboard.press("Space");
+      await backToResult.waitFor();
+      assert.equal(await backToResult.evaluate(button => button === document.activeElement), true);
+      await page.keyboard.press("Space");
+      await showSolution.waitFor();
+      assert.equal(await showSolution.evaluate(button => button === document.activeElement), true);
+      assert.deepEqual(commands, []);
       await page.route(nextPattern, route => route.abort(), { times: 1 });
       await page.getByRole("button", { name: "Next", exact: true }).click();
       await retry(page).waitFor();

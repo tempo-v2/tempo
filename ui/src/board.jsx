@@ -66,7 +66,7 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
   </div>;
 }
 
-export function Replay({ route, color, ply, onPly, sounds, layout }) {
+export function Replay({ route, color, ply, onPly, sounds, controlsTarget }) {
   const game = position(route, ply);
   const timeline = position(route).history({ verbose: true });
   function seek(next) {
@@ -92,5 +92,5 @@ export function Replay({ route, color, ply, onPly, sounds, layout }) {
         onClick={() => seek(index + 1)}>{san}</button>)}
     </div>
   </>;
-  return layout ? layout(board, controls) : <>{board}{controls}</>;
+  return <>{board}{controlsTarget ? createPortal(controls, controlsTarget) : controls}</>;
 }
