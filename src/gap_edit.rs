@@ -24,6 +24,14 @@ pub struct Draft {
     report: String,
     gap: usize,
     pgn: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<DraftAnchor>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DraftAnchor {
+    RecordedLeadIn,
 }
 
 struct Edit {
@@ -46,6 +54,16 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
     let command = chess::id(&["gap-save-v1", &serde_json::to_string(&draft)?]);
     let (scan, revision, gap) = coverage::selected(c, &draft.report, draft.gap)?;
     let target = chess::position_id(&chess::position(&gap.fen)?);
+    let prefix = draft
+        .anchor
+        .map(|DraftAnchor::RecordedLeadIn| coverage::recorded_lead_in(&scan, &gap));
+    if let Some(prefix) = &prefix {
+        let board = chess::board_at(prefix, prefix.moves.len())?;
+        ensure!(
+            chess::position_id(&board) == target,
+            "The recorded lead-in does not reach this gap."
+        );
+    }
     let game = chess::parse_gap_pgn(&draft.pgn).map_err(|error| {
         if error.is::<chess::ExpandedPgn>() {
             anyhow::anyhow!(
@@ -58,16 +76,24 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
     let mut plans = vec![];
     let mut included = HashSet::new();
     for route in std::iter::once(game.main).chain(game.variations) {
-        let mut board = chess::position(&route.fen)?;
-        let mut anchor = None;
-        for (ply, m) in route.moves.iter().enumerate() {
-            if chess::position_id(&board) == target {
-                anchor = Some(ply);
-                break;
+        let anchor = match &prefix {
+            Some(prefix) => {
+                let ply = prefix.moves.len();
+                if route.moves.len() <= ply
+                    || !same_route(
+                        prefix,
+                        &chess::Route {
+                            fen: route.fen.clone(),
+                            moves: route.moves[..ply].to_vec(),
+                        },
+                    )?
+                {
+                    continue;
+                }
+                Some(ply)
             }
-            let legal = chess::parse_move(&board, m)?;
-            board.play_unchecked(legal);
-        }
+            None => first_anchor(&route, &target)?,
+        };
         let Some(start_at) = anchor else { continue };
         if !included.insert((route.fen.clone(), route.moves.clone())) {
             continue;
@@ -158,6 +184,18 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
         anchor: target,
         conflicts,
     })
+}
+
+fn first_anchor(route: &chess::Route, target: &str) -> Result<Option<usize>> {
+    let mut board = chess::position(&route.fen)?;
+    for (ply, movement) in route.moves.iter().enumerate() {
+        if chess::position_id(&board) == target {
+            return Ok(Some(ply));
+        }
+        let legal = chess::parse_move(&board, movement)?;
+        board.play_unchecked(legal);
+    }
+    Ok(None)
 }
 
 fn first_reply(answers: &str) -> Result<String> {
@@ -924,6 +962,7 @@ mod tests {
             report: "scan".into(),
             gap: 0,
             pgn: "1. Nf3 Nc6 2. e4 e5 3. Nc3 Nf6 4. d4 *".into(),
+            anchor: None,
         };
         let route = main(&draft.pgn)?;
         let anchor = chess::board_at(&route, 2)?;

@@ -391,7 +391,9 @@ export function Gaps() {
   const isPending = command => command === draft.pending?.command || command === draft.applyCommand?.command;
   const busy = !!work && (work.command ? isPending(work.command) : work.view === viewIdentity(draft));
   const locked = busy || !!draft.pending || !!draft.applyCommand;
-  const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
+  const staged = gap && report ? stagedLead(report, gap, gapIndex, draft) : null;
+  const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??"",
+    ...(staged ? { anchor: "recorded_lead_in" } : {})};
   const replacements = draft.replacements ?? noReplacements;
   const hasReplacements = Object.keys(replacements).length > 0;
 
@@ -402,7 +404,9 @@ export function Gaps() {
   }
   function isCurrent(candidate, choices) {
     const latest = restore();
-    return mounted.current && latest.report === candidate.report && latest.index === candidate.gap &&
+    const anchor = gap && report && stagedLead(report, gap, gapIndex, latest)
+      ? "recorded_lead_in" : undefined;
+    return candidate.anchor === anchor && mounted.current && latest.report === candidate.report && latest.index === candidate.gap &&
       latest.pgn === candidate.pgn && latest.saveAcknowledgement?.report !== candidate.report &&
       latest.savedReport !== candidate.report &&
       JSON.stringify(latest.replacements ?? noReplacements) === JSON.stringify(choices);
@@ -463,7 +467,6 @@ export function Gaps() {
   const status = pendingFeedback?.message || (!draft.pending && saved && savedMessage) || message;
   const blocked = locked || report?.stale || Boolean(saved);
   const blockedSelection = locked || Boolean(saved);
-  const staged = gap && report ? stagedLead(report, gap, gapIndex, draft) : null;
   const reviewStart = requestedReview?.report === reportId && requestedReview?.index === gapIndex ? requestedReview : null;
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>

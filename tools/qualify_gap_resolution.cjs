@@ -550,7 +550,8 @@ async function reviewWinningMoves(browser, stockfish) {
   const mate = "7k/8/5KQ1/8/8/8/8/8 w - - 0 1";
   await withServer(candidate, db, async (origin, api) => {
     const repertoire = await addOpening(api, "Mate review", ["e2e4"]);
-    seedReport(db, "review", repertoire, mate, [], { fen: mate, moves: [] });
+    const cycle = ["g6g1", "h8h7", "g1g6", "h7h8"];
+    seedReport(db, "review", repertoire, mate.replace("0 1", "4 3"), [], { fen: mate, moves: cycle });
     const page = await browser.newPage();
     let popups = 0;
     page.on("popup", () => popups++);
@@ -585,7 +586,7 @@ async function reviewWinningMoves(browser, stockfish) {
       await table.getByRole("button", { name: last.san, exact: true }).click();
       await page.getByRole("button", { name: "Use reply", exact: true }).click();
       const draft = await page.getByRole("textbox", { name: "Paste PGN from Lichess" }).inputValue();
-      assert.ok(draft.includes(mate) && draft.includes(last.san));
+      assert.ok(draft.includes(mate) && draft.includes("Qg1 Kh7 2. Qg6+ Kh8 3. " + last.san));
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "0");
       const optional = page.getByRole("link", { name: "Extend staged reply in Lichess" });
       assert.ok(decodeURIComponent(await optional.getAttribute("href")).includes(last.san.replaceAll("+", "")));
@@ -594,7 +595,11 @@ async function reviewWinningMoves(browser, stockfish) {
       await optional.click();
       await (await opened).close();
 
+      const preview = page.waitForResponse("**/api/coverage/preview");
       await page.getByRole("button", { name: "Preview", exact: true }).click();
+      const previewed = await (await preview).json();
+      assert.equal(previewed.new_replies, 1);
+      assert.deepEqual(previewed.responses.map(response => response.move), [last.first_move]);
       await page.getByRole("button", { name: "Save to repertoire", exact: true }).click();
       await page.getByText("Continuation saved.", { exact: true }).waitFor();
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");

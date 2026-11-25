@@ -317,6 +317,12 @@ pub fn selected(c: &Connection, id: &str, index: usize) -> Result<(Scan, i64, Ga
     Ok((scan, rev, gap))
 }
 
+pub fn recorded_lead_in(scan: &Scan, gap: &Gap) -> chess::Route {
+    let mut route = scan.route.clone();
+    route.moves.extend(gap.moves.iter().cloned());
+    route
+}
+
 #[derive(Deserialize)]
 pub struct Apply {
     command: String,
