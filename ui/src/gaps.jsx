@@ -4,8 +4,26 @@ import { api } from "./api.js";
 import { position } from "./board.jsx";
 
 const storage = "tempo-lean-gap-draft-v1";
+function stored(key) {
+  try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
+}
 function restore() {
-  try { return JSON.parse(localStorage.getItem(storage)) ?? {}; } catch { return {}; }
+  return { ...stored(storage), pending: stored(storage + ".save"), applyCommand: stored(storage + ".apply") };
+}
+async function claimCommand(kind, command) {
+  return navigator.locks.request(storage + "." + kind, () => {
+    const key = storage + "." + kind;
+    const current = stored(key);
+    if (current) return current.command === command.command;
+    localStorage.setItem(key, JSON.stringify(command));
+    return true;
+  });
+}
+async function clearCommand(kind, command) {
+  await navigator.locks.request(storage + "." + kind, () => {
+    const key = storage + "." + kind;
+    if (stored(key)?.command === command.command) localStorage.removeItem(key);
+  });
 }
 function notation(game) {
   return game.history({verbose:true}).map(m => (m.color === "w" ? m.before.split(" ")[5] + ". " : "") + m.san).join(" ");
@@ -29,7 +47,7 @@ export function Gaps() {
   const [message,setMessage] = useState("");
   const [reload, setReload] = useState(0);
   function update(patch) {
-    const next={...restore(),...patch};
+    const next={...stored(storage),...patch};
       localStorage.setItem(storage, JSON.stringify(next));
     setDraft(next);
   }
@@ -93,19 +111,19 @@ export function Gaps() {
     setPreview(null);setMessage("");update({index,pgn:""});
   }
   async function save(command) {
-    const current = restore().pending;
-    if (current && current.command !== command.command) {
+    if (!await claimCommand("save", command)) {
       setDraft(restore());
       setReload(n => n + 1);
       return;
     }
-    update({pending:command});
+    setDraft(restore());
     let receipt;
     try {
       receipt=await api("coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
       if(e.code==="stale_gap") {
-        if (restore().pending?.command === command.command) update({pending:null});
+        await clearCommand("save", command);
+        setDraft(restore());
         setPreview(null);
         setReport(old=>({...old,stale:true}));
       }
@@ -115,20 +133,29 @@ export function Gaps() {
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
     setReport(old=>({...old,stale:true}));
     setMessage("Continuation saved. Refreshing coverage…");
-    if (restore().pending?.command === command.command) update({pending:null,previous:report.authored});
+    await clearCommand("save", command);
+    update({previous:report.authored});
     setPreview(null);
     await scan(report.scan,report.authored);
   }
   async function applyOrder() {
     const pending = restore().applyCommand ?? { report: report.id, command: crypto.randomUUID() };
-    update({applyCommand:pending});
+    if (!await claimCommand("apply", pending)) {
+      setDraft(restore());
+      return;
+    }
+    setDraft(restore());
     try {
       const reply = await api("coverage/" + pending.report + "/apply", { command: pending.command });
       if(reply?.command!==pending.command || reply.id!==pending.report)throw new Error("Retry applying the opening order.");
-      if (restore().applyCommand?.command === pending.command) update({applyCommand:null});
+      await clearCommand("apply", pending);
+      setDraft(restore());
       setMessage("Applied opening order for "+reply.cards+" reached cards. New cards use this order when Maia is selected in Settings.");
     } catch(e) {
-      if (e.code === "stale_gap" && restore().applyCommand?.command === pending.command) update({applyCommand:null});
+      if (e.code === "stale_gap") {
+        await clearCommand("apply", pending);
+        setDraft(restore());
+      }
       throw e;
     }
   }
