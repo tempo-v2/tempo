@@ -8,7 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const net = require("node:net");
 
-const [candidate, predecessor, retainedDatabase] = process.argv.slice(2).map(p => path.resolve(p));
+const [candidate, predecessor, retainedDatabase, packArtifact, legacyStudyClient] = process.argv.slice(2).map(p => path.resolve(p));
 const chrome = process.env.TEMPO_QUALIFY_CHROME ||
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -61,6 +61,110 @@ async function seed(api) {
 function grades(db) {
   return Number(execFileSync("sqlite3", ["-readonly", db,
     "SELECT count(*) FROM attempts WHERE result IS NOT NULL"], { encoding: "utf8" }));
+}
+
+async function openPuzzle(api, puzzle, options = {}) {
+  const { dataset, revision } = await api("tactics/packs");
+  const start = { dataset, revision, puzzle, request: crypto.randomUUID(), practice: false, ...options };
+  return { start, play: await api("tactics/plays", start) };
+}
+
+async function fullLineRecovery(browser, db) {
+  const port = await unusedPort();
+  const page = await browser.newPage();
+  try {
+    await serve(legacyStudyClient, db, port, async (origin, api) => {
+      await api("tactics", { name: "Old card", pgn: "1. e4 e5 1-0" });
+      await page.goto(origin);
+      await reveal(page).click();
+      await next(page).waitFor();
+    });
+    execFileSync(candidate, ["migrate-games", db]);
+    execFileSync(candidate, ["import-lichess-packs", db, packArtifact]);
+    // Give the repeat deck an empty starting slot on this disposable fixture.
+    execFileSync("sqlite3", [db, "DELETE FROM deck"]);
+    await serve(candidate, db, port, async (origin, api) => {
+      const { play } = await openPuzzle(api, "03N75");
+      const move = { dataset: play.dataset, play: play.play, step: 0 };
+      await assert.rejects(api("tactics/plays/move", move), /missing field/);
+      assert.equal(grades(db), 1);
+      await api("tactics/plays/move", { ...move, played: null });
+      await next(page).click();
+      const rejected = page.waitForResponse(res => res.url().endsWith("/api/study/answer"));
+      await reveal(page).click();
+      assert.equal((await (await rejected).json()).code, "refresh_required");
+      await retry(page).waitFor();
+      await page.reload();
+      await page.getByRole("button", { name: "Reveal solution" }).waitFor();
+      assert.equal(await retry(page).count(), 0);
+      assert.equal(grades(db), 2);
+      const current = await api("study");
+      const studyMove = { dataset: current.dataset, play: current.puzzle.play, step: 0 };
+      await assert.rejects(api("study/puzzle-move", studyMove), /missing field/);
+      const continued = await api("study/puzzle-move", { ...studyMove, played: "d6b8" });
+      assert.equal(continued.result, null);
+      const finish = { ...studyMove, step: continued.step, played: "a7b8r" };
+      const solved = await api("study/puzzle-move", finish);
+      assert.equal(solved.result.rating, "Good");
+      assert.equal(solved.solution.moves.at(-1), "a7b8r");
+      assert.deepEqual(await api("study/puzzle-move", finish), solved);
+      assert.equal(grades(db), 3);
+      await page.reload();
+      await page.getByRole("status").filter({ hasText: "Solved" }).waitFor();
+      const commands = [];
+      page.on("request", request => {
+        if (request.method() === "POST") commands.push([new URL(request.url()).pathname, request.postDataJSON()]);
+      });
+      await page.route(nextPattern, route => route.abort(), { times: 1 });
+      await page.getByRole("button", { name: "Next", exact: true }).click();
+      await retry(page).waitFor();
+      assert.equal(await page.getByRole("status").filter({ hasText: "Solved" }).count(), 1);
+      await retry(page).click();
+      await retry(page).waitFor({ state: "hidden" });
+      const expectedNext = ["/api/study/next", { after: current.attempt, dataset: current.dataset }];
+      assert.deepEqual(commands, [expectedNext, expectedNext]);
+      assert.equal(grades(db), 3);
+    });
+  } finally {
+    await page.context().close();
+  }
+  console.log("A legacy tab's rejected Answer recovered after reload; missing actions produced no grade and the alternate mating finish replayed once.");
+}
+
+async function startRecovery(db) {
+  let historical, historicalMove, historicalReply, pending, undelivered;
+  execFileSync(predecessor, ["import-lichess-packs", db, packArtifact]);
+  await serve(predecessor, db, await unusedPort(), async (_, api) => {
+    historical = await openPuzzle(api, "03N75");
+    historicalMove = { dataset: historical.play.dataset, play: historical.play.play, step: 0, played: "d6b8" };
+    historicalReply = await api("tactics/plays/move", historicalMove);
+    const { puzzles } = await api("tactics/packs/fork/1000");
+    pending = await openPuzzle(api, puzzles.find(row => row.puzzle !== "03N75").puzzle);
+    undelivered = { dataset: pending.play.dataset, play: pending.play.play, step: 0, played: null };
+  });
+  execFileSync(candidate, ["migrate-games", db]);
+  await serve(candidate, db, await unusedPort(), async (_, api) => {
+    assert.deepEqual(await api("tactics/plays", historical.start), historicalReply);
+    assert.deepEqual(await api("tactics/plays/move", historicalMove), historicalReply);
+    const accepted = await api("tactics/plays/move", undelivered);
+    assert.equal(accepted.result.rating, "Again");
+    assert.deepEqual(await api("tactics/plays/move", undelivered), accepted);
+    const current = await openPuzzle(api, historical.start.puzzle);
+    assert.equal(current.play.play, historical.play.play);
+    await assert.rejects(api("tactics/plays", { ...current.start, revision: "changed" }));
+    await assert.rejects(api("tactics/plays", { ...current.start, request: crypto.randomUUID(), revision: "changed" }));
+    const finish = await api("tactics/plays/move", { ...historicalMove, step: historicalReply.step, played: "a7b8r" });
+    assert.equal(finish.result.rating, "Good");
+    assert.deepEqual(await api("tactics/plays", current.start), finish);
+    assert.equal(grades(db), 2);
+    const { play: enPassant } = await openPuzzle(api, "07Duy");
+    const capture = { dataset: enPassant.dataset, play: enPassant.play, step: enPassant.step };
+    await assert.rejects(api("tactics/plays/move", { ...capture, played: "b4c3q" }), /illegal_move/);
+    assert.deepEqual(await api(`tactics/plays/${enPassant.play}`), enPassant);
+    const legalCapture = await api("tactics/plays/move", { ...capture, played: "b4c3" });
+    assert.ok(legalCapture.step > enPassant.step);
+  });
+  console.log("Schema-12 Start and Move recovery preserved the original play and receipt. New Starts fence their catalog revision.");
 }
 
 async function studyDrop(browser, db, { fen, solution, from, to, piece, promotion, correction, retryLost }) {
@@ -821,6 +925,17 @@ async function openingPreview(browser, db) {
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true, timeout: 15000 });
+    if (process.env.TEMPO_QUALIFY_PACKS_ONLY === "1") {
+      assert.ok(retainedDatabase && packArtifact && legacyStudyClient, "Provide all predecessor inputs");
+      for (const accepted of [true, false]) {
+        const copy = path.join(root, `retained-${accepted}.db`);
+        execFileSync("sqlite3", ["-readonly", retainedDatabase, ".backup " + copy]);
+        await predecessorRecovery(browser, copy, accepted, { retained: true });
+      }
+      await fullLineRecovery(browser, path.join(root, "legacy-full-line.db"));
+      await startRecovery(path.join(root, "pack-schema12.db"));
+      return;
+    }
     const rookFen = "4k3/n7/8/8/8/8/8/R3K3 w - - 0 1";
     for (const [name, move] of Object.entries({
       capture: { fen: rookFen, solution: "Rxa7", from: "a1", to: "a7", piece: "rook", retryLost: true },
@@ -843,6 +958,10 @@ async function openingPreview(browser, db) {
         await predecessorRecovery(browser, copy, accepted, { retained: true });
       }
       console.log("Both predecessor Answer deliveries recovered on copies of its retained database.");
+    }
+    if (packArtifact && legacyStudyClient) {
+      await fullLineRecovery(browser, path.join(root, "legacy-full-line.db"));
+      await startRecovery(path.join(root, "pack-schema12.db"));
     }
     await twoTabs(browser, path.join(root, "concurrent.db"));
     await mixedTabs(browser, path.join(root, "mixed.db"));
