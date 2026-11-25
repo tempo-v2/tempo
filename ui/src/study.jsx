@@ -109,6 +109,7 @@ function decodeStudyReply(body, dataset) {
     throw new Error(incomplete);
   }
   const result = body.result === null ? null : decodeResult(body.result, incomplete);
+  if (result === null && body.legal.length === 0) throw new Error(incomplete);
   // The server supplies the allowed moves. Verify that the board can render
   // those moves and the feedback from this position before replacing the card.
   let playable;
