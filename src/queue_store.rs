@@ -94,9 +94,15 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
         [],
         |row| row.get(0),
     )?;
-    let mut counts = Counts { new: 0, reviews: 0 };
-    let mut unseen = db.prepare(&format!("SELECT count(*) {PREPARED_UNSEEN}"))?;
-    let mut due = db.prepare(&format!("SELECT count(*) {PREPARED_DUE}"))?;
+    let mut counts = Counts::default();
+    // One additional match distinguishes an exact total at the cap from a lower bound.
+    const SCAN_LIMIT: usize = queue::COUNT_CAP + 1;
+    let mut unseen = db.prepare(&format!(
+        "SELECT count(*) FROM (SELECT 1 {PREPARED_UNSEEN} LIMIT {SCAN_LIMIT})"
+    ))?;
+    let mut due = db.prepare(&format!(
+        "SELECT count(*) FROM (SELECT 1 {PREPARED_DUE} LIMIT {SCAN_LIMIT})"
+    ))?;
     for kind in [CardKind::Opening, CardKind::Tactic] {
         if queue::admits_uncommitted_new(kind, paused) {
             counts.new += unseen.query_row([kind.as_str()], |row| row.get::<_, usize>(0))?;
@@ -104,6 +110,18 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
         counts.reviews +=
             due.query_row(params![kind.as_str(), now], |row| row.get::<_, usize>(0))?;
     }
+    // Again can add one card to the 20-slot spacing window. Without prepared
+    // membership, Next cannot issue another attempt while a repeat is deferred.
+    let exceeds_committed_bound = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM deck LIMIT 1 OFFSET 21)
+            OR EXISTS(SELECT 1 FROM repeat_obligation LIMIT 1 OFFSET 1)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    anyhow::ensure!(
+        !exceeds_committed_bound,
+        "Committed work exceeds the Study count bound"
+    );
     // SQLite preserves CROSS JOIN order. Drive the lookups from committed
     // identities so the optimizer cannot scan the entire prepared queue.
     let mut committed = db.prepare(
@@ -125,7 +143,7 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
 
 pub fn committed_head(db: &Connection) -> Result<Option<(String, String)>> {
     Ok(db.query_row(
-        "SELECT d.card_id,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 1",
+        "SELECT d.card_id,c.kind FROM deck d CROSS JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 1",
         [], |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?)
 }
@@ -143,7 +161,7 @@ pub fn place_repeat(
     draw: u8,
 ) -> Result<u8> {
     let mut q = db.prepare(
-        "SELECT d.slot,c.kind FROM deck d JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 22",
+        "SELECT d.slot,c.kind FROM deck d CROSS JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 22",
     )?;
     let mut queued = q
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
@@ -377,6 +395,90 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn counts_preserve_the_cap_boundary_and_bound_eligible_work() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+
+        let db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("game_pipeline.sql"),
+            include_str!("prepared_queue.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        db.execute_batch(
+            "UPDATE prepared_queue_state SET ready=1;
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<9999)
+             INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+             SELECT 'n-'||i,'opening','','white','','','[]' FROM n
+             UNION ALL SELECT 'r-'||i,'tactic','','white','','','[]' FROM n;
+             INSERT INTO learning SELECT id,1,1,1,10 FROM cards WHERE kind='tactic';",
+        )?;
+        let display = |now| -> Result<_> {
+            Ok(serde_json::to_value(
+                counts(&db, now, None)?.map(queue::DisplayCounts::from),
+            )?)
+        };
+        assert_eq!(display(9)?, serde_json::json!({"new":9999,"reviews":0}));
+        assert_eq!(display(10)?, serde_json::json!({"new":9999,"reviews":9999}));
+        // A reserved candidate is absent from the bounded base and counted as committed once.
+        db.execute_batch(
+            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers) VALUES
+                 ('committed','opening','','white','','','[]'),
+                 ('review-10000','opening','','white','','','[]');
+             INSERT INTO deck VALUES (1,'committed');
+             INSERT INTO learning VALUES ('review-10000',1,1,1,10);",
+        )?;
+        assert_eq!(
+            display(10)?,
+            serde_json::json!({"new":10000,"reviews":10000})
+        );
+        db.execute_batch(
+            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers) VALUES
+            ('new-10001','tactic','','white','','','[]');",
+        )?;
+        assert_eq!(
+            display(10)?,
+            serde_json::json!({"new":{"at_least":10000},"reviews":10000})
+        );
+        db.execute_batch(
+            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers) VALUES
+                ('review-10001','opening','','white','','','[]');
+             INSERT INTO learning VALUES ('review-10001',1,1,1,10);",
+        )?;
+        let capped = serde_json::json!({"new":{"at_least":10000},"reviews":{"at_least":10000}});
+        assert_eq!(display(10)?, capped);
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<25000)
+             INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+             SELECT 'on-'||i,'opening','','white','','','[]' FROM n
+             UNION ALL SELECT 'od-'||i,'opening','','white','','','[]' FROM n
+             UNION ALL SELECT 'tn-'||i,'tactic','','white','','','[]' FROM n
+             UNION ALL SELECT 'td-'||i,'tactic','','white','','','[]' FROM n;
+             INSERT INTO learning SELECT id,1,1,1,10 FROM cards WHERE id GLOB '[ot]d-*';",
+        )?;
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&steps);
+        db.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Relaxed);
+                false
+            }),
+        );
+        assert_eq!(display(10)?, capped);
+        let work = steps.load(Relaxed);
+        eprintln!("Study counts SQL steps with all four ranges saturated: {work}");
+        assert!(work < 500_000, "Study counts used {work} SQLite steps");
+        Ok(())
+    }
+
     #[test]
     fn seed_progress_observes_interleaved_changes_even_behind_the_cursor() -> Result<()> {
         let mut db = Connection::open_in_memory()?;

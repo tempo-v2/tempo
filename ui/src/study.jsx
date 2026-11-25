@@ -1,6 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
-import { api } from "./api.js";
+import { api, readView } from "./api.js";
+import {
+  answerIntent, answerPayload, importPredecessorAnswer, isMove, nextSavedAnswer, resolveAnswer, saveAnswer,
+} from "./answer-journal.js";
 import { ChessBoard, play } from "./board.jsx";
 import { moveCue } from "./sounds.js";
 
@@ -30,6 +33,15 @@ function markedMove(move, brush) {
   return [{ orig, dest, brush }, { orig: dest, brush }];
 }
 
+function validStudyCount(value) {
+  return (Number.isSafeInteger(value) && value >= 0) ||
+    (Number.isSafeInteger(value?.at_least) && value.at_least > 0);
+}
+
+function formatStudyCount(value) {
+  return typeof value === "number" ? String(value) : `${value.at_least.toLocaleString("en-US")}+`;
+}
+
 function useStudyCounts() {
   const [counts, setCounts] = useState(null);
   const invalidate = useRef(null);
@@ -46,9 +58,7 @@ function useStudyCounts() {
       try {
         const response = await fetch("/api/study/counts", { signal: request.signal });
         const totals = response.ok ? await response.json() : null;
-        const valid = [totals?.new, totals?.reviews].every(
-          (value) => Number.isSafeInteger(value) && value >= 0
-        );
+        const valid = [totals?.new, totals?.reviews].every(validStudyCount);
         if (active && !dirty) setCounts(valid ? totals : null);
       } catch {
         if (active && !dirty) setCounts(null);
@@ -74,10 +84,69 @@ function useStudyCounts() {
   return [counts, invalidate];
 }
 
+function decodeResult(body, incompleteReply) {
+  if (!["Good", "Again"].includes(body?.rating) ||
+      !Array.isArray(body.answers) || !body.answers.length || !body.answers.every(isMove) ||
+      !(body.repeat_after === null || Number.isInteger(body.repeat_after) &&
+        body.repeat_after >= 0 && body.repeat_after <= 255)) {
+    throw new Error(incompleteReply);
+  }
+  return {
+    ...body,
+    display_move: body.answers.includes(body.display_move) ? body.display_move : body.answers[0],
+    played_in_game: isMove(body.played_in_game) ? body.played_in_game : null,
+  };
+}
+
+function decodeStudyReply(body, dataset) {
+  if (body === null) return null;
+  const incomplete = "The Study reply was incomplete. Retry.";
+  if (!Number.isSafeInteger(body?.attempt) || body.attempt <= 0 ||
+      typeof body.dataset !== "string" || !body.dataset || (dataset && body.dataset !== dataset) ||
+      !["opening", "tactic"].includes(body.kind) || !["white", "black"].includes(body.color) ||
+      typeof body.fen !== "string" || !body.fen ||
+      !Array.isArray(body.legal) || !body.legal.every(isMove)) {
+    throw new Error(incomplete);
+  }
+  const result = body.result === null ? null : decodeResult(body.result, incomplete);
+  if (result === null && body.legal.length === 0) throw new Error(incomplete);
+  // The server supplies the allowed moves. Verify that the board can render
+  // those moves and the feedback from this position before replacing the card.
+  let playable;
+  try {
+    playable = new Set(new Chess(body.fen).moves({ verbose: true }).map((move) => move.lan));
+  } catch {
+    throw new Error(incomplete);
+  }
+  if (body.legal.some((move) => !playable.has(move)) ||
+      result?.answers.some((move) => !playable.has(move))) {
+    throw new Error(incomplete);
+  }
+  return {
+    ...body,
+    title: typeof body.title === "string" ? body.title : "",
+    result,
+  };
+}
+
+// A typed terminal reply ends this exact intent. Transport failure keeps it pending.
+async function deliverAnswer(intent) {
+  let result;
+  try {
+    const body = await api("study/answer", answerPayload(intent));
+    result = decodeResult(body, "The Answer reply was incomplete. Retry.");
+  } catch (error) {
+    if (!["stale_dataset", "stale_attempt", "answer_conflict"].includes(error.code)) throw error;
+  }
+  // A failed journal cleanup can cause an exact replay. Acceptance stays authoritative.
+  void resolveAnswer(intent).catch(() => {});
+  return result;
+}
+
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
   const [counts, invalidateCounts] = useStudyCounts();
-  const [source, setSource] = useState(null);
+  const [sourceRead, setSource] = useState(null);
   const [opponent, setOpponent] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(null);
@@ -86,12 +155,25 @@ export function Study({ openGame, sounds }) {
   const waiting = useRef(false);
   const retry = useRef(null);
   const nextButton = useRef(null);
+  const opponentRead = useRef(null);
+  const currentRead = useRef(null);
+  async function loadCurrent() {
+    currentRead.current?.abort();
+    const request = new AbortController();
+    currentRead.current = request;
+    try {
+      return decodeStudyReply(await readView("study", request.signal));
+    } finally {
+      if (currentRead.current === request) currentRead.current = null;
+    }
+  }
   const [promotionTarget, setPromotionTarget] = useState(null);
   const [epoch, setEpoch] = useState(0);
   const [advanceAfter, setAdvanceAfter] = useState(null);
   const mounted = useRef(true);
   const [openingProgress, setOpeningProgress] = useState(null);
   const attemptKey = card ? `${card.dataset}/${card.attempt}` : null;
+  const source = sourceRead?.key === attemptKey ? sourceRead.result : null;
   const frames = useMemo(() => openingFrames(card?.lead_in, card?.fen), [card?.lead_in, card?.fen]);
   const openingPly = openingProgress?.key === attemptKey ? openingProgress.ply : 0;
   const lastPly = frames ? frames.length - 1 : 0;
@@ -115,54 +197,77 @@ export function Study({ openGame, sounds }) {
     catch (error) { setError(error); setEpoch((n) => n + 1); }
     finally { waiting.current = false; setPending(false); }
   }
+  function showCard(view) {
+    setCard(view);
+    setLoaded(true);
+    invalidateCounts.current?.();
+  }
+  async function loadNext(payload) {
+    const body = await api("study/next", payload, undefined, { requireJson: true });
+    const view = decodeStudyReply(body, payload.dataset);
+    if (mounted.current) showCard(view);
+  }
   function next(after = null) {
     setAdvanceAfter(null);
-    return run(async () => {
-      setCard(await api("study/next", { after, dataset: card?.dataset }));
-      setLoaded(true);
-      invalidateCounts.current?.();
-    });
+    const payload = { after, dataset: card?.dataset };
+    return run(() => loadNext(payload));
   }
   useEffect(() => {
     mounted.current = true;
     run(async () => {
-      const unresolved = localStorage.getItem("tempo.pending-answer.v2");
-      let replayAccepted = false;
-      if (unresolved) {
-        try {
-          await api("study/answer", JSON.parse(unresolved));
-          replayAccepted = true;
-          invalidateCounts.current?.();
-        }
-        catch (error) {
-          if (!["stale_dataset", "answer_conflict"].includes(error.code)) throw error;
-        }
-        localStorage.removeItem("tempo.pending-answer.v2");
+      await importPredecessorAnswer();
+      let intent;
+      while ((intent = await nextSavedAnswer(intent))) {
+        await deliverAnswer(intent);
       }
-      const active = await api("study");
-      setCard(active ?? await api("study/next", { after: null }));
-      setLoaded(true);
-      if (!replayAccepted || !active) invalidateCounts.current?.();
+      if (!mounted.current) return;
+      async function resumeCurrent() {
+        const active = await loadCurrent();
+        if (!mounted.current) return;
+        if (active !== null) {
+          showCard(active);
+          return;
+        }
+        const payload = { after: null };
+        const initialNext = () => loadNext(payload);
+        retry.current = initialNext;
+        await initialNext();
+      }
+      retry.current = resumeCurrent;
+      await resumeCurrent();
     });
-    return () => { mounted.current = false; sounds.cancel(); };
+    return () => {
+      mounted.current = false;
+      currentRead.current?.abort();
+      sounds.cancel();
+    };
   }, []);
   useEffect(() => {
-    let active = true;
-    setSource(null);
-    if (card?.result) api(`study/${card.attempt}/context`).then((result) => {
-      if (active) setSource(result);
-    }).catch(() => {});
-    return () => { active = false; };
-  }, [card?.attempt, Boolean(card?.result)]);
+    if (!attemptKey || card.kind === "opening") return;
+    const request = new AbortController();
+    opponentRead.current = readView(`study/${card.attempt}/opponent-move`, request.signal)
+      .then((move) => {
+        if (!request.signal.aborted && move) {
+          setOpponent({ key: attemptKey, move: [move.slice(0, 2), move.slice(2, 4)] });
+        }
+      }).catch(() => {});
+    return () => {
+      request.abort();
+      opponentRead.current = null;
+    };
+  }, [attemptKey, card?.kind]);
 
   useEffect(() => {
-    if (!attemptKey || card.kind === "opening") return;
-    let active = true;
-    api(`study/${card.attempt}/opponent-move`).then((move) => {
-      if (active && move) setOpponent({ key: attemptKey, move: [move.slice(0, 2), move.slice(2, 4)] });
+    setSource(null);
+    if (!card?.result) return;
+    const request = new AbortController();
+    Promise.resolve(opponentRead.current).then(async () => {
+      if (request.signal.aborted) return;
+      const result = await readView(`study/${card.attempt}/context`, request.signal);
+      if (!request.signal.aborted) setSource({ key: attemptKey, result });
     }).catch(() => {});
-    return () => { active = false; };
-  }, [attemptKey, card?.kind]);
+    return () => request.abort();
+  }, [attemptKey, Boolean(card?.result)]);
 
   useEffect(() => {
     if (advanceAfter === null) return;
@@ -186,13 +291,24 @@ export function Study({ openGame, sounds }) {
   }, []);
 
   function answer(played) {
-    const submission = { attempt: card.attempt, dataset: card.dataset, played };
+    const intent = answerIntent({ attempt: card.attempt, dataset: card.dataset, played });
     run(async () => {
+      await saveAnswer(intent);
       if (played) setSubmitted({ key: attemptKey, move: played });
-      localStorage.setItem("tempo.pending-answer.v2", JSON.stringify(submission));
-      const result = await api("study/answer", submission);
-      localStorage.removeItem("tempo.pending-answer.v2");
+      const result = await deliverAnswer(intent);
       if (!mounted.current) return;
+      if (!result) {
+        setSubmitted(null);
+        async function refreshCurrent() {
+          const current = await loadCurrent();
+          if (!mounted.current) return;
+          setCard(current);
+          invalidateCounts.current?.();
+        }
+        retry.current = refreshCurrent;
+        await refreshCurrent();
+        return;
+      }
       setCard((old) => ({ ...old, result }));
       invalidateCounts.current?.();
       if (result.display_move) {
@@ -216,6 +332,13 @@ export function Study({ openGame, sounds }) {
   const previous = card?.kind === "opening"
     ? (frame?.movedBy !== learner ? frame?.lastMove : undefined)
     : (opponent?.key === attemptKey ? opponent?.move : undefined);
+  let playedInGame;
+  const gameMove = card?.result?.played_in_game ?? source?.played;
+  if (isMove(gameMove)) {
+    try {
+      playedInGame = play(new Chess(card.fen), gameMove).san;
+    } catch { /* Optional context can be unavailable for the issued position. */ }
+  }
   const shapes = [...markedMove(previous, "red"), ...markedMove(played, "green")];
   if (boardMove) play(game, boardMove);
   return <section className="study" aria-label="Study">
@@ -230,7 +353,7 @@ export function Study({ openGame, sounds }) {
     </div>
     <div className="study-panel">
       <h1>Study</h1>
-      {counts && <p>{counts.new} new · {counts.reviews} {counts.reviews === 1 ? "review" : "reviews"}</p>}
+      {counts && <p>{formatStudyCount(counts.new)} new · {formatStudyCount(counts.reviews)} {counts.reviews === 1 ? "review" : "reviews"}</p>}
       {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
       {!loaded && !error && <p>Loading your deck…</p>}
       {loaded && !card && <><p>No cards are ready. Add an opening or tactic to get started.</p>
@@ -248,8 +371,7 @@ export function Study({ openGame, sounds }) {
         </div>
         {card.result && <div className="feedback">
           <p>Answer: {card.result.answers.map((move) => play(new Chess(card.fen), move).san).join(" or ")}</p>
-          {(card.result.played_in_game || source?.played) &&
-            <p>In the game you played {play(new Chess(card.fen), card.result.played_in_game || source.played).san}.</p>}
+          {playedInGame && <p>In the game you played {playedInGame}.</p>}
           {source?.game_id && <button onClick={() => openGame(source.game_id, source.ply)}>View source game</button>}
         </div>}
       </>}

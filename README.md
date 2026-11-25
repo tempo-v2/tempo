@@ -93,3 +93,39 @@ A service backup that must resume queued PGN uploads includes the SQLite
 database and its adjacent `.uploads` directory. Stop the service before
 copying both for a coordinated release or rollback. The `opening-rank-apply`
 and legacy opening import commands also require exclusive database ownership.
+
+## Archive conversion and recovery
+
+With the service stopped, run `tempo migrate-games DATABASE` on the existing
+Lean database before starting this release. The command acquires the service
+lock and converts archived routes to the versioned packed format in one
+transaction. It preserves game IDs, staged uploads, saved Study receipts and
+Learning. Keep the stopped database and adjacent `.uploads` directory together
+for recovery. The schema-6 executable belongs with its matching schema-6 backup.
+
+Reload active Study tabs during cutover. The current browser imports surviving
+predecessor pending Answers into its per-intent journal. An accepted Answer
+can be recovered independently of loading the next card.
+
+## Provider turns and repertoire choices
+
+A provider job freezes its window inventory, stages each nonempty download
+(up to 32 MiB), and accepts at most one record per turn. The file reference,
+byte offset, accepted game or rejected record, and ready order are durable.
+Restart and Retry continue the staged window at its saved offset. The
+account checkpoint advances after all windows finish. Every Games job turn
+uses one 60-second deadline for new work and writer admission. Short recovery
+and claim attempts use separate two-second admission budgets. A claimed write
+resolves before another turn can use its result. The next bounded claim records
+a failed turn together with claiming the next job. Local blocking filesystem
+operations retain the worker until they physically return. Unfinished
+older manual uploads with a prior rejection replay in bounded turns from
+the staged file because their old cursor can point inside a rejected game.
+Already accepted records are deduplicated. Completion uses the replay's
+physical rejection count.
+
+The Openings editor requests up to 50 destination choices by repertoire
+identity and practice color. Each choice keeps the first authored line as
+its display example. The picker follows the same indexed lookup through
+migration and newly saved content. Choice paging has its own read slot and
+the same SQL budget as other optional reads.

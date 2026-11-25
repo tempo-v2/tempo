@@ -3,26 +3,31 @@ use crate::{
     chess, db,
     learning::{self, Rating},
     queue, queue_store,
-    study::{AcceptedView, Answer, AnswerState, Next, NextState, Review},
+    study::{
+        AcceptedView, AnswerIntentV1, AnswerState, Next, NextState, RepeatDisposition, Review,
+    },
     study_store,
 };
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{Connection, TransactionBehavior::Immediate};
 
-pub fn counts(db: &mut Connection) -> Result<Option<queue::Counts>> {
+pub fn counts(db: &mut Connection) -> Result<Option<queue::DisplayCounts>> {
     let snapshot = db.transaction()?;
     let unanswered = study_store::unanswered_card(&snapshot)?;
-    queue_store::counts(&snapshot, Utc::now().timestamp(), unanswered.as_deref())
+    Ok(
+        queue_store::counts(&snapshot, Utc::now().timestamp(), unanswered.as_deref())?
+            .map(queue::DisplayCounts::from),
+    )
 }
 
-pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
+pub fn answer(db: &mut Connection, input: AnswerIntentV1) -> Result<AcceptedView> {
     let tx = db.transaction_with_behavior(Immediate)?;
     let issued = match study_store::begin_answer(&tx, &input)? {
         AnswerState::Replayed(view) => return Ok(view),
         AnswerState::Pending(issued) => issued,
     };
-    let rating = if chess::answer_matches(&issued.fen, &issued.answers, input.played.as_deref())? {
+    let rating = if chess::answer_matches(&issued.answers, issued.action.played()) {
         Rating::Good
     } else {
         Rating::Again
@@ -31,11 +36,11 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
     let prior = db::prior_review(&tx, &issued.card)?;
     let schedule = learning::schedule(rating, prior, now)?;
     db::save_review(&tx, &issued.card, now, schedule)?;
-    let mut repeat_after = None;
+    let mut repeat = RepeatDisposition::None;
     if matches!(rating, Rating::Again) && queue_store::can_repeat(&tx, &issued.card)? {
         let draw = queue::draw_repeat_offset();
         if queue_store::prepared(&tx)? {
-            repeat_after = Some(queue_store::place_repeat(
+            repeat = RepeatDisposition::Placed(queue_store::place_repeat(
                 &tx,
                 &issued.card,
                 issued.previous_kind.as_deref(),
@@ -51,9 +56,10 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
                 now,
                 draw,
             )?;
+            repeat = RepeatDisposition::Deferred;
         }
     }
-    let accepted = study_store::accept_answer(&tx, &input, issued, rating.label(), repeat_after)?;
+    let accepted = study_store::accept_answer(&tx, &input, issued, rating, repeat)?;
     tx.commit()?;
     Ok(accepted)
 }
@@ -95,6 +101,98 @@ pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_next_and_again_work_stays_bounded_as_catalog_grows() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+
+        fn measure(noise: usize, first: &str) -> Result<(String, usize, usize)> {
+            let mut db = Connection::open_in_memory()?;
+            for schema in [
+                include_str!("schema.sql"),
+                include_str!("opening_policy.sql"),
+                include_str!("opening_order.sql"),
+                include_str!("game_pipeline.sql"),
+                include_str!("prepared_queue.sql"),
+            ] {
+                db.execute_batch(schema)?;
+            }
+            db.execute_batch("INSERT INTO metadata VALUES ('fixture')")?;
+            let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+            for id in ["a", "b"] {
+                db.execute(
+                    r#"INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+                     VALUES (?1,'tactic',?1,'white',?2,?1,'["e2e4"]')"#,
+                    (id, fen),
+                )?;
+            }
+            db.execute_batch(
+                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
+                 VALUES ('quarantined','opening','','white','unused','unused','[]',1);
+                 INSERT INTO deck VALUES (1,'quarantined');
+                 UPDATE prepared_queue_state SET ready=1;",
+            )?;
+            db.execute(
+                "INSERT INTO deck VALUES (2,?1),(3,?2)",
+                (first, if first == "a" { "b" } else { "a" }),
+            )?;
+            db.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 WHERE ?1>0 UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                 INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
+                 SELECT printf('unrelated%06d',i),'opening','','white','unused','unused','[]',1 FROM n",
+                [noise],
+            )?;
+            let steps = Arc::new(AtomicUsize::new(0));
+            let count = steps.clone();
+            db.progress_handler(
+                1,
+                Some(move || {
+                    count.fetch_add(1, Relaxed);
+                    false
+                }),
+            );
+            let review = next(
+                &mut db,
+                Next {
+                    after: None,
+                    dataset: None,
+                },
+            )?
+            .unwrap();
+            let next_steps = steps.swap(0, Relaxed);
+            answer(
+                &mut db,
+                AnswerIntentV1 {
+                    attempt: review.attempt,
+                    dataset: review.dataset,
+                    action: crate::study::AnswerAction::Reveal,
+                },
+            )?;
+            Ok((review.title, next_steps, steps.load(Relaxed)))
+        }
+
+        let small = measure(0, "a")?;
+        let large = measure(100_000, "a")?;
+        assert_eq!(small.0, "a");
+        assert_eq!(large.0, "a");
+        assert!(
+            large.1 <= small.1 + 50,
+            "Next steps grew from {} to {}",
+            small.1,
+            large.1
+        );
+        assert!(
+            large.2 <= small.2 + 50,
+            "Again steps grew from {} to {}",
+            small.2,
+            large.2
+        );
+        assert_eq!(measure(0, "b")?.0, "b");
+        Ok(())
+    }
 
     #[test]
     fn studied_commands_do_not_read_games_or_live_rank() -> Result<()> {
@@ -140,10 +238,10 @@ mod tests {
         assert_eq!(review.title, "Title");
         let accepted = answer(
             &mut db,
-            Answer {
+            AnswerIntentV1 {
                 attempt: review.attempt,
                 dataset: review.dataset,
-                played: Some("e2e4".into()),
+                action: crate::study::AnswerAction::Play("e2e4".into()),
             },
         )?;
         assert_eq!(serde_json::to_value(accepted)?["rating"], "Good");
@@ -177,10 +275,10 @@ mod tests {
             },
         )?
         .unwrap();
-        let answer_command = || Answer {
+        let answer_command = || AnswerIntentV1 {
             attempt: review.attempt,
             dataset: "fixture".into(),
-            played: None,
+            action: crate::study::AnswerAction::Reveal,
         };
         let first = serde_json::to_value(answer(&mut db, answer_command())?)?;
         assert_eq!(first["rating"], "Again");

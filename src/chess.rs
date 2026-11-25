@@ -4,7 +4,7 @@ use pgn_reader::shakmaty::{
 };
 use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io::Cursor, ops::ControlFlow};
+use std::{collections::BTreeMap, io::Read, ops::ControlFlow};
 
 pub const MAX_PLIES: usize = 1024;
 const MODE: CastlingMode = CastlingMode::Standard;
@@ -21,6 +21,7 @@ pub struct Pgn {
     pub main: Route,
     pub variations: Vec<Route>,
     pub finished: bool,
+    pub terminal_outcome: Option<pgn_reader::Outcome>,
 }
 
 pub fn position(fen: &str) -> Result<Chess> {
@@ -54,12 +55,9 @@ pub fn uci(m: Move) -> String {
     UciMove::from_move(m, MODE).to_string()
 }
 
-pub fn answer_matches(fen: &str, accepted: &[String], played: Option<&str>) -> Result<bool> {
-    let Some(played) = played else {
-        return Ok(false);
-    };
-    let board = position(fen)?;
-    Ok(accepted.contains(&uci(parse_move(&board, played)?)))
+/// Both the issued answer set and the already validated submission use canonical UCI.
+pub fn answer_matches(accepted: &[String], played: Option<&str>) -> bool {
+    played.is_some_and(|played| accepted.iter().any(|answer| answer == played))
 }
 
 pub fn legal(board: &Chess) -> Vec<String> {
@@ -104,7 +102,7 @@ struct Movetext {
     current: Line,
     stack: Vec<Line>,
     variations: Vec<Route>,
-    finished: bool,
+    terminal_outcome: Option<pgn_reader::Outcome>,
     moves_read: usize,
 }
 
@@ -156,7 +154,7 @@ impl Visitor for Parser {
                 },
                 stack: vec![],
                 variations: vec![],
-                finished: false,
+                terminal_outcome: None,
                 moves_read: 0,
             }),
             Err(error) => ControlFlow::Break(Err(error)),
@@ -228,7 +226,7 @@ impl Visitor for Parser {
         outcome: pgn_reader::Outcome,
     ) -> ControlFlow<Self::Output> {
         if text.stack.is_empty() {
-            text.finished = !matches!(outcome, pgn_reader::Outcome::Unknown);
+            text.terminal_outcome = Some(outcome);
         }
         ControlFlow::Continue(())
     }
@@ -236,7 +234,9 @@ impl Visitor for Parser {
     fn end_game(&mut self, text: Movetext) -> Self::Output {
         ensure!(!text.current.moves.is_empty(), "PGN has no moves");
         ensure!(text.stack.is_empty(), "unclosed PGN variation");
-        let finished = text.finished
+        let finished = text
+            .terminal_outcome
+            .is_some_and(|outcome| !matches!(outcome, pgn_reader::Outcome::Unknown))
             || text
                 .tags
                 .get("Result")
@@ -249,6 +249,7 @@ impl Visitor for Parser {
             },
             variations: text.variations,
             finished,
+            terminal_outcome: text.terminal_outcome,
         })
     }
 }
@@ -256,12 +257,20 @@ impl Visitor for Parser {
 pub fn read_pgn(
     text: &str,
     branches: bool,
-    mut visit: impl FnMut(Result<Pgn>) -> Result<()>,
+    visit: impl FnMut(Result<Pgn>) -> Result<()>,
 ) -> Result<()> {
     if text.trim().is_empty() {
         bail!("enter a PGN");
     }
-    let mut reader = Reader::new(Cursor::new(text.as_bytes()));
+    read_pgn_from(text.as_bytes(), branches, visit)
+}
+
+fn read_pgn_from(
+    input: impl Read,
+    branches: bool,
+    mut visit: impl FnMut(Result<Pgn>) -> Result<()>,
+) -> Result<()> {
+    let mut reader = Reader::new(input);
     let mut parser = Parser { branches };
     let first = reader.read_game(&mut parser)?.context("PGN has no games")?;
     visit(first)?;
@@ -271,29 +280,40 @@ pub fn read_pgn(
     Ok(())
 }
 
-/// Resume at a game boundary reported by this same parser. The offset excludes
-/// read-ahead bytes so a restarted import does not miss the next game.
-pub fn resume_pgn<R: std::io::Read + std::io::Seek>(
+/// Preview a single mainline. The caller supplies the bounded input reader.
+pub fn preview_pgn(input: impl Read) -> Result<Route> {
+    let mut game = None;
+    read_pgn_from(input, false, |record| {
+        ensure!(game.is_none(), "too many games in this batch");
+        game = Some(record);
+        Ok(())
+    })?;
+    Ok(game.context("PGN has no games")??.main)
+}
+
+/// Read one record at a committed PGN boundary, excluding reader lookahead from the next offset.
+pub fn pgn_record<R: std::io::Read + std::io::Seek>(
     mut input: R,
     offset: u64,
-    mut visit: impl FnMut(Result<Pgn>, u64) -> Result<()>,
-) -> Result<()> {
+) -> Result<Option<(Result<Pgn>, u64)>> {
     input.seek(std::io::SeekFrom::Start(offset))?;
     let mut reader = Reader::new(input);
     let mut parser = Parser { branches: false };
-    let mut seen = offset != 0;
-    while let Some(game) = reader.read_game(&mut parser)? {
-        seen = true;
-        let buffered = reader.buffer().len() as u64;
-        let next = reader
-            .get_mut()
-            .stream_position()?
-            .checked_sub(buffered)
-            .context("invalid PGN checkpoint")?;
-        visit(game, next)?;
-    }
-    ensure!(seen, "PGN has no games");
-    Ok(())
+    let Some(game) = reader.read_game(&mut parser)? else {
+        ensure!(offset != 0, "PGN has no games");
+        return Ok(None);
+    };
+    // An early visitor result leaves the rest of the physical game pending.
+    // Complete that skip before recording a restart checkpoint.
+    reader.has_more()?;
+    let buffered = reader.buffer().len() as u64;
+    let next = reader
+        .get_mut()
+        .stream_position()?
+        .checked_sub(buffered)
+        .context("invalid PGN checkpoint")?;
+    ensure!(next > offset, "PGN checkpoint did not advance");
+    Ok(Some((game, next)))
 }
 
 pub fn parse_pgn(text: &str, branches: bool, limit: usize) -> Result<Vec<Result<Pgn>>> {

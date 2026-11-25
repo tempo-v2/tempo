@@ -1,30 +1,75 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
-import { api, fileText } from "./api.js";
+import { api, fileText, readView } from "./api.js";
 import { ChessBoard, Replay, play, position } from "./board.jsx";
 import { moveCue } from "./sounds.js";
 
 export function useList(endpoint) {
   const [rows, setRows] = useState([]);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [more, setMore] = useState(false);
-  async function load(append = false) {
-    setBusy(true);
-    try {
-      const page = await api(endpoint + (append ? "?after=" + rows.at(-1).id : ""));
-      setRows(append ? [...rows, ...page] : page);
-      setMore(page.length === (endpoint === "games" ? 50 : 100));
-      setError("");
-    } catch (error) { setError(error.message); }
-    finally { setBusy(false); }
-  }
-  useEffect(() => { load(); }, [endpoint]);
+  const controller = useRef(null);
+  const load = useCallback((append = false) => controller.current?.(append), []);
+
+  useEffect(() => {
+    let active = true;
+    let request;
+    let refresh = true;
+    let tail;
+    async function read(append = false) {
+      if (!active) return;
+      if (!append) refresh = true;
+      if (request || document.hidden || (append && !tail)) return;
+      const current = new AbortController();
+      request = current;
+      const appendPage = append && !refresh;
+      refresh = false;
+      setBusy(true);
+      try {
+        const query = appendPage ? "?" + new URLSearchParams({ after: tail }) : "";
+        const page = await readView(endpoint + query, current.signal);
+        if (!active || current.signal.aborted || refresh) return;
+        tail = page.at(-1)?.id;
+        setRows((prior) => appendPage ? [...prior, ...page] : page);
+        setMore(page.length === (endpoint === "games" ? 50 : 100));
+        setError(null);
+      } catch (failure) {
+        if (active && !current.signal.aborted && !refresh) {
+          setError({ message: failure.message, append: appendPage });
+        }
+      } finally {
+        request = undefined;
+        if (active) {
+          setBusy(false);
+          if (refresh && !document.hidden) void read();
+        }
+      }
+    }
+    function visibilityChanged() {
+      if (document.hidden) {
+        if (request) refresh = true;
+        request?.abort();
+      } else if (refresh) {
+        void read();
+      }
+    }
+    controller.current = read;
+    document.addEventListener("visibilitychange", visibilityChanged);
+    void read();
+    return () => {
+      active = false;
+      controller.current = null;
+      request?.abort();
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
+  }, [endpoint]);
   return { rows, busy, more, error, load };
 }
 
 export function More({ list }) {
-  return <>{list.error && <p className="error" role="alert">{list.error}</p>}
+  return <>{list.error && <p className="error" role="alert">{list.error.message}{" "}
+    <button disabled={list.busy} onClick={() => list.load(list.error.append)}>Retry list</button></p>}
     {list.more && <button disabled={list.busy} onClick={() => list.load(true)}>Load more</button>}</>;
 }
 
@@ -43,14 +88,53 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const list = useList("openings");
   const [draft, setDraft] = useState(fromGame ?? initial);
   const [repertoires, setRepertoires] = useState([]);
-  const [destination, setDestination] = useState(fromGame ? "" : "new");
-  const saveDestination = repertoires.find((entry) => entry.id === destination);
+  const [moreRepertoires, setMoreRepertoires] = useState(false);
+  const [loadingRepertoires, setLoadingRepertoires] = useState(false);
+  const [repertoireFailure, setRepertoireFailure] = useState(null);
+  const repertoireRequest = useRef(null);
+  const [destination, setDestination] = useState(fromGame ? null : "new");
+  const choiceKey = ({ id, color }) => id + "/" + color;
+  const saveDestination = destination === "new" ? null : destination;
+  const choices = saveDestination && !repertoires.some((entry) => choiceKey(entry) === choiceKey(saveDestination))
+    ? [saveDestination, ...repertoires] : repertoires;
+  async function loadRepertoires(append = false) {
+    if (document.hidden) return;
+    if (repertoireRequest.current) {
+      if (append) return;
+      repertoireRequest.current.abort();
+    }
+    const request = new AbortController();
+    repertoireRequest.current = request;
+    setLoadingRepertoires(true);
+    const tail = append ? repertoires.at(-1) : null;
+    const cursor = tail ? "?" + new URLSearchParams({ after: tail.id, color: tail.color }) : "";
+    try {
+      const page = await readView("openings/repertoires" + cursor, request.signal);
+      if (request.signal.aborted) return;
+      setRepertoires((rows) => append ? [...rows, ...page] : page);
+      setMoreRepertoires(page.length === 50);
+      setRepertoireFailure(null);
+    } catch (error) {
+      if (!request.signal.aborted) setRepertoireFailure({ message: error.message, append });
+    } finally {
+      if (repertoireRequest.current === request) {
+        repertoireRequest.current = null;
+        setLoadingRepertoires(false);
+      }
+    }
+  }
   useEffect(() => {
-    let active = true;
-    api("openings/repertoires").then((rows) => {
-      if (active) setRepertoires(rows);
-    }).catch((error) => { if (active) setError(error.message); });
-    return () => { active = false; };
+    function visibilityChanged() {
+      if (document.hidden) repertoireRequest.current?.abort();
+      else loadRepertoires();
+    }
+    document.addEventListener("visibilitychange", visibilityChanged);
+    loadRepertoires();
+    return () => {
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      repertoireRequest.current?.abort();
+      repertoireRequest.current = null;
+    };
   }, []);
   const [name, setName] = useState("");
   const [color, setColor] = useState(fromGame?.color ?? "white");
@@ -82,15 +166,15 @@ export function Openings({ fromGame, onSaved, sounds }) {
     setBusy(true);
     setOfflineDraft(null);
     const request = {
-      name, color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at,
-      destination: destination === "new" ? { kind: "new" } : { kind: "existing", repertoire_id: destination },
+      name, color: saveDestination?.color ?? color, route: { fen: draft.fen, moves: draft.moves }, start_at: draft.start_at,
+      destination: destination === "new" ? { kind: "new" } : { kind: "existing", repertoire_id: saveDestination.id },
     };
     try {
       await api("openings", request);
       setNotice("Opening saved. Its responses are ready in Study.");
       onSaved();
       await list.load();
-      api("openings/repertoires").then(setRepertoires).catch((error) => setError(error.message));
+      if (destination === "new") loadRepertoires();
     } catch (error) {
       setError(error.message);
       if (error.code === "content_over_budget") setOfflineDraft(request);
@@ -109,7 +193,10 @@ export function Openings({ fromGame, onSaved, sounds }) {
             });
             setName(Array.from(opening.name).slice(0, 150).join("") + " variation");
             setColor(opening.color);
-            setDestination(opening.repertoire_id);
+            setDestination({
+              id: opening.repertoire_id, color: opening.color,
+              example_line: opening.repertoire_example ?? opening.name,
+            });
             setOpening(null);
           }}>Branch here</button>
         </> : <>
@@ -124,25 +211,30 @@ export function Openings({ fromGame, onSaved, sounds }) {
             }} />
           <div className="controls">
             <button disabled={draft.moves.length <= draft.start_at} onClick={() => setDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
-            <button onClick={() => { setDraft(initial); setDestination(fromGame ? "" : "new"); setNotice(""); }}>Start over</button>
+            <button onClick={() => { setDraft(initial); setDestination(fromGame ? null : "new"); setNotice(""); }}>Start over</button>
             <span>{draft.moves.length - draft.start_at} continuation plies</span>
           </div>
         </>}
       </div>
       <div>
         {!opening && <form onSubmit={save}>
-          <label>Repertoire<select required value={destination} onChange={(e) => {
+          <label>Repertoire<select required value={saveDestination ? choiceKey(saveDestination) : destination ?? ""} onChange={(e) => {
             const next = e.target.value;
-            setDestination(next);
-            const entry = repertoires.find((item) => item.id === next);
+            const entry = choices.find((item) => choiceKey(item) === next);
+            setDestination(next === "new" ? "new" : entry ?? null);
             if (entry) setColor(entry.color);
           }}>
             <option value="" disabled>Choose a repertoire</option>
-            {repertoires.map((entry) => <option key={entry.id} value={entry.id}>{entry.example_line} ({entry.color})</option>)}
+            {choices.map((entry) => <option key={choiceKey(entry)} value={choiceKey(entry)}>{entry.example_line} ({entry.color})</option>)}
             <option value="new">New repertoire</option>
           </select></label>
+          {repertoireFailure && <p className="error" role="alert">{repertoireFailure.message}</p>}
+          {(moreRepertoires || repertoireFailure) && <button type="button" disabled={loadingRepertoires}
+            onClick={() => loadRepertoires(repertoireFailure?.append ?? true)}>
+            {repertoireFailure ? "Retry loading repertoires" : "Load more repertoires"}
+          </button>}
           <label>Opening name<input required maxLength={160} value={name} onChange={(e) => setName(e.target.value)} /></label>
-          <label>Practice color<select disabled={Boolean(saveDestination) || (destination !== "" && destination !== "new")} value={color} onChange={(e) => setColor(e.target.value)}>
+          <label>Practice color<select disabled={Boolean(saveDestination)} value={color} onChange={(e) => setColor(e.target.value)}>
             <option value="white">White</option><option value="black">Black</option>
           </select></label>
           <button className="primary" disabled={busy || !destination || draft.moves.length <= draft.start_at}>Save opening</button>
