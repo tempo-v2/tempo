@@ -4,7 +4,12 @@ import { createPortal } from "react-dom";
 import { Chess } from "chess.js";
 import { moveCue } from "./sounds.js";
 
-const promotionRoles = { q: "Queen", r: "Rook", b: "Bishop", n: "Knight" };
+const promotions = {
+  q: { role: "queen", label: "Queen" },
+  r: { role: "rook", label: "Rook" },
+  b: { role: "bishop", label: "Bishop" },
+  n: { role: "knight", label: "Knight" },
+};
 
 export function play(game, move) {
   return game.move({ from: move.slice(0, 2), to: move.slice(2, 4), promotion: move[4] });
@@ -34,11 +39,14 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
   const choices = promotion?.key === key ? promotion.choices : null;
   const turn = game.turn() === "w" ? "white" : "black";
   const promotionControls = choices && <div className="promotion" role="group" aria-label="Piece to promote to">
-    {choices.map((move) => <button key={move} onClick={() => {
-      ref.current?.previewPromotion(move.slice(2, 4), promotionRoles[move[4]].toLowerCase());
-      setPromotion(null);
-      onMove(move);
-    }}>{promotionRoles[move[4]]}</button>)}
+    {choices.map((move) => {
+      const { role, label } = promotions[move[4]];
+      return <button key={move} onClick={() => {
+        ref.current?.previewPromotion(move.slice(2, 4), role);
+        setPromotion(null);
+        onMove(move);
+      }}>{label}</button>;
+    })}
     <button onClick={() => { setPromotion(null); ref.current?.clearInput(); }}>Cancel</button>
   </div>;
   return <div className="board-shell">
