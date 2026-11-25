@@ -1,6 +1,7 @@
 export async function api(path, data, signal, { requireJson = data === undefined } = {}) {
   const response = await fetch("/api/" + path, data === undefined ? { signal } : {
     method: "POST",
+    signal,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });

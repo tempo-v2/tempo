@@ -84,9 +84,18 @@ function useStudyCounts() {
   return [counts, invalidate];
 }
 
-function decodeResult(body, incompleteReply) {
+function playableMoves(fen, incompleteReply) {
+  try {
+    return new Set(new Chess(fen).moves({ verbose: true }).map((move) => move.lan));
+  } catch {
+    throw new Error(incompleteReply);
+  }
+}
+
+function decodeResult(body, incompleteReply, playable) {
   if (!["Good", "Again"].includes(body?.rating) ||
       !Array.isArray(body.answers) || !body.answers.length || !body.answers.every(isMove) ||
+      (playable && body.answers.some((move) => !playable.has(move))) ||
       !(body.repeat_after === null || Number.isInteger(body.repeat_after) &&
         body.repeat_after >= 0 && body.repeat_after <= 255)) {
     throw new Error(incompleteReply);
@@ -108,18 +117,11 @@ function decodeStudyReply(body, dataset) {
       !Array.isArray(body.legal) || !body.legal.every(isMove)) {
     throw new Error(incomplete);
   }
-  const result = body.result === null ? null : decodeResult(body.result, incomplete);
-  if (result === null && body.legal.length === 0) throw new Error(incomplete);
   // The server supplies the allowed moves. Verify that the board can render
   // those moves and the feedback from this position before replacing the card.
-  let playable;
-  try {
-    playable = new Set(new Chess(body.fen).moves({ verbose: true }).map((move) => move.lan));
-  } catch {
-    throw new Error(incomplete);
-  }
-  if (body.legal.some((move) => !playable.has(move)) ||
-      result?.answers.some((move) => !playable.has(move))) {
+  const playable = playableMoves(body.fen, incomplete);
+  const result = body.result === null ? null : decodeResult(body.result, incomplete, playable);
+  if (body.legal.some((move) => !playable.has(move)) || (result === null && body.legal.length === 0)) {
     throw new Error(incomplete);
   }
   return {
@@ -130,11 +132,14 @@ function decodeStudyReply(body, dataset) {
 }
 
 // A typed terminal reply ends this exact intent. Transport failure keeps it pending.
-async function deliverAnswer(intent) {
+async function deliverAnswer(intent, fen) {
   let result;
   try {
     const body = await api("study/answer", answerPayload(intent));
-    result = decodeResult(body, "The Answer reply was incomplete. Retry.");
+    const incomplete = "The Answer reply was incomplete. Retry.";
+    // A mounted answer renders here. Startup replay renders from Current instead.
+    const playable = fen === undefined ? undefined : playableMoves(fen, incomplete);
+    result = decodeResult(body, incomplete, playable);
   } catch (error) {
     if (!["stale_dataset", "stale_attempt", "answer_conflict"].includes(error.code)) throw error;
   }
@@ -295,7 +300,7 @@ export function Study({ openGame, sounds }) {
     run(async () => {
       await saveAnswer(intent);
       if (played) setSubmitted({ key: attemptKey, move: played });
-      const result = await deliverAnswer(intent);
+      const result = await deliverAnswer(intent, card.fen);
       if (!mounted.current) return;
       if (!result) {
         setSubmitted(null);

@@ -145,22 +145,50 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const [error, setError] = useState("");
   const [offlineDraft, setOfflineDraft] = useState(null);
   const [busy, setBusy] = useState(false);
+  const previewRequest = useRef(null);
   const game = position(draft);
   const legal = game.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? ""));
+
+  function cancelPreview() {
+    previewRequest.current?.abort();
+    previewRequest.current = null;
+  }
+  useEffect(() => () => previewRequest.current?.abort(), []);
+
+  function editDraft(next) {
+    cancelPreview();
+    setDraft(next);
+  }
+  function changeStartingText(text) {
+    cancelPreview();
+    setStartingText(text);
+  }
+
   async function chooseStart(useExistingMoves = false) {
+    cancelPreview();
+    const request = new AbortController();
+    previewRequest.current = request;
     setError("");
     try {
       let route;
       try { route = { fen: new Chess(startingText.trim()).fen(), moves: [] }; }
-      catch { route = await api("openings/pgn", { pgn: startingText }); }
+      catch {
+        route = await api("openings/pgn", { pgn: startingText }, request.signal, { requireJson: true });
+      }
+      if (request.signal.aborted) return;
       setDraft({ ...draft, ...route, start_at: useExistingMoves ? 0 : route.moves.length });
       setOpening(null);
       setNotice("Position loaded. Play your continuation.");
-    } catch (error) { setError(error.message); }
+    } catch (error) {
+      if (!request.signal.aborted) setError(error.message);
+    } finally {
+      if (previewRequest.current === request) previewRequest.current = null;
+    }
   }
   async function save(event) {
     event.preventDefault();
     if (!destination) return;
+    cancelPreview();
     setError("");
     setNotice("");
     setBusy(true);
@@ -187,7 +215,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
         {opening ? <><h2>{opening.name}</h2>
           <Replay sounds={sounds} route={opening.route} color={opening.color} ply={ply} onPly={setPly} />
           <button className="primary" onClick={() => {
-            setDraft({
+            editDraft({
               ...opening.route, moves: opening.route.moves.slice(0, ply), start_at: ply,
 
             });
@@ -206,12 +234,12 @@ export function Openings({ fromGame, onSaved, sounds }) {
               const board = position(draft);
               const played = play(board, move);
               sounds.play(moveCue(played, board));
-              setDraft({ ...draft, moves: [...draft.moves, move] });
+              editDraft({ ...draft, moves: [...draft.moves, move] });
               setNotice("");
             }} />
           <div className="controls">
-            <button disabled={draft.moves.length <= draft.start_at} onClick={() => setDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
-            <button onClick={() => { setDraft(initial); setDestination(fromGame ? null : "new"); setNotice(""); }}>Start over</button>
+            <button disabled={draft.moves.length <= draft.start_at} onClick={() => editDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
+            <button onClick={() => { editDraft(initial); setDestination(fromGame ? null : "new"); setNotice(""); }}>Start over</button>
             <span>{draft.moves.length - draft.start_at} continuation plies</span>
           </div>
         </>}
@@ -243,15 +271,18 @@ export function Openings({ fromGame, onSaved, sounds }) {
         {error && <p className="error" role="alert">{error}</p>}
         {offlineDraft && <button onClick={() => downloadOpeningDraft(offlineDraft)}>Download for offline import</button>}
         <details><summary>Start from PGN or FEN</summary>
-          <textarea aria-label="Opening PGN or FEN" value={startingText} onChange={(e) => setStartingText(e.target.value)} />
-          <label>Upload opening PGN<input type="file" accept=".pgn,text/plain" onChange={(e) => fileText(e, setStartingText, setError)} /></label>
+          <textarea aria-label="Opening PGN or FEN" value={startingText} onChange={(e) => changeStartingText(e.target.value)} />
+          <label>Upload opening PGN<input type="file" accept=".pgn,text/plain" onChange={(e) => {
+            cancelPreview();
+            fileText(e, changeStartingText, setError);
+          }} /></label>
           <button disabled={!startingText.trim()} onClick={() => chooseStart()}>Load position</button>
           <button disabled={!startingText.trim()} onClick={() => chooseStart(true)}>Use these moves as the line</button>
         </details>
         <h2>Saved openings</h2>
-        {opening && <button onClick={() => setOpening(null)}>Back to editor</button>}
+        {opening && <button onClick={() => { cancelPreview(); setOpening(null); }}>Back to editor</button>}
         <ul className="items">{list.rows.map((line) => <li key={line.id}>
-          <button onClick={() => { setOpening(line); setPly(0); }}>{line.name} <small>{line.color}</small></button>
+          <button onClick={() => { cancelPreview(); setOpening(line); setPly(0); }}>{line.name} <small>{line.color}</small></button>
         </li>)}</ul>
         <More list={list} />
       </div>
