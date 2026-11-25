@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
+import { ExerciseLayout } from "./exercise_layout.jsx";
 import { api } from "./api.js";
 import { ChessBoard, Replay, position } from "./board.jsx";
 import { isMove } from "./answer-journal.js";
@@ -63,7 +64,7 @@ export async function startPuzzle(intent) {
   return finish("tactics", { kind: "start", intent });
 }
 
-export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuation }) {
+export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuation, heading, children }) {
   const [pending, setPending] = useState(false);
   const [issue, setIssue] = useState("");
   const [replay, setReplay] = useState(null);
@@ -105,25 +106,30 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
   }
   const finished = view.result !== null;
   const lastMove = view.last_move ? [view.last_move.slice(0, 2), view.last_move.slice(2, 4)] : undefined;
-  return <>
-    {replay === null
-      ? <ChessBoard game={new Chess(view.fen)} orientation={view.color}
-          legal={view.legal} identity={`${scope}/${view.dataset}/${view.play}/${view.step}`}
-          lastMove={lastMove} promotionTarget={promotionTarget}
-          onRejectedMove={() => sounds.play("illegal")}
-          onMove={finished ? undefined : move} locked={pending || Boolean(issue)} />
-      : <Replay route={view.solution} color={view.color} ply={replay} onPly={setReplay} sounds={sounds} />}
-    <div ref={setPromotionTarget} />
-    <div className="controls">
-      {finished ? <>
-        <strong role="status">{view.result.rating === "Good" ? "Solved" : "Again"}</strong>
-        {view.result.due_day && <span>First Study review {view.result.due_day}</span>}
-        {view.result.repeat === "Deferred" && <span>Repeat saved for Study</span>}
-        {view.result.repeat?.Placed !== undefined && <span>Repeat after {view.result.repeat.Placed} cards</span>}
-        <button onClick={() => setReplay(replay === null ? view.step : null)}>{replay === null ? "Show solution" : "Back to result"}</button>
-        {continuation}
-      </> : <button disabled={pending || Boolean(issue)} onClick={() => move(null)}>Reveal solution</button>}
-      {issue && <span role="alert">{issue} <button disabled={pending} onClick={() => run(retry.current)}>Retry</button></span>}
-    </div>
-  </>;
+  function layout(board, replayControls) {
+    return <ExerciseLayout label={scope === "study" ? "Study" : "Play puzzle"} board={board}>
+      {heading}
+      <div ref={setPromotionTarget} />
+      <div className="controls">
+        {finished ? <>
+          <strong role="status">{view.result.rating === "Good" ? "Solved" : "Again"}</strong>
+          {view.result.due_day && <span>First Study review {view.result.due_day}</span>}
+          {view.result.repeat === "Deferred" && <span>Repeat saved for Study</span>}
+          {view.result.repeat?.Placed !== undefined && <span>Repeat after {view.result.repeat.Placed} cards</span>}
+          <button onClick={() => setReplay(replay === null ? view.step : null)}>{replay === null ? "Show solution" : "Back to result"}</button>
+          {continuation}
+        </> : <button disabled={pending || Boolean(issue)} onClick={() => move(null)}>Reveal solution</button>}
+        {issue && <span role="alert">{issue} <button disabled={pending} onClick={() => run(retry.current)}>Retry</button></span>}
+      </div>
+      {replayControls}
+      {children}
+    </ExerciseLayout>;
+  }
+  return replay === null
+    ? layout(<ChessBoard game={new Chess(view.fen)} orientation={view.color}
+        legal={view.legal} identity={`${scope}/${view.dataset}/${view.play}/${view.step}`}
+        lastMove={lastMove} promotionTarget={promotionTarget}
+        onRejectedMove={() => sounds.play("illegal")}
+        onMove={finished ? undefined : move} locked={pending || Boolean(issue)} />)
+    : <Replay route={view.solution} color={view.color} ply={replay} onPly={setReplay} sounds={sounds} layout={layout} />;
 }

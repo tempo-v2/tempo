@@ -135,16 +135,17 @@ export function TacticPacks({ sounds }) {
     setRefresh((value) => value + 1);
   }
   const nextPackButton = nextPack && <button disabled={busy} onClick={openNextPack}>Open next pack {band(nextPack)}</button>;
-  if (view) return <section aria-label="Play puzzle">
-    <button disabled={busy} onClick={() => { setView(null); setRefresh((value) => value + 1); }}>{selectedPack ? "Back to pack" : "Back to packs"}</button>
-    <h2>Lichess puzzle</h2>
-    <PuzzleBoard key={view.play} view={view} scope="tactics" sounds={sounds} onView={showView}
-      onRefresh={async () => showView(await resume(view.play))}
-      continuation={view.result && view.mode === "first" && members && (following
-        ? <button disabled={busy} onClick={() => tryPuzzle(following)}>Next puzzle</button>
-        : nextPackButton)} />
+  if (view) return <PuzzleBoard key={view.play} view={view} scope="tactics" sounds={sounds} onView={showView}
+    onRefresh={async () => showView(await resume(view.play))}
+    heading={<>
+      <button disabled={busy} onClick={() => { setView(null); setRefresh((value) => value + 1); }}>{selectedPack ? "Back to pack" : "Back to packs"}</button>
+      <h2>Lichess puzzle</h2>
+    </>}
+    continuation={view.result && view.mode === "first" && members && (following
+      ? <button disabled={busy} onClick={() => tryPuzzle(following)}>Next puzzle</button>
+      : nextPackButton)}>
     {issue && <p role="alert">{issue} <button disabled={busy} onClick={() => run(retry.current)}>Retry</button></p>}
-  </section>;
+  </PuzzleBoard>;
   return <section aria-label="Puzzle packs">
     {issue && <p role="alert">{issue} <button disabled={busy} onClick={() => run(retry.current)}>Retry</button></p>}
     {index?.revision === null && <p>Puzzle packs have not been imported.</p>}
