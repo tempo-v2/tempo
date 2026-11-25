@@ -49,7 +49,7 @@ export function Gaps() {
   function update(patch) {
     const next={...stored(storage),...patch};
       localStorage.setItem(storage, JSON.stringify(next));
-    setDraft(next);
+    setDraft(restore());
   }
   useEffect(() => {
     const ctrl=new AbortController();
