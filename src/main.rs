@@ -101,6 +101,17 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if let Some(error) = self
+            .0
+            .downcast_ref::<opening_replacement::PreviewUnavailable>()
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "code":"replacement_preview_unavailable", "reason":error.reason(), "error":error.to_string()
+                })),
+            ).into_response();
+        }
         if self.0.is::<opening_replacement::OverBudget>() {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
