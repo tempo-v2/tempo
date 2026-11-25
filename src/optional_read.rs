@@ -43,6 +43,8 @@ pub enum Reader {
     ProviderSettings,
     OpeningSettings,
     Coverage,
+    CoverageGaps,
+    CoverageStudied,
     CurrentStudy,
 }
 

@@ -739,6 +739,8 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         )
         .route("/api/coverage", post(coverage::start))
         .route("/api/coverage/{id}", get(coverage::read))
+        .route("/api/coverage/{id}/gaps", get(coverage::gaps))
+        .route("/api/coverage/{id}/studied", get(coverage::studied))
         .route("/api/coverage/{id}/apply", post(coverage::apply))
         .route(
             "/api/coverage/preview",

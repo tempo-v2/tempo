@@ -178,9 +178,9 @@ pub fn seal_detector(db: &mut Connection, job: i64, game: &str, file: &str) -> R
     Ok(())
 }
 
-// A new capture can write both a finding and a qualification row.
+// A new capture can write a finding, a qualification row and a counter update.
 // Keep the remaining eight writes available for the scan checkpoint.
-pub const MAX_FINDINGS_PER_APPLY: usize = 60;
+pub const MAX_FINDINGS_PER_APPLY: usize = 40;
 const MAX_APPLY_ROWS: u64 = 128;
 
 pub struct DetectorBatch {
@@ -366,6 +366,7 @@ mod tests {
         db.execute_batch(include_str!("detectors.sql"))?;
         db.execute_batch(include_str!("card_availability.sql"))?;
         db.execute_batch(include_str!("tactic_qualification.sql"))?;
+        db.execute_batch(include_str!("capture_status.sql"))?;
         db.execute("INSERT INTO metadata VALUES ('fixture')", [])?;
         Ok(())
     }

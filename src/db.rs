@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 14;
+const SCHEMA: i32 = 15;
 
 pub struct Database;
 
@@ -62,6 +62,7 @@ impl Database {
         db.execute_batch(include_str!("detectors.sql"))?;
         db.execute_batch(include_str!("card_availability.sql"))?;
         db.execute_batch(include_str!("tactic_qualification.sql"))?;
+        upgrade_views(&db)?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],
@@ -105,8 +106,11 @@ impl Database {
             if version < 13 {
                 tx.execute_batch(include_str!("lichess_start_revision.sql"))?;
             }
-            tx.execute_batch(include_str!("card_availability.sql"))?;
-            tx.execute_batch(include_str!("tactic_qualification.sql"))?;
+            if version < 14 {
+                tx.execute_batch(include_str!("card_availability.sql"))?;
+                tx.execute_batch(include_str!("tactic_qualification.sql"))?;
+            }
+            upgrade_views(&tx)?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -144,6 +148,7 @@ impl Database {
         tx.execute_batch(include_str!("lichess_start_revision.sql"))?;
         tx.execute_batch(include_str!("card_availability.sql"))?;
         tx.execute_batch(include_str!("tactic_qualification.sql"))?;
+        upgrade_views(&tx)?;
         let valid: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
             [],
@@ -202,4 +207,10 @@ pub fn save_review(
         last_at=excluded.last_at,due_at=excluded.due_at",
         rusqlite::params![card,schedule.stability,schedule.difficulty,now,schedule.due_at])?;
     Ok(())
+}
+
+fn upgrade_views(db: &Connection) -> Result<()> {
+    db.execute_batch(include_str!("capture_status.sql"))?;
+    db.execute_batch(include_str!("coverage_views.sql"))?;
+    crate::coverage::backfill_views(db)
 }

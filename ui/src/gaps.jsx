@@ -42,6 +42,8 @@ export function Gaps() {
   const form = useRef(stored(storage));
   const [books, setBooks] = useState([]);
   const [report,setReport] = useState(null);
+  const [summary, setSummary] = useState(null);
+  const [summaryRetry, setSummaryRetry] = useState(0);
   const [preview,setPreview] = useState(null);
   const [busy,setBusy] = useState(false);
   const [error,setError] = useState("");
@@ -71,12 +73,12 @@ export function Gaps() {
       const saved = { ...form.current, pending: stored(storage + ".save") };
       const reportId = saved.pending?.draft.report ?? saved.report;
       if (!reportId) return;
-      const result = await api("coverage/" + reportId, undefined, ctrl.signal);
+      const result = await api("coverage/" + reportId + "/gaps", undefined, ctrl.signal);
       // Recover an editor opened on a later page without fetching intervening pages.
       const index = saved.pending?.draft.gap ?? saved.index;
       if (index >= result.gaps.length && index < result.total) {
         const offset = Math.floor(index / 30) * 30;
-        const page = await api("coverage/" + reportId + "?offset=" + offset, undefined, ctrl.signal);
+        const page = await api("coverage/" + reportId + "/gaps?offset=" + offset, undefined, ctrl.signal);
         result.selectedGap = page.gaps[index - offset];
       }
       const latest = { ...form.current, pending: stored(storage + ".save") };
@@ -88,6 +90,16 @@ export function Gaps() {
     void loadReport().catch(failed);
     return () => ctrl.abort();
   }, [reload]);
+  const reportId = report?.id;
+  useEffect(() => {
+    if (!reportId) return;
+    const controller = new AbortController();
+    api("coverage/" + reportId + "/studied", undefined, controller.signal)
+      .then(value => { if (!controller.signal.aborted && value.id === reportId) setSummary(value); })
+      .catch(() => { if (!controller.signal.aborted) setSummary({ id: reportId, unavailable: true }); });
+    return () => controller.abort();
+  }, [reportId, reload, summaryRetry]);
+  const currentSummary = summary?.id === reportId ? summary : null;
   async function run(fn) {
     setBusy(true);setError("");
     try { await fn(); } catch(e){setError(e.message);} finally {setBusy(false);}
@@ -95,8 +107,9 @@ export function Gaps() {
   const book = draft.book ? books.find(b => b.id + "/" + b.color === draft.book) : books[0];
   async function scan(request, previous) {
     const {id}=await api("coverage",request);
-    const next=await api("coverage/"+id);
+    const next=await api("coverage/"+id+"/gaps");
     setReport(next);setPreview(null);
+    if (reportId === id) setSummaryRetry(n => n + 1);
     update({report:id,index:null,pgn:"",previous:null});
     if(previous!=null)setMessage("Saved. Authored coverage moved from "+percent(previous)+" to "+percent(next.authored)+".");
   }
@@ -193,7 +206,7 @@ export function Gaps() {
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · {report.model}</p>
-      <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
+      <p>Authored {range(report.authored,report.unresolved)} · Personally studied {currentSummary?.unavailable ? <button onClick={() => setSummaryRetry(n => n + 1)}>Retry summary</button> : currentSummary ? range(currentSummary.studied,report.unresolved) : "Loading…"}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
       {report.model_superseded && <p>Rescan with the current model before using these probabilities to set your opening order.</p>}
       {(report.model_superseded||report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : draft.previous))}>Retry scan</button>}
@@ -214,7 +227,7 @@ export function Gaps() {
       </section>}
       <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
       {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
-        const page=await api("coverage/"+report.id+"?offset="+report.gaps.length);
+        const page=await api("coverage/"+report.id+"/gaps?offset="+report.gaps.length);
         setReport({...page,selectedGap:report.selectedGap,gaps:[...report.gaps,...page.gaps]});
       })}>Show more gaps</button>}
     </>}

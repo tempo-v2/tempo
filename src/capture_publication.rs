@@ -8,6 +8,16 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
 use serde_json::{Value, json};
 
+#[derive(Debug)]
+pub struct InvalidEvidence(anyhow::Error);
+
+impl std::fmt::Display for InvalidEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for InvalidEvidence {}
+
 struct Candidate {
     work: Work,
     position: String,
@@ -119,7 +129,8 @@ pub fn submit(db: &mut Connection, work: &Work, evidence: &Evidence) -> Result<S
         chess::legal(&board).contains(&candidate.played),
         "Invalid played move"
     );
-    let decision = tactic_qualification::qualify(&work.fen, &candidate.captures, evidence)?;
+    let decision = tactic_qualification::qualify(&work.fen, &candidate.captures, evidence)
+        .map_err(InvalidEvidence)?;
     let outcome = match decision {
         Decision::Unique(best) if best != candidate.played => catalog::qualify_game_tactic(
             &tx,
@@ -160,31 +171,19 @@ pub fn submit(db: &mut Connection, work: &Work, evidence: &Evidence) -> Result<S
 }
 
 pub fn status(db: &Connection) -> Result<Value> {
-    let mut result = json!({"kept":0,"narrowed":0,"published":0,"removed":0,"rejected_unpublished":0,"unresolved":0,"retrying":0});
-    let mut counts = db.prepare(
-        "SELECT outcome,
-          EXISTS(SELECT 1 FROM tactics WHERE game_id=q.game_id AND game_ply=q.ply),
-          last_error IS NOT NULL,count(*)
-         FROM capture_qualification q GROUP BY 1,2,3",
-    )?;
-    let mut rows = counts.query([])?;
-    while let Some(row) = rows.next()? {
-        let outcome: Option<String> = row.get(0)?;
-        let existing: bool = row.get(1)?;
-        let retrying: bool = row.get(2)?;
-        let count: u64 = row.get(3)?;
-        let key = match outcome.as_deref() {
-            Some(key @ ("kept" | "narrowed" | "published")) => key,
-            Some(_) if existing => "removed",
-            Some(_) => "rejected_unpublished",
-            None => "unresolved",
-        };
-        result[key] = json!(result[key].as_u64().unwrap_or_default() + count);
-        if retrying {
-            result["retrying"] = json!(result["retrying"].as_u64().unwrap_or_default() + count);
-        }
-    }
-    Ok(result)
+    Ok(db.query_row(
+        "SELECT kept,narrowed,published,removed,rejected_unpublished,unresolved,retrying
+         FROM capture_status WHERE singleton=1",
+        [],
+        |r| {
+            Ok(json!({
+                "kept":r.get::<_,u64>(0)?, "narrowed":r.get::<_,u64>(1)?,
+                "published":r.get::<_,u64>(2)?, "removed":r.get::<_,u64>(3)?,
+                "rejected_unpublished":r.get::<_,u64>(4)?, "unresolved":r.get::<_,u64>(5)?,
+                "retrying":r.get::<_,u64>(6)?
+            }))
+        },
+    )?)
 }
 
 #[cfg(test)]
@@ -260,6 +259,52 @@ mod tests {
             source: Some(("game", 0, "e1e2")),
         })?;
         catalog::apply_tactic(db, &plan)
+    }
+
+    #[test]
+    fn exact_status_is_constant_work_and_tracks_retry_and_verdict() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut db = Database::init(&directory.path().join("db"))?;
+        existing(&db, Some(FEN))?;
+        let work = next(&db, 0)?.unwrap();
+        retry(&mut db, &work, Failure::Timeout, 0)?;
+        assert_eq!(status(&db)?["retrying"], 1);
+        let evidence = fixture_evidence(&work, A)?;
+        assert_eq!(submit(&mut db, &work, &evidence)?, "narrowed");
+        assert_eq!(submit(&mut db, &work, &evidence)?, "narrowed");
+        assert_eq!(status(&db)?["retrying"], 0);
+        assert_eq!(status(&db)?["narrowed"], 1);
+        fn measure(db: &Connection) -> Result<(Value, usize)> {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+            let steps = Arc::new(AtomicUsize::new(0));
+            let hook = steps.clone();
+            db.progress_handler(
+                1,
+                Some(move || {
+                    hook.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let counts = status(db)?;
+            db.progress_handler(0, None::<fn() -> bool>);
+            Ok((counts, steps.load(Ordering::Relaxed)))
+        }
+        let (_, before) = measure(&db)?;
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
+            INSERT INTO missed_captures
+            SELECT 'game',i,'fixture','e1e2','[]',NULL,1 FROM n;
+            UPDATE capture_qualification SET outcome='equivalent' WHERE ply>0;",
+        )?;
+        let (counts, after) = measure(&db)?;
+        assert_eq!(counts["rejected_unpublished"], 100000);
+        assert_eq!(counts["narrowed"], 1);
+        assert_eq!(counts["unresolved"], 0);
+        assert!(before.abs_diff(after) <= 2, "{before} versus {after}");
+        Ok(())
     }
 
     #[test]
