@@ -249,8 +249,14 @@ export function Study({ openGame, sounds }) {
       if (!mounted.current) return;
       if (!result) {
         setSubmitted(null);
-        setCard(await loadCurrent());
-        invalidateCounts.current?.();
+        async function refreshCurrent() {
+          const current = await loadCurrent();
+          if (!mounted.current) return;
+          setCard(current);
+          invalidateCounts.current?.();
+        }
+        retry.current = refreshCurrent;
+        await refreshCurrent();
         return;
       }
       setCard((old) => ({ ...old, result }));

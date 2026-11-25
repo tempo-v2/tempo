@@ -306,6 +306,43 @@ async function mixedTabs(browser, db) {
   console.log("A still-loaded schema-6 tab cleared its legacy scalar after cutover while the new tab retained and replayed its newer Answer.");
 }
 
+async function invalidCurrentReply(browser, db) {
+  await serve(candidate, db, await unusedPort(), async (origin, api) => {
+    await seed(api);
+    const page = await browser.newPage();
+    const commands = [];
+    try {
+      page.on("request", request => {
+        if (request.method() === "POST") commands.push(request.url().split("/").at(-1));
+      });
+      await page.route("**/api/study", route => route.fulfill({
+        status: 200, contentType: "application/json", body: "{"
+      }), { times: 1 });
+      await page.goto(origin);
+      await retry(page).waitFor();
+      assert.deepEqual(commands, []);
+      await retry(page).click();
+      await reveal(page).waitFor();
+      assert.deepEqual(commands, ["next"]);
+
+      await page.route(answerPattern, route => route.fulfill({
+        status: 409, json: { code: "answer_conflict", error: "Already resolved" }
+      }), { times: 1 });
+      await page.route("**/api/study", route => route.fulfill({
+        status: 503, json: { code: "view_unavailable", error: "Study view busy" }
+      }), { times: 1 });
+      await reveal(page).click();
+      await retry(page).waitFor();
+      await retry(page).click();
+      await retry(page).waitFor({ state: "hidden" });
+      assert.deepEqual(commands, ["next", "answer"]);
+      assert.equal(grades(db), 0);
+    } finally {
+      await page.context().close();
+    }
+  });
+}
+
 async function browserReads(browser, db) {
   await serve(candidate, db, await unusedPort(), async origin => {
     const page = await browser.newPage();
@@ -382,6 +419,7 @@ async function browserReads(browser, db) {
     await twoTabs(browser, path.join(root, "concurrent.db"));
     await mixedTabs(browser, path.join(root, "mixed.db"));
     await browserReads(browser, path.join(root, "browse.db"));
+    await invalidCurrentReply(browser, path.join(root, "invalid-current.db"));
     console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, incomplete reply replay, and Next-only retry passed.");
   } finally {
     if (browser) await browser.close();

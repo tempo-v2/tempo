@@ -4,7 +4,10 @@ export async function api(path, data, signal) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  const body = await response.json().catch(() => null);
+  const body = await response.json().catch((error) => {
+    if (response.ok && data === undefined) throw error;
+    return null;
+  });
   signal?.throwIfAborted();
   if (!response.ok) {
     const error = new Error(body?.error ?? `Request failed (${response.status}).`);

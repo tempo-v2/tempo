@@ -24,8 +24,12 @@ export function Games({ jump, addOpening, settings, sounds }) {
       try {
         const result = await readView("games/archive/" + encodeURIComponent(selection.id), signal);
         if (signal.aborted) return;
+        if (result?.id !== selection.id || !Array.isArray(result.route?.moves)) {
+          throw new Error("The game replay reply was incomplete.");
+        }
+        const targetPly = Math.min(selection.ply ?? 0, result.route.moves.length);
         setGame(result);
-        setPly(Math.min(selection.ply ?? 0, result.route.moves.length));
+        setPly(targetPly);
         setReplayFailure(null);
       } catch (failure) {
         if (!signal.aborted) setReplayFailure({ selection, message: failure.message });
