@@ -111,11 +111,11 @@ export function Gaps() {
     await scan(report.scan,report.authored);
   }
   async function applyOrder() {
-    const command=draft.applyCommand??crypto.randomUUID();
-    update({applyCommand:command});
+    const pending = draft.applyCommand ?? { report: report.id, command: crypto.randomUUID() };
+    update({applyCommand:pending});
     try {
-      const reply=await api("coverage/"+report.id+"/apply",{command});
-      if(reply?.command!==command || reply.id!==report.id)throw new Error("Retry applying the opening order.");
+      const reply = await api("coverage/" + pending.report + "/apply", { command: pending.command });
+      if(reply?.command!==pending.command || reply.id!==pending.report)throw new Error("Retry applying the opening order.");
       update({applyCommand:null});setMessage("Applied opening order for "+reply.cards+" reached cards. New cards use this order when Maia is selected in Settings.");
     } catch(e) {
       if(e.code==="stale_gap")update({applyCommand:null});
@@ -133,12 +133,13 @@ export function Gaps() {
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
     {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
     {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{message && <p role="status">{message}</p>}
+    {draft.applyCommand && <button disabled={busy} onClick={() => run(applyOrder)}>Retry applying order</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · Maia-2 Rapid 1500/1500</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
       {(report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,draft.previous))}>Retry scan</button>}
-      <button disabled={busy||!!draft.pending||(report.stale&&!draft.applyCommand)} onClick={()=>run(applyOrder)}>{draft.applyCommand?"Retry applying order":"Apply to opening order"}</button>
+      <button disabled={locked||report.stale} onClick={()=>run(applyOrder)}>Apply to opening order</button>
       {report.gaps.length>0 && <button disabled={locked||report.stale} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
