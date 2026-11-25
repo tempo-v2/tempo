@@ -90,6 +90,24 @@ async function browserFlow(browser) {
     await addOpening(api, "Keep legal tail", [...line, "h7h6", "a2a3"], repertoire);
     await addOpening(api, "Other conflict", ["e2e4", "e7e6", "g1f3", "b8c6", "b1c3"], repertoire);
     seedReport(db, "browser", repertoire, anchor, ["g1f3", "b8c6"]);
+    const draft = { report: "browser", gap: 0, pgn: originalPgn };
+    const conflict = (await api("coverage/preview", draft)).conflicts[0];
+    sql(db, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000)
+      INSERT INTO openings(id,repertoire_id,name,color,route,start_at)
+      SELECT printf('!fixture-%04d',i),${quoted(repertoire)},'Other line','white',
+      ${quoted(JSON.stringify({ fen: start, moves: ["e2e4"] }))},0 FROM n;`);
+    const limited = await api("coverage/preview", draft);
+    assert.equal(limited.conflicts[0].saved.line, conflict.saved.line);
+    assert.equal(limited.conflicts[0].transposition, true);
+    assert.equal(limited.conflicts[0].saved_route_recorded, true);
+    assert.equal(limited.conflicts[0].saved_route_limited, true);
+    const unavailable = await api("coverage/preview", {
+      ...draft, replacements: { [conflict.position]: "d2d4" },
+    }, 422);
+    assert.equal(unavailable.code, "replacement_preview_unavailable");
+    assert.equal(unavailable.reason, "work_limit");
+    sql(db, "DELETE FROM openings WHERE id GLOB '!fixture-*';");
+
     const page = await browser.newPage({ viewport: { width: 820, height: 800 } });
     await page.addInitScript(({ key, pgn }) => {
       if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({ report: "browser", index: 0, pgn }));

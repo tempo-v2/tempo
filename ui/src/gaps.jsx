@@ -196,7 +196,7 @@ export function Gaps() {
       receipt=await api(command.replacements ? "coverage/replace" : "coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
       const stale = e.code === "stale_gap" || e.code === "gap_save_interrupted";
-      if(stale || e.code==="opening_reply_conflict" || e.code==="replacement_over_budget") {
+      if(stale || e.code==="opening_reply_conflict" || e.code==="replacement_over_budget" || e.code==="replacement_preview_unavailable") {
         await clearCommand("save", command);
         refreshJournal();
         clearPreview();

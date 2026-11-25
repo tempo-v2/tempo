@@ -25,6 +25,31 @@ pub struct Replacement {
     rewritten: Vec<catalog::OpeningPlan>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum PreviewUnavailable {
+    WorkLimit,
+    CyclicReplies,
+}
+
+impl PreviewUnavailable {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::WorkLimit => "work_limit",
+            Self::CyclicReplies => "cyclic_replies",
+        }
+    }
+}
+
+impl std::fmt::Display for PreviewUnavailable {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(match self {
+            Self::WorkLimit => "These saved continuations exceed the preview work limit. Split the replacement and preview again.",
+            Self::CyclicReplies => "The saved continuations reach competing replies in different orders. Preview the replacements separately.",
+        })
+    }
+}
+impl std::error::Error for PreviewUnavailable {}
+
 pub fn revision(db: &Connection, repertoire: &str) -> Result<i64> {
     Ok(db
         .query_row(
@@ -56,7 +81,7 @@ fn saved_lines(db: &Connection, repertoire: &str, color: &str) -> Result<Vec<Sav
         expanded_work += route.moves.len().pow(2);
         ensure!(
             lines.len() < 2000 && moves <= 100_000 && expanded_work <= 8_000_000,
-            "This repertoire is too large to preview a replacement here."
+            PreviewUnavailable::WorkLimit
         );
         lines.push(SavedLine {
             id: row.get(0)?,
@@ -179,8 +204,9 @@ fn stop_at_reachable_conflicts(
     let mut visits_left = 8_000_000usize;
     loop {
         let decisions: usize = continuations.iter().map(|line| line.decisions.len()).sum();
-        visits_left = visits_left.checked_sub(3 * decisions)
-            .context("These saved continuations exceed the conflict preview work limit. Split the replacement and preview again.")?;
+        visits_left = visits_left
+            .checked_sub(3 * decisions)
+            .ok_or(PreviewUnavailable::WorkLimit)?;
         let candidates = continuations
             .iter()
             .flat_map(|line| &line.decisions)
@@ -202,10 +228,7 @@ fn stop_at_reachable_conflicts(
             .into_iter()
             .map(str::to_owned)
             .collect();
-        ensure!(
-            !reachable.is_empty(),
-            "The saved continuations reach competing replies in different orders. Preview the replacements separately."
-        );
+        ensure!(!reachable.is_empty(), PreviewUnavailable::CyclicReplies);
         for line in continuations.iter_mut() {
             line.stop_before(|reply| reachable.contains(reply.position.as_str()));
         }
@@ -442,8 +465,8 @@ pub fn apply(db: &Connection, repertoire: &str, replacement: &Replacement) -> Re
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_discarded_suffix_cannot_trim_an_independent_continuation() -> Result<()> {
+    #[tokio::test]
+    async fn a_discarded_suffix_cannot_trim_an_independent_continuation() -> Result<()> {
         let line = |steps: &[(&str, &str)]| Rewritten {
             moves: steps
                 .iter()
@@ -475,7 +498,21 @@ mod tests {
             line(&[("first", "a2a3"), ("later", "e2e4")]),
             line(&[("later", "d2d4"), ("first", "a2a4")]),
         ];
-        assert!(stop_at_reachable_conflicts(&mut cyclic, |_| true).is_err());
+        use axum::response::IntoResponse;
+        let error = stop_at_reachable_conflicts(&mut cyclic, |_| true).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<PreviewUnavailable>(),
+            Some(&PreviewUnavailable::CyclicReplies)
+        );
+        let response = crate::ApiError(error).into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(body["code"], "replacement_preview_unavailable");
+        assert_eq!(body["reason"], "cyclic_replies");
         Ok(())
     }
 
