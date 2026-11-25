@@ -8,7 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const net = require("node:net");
 
-const [candidate, predecessor] = process.argv.slice(2).map(p => path.resolve(p));
+const [candidate, predecessor, retainedDatabase] = process.argv.slice(2).map(p => path.resolve(p));
 const chrome = process.env.TEMPO_QUALIFY_CHROME ||
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -78,14 +78,17 @@ function pendingAnswers() {
   });
 }
 
-async function predecessorRecovery(browser, db, accepted) {
+async function predecessorRecovery(browser, db, accepted, { retained = false } = {}) {
   const port = await unusedPort();
   const page = await browser.newPage();
   let original;
   let previousSchema;
+  let priorGrades;
   try {
     await serve(predecessor, db, port, async (origin, api) => {
-      await seed(api);
+      if (!retained) await seed(api);
+      priorGrades = grades(db);
+      const current = retained ? await api("study") : null;
       previousSchema = Number(execFileSync("sqlite3", ["-readonly", db, "PRAGMA user_version"]));
       await page.route(answerPattern, async route => {
         original = route.request().postDataJSON();
@@ -93,6 +96,12 @@ async function predecessorRecovery(browser, db, accepted) {
         await route.abort();
       });
       await page.goto(origin);
+      if (retained) {
+        if (current?.result) await next(page).click();
+        const skip = page.getByRole("button", { name: "Skip to your move" });
+        await reveal(page).or(skip).first().waitFor();
+        if (await skip.isVisible()) await skip.click();
+      }
       await reveal(page).click();
       await retry(page).waitFor();
       assert.ok(original?.dataset);
@@ -103,7 +112,7 @@ async function predecessorRecovery(browser, db, accepted) {
           { version: 1, dataset: original.dataset, attempt: original.attempt, action: { kind: "reveal" } },
         ]);
       }
-      assert.equal(grades(db), accepted ? 1 : 0);
+      assert.equal(grades(db), priorGrades + Number(accepted));
       await page.unroute(answerPattern);
     });
     execFileSync(candidate, ["migrate-games", db]);
@@ -112,7 +121,7 @@ async function predecessorRecovery(browser, db, accepted) {
       await page.reload();
       assert.deepEqual((await recovered).postDataJSON(), original);
       await next(page).waitFor();
-      assert.equal(grades(db), 1);
+      assert.equal(grades(db), priorGrades + 1);
       assert.deepEqual(await page.evaluate(() =>
         JSON.parse(localStorage.getItem("tempo.pending-answer.v2"))), previousSchema < 7 ? original : null);
     });
@@ -216,6 +225,56 @@ async function incompleteReply(browser, db) {
       assert.deepEqual((await replay).postDataJSON(), original);
       await next(page).waitFor();
       assert.equal(grades(db), 1);
+    });
+  } finally {
+    await page.context().close();
+  }
+}
+
+async function unplayableAnswerReply(browser, db) {
+  const page = await browser.newPage();
+  try {
+    await serve(candidate, db, await unusedPort(), async (origin, api) => {
+      await seed(api);
+      const commands = [];
+      const errors = [];
+      page.on("request", request => {
+        if (request.url().endsWith("/api/study/answer") || request.url().endsWith("/api/study/next")) {
+          commands.push([new URL(request.url()).pathname, request.postDataJSON()]);
+        }
+      });
+      page.on("pageerror", error => errors.push(error.message));
+      await page.route(answerPattern, async route => {
+        const response = await route.fetch();
+        assert.equal(response.status(), 200);
+        const result = await response.json();
+        assert.equal(result.rating, "Again");
+        await route.fulfill({ response, json: { ...result, answers: ["a1a8"], display_move: "a1a8" } });
+      }, { times: 1 });
+      await page.goto(origin);
+      await reveal(page).waitFor();
+      commands.length = 0;
+      await reveal(page).click();
+      await retry(page).waitFor();
+      assert.equal(await reveal(page).isVisible(), true);
+      const [command] = commands;
+      const { dataset, attempt } = command[1];
+      assert.deepEqual(await page.evaluate(pendingAnswers), [
+        { version: 1, dataset, attempt, action: { kind: "reveal" } },
+      ]);
+      const effects = () => execFileSync("sqlite3", ["-readonly", db, `
+        SELECT id,card_id,submission,result FROM attempts ORDER BY id;
+        SELECT * FROM learning ORDER BY card_id;
+        SELECT * FROM deck ORDER BY slot;
+      `], { encoding: "utf8" });
+      const saved = effects();
+      assert.equal(grades(db), 1);
+      await retry(page).click();
+      await next(page).waitFor();
+      assert.deepEqual(commands, [command, command]);
+      assert.equal(effects(), saved);
+      assert.deepEqual(await page.evaluate(pendingAnswers), []);
+      assert.deepEqual(errors, []);
     });
   } finally {
     await page.context().close();
@@ -534,6 +593,108 @@ async function browserReads(browser, db) {
   console.log("Mounted Games coalesced status invalidation, retained its page on failure, and retried the read alone.");
 }
 
+async function openingPreview(browser, db) {
+  const page = await browser.newPage();
+  try {
+    await serve(candidate, db, await unusedPort(), async (origin) => {
+      const errors = [];
+      page.on("pageerror", error => errors.push(error.message));
+      await page.goto(origin);
+      await page.getByRole("button", { name: "Openings", exact: true }).click();
+      await page.getByText("Start from PGN or FEN", { exact: true }).click();
+      const input = page.getByRole("textbox", { name: "Opening PGN or FEN" });
+      const useLine = page.getByRole("button", { name: "Use these moves as the line" });
+      const previewPattern = "**/api/openings/pgn";
+      async function holdPreview(pgn) {
+        const reply = Promise.withResolvers();
+        await page.route(previewPattern, async route => {
+          try {
+            const response = await route.fetch();
+            assert.equal(response.status(), 200);
+            reply.resolve(() => route.fulfill({ response }));
+          } catch (error) {
+            reply.reject(error);
+          }
+        }, { times: 1 });
+        await input.fill(pgn);
+        await useLine.click();
+        return reply.promise;
+      }
+
+      const stale = await holdPreview("1. c4 e5 1-0");
+      const canceled = page.waitForEvent("requestfailed", {
+        predicate: request => request.url().endsWith("/api/openings/pgn"), timeout: 5000,
+      });
+      await input.fill("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+      await page.getByRole("button", { name: "Load position", exact: true }).click();
+      await canceled;
+      await stale().catch(() => {});
+      assert.equal(await page.getByText("0 continuation plies", { exact: true }).isVisible(), true);
+
+      const olderPgn = "1. c4 e5 1-0";
+      const newerPgn = "1. d4 d5 1-0";
+      await page.evaluate(() => {
+        const text = File.prototype.text;
+        File.prototype.text = function () {
+          return new Promise((resolve, reject) => {
+            window.finishOpeningFileRead = async (fail) => {
+              delete window.finishOpeningFileRead;
+              if (fail) reject(new Error("Superseded file failure"));
+              else resolve(await text.call(this));
+            };
+          });
+        };
+      });
+      async function selectOpeningFile(name) {
+        await page.getByLabel("Upload opening PGN").setInputFiles({
+          name, mimeType: "text/plain", buffer: Buffer.from(olderPgn),
+        });
+        await page.waitForFunction(() => typeof window.finishOpeningFileRead === "function");
+      }
+
+      await selectOpeningFile("old.pgn");
+      const current = await holdPreview(newerPgn);
+      await page.evaluate(() => window.finishOpeningFileRead(false));
+      assert.equal(await input.inputValue(), newerPgn);
+      await page.getByRole("textbox", { name: "Opening name" }).fill("Edited name");
+      await current();
+      const draft = page.getByText("2 continuation plies", { exact: true });
+      await draft.waitFor();
+
+      await selectOpeningFile("failed.pgn");
+      await input.fill("1. e4 e5 1-0");
+      await page.evaluate(() => window.finishOpeningFileRead(true));
+      assert.equal(await page.getByText("Superseded file failure").isVisible(), false);
+      await selectOpeningFile("current.pgn");
+      await page.evaluate(() => window.finishOpeningFileRead(false));
+      assert.equal(await input.inputValue(), olderPgn);
+
+      const initialFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+      for (const malformed of [
+        { fen: "invalid", moves: [] },
+        { fen: initialFen, moves: ["a1a8"] },
+        { fen: initialFen, moves: ["e2e4garbage"] },
+      ]) {
+        await page.route(previewPattern, route => route.fulfill({ json: malformed }), { times: 1 });
+        const reply = page.waitForResponse(response => response.url().endsWith("/api/openings/pgn"));
+        await useLine.click();
+        await reply;
+        await page.getByText("The opening preview reply was incomplete. Try again.").waitFor();
+        assert.equal(await draft.isVisible(), true);
+      }
+      const query = sql => execFileSync("sqlite3", ["-readonly", db, sql], { encoding: "utf8" }).trim();
+      assert.equal(query("SELECT count(*) FROM openings"), "0");
+      await page.getByRole("button", { name: "Save opening" }).click();
+      await page.getByText("Opening saved. Its responses are ready in Study.", { exact: true }).waitFor();
+      assert.equal(query("SELECT name FROM openings"), "Edited name");
+      assert.deepEqual(JSON.parse(query("SELECT route FROM openings")).moves, ["d2d4", "d7d5"]);
+      assert.deepEqual(errors, []);
+    });
+  } finally {
+    await page.context().close();
+  }
+}
+
 (async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tempo-answer-ir-"));
   let browser;
@@ -541,8 +702,17 @@ async function browserReads(browser, db) {
     browser = await chromium.launch({ executablePath: chrome, headless: true, timeout: 15000 });
     await titleInvariance(browser, root);
     await incompleteReply(browser, path.join(root, "truncated.db"));
+    await unplayableAnswerReply(browser, path.join(root, "unplayable-answer.db"));
     await predecessorRecovery(browser, path.join(root, "accepted.db"), true);
     await predecessorRecovery(browser, path.join(root, "undelivered.db"), false);
+    if (retainedDatabase) {
+      for (const accepted of [true, false]) {
+        const copy = path.join(root, `retained-${accepted}.db`);
+        execFileSync("sqlite3", ["-readonly", retainedDatabase, ".backup " + copy]);
+        await predecessorRecovery(browser, copy, accepted, { retained: true });
+      }
+      console.log("Both predecessor Answer deliveries recovered on copies of its retained database.");
+    }
     await twoTabs(browser, path.join(root, "concurrent.db"));
     await mixedTabs(browser, path.join(root, "mixed.db"));
     await browserReads(browser, path.join(root, "browse.db"));
@@ -551,6 +721,8 @@ async function browserReads(browser, db) {
       await incompleteNextReply(browser, path.join(root, failure + "-next.db"), failure);
     }
     await incompleteStartupNext(browser, path.join(root, "startup-next.db"));
+    await openingPreview(browser, path.join(root, "preview.db"));
+    console.log("Malformed Answer feedback retained the original journal and one durable grade. Superseded files and invalid previews kept the draft intact, and name edits left the current preview applicable.");
     console.log("Malformed Next replies preserved saved manual and automatic results. Retry reused the issued attempt and the startup retry accepted real null.");
     console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, incomplete reply replay, and Next-only retry passed.");
   } finally {

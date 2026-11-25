@@ -50,6 +50,20 @@ struct Runtime {
     database: PathBuf,
     writer: writer::Writer,
     staging: uploads::Staging,
+    content_preparation: Arc<Semaphore>,
+    games_upload_staging: Arc<Semaphore>,
+}
+
+impl Runtime {
+    fn new(database: PathBuf, writer: writer::Writer, staging: uploads::Staging) -> Self {
+        Self {
+            database,
+            writer,
+            staging,
+            content_preparation: Arc::new(Semaphore::new(2)),
+            games_upload_staging: Arc::new(Semaphore::new(2)),
+        }
+    }
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
 
@@ -138,19 +152,18 @@ async fn write_db<T: Serialize + Send + 'static>(
 }
 
 async fn prepare<T: Send + 'static>(
+    slots: &Arc<Semaphore>,
+    busy: fn() -> ApiError,
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T, ApiError> {
-    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let permit = SLOTS
-        .try_acquire()
-        .map_err(|_| ApiError(writer::Unavailable.into()))?;
+    let permit = slots.clone().try_acquire_owned().map_err(|_| busy())?;
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         work()
     });
     tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
-        .map_err(|_| ApiError(writer::Unavailable.into()))?
+        .map_err(|_| busy())?
         .map_err(|error| ApiError(error.into()))?
         .map_err(ApiError)
 }
@@ -220,7 +233,12 @@ fn apply_opening(
 }
 
 async fn save_opening(State(db): State<App>, Json(input): Json<SaveOpening>) -> ApiResult {
-    let plan = prepare(move || catalog::prepare_opening(&input.opening)).await?;
+    let plan = prepare(
+        &db.content_preparation,
+        || ApiError(writer::Unavailable.into()),
+        move || catalog::prepare_opening(&input.opening),
+    )
+    .await?;
     write_db(db, move |c| {
         let id = apply_opening(
             c,
@@ -337,7 +355,12 @@ fn apply_puzzle(db: &mut Connection, plan: &catalog::TacticPlan) -> Result<Strin
 }
 
 async fn save_tactic(State(db): State<App>, Json(input): Json<PgnInput>) -> ApiResult {
-    let plan = prepare(move || prepare_puzzle(input)).await?;
+    let plan = prepare(
+        &db.content_preparation,
+        || ApiError(writer::Unavailable.into()),
+        move || prepare_puzzle(input),
+    )
+    .await?;
     write_db(db, move |c| Ok(json!({"id":apply_puzzle(c,&plan)?}))).await
 }
 
@@ -378,7 +401,12 @@ async fn upload_games(State(db): State<App>, Json(input): Json<GamesUpload>) -> 
         .map_err(ApiError)?
         .to_owned();
     let staging = db.staging.clone();
-    let staged = prepare(move || staging.manual(&input.pgn)).await?;
+    let staged = prepare(
+        &db.games_upload_staging,
+        || ApiError(uploads::Unavailable.into()),
+        move || staging.manual(&input.pgn),
+    )
+    .await?;
     write_db(db, move |c| {
         let id = job_store::start(
             c,
@@ -604,15 +632,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
                 }
             })?;
     }
-    let app = router(
-        &path,
-        port,
-        Arc::new(Runtime {
-            database: db,
-            writer,
-            staging,
-        }),
-    );
+    let app = router(&path, port, Arc::new(Runtime::new(db, writer, staging)));
     println!("Tempo at http://127.0.0.1:{port}");
     axum::serve(listener, app).await?;
     Ok(())
@@ -735,22 +755,22 @@ mod preview_tests {
     use tokio::sync::oneshot;
 
     #[tokio::test]
-    async fn cancelled_preview_parse_keeps_its_slot_without_blocking_commands() -> Result<()> {
+    async fn preparation_slots_keep_preview_staging_and_commands_independent() -> Result<()> {
         let directory =
             std::env::temp_dir().join(format!("tempo-preview-{:x}", rand::random::<u128>()));
         std::fs::create_dir(&directory)?;
         let database = directory.join("fixture.sqlite3");
         let mut db = Database::init(&database)?;
         queue_store::seed_batch(&mut db)?;
-        let app = Arc::new(Runtime {
-            writer: writer::Writer::start(db, None)?,
-            staging: uploads::Staging::start(&database)?,
-            database,
-        });
+        let app = Arc::new(Runtime::new(
+            database.clone(),
+            writer::Writer::start(db, None)?,
+            uploads::Staging::start(&database)?,
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
-        let app = router(Path::new("."), port, app);
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let routes = router(Path::new("."), port, app.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, routes).await });
         let (started, running) = oneshot::channel();
         let (release, held) = oneshot::channel();
         let caller = tokio::spawn(run_preview(
@@ -778,6 +798,20 @@ mod preview_tests {
         let response = post("openings/pgn", preview.clone()).await?;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.json::<Value>().await?["code"], "view_unavailable");
+
+        let staging_slots = app.games_upload_staging.clone().try_acquire_many_owned(2)?;
+        let upload_payload = json!({"username":"Learner",
+            "pgn":"[White \"Learner\"]\n[Black \"Other\"]\n\n1. e4 e5 1-0"});
+        let blocked = post("games/uploads", upload_payload.clone()).await?;
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            blocked.json::<Value>().await?["code"],
+            "staging_unavailable"
+        );
+        let jobs: usize =
+            Database::read(&database)?
+                .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))?;
+        assert_eq!(jobs, 0);
         for (route, payload) in [
             ("tactics", json!({"name":"Puzzle","pgn":"1. d4 d5 1-0"})),
             (
@@ -788,12 +822,13 @@ mod preview_tests {
         ] {
             post(route, payload).await?.error_for_status()?;
         }
-        let pgn = "[White \"Learner\"]\n[Black \"Other\"]\n\n1. e4 e5 1-0";
-        let mut upload = post("games/uploads", json!({"username":"Learner","pgn":pgn})).await?;
+        drop(staging_slots);
+        let content_slots = app.content_preparation.clone().try_acquire_many_owned(2)?;
+        let mut upload = post("games/uploads", upload_payload.clone()).await?;
         if upload.status() == StatusCode::SERVICE_UNAVAILABLE {
             assert_eq!(upload.json::<Value>().await?["code"], "staging_unavailable");
             tokio::time::sleep(Duration::from_millis(100)).await;
-            upload = post("games/uploads", json!({"username":"Learner","pgn":pgn})).await?;
+            upload = post("games/uploads", upload_payload).await?;
         }
         upload.error_for_status()?;
         let attempt: Value = post("study/next", json!({"after":null}))
@@ -812,6 +847,7 @@ mod preview_tests {
         .json()
         .await?;
         assert_eq!(result["rating"], "Again");
+        drop(content_slots);
 
         release.send(()).unwrap();
         drop(tokio::time::timeout(Duration::from_secs(1), OPENING_PREVIEW.acquire()).await??);

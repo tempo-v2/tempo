@@ -1,6 +1,7 @@
 export async function api(path, data, signal, { requireJson = data === undefined } = {}) {
   const response = await fetch("/api/" + path, data === undefined ? { signal } : {
     method: "POST",
+    signal,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
@@ -17,11 +18,15 @@ export async function api(path, data, signal, { requireJson = data === undefined
   return body;
 }
 
-export function fileText(event, setter, setError) {
+export function fileText(event, setter, setError, signal) {
   const file = event.target.files?.[0];
   if (!file) return;
   if (file.size > 64 * 1024 * 1024) { setError("Choose a PGN up to 64 MiB."); return; }
-  file.text().then(setter, (error) => setError(error.message));
+  return file.text().then((text) => {
+    if (!signal?.aborted) setter(text);
+  }, (error) => {
+    if (!signal?.aborted) setError(error.message);
+  });
 }
 
 // Only disposable reads use this deadline. Durable commands keep their recovery rules.
