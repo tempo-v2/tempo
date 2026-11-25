@@ -25,8 +25,12 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
         .optional()?;
     row.map(
         |(attempt, kind, title, color, fen, result, submission, context, played_in_game)| {
+            let puzzle = crate::lichess_play::for_review(db, attempt)?
+                .map(|id| crate::lichess_play::resume(db, id))
+                .transpose()?;
             let legal = chess::legal(&chess::position(&fen)?);
             let result = result
+                .filter(|_| puzzle.is_none())
                 .as_deref()
                 .map(|saved| {
                     serde_json::from_str::<AnswerReceipt>(saved)?.view(
@@ -52,6 +56,7 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
                 legal,
                 lead_in,
                 result,
+                puzzle,
             })
         },
     )
@@ -99,6 +104,7 @@ pub fn issue(db: &Connection, card: Option<(&str, &str)>) -> Result<()> {
     if let Some((id, kind)) = card {
         db.execute("INSERT INTO attempts(card_id) VALUES (?1)", [id])?;
         let attempt = db.last_insert_rowid();
+        crate::lichess_play::issue_review(db, id, attempt)?;
         db.execute(
             "UPDATE study SET active=?1,last_kind=?2",
             params![attempt, kind],
@@ -111,6 +117,10 @@ pub fn issue(db: &Connection, card: Option<(&str, &str)>) -> Result<()> {
 
 pub fn begin_answer(db: &Connection, input: &AnswerIntentV1) -> Result<AnswerState> {
     check_dataset(Some(&input.dataset), &crate::db::dataset(db)?)?;
+    ensure!(
+        crate::lichess_play::for_review(db, input.attempt)?.is_none(),
+        Conflict::FullSolution
+    );
     type IssuedRow = (
         String,
         Option<String>,

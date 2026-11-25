@@ -6,6 +6,9 @@ pub enum Conflict {
     Dataset,
     Submission,
     Attempt,
+    PackChanged,
+    IllegalMove,
+    FullSolution,
 }
 
 impl Conflict {
@@ -14,6 +17,9 @@ impl Conflict {
             Self::Dataset => "stale_dataset",
             Self::Submission => "answer_conflict",
             Self::Attempt => "stale_attempt",
+            Self::PackChanged => "pack_changed",
+            Self::IllegalMove => "illegal_move",
+            Self::FullSolution => "refresh_required",
         }
     }
 }
@@ -23,7 +29,10 @@ impl std::fmt::Display for Conflict {
         f.write_str(match self {
             Self::Dataset => "The Study dataset changed.",
             Self::Submission => "This card already has a different accepted answer.",
-            Self::Attempt => "The Study attempt is no longer available.",
+            Self::Attempt => "This attempt is no longer available.",
+            Self::PackChanged => "The puzzle catalog changed. Reload the pack.",
+            Self::IllegalMove => "That move is illegal in this position.",
+            Self::FullSolution => "Reload Tempo to continue the full puzzle.",
         })
     }
 }
@@ -171,6 +180,8 @@ pub struct Review {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_in: Option<chess::Route>,
     pub result: Option<AcceptedView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub puzzle: Option<crate::lichess_play::View>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

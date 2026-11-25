@@ -1,3 +1,4 @@
+import { TacticPacks } from "./tactic_packs.jsx";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api, fileText, readView } from "./api.js";
@@ -324,6 +325,18 @@ export function Openings({ fromGame, onSaved, sounds }) {
 }
 
 export function Tactics({ openGame, sounds }) {
+  const [page, setPage] = useState("packs");
+  return <section aria-label="Tactics">
+    <h1>Tactics</h1>
+    <div className="controls">
+      <button aria-pressed={page === "packs"} onClick={() => setPage("packs")}>Packs</button>
+      <button aria-pressed={page === "library"} onClick={() => setPage("library")}>Puzzle library</button>
+    </div>
+    {page === "packs" ? <TacticPacks sounds={sounds} /> : <TacticLibrary openGame={openGame} sounds={sounds} />}
+  </section>;
+}
+
+function TacticLibrary({ openGame, sounds }) {
   const list = useList("tactics");
   const [name, setName] = useState("");
   const [pgn, setPgn] = useState("");
@@ -339,7 +352,7 @@ export function Tactics({ openGame, sounds }) {
     catch (error) { setError(error.message); }
     finally { setBusy(false); }
   }
-  return <section aria-label="Tactics"><h1>Tactics</h1>
+  return <section aria-label="Puzzle library">
     <div className="split">
       <div>{problem && <>
         <h2>{problem.name}</h2>

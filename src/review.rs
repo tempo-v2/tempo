@@ -33,35 +33,53 @@ pub fn answer(db: &mut Connection, input: AnswerIntentV1) -> Result<AcceptedView
         Rating::Again
     };
     let now = Utc::now().timestamp();
-    let prior = db::prior_review(&tx, &issued.card)?;
-    let schedule = learning::schedule(rating, prior, now)?;
-    db::save_review(&tx, &issued.card, now, schedule)?;
-    let mut repeat = RepeatDisposition::None;
-    if matches!(rating, Rating::Again) && queue_store::can_repeat(&tx, &issued.card)? {
-        let draw = queue::draw_repeat_offset();
-        if queue_store::prepared(&tx)? {
-            repeat = RepeatDisposition::Placed(queue_store::place_repeat(
-                &tx,
-                &issued.card,
-                issued.previous_kind.as_deref(),
-                now,
-                draw,
-            )?);
-        } else {
-            queue_store::defer_repeat(
-                &tx,
-                input.attempt,
-                &issued.card,
-                issued.previous_kind.as_deref(),
-                now,
-                draw,
-            )?;
-            repeat = RepeatDisposition::Deferred;
-        }
-    }
+    let (repeat, _) = record_rating(
+        &tx,
+        &issued.card,
+        input.attempt,
+        issued.previous_kind.as_deref(),
+        rating,
+        now,
+        None,
+    )?;
     let accepted = study_store::accept_answer(&tx, &input, issued, rating, repeat)?;
     tx.commit()?;
     Ok(accepted)
+}
+
+/// Apply an authoritative assessment from either first play or Study.
+pub fn record_rating(
+    db: &Connection,
+    card: &str,
+    attempt: i64,
+    previous: Option<&str>,
+    rating: Rating,
+    now: i64,
+    first_due: Option<(i64, String)>,
+) -> Result<(RepeatDisposition, Option<String>)> {
+    let prior = db::prior_review(db, card)?;
+    anyhow::ensure!(
+        first_due.is_none() || prior.is_none(),
+        "First review already exists"
+    );
+    let mut schedule = learning::schedule(rating, prior, now)?;
+    let day = first_due.map(|(due, day)| {
+        schedule.due_at = due;
+        day
+    });
+    db::save_review(db, card, now, schedule)?;
+    let repeat = if matches!(rating, Rating::Again) && queue_store::can_repeat(db, card)? {
+        let draw = queue::draw_repeat_offset();
+        if queue_store::can_place_now(db)? {
+            RepeatDisposition::Placed(queue_store::place_repeat(db, card, previous, now, draw)?)
+        } else {
+            queue_store::defer_repeat(db, attempt, card, previous, now, draw)?;
+            RepeatDisposition::Deferred
+        }
+    } else {
+        RepeatDisposition::None
+    };
+    Ok((repeat, day))
 }
 
 #[derive(Debug)]
@@ -117,6 +135,7 @@ mod tests {
                 include_str!("opening_order.sql"),
                 include_str!("game_pipeline.sql"),
                 include_str!("prepared_queue.sql"),
+                include_str!("lichess_packs.sql"),
                 include_str!("coverage_order.sql"),
             ] {
                 db.execute_batch(schema)?;
@@ -205,6 +224,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
@@ -259,6 +279,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;

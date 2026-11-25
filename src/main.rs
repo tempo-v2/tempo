@@ -10,6 +10,8 @@ mod job_store;
 mod jobs;
 mod learning;
 mod legacy;
+mod lichess_catalog;
+mod lichess_play;
 mod opening_rank;
 mod optional_read;
 mod providers;
@@ -494,6 +496,66 @@ async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> A
 async fn answer(State(db): State<App>, Json(input): Json<study::AnswerWire>) -> ApiResult {
     write_db(db, move |c| review::answer(c, input.into())).await
 }
+async fn pack_index(State(db): State<App>) -> ViewResult {
+    optional_view(db, optional_read::Reader::LichessPacks, |c| {
+        lichess_catalog::index(c)
+    })
+    .await
+}
+#[derive(Deserialize)]
+struct PackCursor {
+    #[serde(default)]
+    after: i64,
+}
+async fn pack_theme(
+    State(db): State<App>,
+    UrlPath(theme): UrlPath<String>,
+    Query(page): Query<PackCursor>,
+) -> ViewResult {
+    optional_view(db, optional_read::Reader::LichessPacks, move |c| {
+        lichess_catalog::theme(c, &theme, page.after)
+    })
+    .await
+}
+async fn pack_members(
+    State(db): State<App>,
+    UrlPath((theme, band)): UrlPath<(String, i64)>,
+) -> ViewResult {
+    optional_view(db, optional_read::Reader::LichessMembers, move |c| {
+        lichess_catalog::members(c, &theme, band)
+    })
+    .await
+}
+async fn pack_pending(State(db): State<App>, Query(page): Query<PackCursor>) -> ViewResult {
+    optional_view(db, optional_read::Reader::LichessPlays, move |c| {
+        lichess_play::pending(c, page.after)
+    })
+    .await
+}
+async fn pack_resume(State(db): State<App>, UrlPath(play): UrlPath<i64>) -> ViewResult {
+    optional_view(db, optional_read::Reader::LichessPlays, move |c| {
+        lichess_play::resume_tactics(c, play)
+    })
+    .await
+}
+async fn pack_start(State(db): State<App>, Json(input): Json<lichess_play::Start>) -> ApiResult {
+    write_db(db, move |c| lichess_play::start(c, input)).await
+}
+async fn pack_move(State(db): State<App>, Json(input): Json<lichess_play::Move>) -> ApiResult {
+    write_db(db, move |c| {
+        lichess_play::play(c, input, lichess_play::Surface::Tactics)
+    })
+    .await
+}
+async fn study_puzzle_move(
+    State(db): State<App>,
+    Json(input): Json<lichess_play::Move>,
+) -> ApiResult {
+    write_db(db, move |c| {
+        lichess_play::play(c, input, lichess_play::Surface::Study)
+    })
+    .await
+}
 type ViewResult = std::result::Result<Response, ApiError>;
 
 async fn optional_view<T: Serialize + 'static>(
@@ -702,6 +764,13 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             "/api/settings/new-openings",
             get(new_opening_settings).post(save_new_opening_settings),
         )
+        .route("/api/tactics/packs", get(pack_index))
+        .route("/api/tactics/packs/{theme}", get(pack_theme))
+        .route("/api/tactics/packs/{theme}/{band}", get(pack_members))
+        .route("/api/tactics/plays", get(pack_pending).post(pack_start))
+        .route("/api/tactics/plays/{play}", get(pack_resume))
+        .route("/api/tactics/plays/move", post(pack_move))
+        .route("/api/study/puzzle-move", post(study_puzzle_move))
         .route("/api/study", get(current))
         .route("/api/study/counts", get(study_counts))
         .route("/api/study/next", post(next_review))
@@ -728,6 +797,14 @@ async fn main() -> Result<()> {
             let path = Path::new(db);
             let _lock = lock_database(path)?;
             Database::migrate_games(path)
+        }
+        [command, db, artifact] if command == "import-lichess-packs" => {
+            let path = Path::new(db);
+            let _lock = lock_database(path)?;
+            let mut database = Database::init(path)?;
+            let report = lichess_catalog::import(&mut database, Path::new(artifact))?;
+            println!("{}", serde_json::to_string(&report)?);
+            Ok(())
         }
         [command, source, dest] if command == "import-openings" => {
             let _lock = lock_database(Path::new(dest))?;
@@ -779,7 +856,7 @@ async fn main() -> Result<()> {
             opening_rank::replace(&mut database, snapshot)
         }
         _ => anyhow::bail!(
-            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT"
+            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT"
         ),
     }
 }
