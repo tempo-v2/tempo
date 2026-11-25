@@ -357,12 +357,12 @@ impl std::fmt::Display for ExpandedPgn {
 }
 impl std::error::Error for ExpandedPgn {}
 
-pub fn parse_gap_pgn(text: &str, online: bool) -> Result<Pgn> {
+pub fn parse_gap_pgn(text: &str) -> Result<Pgn> {
     let mut reader = Reader::new(text.as_bytes());
     let mut parser = Parser {
         branches: true,
         // Conservatively bounds both expanded route storage and card contexts.
-        max_expanded_work: Some(if online { 2_000_000 } else { 8_000_000 }),
+        max_expanded_work: Some(8_000_000),
     };
     let game = reader
         .read_game(&mut parser)?
@@ -418,7 +418,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gap_preview_bounds_expanded_variations_but_offline_can_parse_them() -> Result<()> {
+    fn gap_preparation_bounds_expanded_variations() -> Result<()> {
         let mut pgn = String::new();
         for move_number in (1..301).step_by(2) {
             pgn.push_str(&format!(
@@ -431,15 +431,13 @@ mod tests {
             pgn.push_str("(301. d4) ");
         }
         pgn.push('*');
-        let error = parse_gap_pgn(&pgn, true).unwrap_err();
-        assert!(error.is::<ExpandedPgn>());
-        assert_eq!(parse_gap_pgn(&pgn, false)?.variations.len(), 8);
+        assert_eq!(parse_gap_pgn(&pgn)?.variations.len(), 8);
         pgn.pop();
         for _ in 0..16 {
             pgn.push_str("(301. d4) ");
         }
         pgn.push('*');
-        assert!(parse_gap_pgn(&pgn, false).unwrap_err().is::<ExpandedPgn>());
+        assert!(parse_gap_pgn(&pgn).unwrap_err().is::<ExpandedPgn>());
         Ok(())
     }
 

@@ -79,10 +79,10 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
-        if self.0.is::<gap_edit::OfflineRequired>() {
+        if self.0.is::<gap_edit::Interrupted>() {
             return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({"code":"gap_offline_required","error":self.0.to_string()})),
+                StatusCode::CONFLICT,
+                Json(json!({"code":"gap_save_interrupted","error":self.0.to_string()})),
             )
                 .into_response();
         }
@@ -134,10 +134,10 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
-        if let Some(error) = self.0.downcast_ref::<catalog::OpeningConflict>() {
+        if self.0.is::<catalog::OpeningConflict>() || self.0.is::<gap_edit::Conflicts>() {
             return (
                 StatusCode::CONFLICT,
-                Json(json!({"code":"opening_reply_conflict","error":error.to_string()})),
+                Json(json!({"code":"opening_reply_conflict","error":self.0.to_string()})),
             )
                 .into_response();
         }
@@ -672,6 +672,7 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             "/api/coverage/save",
             post(gap_edit::save).layer(DefaultBodyLimit::max(800 * 1024)),
         )
+        .route("/api/coverage/save/{command}", get(gap_edit::progress))
         .route("/api/openings", get(openings).post(save_opening))
         .route("/api/openings/repertoires", get(repertoires))
         .route(

@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 10;
+const SCHEMA: i32 = 11;
 
 pub struct Database;
 
@@ -55,6 +55,7 @@ impl Database {
         db.execute_batch(include_str!("job_admission.sql"))?;
         db.execute_batch(include_str!("coverage.sql"))?;
         db.execute_batch(include_str!("coverage_order.sql"))?;
+        db.execute_batch(include_str!("gap_batches.sql"))?;
         crate::games::upgrade(&db)?;
         db.execute_batch(include_str!("detectors.sql"))?;
         db.execute(
@@ -88,7 +89,10 @@ impl Database {
             if version < 9 {
                 tx.execute_batch(include_str!("coverage.sql"))?;
             }
-            tx.execute_batch(include_str!("coverage_order.sql"))?;
+            if version < 10 {
+                tx.execute_batch(include_str!("coverage_order.sql"))?;
+            }
+            tx.execute_batch(include_str!("gap_batches.sql"))?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -119,6 +123,7 @@ impl Database {
         }
         tx.execute_batch(include_str!("coverage.sql"))?;
         tx.execute_batch(include_str!("coverage_order.sql"))?;
+        tx.execute_batch(include_str!("gap_batches.sql"))?;
         crate::games::upgrade(&tx)?;
         tx.execute_batch(include_str!("detectors.sql"))?;
         let valid: bool = tx.query_row(
