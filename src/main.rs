@@ -14,6 +14,7 @@ mod learning;
 mod legacy;
 mod lichess_catalog;
 mod lichess_play;
+mod opening_engine;
 mod opening_rank;
 mod opening_replacement;
 mod optional_read;
@@ -81,6 +82,26 @@ type ApiResult = std::result::Result<Json<Value>, ApiError>;
 struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Some(error) = self.0.downcast_ref::<repertoire_similarity::Error>() {
+            use repertoire_similarity::Error::*;
+            let (status, message) = match error {
+                InvalidRequest => (StatusCode::BAD_REQUEST, "Invalid position or repertoire."),
+                InvalidSnapshot => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "The saved repertoire could not be read.",
+                ),
+                WorkLimit => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "This repertoire exceeds the similarity search limit.",
+                ),
+                Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Similar moves are temporarily unavailable.",
+                ),
+            };
+            return (status, Json(json!({"code":error,"error":message}))).into_response();
+        }
+
         if self.0.is::<gap_edit::Stale>() {
             return (
                 StatusCode::CONFLICT,
@@ -782,6 +803,11 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .route("/api/coverage/save/{command}", get(gap_edit::progress))
         .route("/api/openings", get(openings).post(save_opening))
         .route("/api/openings/repertoires", get(repertoires))
+        .route(
+            "/api/openings/similar-moves",
+            post(repertoire_similarity::browse),
+        )
+        .route("/api/openings/engine-moves", post(opening_engine::browse))
         .route(
             "/api/openings/pgn",
             post(preview_opening).layer(pgn_body_limit),

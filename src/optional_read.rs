@@ -46,11 +46,12 @@ pub enum Reader {
     CoverageGaps,
     CoverageStudied,
     CurrentStudy,
+    RepertoireSimilarity,
 }
 
 impl Reader {
     fn slot(self) -> &'static Semaphore {
-        const LANES: usize = Reader::CurrentStudy as usize + 1;
+        const LANES: usize = Reader::RepertoireSimilarity as usize + 1;
         static SLOTS: [Semaphore; LANES] = [const { Semaphore::const_new(1) }; LANES];
         &SLOTS[self as usize]
     }
@@ -68,11 +69,20 @@ pub async fn read<T: Serialize + 'static>(
     database: PathBuf,
     work: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
 ) -> Result<Vec<u8>> {
+    read_until(reader, database, |db, _| work(db)).await
+}
+
+pub async fn read_until<T: Serialize + 'static>(
+    reader: Reader,
+    database: PathBuf,
+    work: impl FnOnce(&mut Connection, &dyn Fn() -> bool) -> Result<T> + Send + 'static,
+) -> Result<Vec<u8>> {
     run(reader.slot(), DEADLINE, move |deadline, cancelled| {
         let mut db =
             Database::read_with_busy_timeout(&database, Duration::ZERO).map_err(|_| Unavailable)?;
         limit_query(&db, deadline, VM_BUDGET, cancelled.clone());
-        let value = work(&mut db).map_err(|error| {
+        let stopped = || Instant::now() >= deadline || cancelled.load(Ordering::Relaxed);
+        let value = work(&mut db, &stopped).map_err(|error| {
             if reader.hides_read_errors()
                 || error.chain().any(|cause| {
                     matches!(cause.downcast_ref::<rusqlite::Error>(),

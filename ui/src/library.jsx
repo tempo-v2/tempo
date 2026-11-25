@@ -1,3 +1,4 @@
+import { SimilarMoves } from "./similar_moves.jsx";
 import { TacticPacks } from "./tactic_packs.jsx";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
@@ -164,8 +165,17 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const [offlineDraft, setOfflineDraft] = useState(null);
   const [busy, setBusy] = useState(false);
   const sourceRequest = useRef(null);
+  const [savedRevision, setSavedRevision] = useState(0);
   const game = position(draft);
   const legal = game.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? ""));
+
+  function appendMove(move) {
+    const board = position(draft);
+    const played = play(board, move);
+    sounds.play(moveCue(played, board));
+    editDraft({ ...draft, moves: [...draft.moves, move] });
+    setNotice("");
+  }
 
   function cancelSource() {
     sourceRequest.current?.abort();
@@ -237,6 +247,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
     try {
       await api("openings", request);
       setNotice("Opening saved. Its responses are ready in Study.");
+      setSavedRevision(revision => revision + 1);
       onSaved();
       await list.load();
       if (destination === "new") loadRepertoires();
@@ -267,13 +278,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
         </> : <>
           <ChessBoard game={game} legal={legal} orientation={color} identity="opening-editor"
             onRejectedMove={() => sounds.play("illegal")}
-            onMove={(move) => {
-              const board = position(draft);
-              const played = play(board, move);
-              sounds.play(moveCue(played, board));
-              editDraft({ ...draft, moves: [...draft.moves, move] });
-              setNotice("");
-            }} />
+            onMove={appendMove} />
           <div className="controls">
             <button disabled={draft.moves.length <= draft.start_at} onClick={() => editDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
             <button onClick={() => { editDraft(initial); setDestination(fromGame ? null : "new"); setNotice(""); }}>Start over</button>
@@ -304,6 +309,9 @@ export function Openings({ fromGame, onSaved, sounds }) {
           </select></label>
           <button className="primary" disabled={busy || !destination || draft.moves.length <= draft.start_at}>Save opening</button>
         </form>}
+        {!opening && saveDestination && !busy && <SimilarMoves
+          key={JSON.stringify([draft, saveDestination.id, saveDestination.color, savedRevision])}
+          game={game} repertoire={saveDestination} onUse={appendMove} />}
         {notice && <p role="status">{notice}</p>}
         {error && <p className="error" role="alert">{error}</p>}
         {offlineDraft && <button onClick={() => downloadOpeningDraft(offlineDraft)}>Download for offline import</button>}

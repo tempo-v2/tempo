@@ -97,3 +97,22 @@ pub async fn send<T: Serialize>(
     stream.write_all(&bytes).await?;
     stream.shutdown().await
 }
+
+pub fn engine_path(database: &Path) -> PathBuf {
+    socket_path(database).with_file_name("engine")
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineRequest {
+    pub fen: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EngineReply {
+    Ranked { first_moves: Vec<String> },
+    Terminal,
+    Busy,
+    Unavailable,
+}
