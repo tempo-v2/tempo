@@ -39,6 +39,7 @@ pub enum Reader {
     Tactics,
     ProviderSettings,
     OpeningSettings,
+    Coverage,
     CurrentStudy,
 }
 

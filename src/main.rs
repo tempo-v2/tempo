@@ -1,9 +1,11 @@
 mod catalog;
 mod chess;
+mod coverage;
 mod db;
 mod game_ir;
 mod game_pipeline;
 mod games;
+mod gap_edit;
 mod job_store;
 mod jobs;
 mod learning;
@@ -645,6 +647,10 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             "/api/health",
             get(|| async { Json(json!({"status":"ready","profile":"lean"})) }),
         )
+        .route("/api/coverage", post(coverage::start))
+        .route("/api/coverage/{id}", get(coverage::read))
+        .route("/api/coverage/preview", post(gap_edit::preview))
+        .route("/api/coverage/save", post(gap_edit::save))
         .route("/api/openings", get(openings).post(save_opening))
         .route("/api/openings/repertoires", get(repertoires))
         .route(

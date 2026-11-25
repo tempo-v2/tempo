@@ -167,6 +167,14 @@ struct OpeningCard {
     context: String,
 }
 
+impl OpeningPlan {
+    pub fn responses(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.cards
+            .iter()
+            .map(|c| (c.position.as_str(), c.version.as_str(), c.answers.as_str()))
+    }
+}
+
 pub fn prepare_opening(input: &OpeningInput) -> Result<OpeningPlan> {
     let name = name(&input.name)?.to_owned();
     ensure!(

@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 8;
+const SCHEMA: i32 = 9;
 
 pub struct Database;
 
@@ -53,6 +53,7 @@ impl Database {
         db.execute_batch(include_str!("job_turns.sql"))?;
         db.execute_batch(include_str!("operation_bounds.sql"))?;
         db.execute_batch(include_str!("job_admission.sql"))?;
+        db.execute_batch(include_str!("coverage.sql"))?;
         crate::games::upgrade(&db)?;
         db.execute_batch(include_str!("detectors.sql"))?;
         db.execute(
@@ -80,9 +81,10 @@ impl Database {
         if version == SCHEMA {
             return Ok(());
         }
-        if version == 7 {
+        if version >= 7 {
             // The ordinal cursor changes job interpretation, not the table layout.
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("coverage.sql"))?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -111,6 +113,7 @@ impl Database {
         if version < 6 {
             tx.execute_batch(include_str!("job_admission.sql"))?;
         }
+        tx.execute_batch(include_str!("coverage.sql"))?;
         crate::games::upgrade(&tx)?;
         tx.execute_batch(include_str!("detectors.sql"))?;
         let valid: bool = tx.query_row(
