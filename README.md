@@ -89,17 +89,13 @@ opening save payload (name, color, route and destination). The `tactic` form
 takes the same PGN and name input as the browser. These commands hold the
 service's database lock and use the same atomic validation and conflict checks.
 
-For an oversized continuation in Openings → Gaps, preview the PGN and choose
-**Download gap for offline import**. Stop Tempo and run
-`tempo import-content DATABASE gap tempo-gap.json` with the exported file.
-Use the same database and rescan if the repertoire has changed since the
-original report. The command imports matching branches together, enforces the
-same conflict rules as online Save, and replays the saved receipt on retry.
-For PGNs whose expanded variations exceed the preview limit, the offline
-import performs the full validation before writing. An exceptionally large
-expanded tree can also exceed the offline limit. In that case, split it
-into smaller continuations and rescan before previewing each part.
-Restart Tempo and rescan to see the new coverage.
+Openings → Gaps saves large continuations online in bounded batches. Tempo
+validates the full PGN first. Each batch's content and checkpoint commit together.
+Retry uses the original previewed command and resumes at the last checkpoint.
+If another edit changes the repertoire between batches, Tempo reports the
+committed progress and asks for a fresh scan. Older exported gap files can
+still be imported with `tempo import-content DATABASE gap tempo-gap.json`
+while Tempo is stopped.
 
 A service backup that must resume queued PGN uploads includes the SQLite
 database and its adjacent `.uploads` directory. Stop the service before
