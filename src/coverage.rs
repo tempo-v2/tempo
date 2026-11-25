@@ -1,6 +1,5 @@
 use crate::{
-    ApiError, ApiResult, App, Database, ViewResult, catalog, chess, db, optional_read,
-    optional_view, write_db,
+    ApiError, ApiResult, App, Database, ViewResult, catalog, chess, optional_read, optional_view,
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -10,12 +9,7 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    io::Write,
-    path::PathBuf,
-    process::{Command, Stdio},
-};
+use std::collections::HashMap;
 use tokio::sync::Semaphore;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -186,137 +180,9 @@ pub fn backfill_views(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+mod scan;
 pub use catalog::authored_reply_revision as revision;
-
-pub fn load(c: &Connection, id: &str) -> Result<(Scan, i64, Forecast)> {
-    let (request, rev, report): (String, i64, String) = c
-        .query_row(
-            "SELECT request,revision,report FROM coverage_report WHERE id=?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?
-        .context("Run the coverage scan again.")?;
-    Ok((
-        serde_json::from_str(&request)?,
-        rev,
-        serde_json::from_str(&report)?,
-    ))
-}
-
-fn snapshot(path: &std::path::Path, scan: &Scan) -> Result<(String, i64, Value)> {
-    let mut c = Database::read(path)?;
-    let tx = c.transaction()?;
-    catalog::existing_repertoire(&tx, &scan.repertoire, &scan.color)?;
-    let rev = revision(&tx, &scan.repertoire)?;
-    let id = chess::id(&[
-        CURRENT_MODEL,
-        &db::dataset(&tx)?,
-        &rev.to_string(),
-        &serde_json::to_string(scan)?,
-    ]);
-    let mut query=tx.prepare("SELECT id,fen,answers,quarantined FROM cards WHERE kind='opening' AND opening_retired=0 AND repertoire_id=?1 AND color=?2")?;
-    let mut rows = query.query((&scan.repertoire, &scan.color))?;
-    let mut cards = vec![];
-    while let Some(r) = rows.next()? {
-        cards.push(json!({"id":r.get::<_,String>(0)?,"fen":r.get::<_,String>(1)?,"answers":serde_json::from_str::<Vec<String>>(&r.get::<_,String>(2)?)?,"quarantined":r.get::<_,bool>(3)?}));
-    }
-    let mut input = serde_json::to_value(scan)?;
-    input["cards"] = json!(cards);
-    Ok((id, rev, input))
-}
-
-fn evaluate(input: Value) -> Result<Forecast> {
-    let root = PathBuf::from(std::env::var_os("HOME").context("Missing home directory")?)
-        .join("Library/Application Support/Tempo Lean/Maia3");
-    let mut child = Command::new(root.join("venv/bin/python"))
-        .arg("-c")
-        .arg(include_str!("../tools/coverage.py"))
-        .arg(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("Maia is unavailable. Run tools/setup-coverage.sh on the Tempo host.")?;
-    let mut stdin = child.stdin.take().unwrap();
-    let written = stdin.write_all(&serde_json::to_vec(&input)?);
-    drop(stdin);
-    let output = child.wait_with_output()?;
-    written?;
-    ensure!(
-        output.status.success(),
-        "Maia could not finish this scan. Check the host model setup and retry."
-    );
-    let forecast: Forecast = serde_json::from_slice(&output.stdout)?;
-    ensure!(forecast.model.is_current(), "Unexpected forecast model");
-    Ok(forecast)
-}
-
-static SLOT: Semaphore = Semaphore::const_new(1);
-
-pub async fn start(State(app): State<App>, Json(mut scan): Json<Scan>) -> ApiResult {
-    let permit = SLOT
-        .try_acquire()
-        .map_err(|_| ApiError(anyhow::anyhow!("A coverage scan is already running.")))?;
-    let path = app.database.clone();
-    let (id, rev, report, scan) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let _permit = permit;
-        ensure!(
-            scan.through > 0 && scan.through <= 100 && scan.route.moves.len() <= 200,
-            "Choose a horizon from 1 to 100 and a starting line of at most 200 plies."
-        );
-        scan.route.fen = chess::fen(&chess::position(&scan.route.fen)?);
-        chess::board_at(&scan.route, scan.route.moves.len())?;
-        let (id, rev, input) = snapshot(&path, &scan)?;
-        let cached = Database::read(&path)?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM coverage_report WHERE id=?1)",
-            [&id],
-            |r| r.get::<_, bool>(0),
-        )?;
-        let report = if cached {
-            None
-        } else {
-            let forecast = evaluate(input)?;
-            Some((
-                serde_json::to_string(&forecast)?,
-                Projection::prepare(&forecast)?,
-            ))
-        };
-        Ok((id, rev, report, scan))
-    })
-    .await
-    .map_err(|e| ApiError(e.into()))?
-    .map_err(ApiError)?;
-    write_db(app, move |c| {
-        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        ensure!(
-            revision(&tx, &scan.repertoire)? == rev,
-            "The repertoire changed. Retry scan."
-        );
-        if let Some((report, projection)) = &report {
-            let before = tx.total_changes();
-            if tx.execute(
-                "INSERT OR IGNORE INTO coverage_report VALUES(?1,?2,?3,?4,?5)",
-                (
-                    &id,
-                    &scan.repertoire,
-                    rev,
-                    serde_json::to_string(&scan)?,
-                    report,
-                ),
-            )? != 0
-            {
-                projection.insert(&tx, &id)?;
-            }
-            ensure!(
-                tx.total_changes() - before <= 128,
-                "Coverage publication exceeds row budget"
-            );
-        }
-        tx.commit()?;
-        Ok(json!({"id":id}))
-    })
-    .await
-}
+pub use scan::{ScanFailure, start};
 
 #[derive(Default, Deserialize)]
 pub struct Page {
@@ -472,25 +338,23 @@ pub async fn apply(
         );
         let mut db = Database::read(&app.database)?;
         let tx = db.transaction()?;
-        let (scan, rev, forecast) = load(&tx, &id)?;
-        let reply = json!({"id":id,"command":input.command,"cards":forecast.reach.len()});
-        let prior: Option<String> = tx
-            .query_row(
-                "SELECT report FROM applied_forecast WHERE command=?1",
-                [&input.command],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(prior) = prior {
+        let prior: Option<(String,usize)> = tx.query_row(
+            "SELECT a.report,i.card_count FROM applied_forecast a JOIN coverage_rank_input i ON i.report_id=a.report WHERE command=?1",
+            [&input.command], |row| Ok((row.get(0)?,row.get(1)?))
+        ).optional()?;
+        if let Some((prior,count))=prior {
             ensure!(prior == id, "Apply identity already used");
-            return Ok(reply);
+            return Ok(json!({"id":id,"command":input.command,"cards":count}));
         }
-        ensure!(forecast.model.is_current(), SupersededModel);
-        ensure!(
-            revision(&tx, &scan.repertoire)? == rev,
-            crate::gap_edit::Stale
-        );
-        let order = crate::opening_rank::StagedOrder::prepare(&tx, &id, &forecast.reach)?;
+        let (scan,rev)=scan_metadata(&tx,&id)?;
+        let (model,reach):(String,String)=tx.query_row(
+            "SELECT v.model_id,i.reach FROM coverage_view v JOIN coverage_rank_input i USING(report_id) WHERE report_id=?1",
+            [&id],|row| Ok((row.get(0)?,row.get(1)?)))?;
+        ensure!(serde_json::from_str::<ForecastModel>(&model)?.is_current(), SupersededModel);
+        ensure!(revision(&tx,&scan.repertoire)?==rev,crate::gap_edit::Stale);
+        let reach: HashMap<String,f64>=serde_json::from_str(&reach)?;
+        let reply=json!({"id":id,"command":input.command,"cards":reach.len()});
+        let order=crate::opening_rank::StagedOrder::prepare(&tx,&id,&reach)?;
         tx.commit()?;
         let bank = order.stage(&app.writer)?;
         app.writer.background(move |c| {
@@ -499,10 +363,13 @@ pub async fn apply(
                 revision(&tx, &scan.repertoire)? == rev,
                 crate::gap_edit::Stale
             );
-            tx.execute(
-                "UPDATE forecast_order_state SET bank=?1 WHERE singleton=1",
-                [bank],
-            )?;
+            ensure!(
+                tx.execute(
+                    "UPDATE forecast_order_state SET bank=?1 WHERE singleton=1 AND bank<>?1",
+                    [bank],
+                )? == 1,
+                "Opening order changed during Apply"
+            );
             tx.execute(
                 "INSERT INTO applied_forecast VALUES(?1,?2)",
                 (&input.command, &id),
@@ -663,6 +530,7 @@ mod tests {
         }
 
         backfill_views(&c)?;
+        c.execute("INSERT INTO coverage_rank_input SELECT id,json_extract(report,'$.reach'),1 FROM coverage_report", [])?;
         let accepted = "11111111-1111-4111-8111-111111111111";
         let next = "22222222-2222-4222-8222-222222222222";
         c.execute("INSERT INTO applied_forecast VALUES (?1,'old')", [accepted])?;

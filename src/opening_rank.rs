@@ -146,59 +146,59 @@ impl StagedOrder {
         );
         let active = active_bank(db)?;
         let inactive = if active == "a" { "b" } else { "a" };
-        let mut q=db.prepare(&format!("SELECT card_id,rank,rank_{active},scope_{active},slot_{active},rank_{inactive},scope_{inactive},slot_{inactive}
-          FROM prepared_queue WHERE kind='opening' ORDER BY card_id"))?;
-        let mut rows = q.query([])?;
-        let mut placements = std::collections::BTreeMap::new();
-        let mut next = 0;
-        while let Some(row) = rows.next()? {
-            let base: Option<i64> = row.get(1)?;
-            let live = Placement {
-                rank: row.get(2)?,
-                scope: row.get(3)?,
-                slot: row.get(4)?,
-            };
-            let target = Placement {
-                rank: row.get(5)?,
-                scope: row.get(6)?,
-                slot: row.get(7)?,
-            };
-            next = next.max(live.rank.or(base).unwrap_or(0));
-            placements.insert(row.get::<_, String>(0)?, (base, live, target));
+        let mut next: i64 = db.query_row(&format!(
+            "SELECT coalesce(max(coalesce(rank_{active},rank)),0) FROM prepared_queue WHERE kind='opening'"
+        ), [], |row| row.get(0))?;
+        let mut addressed = db.prepare(&format!(
+            "SELECT coalesce(rank_{active},rank) FROM prepared_queue WHERE card_id=?1 AND kind='opening'"
+        ))?;
+        let mut reached: Vec<_> = reach.iter().collect();
+        reached.sort_unstable_by_key(|(id, _)| *id);
+        let mut cards = Vec::with_capacity(reached.len());
+        for (id, probability) in reached {
+            let rank = addressed.query_row([id], |row| row.get::<_, Option<i64>>(0))?;
+            let slot = rank.unwrap_or_else(|| {
+                next += 1;
+                next
+            });
+            cards.push((id.clone(), slot, *probability));
         }
-        let mut cards = vec![];
-        for (id, (base, live, _)) in &placements {
-            if let Some(probability) = reach.get(id) {
-                let slot = live.rank.or(*base).unwrap_or_else(|| {
-                    next += 1;
-                    next
-                });
-                cards.push((id.clone(), slot, *probability));
-            }
-        }
-        ensure!(
-            cards.len() == reach.len(),
-            "The forecast contains a retired card"
-        );
         let mut slots: Vec<_> = cards.iter().map(|(_, slot, _)| *slot).collect();
         slots.sort_unstable();
         cards.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
-        for (local, ((id, _, _), rank)) in cards.into_iter().zip(slots).enumerate() {
-            placements.get_mut(&id).unwrap().1 = Placement {
-                rank: Some(rank),
-                scope: Some(report.into()),
-                slot: Some(local as i64),
-            };
-        }
-        let changes = placements
+        let changes = cards
             .into_iter()
-            .filter_map(|(id, (_, live, target))| (live != target).then_some((id, live)))
+            .zip(slots)
+            .enumerate()
+            .map(|(local, ((id, _, _), rank))| {
+                (
+                    id,
+                    Placement {
+                        rank: Some(rank),
+                        scope: Some(report.into()),
+                        slot: Some(local as i64),
+                    },
+                )
+            })
             .collect();
         Ok(Self { inactive, changes })
     }
 
     pub fn stage(self, writer: &crate::writer::Writer) -> Result<i64> {
         let bank = self.inactive;
+        let active = if bank == "a" { "b" } else { "a" };
+        let reconcile = format!(
+            "UPDATE prepared_queue SET rank_{bank}=rank_{active},scope_{bank}=scope_{active},slot_{bank}=slot_{active}
+             WHERE card_id IN (SELECT card_id FROM prepared_queue INDEXED BY forecast_bank_difference
+               WHERE rank_a IS NOT rank_b OR scope_a IS NOT scope_b OR slot_a IS NOT slot_b LIMIT 128)"
+        );
+        loop {
+            let sql = reconcile.clone();
+            let rows = writer.background(move |db| Ok(db.execute(&sql, [])?))?;
+            if rows < 128 {
+                break;
+            }
+        }
         let sql = format!(
             "UPDATE prepared_queue SET rank_{bank}=?1,scope_{bank}=?2,slot_{bank}=?3 WHERE card_id=?4"
         );
@@ -221,5 +221,59 @@ impl StagedOrder {
             })?;
         }
         Ok(i64::from(bank == "b"))
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn rank_preparation_seeks_only_the_forecast_cards_and_peak() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let db = crate::db::Database::init(&directory.path().join("rank.sqlite3"))?;
+        db.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+        UPDATE prepared_queue_state SET ready=1;
+        INSERT INTO prepared_queue(card_id,kind,active,reserved,rank) VALUES
+            ('old','opening',1,0,2),('new','opening',1,0,NULL),('outside','opening',0,0,100);",
+        )?;
+        let reach = [("new".to_owned(), 0.75), ("old".to_owned(), 0.25)].into();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let observe = || -> Result<usize> {
+            let counter = steps.clone();
+            counter.store(0, Ordering::Relaxed);
+            db.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let plan = StagedOrder::prepare(&db, "report", &reach)?;
+            db.progress_handler(0, None::<fn() -> bool>);
+            assert_eq!(
+                plan.changes
+                    .iter()
+                    .map(|(id, p)| (id.as_str(), p.rank))
+                    .collect::<Vec<_>>(),
+                [("new", Some(2)), ("old", Some(101))]
+            );
+            Ok(steps.load(Ordering::Relaxed))
+        };
+        let before = observe()?;
+        db.execute_batch("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<20000)
+            INSERT INTO prepared_queue(card_id,kind,active,reserved)
+            SELECT printf('extra%05d',i),CASE WHEN i%2=0 THEN 'opening' ELSE 'tactic' END,(i%4<2),0 FROM n;")?;
+        let after = observe()?;
+        eprintln!(
+            "Apply preparation SQLite VM steps: {before} before, {after} after 20,000 unrelated rows"
+        );
+        assert!(after <= before + 10);
+        Ok(())
     }
 }

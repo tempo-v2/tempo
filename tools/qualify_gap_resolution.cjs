@@ -36,14 +36,14 @@ function seedReport(db, id, repertoire, fen, moves) {
     INSERT INTO coverage_gap_page VALUES (${quoted(id)},0,${quoted(gaps)});`);
 }
 
-async function withServer(binary, db, operation) {
+async function withServer(binary, db, operation, env = process.env) {
   const socket = net.createServer();
   socket.listen(0, "127.0.0.1");
   await once(socket, "listening");
   const port = socket.address().port;
   await new Promise(resolve => socket.close(resolve));
   const origin = "http://127.0.0.1:" + port;
-  const server = spawn(binary, ["serve", db, String(port), "--no-worker"], { stdio: ["ignore", "ignore", "inherit"] });
+  const server = spawn(binary, ["serve", db, String(port), "--no-worker"], { stdio: ["ignore", "ignore", "inherit"], env });
   const api = async (endpoint, body, expected = 200) => {
     const response = await fetch(origin + "/api/" + endpoint, body === undefined ? {} : {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -196,6 +196,57 @@ async function browserFlow(browser) {
   });
 }
 
+async function cancelledScans(browser) {
+  const db = path.join(folder, "cancellation.sqlite3");
+  const model = path.join(folder, "Library/Application Support/Tempo Lean/Maia3");
+  const launcher = path.join(model, "venv/bin/python");
+  const marker = path.join(model, "pid");
+  fs.mkdirSync(path.dirname(launcher), { recursive: true });
+  fs.writeFileSync(launcher, '#!/bin/sh\necho $$ > "$3/pid"\nexec /bin/sleep 60\n', { mode: 0o700 });
+
+  await withServer(candidate, db, async (origin, api) => {
+    const repertoire = await addOpening(api, "Cancellation", ["e2e4", "e7e5", "g1f3"]);
+    seedReport(db, "saved-report", repertoire, anchor, ["g1f3", "b8c6"]);
+    const page = await browser.newPage();
+    await page.addInitScript(key => {
+      if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({
+        report: "saved-report", index: 0, pgn: "1. Nf3 Nc6 2. d4 *"
+      }));
+    }, journal);
+    async function leaveDuringModel() {
+      await waitFor(() => fs.existsSync(marker) && Number(fs.readFileSync(marker, "utf8")) > 0);
+      const pid = Number(fs.readFileSync(marker, "utf8"));
+      await page.getByRole("button", {name:"Games",exact:true}).click();
+      await waitFor(() => {
+        try { process.kill(pid, 0); return false; }
+        catch (error) { if (error.code === "ESRCH") return true; throw error; }
+      });
+      fs.unlinkSync(marker);
+    }
+    await openGaps(page, origin);
+    await page.getByRole("button", { name: "Scan repertoire" }).click();
+    await leaveDuringModel();
+    await openGaps(page, origin);
+    await page.getByRole("button", { name: "Preview", exact:true }).click();
+    await page.getByRole("button", { name: "Save to repertoire", exact:true }).click();
+    await leaveDuringModel();
+    await openGaps(page, origin);
+    await page.getByText("Continuation saved.", {exact:true}).waitFor();
+    assert.equal(await page.getByRole("button", {name:"Retry same save"}).count(), 0);
+    assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
+    assert.equal(sql(db, "SELECT count(*) FROM coverage_report"), "1");
+    await page.close();
+  }, {...process.env, HOME:folder});
+}
+
+async function waitFor(predicate) {
+  for (let attempt=0; attempt<250; attempt++) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error("Timed out waiting for the disposable model process");
+}
+
 async function previousCommands() {
   const db = path.join(folder, "predecessor.sqlite3");
   const commands = await withServer(predecessor, db, async (_origin, api) => {
@@ -238,6 +289,7 @@ async function previousCommands() {
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true });
     await browserFlow(browser);
+    await cancelledScans(browser);
     await previousCommands();
     console.log("Chromium conflict resolution, confirmed replacement retry, and installed predecessor command replay passed.");
   } finally {
