@@ -4,6 +4,8 @@ import { createPortal } from "react-dom";
 import { Chess } from "chess.js";
 import { moveCue } from "./sounds.js";
 
+const promotionRoles = { q: "Queen", r: "Rook", b: "Bishop", n: "Knight" };
+
 export function play(game, move) {
   return game.move({ from: move.slice(0, 2), to: move.slice(2, 4), promotion: move[4] });
 }
@@ -33,9 +35,10 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
   const turn = game.turn() === "w" ? "white" : "black";
   const promotionControls = choices && <div className="promotion" role="group" aria-label="Piece to promote to">
     {choices.map((move) => <button key={move} onClick={() => {
+      ref.current?.previewPromotion(move.slice(2, 4), promotionRoles[move[4]].toLowerCase());
       setPromotion(null);
       onMove(move);
-    }}>{{ q: "Queen", r: "Rook", b: "Bishop", n: "Knight" }[move[4]]}</button>)}
+    }}>{promotionRoles[move[4]]}</button>)}
     <button onClick={() => { setPromotion(null); ref.current?.clearInput(); }}>Cancel</button>
   </div>;
   return <div className="board-shell">
