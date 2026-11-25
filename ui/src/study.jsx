@@ -84,23 +84,57 @@ function useStudyCounts() {
   return [counts, invalidate];
 }
 
+function decodeResult(body, incompleteReply) {
+  if (!["Good", "Again"].includes(body?.rating) ||
+      !Array.isArray(body.answers) || !body.answers.length || !body.answers.every(isMove) ||
+      !(body.repeat_after === null || Number.isInteger(body.repeat_after) &&
+        body.repeat_after >= 0 && body.repeat_after <= 255)) {
+    throw new Error(incompleteReply);
+  }
+  return {
+    ...body,
+    display_move: body.answers.includes(body.display_move) ? body.display_move : body.answers[0],
+    played_in_game: isMove(body.played_in_game) ? body.played_in_game : null,
+  };
+}
+
+function decodeStudyReply(body, dataset) {
+  if (body === null) return null;
+  const incomplete = "The Study reply was incomplete. Retry.";
+  if (!Number.isSafeInteger(body?.attempt) || body.attempt <= 0 ||
+      typeof body.dataset !== "string" || !body.dataset || (dataset && body.dataset !== dataset) ||
+      !["opening", "tactic"].includes(body.kind) || !["white", "black"].includes(body.color) ||
+      typeof body.fen !== "string" || !body.fen ||
+      !Array.isArray(body.legal) || !body.legal.every(isMove)) {
+    throw new Error(incomplete);
+  }
+  const result = body.result === null ? null : decodeResult(body.result, incomplete);
+  if (result === null && body.legal.length === 0) throw new Error(incomplete);
+  // The server supplies the allowed moves. Verify that the board can render
+  // those moves and the feedback from this position before replacing the card.
+  let playable;
+  try {
+    playable = new Set(new Chess(body.fen).moves({ verbose: true }).map((move) => move.lan));
+  } catch {
+    throw new Error(incomplete);
+  }
+  if (body.legal.some((move) => !playable.has(move)) ||
+      result?.answers.some((move) => !playable.has(move))) {
+    throw new Error(incomplete);
+  }
+  return {
+    ...body,
+    title: typeof body.title === "string" ? body.title : "",
+    result,
+  };
+}
+
 // A typed terminal reply ends this exact intent. Transport failure keeps it pending.
 async function deliverAnswer(intent) {
   let result;
   try {
     const body = await api("study/answer", answerPayload(intent));
-    if (!["Good", "Again"].includes(body?.rating) ||
-        !Array.isArray(body.answers) || !body.answers.length || !body.answers.every(isMove) ||
-        !(body.repeat_after === null || Number.isInteger(body.repeat_after) &&
-          body.repeat_after >= 0 && body.repeat_after <= 255)) {
-      throw new Error("The Answer reply was incomplete. Retry.");
-    }
-    result = {
-      ...body,
-      display_move: isMove(body.display_move) && body.answers.includes(body.display_move)
-        ? body.display_move : body.answers[0],
-      played_in_game: isMove(body.played_in_game) ? body.played_in_game : null,
-    };
+    result = decodeResult(body, "The Answer reply was incomplete. Retry.");
   } catch (error) {
     if (!["stale_dataset", "stale_attempt", "answer_conflict"].includes(error.code)) throw error;
   }
@@ -128,7 +162,7 @@ export function Study({ openGame, sounds }) {
     const request = new AbortController();
     currentRead.current = request;
     try {
-      return await readView("study", request.signal);
+      return decodeStudyReply(await readView("study", request.signal));
     } finally {
       if (currentRead.current === request) currentRead.current = null;
     }
@@ -163,13 +197,20 @@ export function Study({ openGame, sounds }) {
     catch (error) { setError(error); setEpoch((n) => n + 1); }
     finally { waiting.current = false; setPending(false); }
   }
+  function showCard(view) {
+    setCard(view);
+    setLoaded(true);
+    invalidateCounts.current?.();
+  }
+  async function loadNext(payload) {
+    const body = await api("study/next", payload, undefined, { requireJson: true });
+    const view = decodeStudyReply(body, payload.dataset);
+    if (mounted.current) showCard(view);
+  }
   function next(after = null) {
     setAdvanceAfter(null);
-    return run(async () => {
-      setCard(await api("study/next", { after, dataset: card?.dataset }));
-      setLoaded(true);
-      invalidateCounts.current?.();
-    });
+    const payload = { after, dataset: card?.dataset };
+    return run(() => loadNext(payload));
   }
   useEffect(() => {
     mounted.current = true;
@@ -180,11 +221,20 @@ export function Study({ openGame, sounds }) {
         await deliverAnswer(intent);
       }
       if (!mounted.current) return;
-      const active = await loadCurrent();
-      if (!mounted.current) return;
-      setCard(active ?? await api("study/next", { after: null }));
-      setLoaded(true);
-      invalidateCounts.current?.();
+      async function resumeCurrent() {
+        const active = await loadCurrent();
+        if (!mounted.current) return;
+        if (active !== null) {
+          showCard(active);
+          return;
+        }
+        const payload = { after: null };
+        const initialNext = () => loadNext(payload);
+        retry.current = initialNext;
+        await initialNext();
+      }
+      retry.current = resumeCurrent;
+      await resumeCurrent();
     });
     return () => {
       mounted.current = false;

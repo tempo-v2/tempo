@@ -1,11 +1,11 @@
-export async function api(path, data, signal) {
+export async function api(path, data, signal, { requireJson = data === undefined } = {}) {
   const response = await fetch("/api/" + path, data === undefined ? { signal } : {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
   const body = await response.json().catch((error) => {
-    if (response.ok && data === undefined) throw error;
+    if (response.ok && requireJson) throw error;
     return null;
   });
   signal?.throwIfAborted();

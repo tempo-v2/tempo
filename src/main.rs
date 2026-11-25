@@ -23,7 +23,7 @@ mod writer;
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path as UrlPath, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Path as UrlPath, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -36,10 +36,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::OpenOptions,
+    io::{self, Read},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tower_http::services::{ServeDir, ServeFile};
 
 type App = Arc<Runtime>;
@@ -237,14 +240,68 @@ struct PgnInput {
     name: Option<String>,
 }
 
-async fn preview_opening(Json(input): Json<PgnInput>) -> ApiResult {
-    let result = prepare(move || {
+static OPENING_PREVIEW: Semaphore = Semaphore::const_new(1);
+const PGN_DEADLINE: Duration = Duration::from_secs(10);
+const PGN_BODY_LIMIT: usize = jobs::MAX_PGN * 2 + 4096;
+
+async fn preview_opening(request: Request) -> Response {
+    let deadline = Instant::now() + PGN_DEADLINE;
+    let Ok(permit) = OPENING_PREVIEW.try_acquire() else {
+        return ApiError(optional_read::Unavailable.into()).into_response();
+    };
+    let request = match buffer_pgn(request, deadline).await {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let reply = run_preview(permit, deadline, move || {
+        // The bounded body is already in memory. Decode it on the preview worker.
+        let Json(input) = match runtime.block_on(Json::<PgnInput>::from_request(request, &())) {
+            Ok(input) => input,
+            Err(error) => return Ok(error.into_response()),
+        };
         ensure!(input.pgn.len() <= jobs::MAX_PGN, "PGN exceeds 64 MiB");
-        let mut games = chess::parse_pgn(&input.pgn, false, 1)?;
-        Ok(games.remove(0)?.main)
+        ensure!(!input.pgn.trim().is_empty(), "enter a PGN");
+        let route = chess::preview_pgn(PreviewInput {
+            bytes: input.pgn.as_bytes(),
+            deadline,
+        })?;
+        Ok(Json(route).into_response())
     })
-    .await?;
-    Ok(Json(json!(result)))
+    .await;
+    reply.unwrap_or_else(|error| ApiError(error).into_response())
+}
+
+struct PreviewInput<'a> {
+    bytes: &'a [u8],
+    deadline: Instant,
+}
+
+impl Read for PreviewInput<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.bytes.read(buffer)
+    }
+}
+
+async fn run_preview<T: Send + 'static>(
+    permit: SemaphorePermit<'static>,
+    deadline: Instant,
+    parse: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        ensure!(Instant::now() < deadline, optional_read::Unavailable);
+        let result = parse();
+        ensure!(Instant::now() < deadline, optional_read::Unavailable);
+        result
+    });
+    tokio::time::timeout_at(deadline.into(), task)
+        .await
+        .map_err(|_| optional_read::Unavailable)?
+        .map_err(|_| optional_read::Unavailable)?
 }
 
 async fn tactics(State(db): State<App>, Query(q): Query<Page>) -> ViewResult {
@@ -438,24 +495,27 @@ async fn opponent_move(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> View
 }
 
 async fn receive_pgn(request: Request, next: Next) -> Response {
-    static UPLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    const BODY_LIMIT: usize = jobs::MAX_PGN * 2 + 4096;
+    static UPLOADS: Semaphore = Semaphore::const_new(2);
     let Ok(_permit) = UPLOADS.try_acquire() else {
         return ApiError(writer::Unavailable.into()).into_response();
     };
+    match buffer_pgn(request, Instant::now() + PGN_DEADLINE).await {
+        Ok(request) => next.run(request).await,
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn buffer_pgn(request: Request, deadline: Instant) -> Result<Request, StatusCode> {
     let (parts, body) = request.into_parts();
-    let bytes = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        axum::body::to_bytes(body, BODY_LIMIT),
-    )
-    .await
-    {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
-    };
-    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
-        .await
+    let bytes =
+        match tokio::time::timeout_at(deadline.into(), axum::body::to_bytes(body, PGN_BODY_LIMIT))
+            .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => return Err(StatusCode::PAYLOAD_TOO_LARGE),
+            Err(_) => return Err(StatusCode::REQUEST_TIMEOUT),
+        };
+    Ok(Request::from_parts(parts, axum::body::Body::from(bytes)))
 }
 
 async fn loopback(State(port): State<u16>, req: Request, next: Next) -> Response {
@@ -544,8 +604,23 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
                 }
             })?;
     }
-    let pgn_body_limit = DefaultBodyLimit::max(jobs::MAX_PGN * 2 + 4096);
-    let app = Router::new()
+    let app = router(
+        &path,
+        port,
+        Arc::new(Runtime {
+            database: db,
+            writer,
+            staging,
+        }),
+    );
+    println!("Tempo at http://127.0.0.1:{port}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn router(path: &Path, port: u16, app: App) -> Router {
+    let pgn_body_limit = DefaultBodyLimit::max(PGN_BODY_LIMIT);
+    Router::new()
         .route(
             "/api/health",
             get(|| async { Json(json!({"status":"ready","profile":"lean"})) }),
@@ -554,9 +629,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         .route("/api/openings/repertoires", get(repertoires))
         .route(
             "/api/openings/pgn",
-            post(preview_opening)
-                .layer(pgn_body_limit)
-                .layer(middleware::from_fn(receive_pgn)),
+            post(preview_opening).layer(pgn_body_limit),
         )
         .route(
             "/api/tactics",
@@ -591,14 +664,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         .nest_service("/assets", ServeDir::new(path.join("assets")))
         .layer(middleware::from_fn_with_state(port, loopback))
         .layer(DefaultBodyLimit::max(16 * 1024))
-        .with_state(Arc::new(Runtime {
-            database: db,
-            writer,
-            staging,
-        }));
-    println!("Tempo at http://127.0.0.1:{port}");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(app)
 }
 
 #[tokio::main]
@@ -660,5 +726,116 @@ async fn main() -> Result<()> {
         _ => anyhow::bail!(
             "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT"
         ),
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn cancelled_preview_parse_keeps_its_slot_without_blocking_commands() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("tempo-preview-{:x}", rand::random::<u128>()));
+        std::fs::create_dir(&directory)?;
+        let database = directory.join("fixture.sqlite3");
+        let mut db = Database::init(&database)?;
+        queue_store::seed_batch(&mut db)?;
+        let app = Arc::new(Runtime {
+            writer: writer::Writer::start(db, None)?,
+            staging: uploads::Staging::start(&database)?,
+            database,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let app = router(Path::new("."), port, app);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let (started, running) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        let caller = tokio::spawn(run_preview(
+            OPENING_PREVIEW.try_acquire()?,
+            Instant::now() + PGN_DEADLINE,
+            move || {
+                let _ = started.send(());
+                let _ = held.blocking_recv();
+                Ok(())
+            },
+        ));
+        running.await?;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        let client = reqwest::Client::new();
+        let post = |route: &str, data: Value| {
+            client
+                .post(format!("http://127.0.0.1:{port}/api/{route}"))
+                .timeout(Duration::from_secs(3))
+                .json(&data)
+                .send()
+        };
+        let preview = json!({"pgn": "1. c4 e5 1-0"});
+        let response = post("openings/pgn", preview.clone()).await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.json::<Value>().await?["code"], "view_unavailable");
+        for (route, payload) in [
+            ("tactics", json!({"name":"Puzzle","pgn":"1. d4 d5 1-0"})),
+            (
+                "openings",
+                json!({"name":"Line","color":"white",
+                "route":{"fen":chess::fen(&chess::position("")?),"moves":["e2e4"]}}),
+            ),
+        ] {
+            post(route, payload).await?.error_for_status()?;
+        }
+        let pgn = "[White \"Learner\"]\n[Black \"Other\"]\n\n1. e4 e5 1-0";
+        let mut upload = post("games/uploads", json!({"username":"Learner","pgn":pgn})).await?;
+        if upload.status() == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(upload.json::<Value>().await?["code"], "staging_unavailable");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            upload = post("games/uploads", json!({"username":"Learner","pgn":pgn})).await?;
+        }
+        upload.error_for_status()?;
+        let attempt: Value = post("study/next", json!({"after":null}))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let result: Value = post(
+            "study/answer",
+            json!({
+                "attempt":attempt["attempt"], "dataset":attempt["dataset"], "played":null,
+            }),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(result["rating"], "Again");
+
+        release.send(()).unwrap();
+        drop(tokio::time::timeout(Duration::from_secs(1), OPENING_PREVIEW.acquire()).await??);
+        let route: Value = post("openings/pgn", preview)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(route["moves"], json!(["c2c4", "e7e5"]));
+        server.abort();
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn expired_preview_input_stops_the_pgn_reader() {
+        let error = chess::preview_pgn(PreviewInput {
+            bytes: b"1. c4 e5 1-0",
+            deadline: Instant::now(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 }

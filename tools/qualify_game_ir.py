@@ -1,6 +1,7 @@
 """Exercise a built Lean candidate on disposable databases and local provider feeds."""
 import argparse
 from contextlib import contextmanager
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -43,11 +44,15 @@ def sql(database, statement, values=()):
         return connection.execute(statement, values).fetchall()
 
 
-@contextmanager
-def serve(binary, database, worker=True):
+def unused_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+        return sock.getsockname()[1]
+
+
+@contextmanager
+def serve(binary, database, worker=True, port=None):
+    port = port or unused_port()
     flags = [] if worker else ["--no-worker"]
     with subprocess.Popen([binary, "serve", database, str(port), *flags],
                           stdout=subprocess.DEVNULL) as service:
@@ -178,6 +183,72 @@ def verify_browse(binary, database):
         assert api("study") is None
         assert sql(database, "SELECT count(*) FROM attempts") == [(0,)]
     print("Interactive reads retained pagination, addressed replay, and original oversized archive metadata.")
+
+
+def verify_preview_admission(binary, database):
+    port = unused_port()
+    preview = {"pgn": "1. c4 e5 1-0"}
+    with serve(binary, database, worker=False, port=port) as api:
+        def post(route, body, chunked=False):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+            try:
+                if chunked:
+                    body = [body[offset:offset + 1024] for offset in range(0, len(body), 1024)]
+                connection.request("POST", "/api/" + route, body,
+                                   headers={"Content-Type": "application/json"}, encode_chunked=chunked)
+                response = connection.getresponse()
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+        body = json.dumps(preview).encode()
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as held:
+            held.sendall((
+                f"POST /api/openings/pgn HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode() + body[:1])
+
+            def saturated():
+                status, reply = post("openings/pgn", body)
+                if status == 503:
+                    assert json.loads(reply)["code"] == "view_unavailable"
+                    return True
+                assert status == 200, (status, reply)
+                return False
+
+            wait_until(saturated, timeout=2)
+            assert sql(database, "SELECT count(*) FROM jobs") == [(0,)]
+            assert sql(database, "SELECT count(*) FROM cards") == [(0,)]
+            assert not list(database.with_suffix(".uploads").glob("*"))
+            assert api("tactics", {"name": "Independent puzzle", "pgn": "1. d4 d5 1-0"})["id"]
+            assert api("games/uploads", {"username": "Learner", "pgn": pgn()})["id"]
+            assert api("openings", {"name": "Independent opening", "color": "white",
+                "route": {"fen": FEN, "moves": ["d1d5"]}})["id"]
+            attempt = api("study/next", {"after": None})
+            assert api("study/answer", {
+                "attempt": attempt["attempt"], "dataset": attempt["dataset"], "played": None,
+            })["rating"] == "Again"
+            held.sendall(body[1:])
+            response = http.client.HTTPResponse(held)
+            response.begin()
+            assert response.status == 200
+            assert json.loads(response.read())["moves"] == ["c2c4", "e7e5"]
+
+        command = b'{"provider":"archive","operation":"scan"}'
+        for chunked in (False, True):
+            for size, expected in [(16 * 1024, 200), (16 * 1024 + 1, 413)]:
+                assert post("games/jobs", command.ljust(size), chunked)[0] == expected
+        pgn_limit = 64 * 1024 * 1024
+        for size, expected in [(pgn_limit, 200), (pgn_limit + 1, 400)]:
+            line = b'1. c4 e5 1-0'.ljust(size)
+            assert post("openings/pgn", b'{"pgn":"' + line + b'"}')[0] == expected
+            status, reply = post("games/uploads", b'{"username":"Learner","pgn":"' + line + b'"}')
+            assert status == expected, (status, reply)
+            if status == 200:
+                (file,), = sql(database, "SELECT upload_file FROM jobs WHERE id=?", (json.loads(reply)["id"],))
+                assert (database.with_suffix(".uploads") / file).stat().st_size == pgn_limit
+    print("Preview reception stayed isolated from durable intake and Study, with the existing JSON and PGN limits.")
 
 
 def verify_interrupted_upload(binary, predecessor, database):
@@ -344,3 +415,4 @@ if __name__ == "__main__":
                 verify_archive_resume(options.binary.resolve(), predecessor, root / "rescan.sqlite3")
         verify_games(options.binary.resolve(), root / "games.sqlite3")
         verify_browse(options.binary.resolve(), root / "browse.sqlite3")
+        verify_preview_admission(options.binary.resolve(), root / "preview.sqlite3")
