@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api } from "./api.js";
 import { position } from "./board.jsx";
@@ -39,6 +39,7 @@ const range = (value, unknown) => percent(value) + (unknown > 0.000001 ? " – "
 
 export function Gaps() {
   const [draft, setDraft] = useState(restore);
+  const form = useRef(stored(storage));
   const [books, setBooks] = useState([]);
   const [report,setReport] = useState(null);
   const [preview,setPreview] = useState(null);
@@ -46,10 +47,13 @@ export function Gaps() {
   const [error,setError] = useState("");
   const [message,setMessage] = useState("");
   const [reload, setReload] = useState(0);
+  function refreshJournal() {
+    setDraft({ ...form.current, pending: stored(storage + ".save"), applyCommand: stored(storage + ".apply") });
+  }
   function update(patch) {
-    const next={...stored(storage),...patch};
-      localStorage.setItem(storage, JSON.stringify(next));
-    setDraft(restore());
+    form.current = { ...form.current, ...patch };
+    localStorage.setItem(storage, JSON.stringify(form.current));
+    refreshJournal();
   }
   useEffect(() => {
     const ctrl=new AbortController();
@@ -64,7 +68,7 @@ export function Gaps() {
       setBooks(options);
     }
     async function loadReport() {
-      const saved = restore();
+      const saved = { ...form.current, pending: stored(storage + ".save") };
       const reportId = saved.pending?.draft.report ?? saved.report;
       if (!reportId) return;
       const result = await api("coverage/" + reportId, undefined, ctrl.signal);
@@ -75,7 +79,7 @@ export function Gaps() {
         const page = await api("coverage/" + reportId + "?offset=" + offset, undefined, ctrl.signal);
         result.selectedGap = page.gaps[index - offset];
       }
-      const latest = restore();
+      const latest = { ...form.current, pending: stored(storage + ".save") };
       if ((latest.pending?.draft.report ?? latest.report) === reportId) setReport(result);
     }
     setError("");
@@ -112,18 +116,18 @@ export function Gaps() {
   }
   async function save(command) {
     if (!await claimCommand("save", command)) {
-      setDraft(restore());
+      refreshJournal();
       setReload(n => n + 1);
       return;
     }
-    setDraft(restore());
+    refreshJournal();
     let receipt;
     try {
       receipt=await api("coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
       if(e.code==="stale_gap") {
         await clearCommand("save", command);
-        setDraft(restore());
+        refreshJournal();
         setPreview(null);
         setReport(old=>({...old,stale:true}));
       }
@@ -141,26 +145,28 @@ export function Gaps() {
   async function applyOrder() {
     const pending = restore().applyCommand ?? { report: report.id, command: crypto.randomUUID() };
     if (!await claimCommand("apply", pending)) {
-      setDraft(restore());
+      refreshJournal();
       return;
     }
-    setDraft(restore());
+    refreshJournal();
     try {
       const reply = await api("coverage/" + pending.report + "/apply", { command: pending.command });
       if(reply?.command!==pending.command || reply.id!==pending.report)throw new Error("Retry applying the opening order.");
       await clearCommand("apply", pending);
-      setDraft(restore());
+      refreshJournal();
       setMessage("Applied opening order for "+reply.cards+" reached cards. New cards use this order when Maia is selected in Settings.");
     } catch(e) {
       if (e.code === "stale_gap") {
         await clearCommand("apply", pending);
-        setDraft(restore());
+        refreshJournal();
       }
       throw e;
     }
   }
   const locked=busy || !!draft.pending || !!draft.applyCommand;
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
+  const currentPreview = preview && preview.draft.report === edit.report &&
+    preview.draft.gap === edit.gap && preview.draft.pgn === edit.pgn ? preview : null;
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
       {!book && <option value="" disabled>Select a repertoire</option>}
@@ -182,9 +188,9 @@ export function Gaps() {
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
         <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{setPreview(null);update({pgn:e.target.value});}}/></label>
-        <button disabled={locked||report.stale||!edit.pgn} onClick={()=>run(async()=>setPreview(await api("coverage/preview",edit)))}>Preview</button>
-        {preview && <><ul>{preview.responses.map(r=><li key={r.position}>{r.move} · {r.status}</li>)}</ul>
-          <button disabled={locked||preview.responses.some(r=>r.status==="conflict")} onClick={()=>run(()=>save({draft:edit,command:preview.command}))}>Save to repertoire</button></>}
+        <button disabled={locked||report.stale||!edit.pgn} onClick={()=>run(async()=>setPreview({ ...await api("coverage/preview",edit), draft: edit }))}>Preview</button>
+        {currentPreview && <><ul>{currentPreview.responses.map(r=><li key={r.position}>{r.move} · {r.status}</li>)}</ul>
+          <button disabled={locked||currentPreview.responses.some(r=>r.status==="conflict")} onClick={()=>run(()=>save({draft:currentPreview.draft,command:currentPreview.command}))}>Save to repertoire</button></>}
         {pendingSave && <button disabled={busy} onClick={()=>run(()=>save(pendingSave))}>Retry same save</button>}
       </section>}
       <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
