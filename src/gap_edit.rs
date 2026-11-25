@@ -1193,6 +1193,7 @@ mod tests {
             has_conflicts: false,
             preview: Value::Null,
             anchor: String::new(),
+            recorded_moves: None,
             conflicts: BTreeMap::new(),
         };
         let ids: Vec<_> = edit

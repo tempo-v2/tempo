@@ -600,7 +600,9 @@ async function reviewWinningMoves(browser, stockfish) {
       extended.loadPgn(draft);
       assert.ok(extended.moves().length > 0);
       extended.move(extended.moves()[0]);
-      await page.getByRole("textbox", { name: "Paste PGN from Lichess" }).fill(extended.pgn());
+      const editor = page.getByRole("textbox", { name: "Paste PGN from Lichess" });
+      await editor.clear();
+      await editor.fill(extended.pgn());
       const preview = page.waitForResponse("**/api/coverage/preview");
       await page.getByRole("button", { name: "Preview", exact: true }).click();
       const previewed = await (await preview).json();

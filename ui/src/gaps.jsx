@@ -176,6 +176,8 @@ export function Gaps() {
     if (scanOwner.current && scanOwner.current.view !== viewIdentity(current)) {
       scanOwner.current.controller.abort();
     }
+    setRequestedReview(request => request?.report === reportOf(current) &&
+      request?.index === (current.pending?.draft.gap ?? current.index) ? request : null);
     setDraft(current);
   }
   function update(patch) {
@@ -504,7 +506,7 @@ export function Gaps() {
         <a href={(staged ?? lead(report,gap)).url} target="_blank" rel="noreferrer">
           {staged ? "Extend staged reply in Lichess" : "Open line in Lichess"}
         </a>
-        <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value,...(!e.target.value.trim() ? { stagedReply:null } : {})});}}/></label>
+        <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value});}}/></label>
         {stagedFor(report, gapIndex, draft) && !staged && <button type="button" disabled={locked}
           onClick={() => { clearPreview(); update({stagedReply:null,replacements:noReplacements}); }}>
           Use pasted line’s own lead-in
