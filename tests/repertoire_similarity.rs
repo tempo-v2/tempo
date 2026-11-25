@@ -92,6 +92,20 @@ fn compares_exact_special_move_identity() {
 }
 
 #[test]
+fn rejects_variant_encoding_and_zero_fullmove() {
+    let variant = START.replace("RNBQKBNR", "RNBQKBNR[N]");
+    let zero = START.replace("0 1", "0 0");
+    for fen in [&variant, &zero] {
+        let (success, reply) = query(fen, &[]);
+        assert!(!success);
+        assert_eq!(reply["error"], "invalid_request");
+        let (success, reply) = query(START, &[(fen, "e2e4")]);
+        assert!(!success);
+        assert_eq!(reply["error"], "invalid_snapshot");
+    }
+}
+
+#[test]
 fn distinguishes_missing_repertoire_from_storage_failure() {
     let area = tempfile::tempdir().unwrap();
     let path = area.path().join("snapshot.sqlite3");
