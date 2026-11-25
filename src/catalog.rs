@@ -224,13 +224,41 @@ pub fn prepare_opening(input: &OpeningInput) -> Result<OpeningPlan> {
     })
 }
 
+// A batch can publish at most 40 learner responses of one prepared route.
+pub fn apply_opening_batch(
+    db: &Connection,
+    plan: &OpeningPlan,
+    repertoire: &str,
+    offset: usize,
+) -> Result<Option<usize>> {
+    ensure!(
+        offset < plan.cards.len(),
+        "Invalid opening batch checkpoint"
+    );
+    let end = (offset + 40).min(plan.cards.len());
+    let next = (end < plan.cards.len()).then_some(end);
+    apply_opening_cards(
+        db,
+        plan,
+        Some(repertoire),
+        true,
+        &plan.cards[offset..end],
+        next.is_none(),
+    )?;
+    Ok(next)
+}
+
 pub fn apply_opening(
     db: &Connection,
     plan: &OpeningPlan,
     inherited_book: Option<&str>,
     online: bool,
 ) -> Result<String> {
-    let id = chess::id(&[
+    apply_opening_cards(db, plan, inherited_book, online, &plan.cards, true)
+}
+
+pub fn opening_id(plan: &OpeningPlan, inherited_book: Option<&str>) -> String {
+    chess::id(&[
         "opening-v1",
         inherited_book.unwrap_or(""),
         &plan.name,
@@ -238,7 +266,17 @@ pub fn apply_opening(
         &plan.fen,
         &plan.moves,
         &plan.start_at.to_string(),
-    ]);
+    ])
+}
+fn apply_opening_cards(
+    db: &Connection,
+    plan: &OpeningPlan,
+    inherited_book: Option<&str>,
+    online: bool,
+    cards: &[OpeningCard],
+    finish_line: bool,
+) -> Result<String> {
+    let id = opening_id(plan, inherited_book);
     let repertoire = inherited_book.unwrap_or(&id);
     let new_choice = inherited_book.is_none()
         && !db.query_row(
@@ -247,7 +285,7 @@ pub fn apply_opening(
             |row| row.get::<_, bool>(0),
         )?;
     let mut pending = std::collections::HashMap::new();
-    for card in &plan.cards {
+    for card in cards {
         let card_id = chess::id(&["opening-card-v1", repertoire, &card.position, &card.version]);
         let prior = db.query_row(
             "SELECT id,quarantined FROM cards WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2
@@ -288,17 +326,19 @@ pub fn apply_opening(
             params![card_id,plan.name,plan.color,card.fen,card.position,card.answers,repertoire,card.version,card.context],
         )?;
     }
-    db.execute(
-        "INSERT OR IGNORE INTO openings VALUES (?1,?2,?3,?4,?5,?6)",
-        params![
-            id,
-            repertoire,
-            plan.name,
-            plan.color,
-            plan.route,
-            plan.start_at
-        ],
-    )?;
+    if finish_line {
+        db.execute(
+            "INSERT OR IGNORE INTO openings VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                id,
+                repertoire,
+                plan.name,
+                plan.color,
+                plan.route,
+                plan.start_at
+            ],
+        )?;
+    }
     Ok(id)
 }
 
