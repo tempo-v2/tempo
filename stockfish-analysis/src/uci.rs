@@ -153,12 +153,12 @@ fn parse_line(
     let Some(info) = line.strip_prefix("info depth ") else {
         return Ok(None);
     };
-    let mut fields = info.split_ascii_whitespace();
+    let mut fields = info.split_ascii_whitespace().peekable();
     let depth = fields
         .next()
         .and_then(|field| field.parse::<u8>().ok())
         .ok_or(Error::Protocol)?;
-    if depth != search.depth {
+    if depth != search.depth || fields.peek() == Some(&"currmove") {
         return Ok(None);
     }
     let mut rank = None;

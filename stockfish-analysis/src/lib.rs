@@ -2,7 +2,7 @@
 mod uci;
 
 use serde::{Deserialize, Serialize};
-use shakmaty::{CastlingMode, Chess, Color, Position, fen::Fen, uci::UciMove};
+use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position, fen::Fen, uci::UciMove};
 use std::{
     collections::HashSet,
     future::{Future, pending},
@@ -39,23 +39,18 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            coverage: Coverage::All,
+            coverage: Coverage::All {},
             depth: 10,
         }
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Coverage {
-    #[default]
-    All,
-    Top {
-        count: u8,
-    },
-    Moves {
-        moves: Vec<String>,
-    },
+    All {},
+    Top { count: u8 },
+    Moves { moves: Vec<String> },
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -202,7 +197,7 @@ struct Search {
 impl Search {
     fn validate(Request { fen, options }: Request) -> Result<(Chess, Search), Error> {
         let invalid = |reason| Error::InvalidRequest { reason };
-        let mut fields = fen.split_ascii_whitespace().rev();
+        let fields = fen.split_ascii_whitespace();
         if fen.len() > MAX_FEN_BYTES
             || !fen
                 .bytes()
@@ -211,8 +206,9 @@ impl Search {
         {
             return Err(invalid("expected a complete standard-chess FEN"));
         }
-        let fullmove = fields.next().unwrap_or_default();
-        let halfmove = fields.next().unwrap_or_default();
+        let mut counters = fields.clone().rev();
+        let fullmove = counters.next().unwrap_or_default();
+        let halfmove = counters.next().unwrap_or_default();
         if !fullmove.bytes().all(|byte| byte.is_ascii_digit())
             || !fullmove.bytes().any(|byte| byte != b'0')
             || !halfmove.bytes().all(|byte| byte.is_ascii_digit())
@@ -222,14 +218,22 @@ impl Search {
         let fen: Fen = fen
             .parse()
             .map_err(|_| invalid("invalid standard-chess FEN"))?;
-        let setup = fen.as_setup();
-        if setup.pockets.is_some() || setup.remaining_checks.is_some() || !setup.promoted.is_empty()
-        {
-            return Err(invalid("FEN contains variant-specific fields"));
-        }
         let board: Chess = fen
             .into_position(MODE)
             .map_err(|_| invalid("invalid standard-chess position"))?;
+        // Shakmaty also accepts variant encodings and normalizes some malformed
+        // fields. The standard placement and castling fields must round-trip.
+        let standard_fen = Fen::from_position(&board, EnPassantMode::Legal).to_string();
+        let standard_fields = standard_fen.split_ascii_whitespace();
+        if fields
+            .step_by(2)
+            .take(2)
+            .ne(standard_fields.step_by(2).take(2))
+        {
+            return Err(invalid(
+                "expected standard piece placement and castling fields",
+            ));
+        }
         // These are the Stockfish 19 limits for the FEN counters.
         if board.halfmoves() > 32_767 || board.fullmoves().get() > 100_000 {
             return Err(invalid("FEN counters exceed Stockfish limits"));
@@ -243,7 +247,7 @@ impl Search {
             .map(|play| UciMove::from_move(play, MODE))
             .collect();
         let (roots, lines, restricted) = match options.coverage {
-            Coverage::All => {
+            Coverage::All {} => {
                 let count = legal.len();
                 (legal, count, false)
             }

@@ -129,11 +129,15 @@ fn terminal_and_bad_input_resolve_before_launch() {
     for input in [
         json!({ "fen": "" }),
         json!({ "fen": format!("{START}\nquit") }),
+        json!({ "fen": START.replace("KQkq", "HAha") }),
+        json!({ "fen": START.replace("KQkq", "KKKK") }),
+        json!({ "fen": START.replace("/8/", "/44/") }),
         json!({ "fen": START.replace("0 1", "0 0") }),
         json!({ "fen": "8/8/8/8/8/2k5/8/K7[Pn] w - - 0 1" }),
         json!({ "fen": "8/8/8/8/8/2k5/8/K7 w - - 1+2 0" }),
         json!({ "fen": START.replace("0 1", "32768 1") }),
         json!({ "fen": START.replace("0 1", "0 100001") }),
+        json!({ "fen": START, "options": { "coverage": { "kind": "all", "moves": ["e2e4"] } } }),
         json!({ "fen": START, "options": { "depth": 19 } }),
         json!({ "fen": START, "options": { "coverage": { "kind": "moves", "moves": ["e2e4", "e2e4"] } } }),
         json!({ "fen": START, "options": { "coverage": { "kind": "moves", "moves": ["e2e5"] } } }),
@@ -215,6 +219,34 @@ done"#,
         Err(Error::Incomplete)
     );
     assert_dead(&engine.pid().await);
+}
+
+#[test]
+fn search_progress_does_not_interrupt_scored_lines() {
+    let engine = Fixture::new(
+        r#"printf 'id name Stockfish fixture
+uciok
+'
+while IFS= read -r line; do
+    case "$line" in
+        isready) printf 'readyok
+' ;;
+        go*) printf 'info depth 10 currmove e2e4 currmovenumber 1
+info depth 10 multipv 1 score cp 25 pv e2e4
+bestmove e2e4
+' ;;
+    esac
+done"#,
+    );
+    let reply = evaluated(
+        &engine.path.join("engine"),
+        START,
+        json!({
+            "coverage": { "kind": "top", "count": 1 }
+        }),
+    );
+    assert_eq!(roots(&reply), HashSet::from(["e2e4"]));
+    assert_eq!(reply["lines"][0]["score"]["white"], 25);
 }
 
 fn start() -> Request {
