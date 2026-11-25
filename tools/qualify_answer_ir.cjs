@@ -13,6 +13,7 @@ const chrome = process.env.TEMPO_QUALIFY_CHROME ||
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const answerPattern = "**/api/study/answer";
+const nextPattern = "**/api/study/next";
 const reveal = page => page.getByRole("button", { name: "Reveal answer" });
 const next = page => page.getByRole("button", { name: "Next card" });
 const retry = page => page.getByRole("button", { name: "Retry", exact: true });
@@ -228,10 +229,10 @@ async function titleInvariance(browser, root) {
   });
   for (const good of [true, false]) {
     let expected;
-    for (const title of ["Original", "Renamed", ""]) {
+    for (const title of ["Original", "Renamed", "", null]) {
       const db = path.join(root, "title-" + good + "-" + title + ".db");
       execFileSync("sqlite3", [baseline, ".backup " + db]);
-      execFileSync("sqlite3", [db, "UPDATE cards SET title='" + title + "'"]);
+      execFileSync("sqlite3", [db, "UPDATE cards SET title='" + (title ?? "Original") + "'"]);
       const page = await browser.newPage();
       try {
         await serve(candidate, db, await unusedPort(), async (origin) => {
@@ -240,6 +241,12 @@ async function titleInvariance(browser, root) {
             if (request.method() === "POST") {
               commands.push([new URL(request.url()).pathname, request.postDataJSON()]);
             }
+          });
+          if (title === null) await page.route(nextPattern, async route => {
+            const response = await route.fetch();
+            const view = await response.json();
+            if (view) delete view.title;
+            await route.fulfill({ response, json: view });
           });
           await page.goto(origin);
           await reveal(page).waitFor();
@@ -270,7 +277,7 @@ async function titleInvariance(browser, root) {
     }
     assert.equal(expected.commands.filter(([route]) => route.endsWith("/answer")).length, 1);
   }
-  console.log("Mounted Study: original, renamed and blank titles preserved exact Good/Again commands, receipt, relative schedule and continuation.");
+  console.log("Mounted Study: original, renamed, blank and omitted titles preserved Good/Again commands, receipts, schedules and continuation.");
 }
 async function mixedTabs(browser, db) {
   const port = await unusedPort();
@@ -367,6 +374,91 @@ async function invalidCurrentReply(browser, db) {
   });
 }
 
+async function incompleteNextReply(browser, db, automatic) {
+  await serve(candidate, db, await unusedPort(), async (origin, api) => {
+    await seed(api);
+    const page = await browser.newPage();
+    const commands = [];
+    let issued;
+    try {
+      await page.goto(origin);
+      await reveal(page).waitFor();
+      const first = await api("study");
+      page.on("request", request => {
+        if (request.method() === "POST") {
+          commands.push([request.url().split("/").at(-1), request.postDataJSON()]);
+        }
+      });
+      await page.route(nextPattern, async route => {
+        const response = await route.fetch();
+        assert.equal(response.status(), 200);
+        issued = await response.json();
+        assert.notEqual(issued.attempt, first.attempt);
+        await route.fulfill(automatic
+          ? { status: 200, json: { ...issued, result: undefined } }
+          : { status: 200, contentType: "application/json", body: '{"attempt":' });
+      }, { times: 1 });
+      const rating = automatic ? "Good" : "Again";
+      if (automatic) {
+        const saved = execFileSync("sqlite3", ["-readonly", db,
+          "SELECT cards.answers FROM study JOIN attempts ON attempts.id=study.active " +
+          "JOIN cards ON cards.id=attempts.card_id"], { encoding: "utf8" });
+        const [move] = JSON.parse(saved);
+        const board = await page.locator("cg-board").boundingBox();
+        const click = (file, rank) => page.mouse.click(
+          board.x + (file.charCodeAt(0) - 97 + 0.5) * board.width / 8,
+          board.y + (8 - Number(rank) + 0.5) * board.height / 8,
+        );
+        await click(move[0], move[1]);
+        await click(move[2], move[3]);
+      } else {
+        await reveal(page).click();
+        await next(page).click();
+      }
+      await retry(page).waitFor();
+      await page.getByRole("status").getByText(rating, { exact: true }).waitFor();
+      assert.equal(await page.getByText("No cards are ready.", { exact: false }).count(), 0);
+      assert.equal((await api("study")).attempt, issued.attempt);
+      const replayed = page.waitForResponse(response => response.url().endsWith("/api/study/next"));
+      await retry(page).click();
+      assert.equal((await (await replayed).json()).attempt, issued.attempt);
+      await reveal(page).waitFor();
+      assert.deepEqual(commands.map(([command]) => command), ["answer", "next", "next"]);
+      assert.deepEqual(commands[1][1], { after: first.attempt, dataset: first.dataset });
+      assert.deepEqual(commands[1], commands[2]);
+      assert.equal(grades(db), 1);
+      assert.equal(Number(execFileSync("sqlite3", ["-readonly", db, "SELECT count(*) FROM attempts"])), 2);
+    } finally {
+      await page.close();
+    }
+  });
+}
+
+async function incompleteStartupNext(browser, db) {
+  await serve(candidate, db, await unusedPort(), async origin => {
+    const page = await browser.newPage();
+    const calls = [];
+    try {
+      page.on("request", request => {
+        if (request.url().endsWith("/api/study")) calls.push(["current"]);
+        if (request.url().endsWith("/api/study/next")) calls.push(["next", request.postDataJSON()]);
+        if (request.url().endsWith("/api/study/answer")) calls.push(["answer"]);
+      });
+      await page.route(nextPattern, route => route.fulfill({
+        status: 200, contentType: "application/json", body: "",
+      }), { times: 1 });
+      await page.goto(origin);
+      await retry(page).waitFor();
+      assert.equal(await page.getByText("No cards are ready.", { exact: false }).count(), 0);
+      await retry(page).click();
+      await page.getByText("No cards are ready.", { exact: false }).waitFor();
+      assert.deepEqual(calls, [["current"], ["next", { after: null }], ["next", { after: null }]]);
+    } finally {
+      await page.close();
+    }
+  });
+}
+
 async function browserReads(browser, db) {
   await serve(candidate, db, await unusedPort(), async origin => {
     const page = await browser.newPage();
@@ -444,6 +536,10 @@ async function browserReads(browser, db) {
     await mixedTabs(browser, path.join(root, "mixed.db"));
     await browserReads(browser, path.join(root, "browse.db"));
     await invalidCurrentReply(browser, path.join(root, "invalid-current.db"));
+    await incompleteNextReply(browser, path.join(root, "manual-next.db"), false);
+    await incompleteNextReply(browser, path.join(root, "automatic-next.db"), true);
+    await incompleteStartupNext(browser, path.join(root, "startup-next.db"));
+    console.log("Malformed Next replies preserved saved manual and automatic results. Retry reused the issued attempt and the startup retry accepted real null.");
     console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, incomplete reply replay, and Next-only retry passed.");
   } finally {
     if (browser) await browser.close();

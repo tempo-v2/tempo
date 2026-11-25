@@ -4,7 +4,7 @@ use pgn_reader::shakmaty::{
 };
 use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io::Cursor, ops::ControlFlow};
+use std::{collections::BTreeMap, io::Read, ops::ControlFlow};
 
 pub const MAX_PLIES: usize = 1024;
 const MODE: CastlingMode = CastlingMode::Standard;
@@ -257,12 +257,20 @@ impl Visitor for Parser {
 pub fn read_pgn(
     text: &str,
     branches: bool,
-    mut visit: impl FnMut(Result<Pgn>) -> Result<()>,
+    visit: impl FnMut(Result<Pgn>) -> Result<()>,
 ) -> Result<()> {
     if text.trim().is_empty() {
         bail!("enter a PGN");
     }
-    let mut reader = Reader::new(Cursor::new(text.as_bytes()));
+    read_pgn_from(text.as_bytes(), branches, visit)
+}
+
+fn read_pgn_from(
+    input: impl Read,
+    branches: bool,
+    mut visit: impl FnMut(Result<Pgn>) -> Result<()>,
+) -> Result<()> {
+    let mut reader = Reader::new(input);
     let mut parser = Parser { branches };
     let first = reader.read_game(&mut parser)?.context("PGN has no games")?;
     visit(first)?;
@@ -270,6 +278,17 @@ pub fn read_pgn(
         visit(game)?;
     }
     Ok(())
+}
+
+/// Preview a single mainline. The caller supplies the bounded input reader.
+pub fn preview_pgn(input: impl Read) -> Result<Route> {
+    let mut game = None;
+    read_pgn_from(input, false, |record| {
+        ensure!(game.is_none(), "too many games in this batch");
+        game = Some(record);
+        Ok(())
+    })?;
+    Ok(game.context("PGN has no games")??.main)
 }
 
 /// Read one record at a committed PGN boundary, excluding reader lookahead from the next offset.
