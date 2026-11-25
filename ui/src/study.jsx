@@ -143,6 +143,11 @@ async function deliverAnswer(intent, fen) {
     const playable = fen === undefined ? undefined : playableMoves(fen, incomplete);
     result = decodeResult(body, incomplete, playable);
   } catch (error) {
+    if (error.code === "refresh_required") {
+      // The server rejected this exact legacy action before grading.
+      await resolveAnswer(intent);
+      return null;
+    }
     if (!["stale_dataset", "stale_attempt", "answer_conflict"].includes(error.code)) throw error;
   }
   // A failed journal cleanup can cause an exact replay. Acceptance stays authoritative.

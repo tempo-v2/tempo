@@ -24,6 +24,7 @@ pub struct Move {
     pub dataset: String,
     pub play: i64,
     pub step: i64,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub played: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
@@ -184,20 +185,24 @@ pub fn start(db: &mut Connection, input: Start) -> Result<View> {
     );
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     check_dataset(&tx, &input.dataset)?;
-    let prior: Option<(String, bool, i64)> = tx
+    let prior: Option<(String, bool, i64, Option<String>)> = tx
         .query_row(
-            "SELECT puzzle,practice,play FROM lichess_starts WHERE request=?1",
+            "SELECT puzzle,practice,play,revision FROM lichess_starts WHERE request=?1",
             [&input.request],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    if let Some((puzzle, practice, id)) = prior {
+    if let Some((puzzle, practice, id, revision)) = prior {
         ensure!(
-            puzzle == input.puzzle && practice == input.practice,
+            puzzle == input.puzzle
+                && practice == input.practice
+                && revision.is_none_or(|revision| revision == input.revision),
             Conflict::Submission
         );
         return view(&tx, id);
     }
+    let version:String=tx.query_row("SELECT m.version FROM lichess_members m CROSS JOIN lichess_catalog c WHERE m.puzzle=?1 AND c.artifact=?2 LIMIT 1",
+        params![input.puzzle,input.revision],|r|r.get(0)).optional()?.ok_or(Conflict::PackChanged)?;
     let existing = if input.practice {
         None
     } else {
@@ -211,8 +216,6 @@ pub fn start(db: &mut Connection, input: Start) -> Result<View> {
     let id = if let Some(id) = existing {
         id
     } else {
-        let version:String=tx.query_row("SELECT m.version FROM lichess_members m CROSS JOIN lichess_catalog c WHERE m.puzzle=?1 AND c.artifact=?2 LIMIT 1",
-            params![input.puzzle,input.revision],|r|r.get(0)).optional()?.ok_or(Conflict::PackChanged)?;
         let learned: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM lichess_cards WHERE puzzle=?1)",
             [&input.puzzle],
@@ -227,8 +230,14 @@ pub fn start(db: &mut Connection, input: Start) -> Result<View> {
         tx.last_insert_rowid()
     };
     tx.execute(
-        "INSERT INTO lichess_starts VALUES (?1,?2,?3,?4)",
-        params![input.request, input.puzzle, input.practice, id],
+        "INSERT INTO lichess_starts(request,puzzle,practice,play,revision) VALUES (?1,?2,?3,?4,?5)",
+        params![
+            input.request,
+            input.puzzle,
+            input.practice,
+            id,
+            input.revision
+        ],
     )?;
     let reply = view(&tx, id)?;
     tx.commit()?;
@@ -314,36 +323,17 @@ pub fn play(db: &mut Connection, input: Move, surface: Surface) -> Result<View> 
         current.result.is_none() && current.ply as i64 == input.step,
         Conflict::Attempt
     );
-    let (active, previous): (Option<i64>, Option<String>) =
-        tx.query_row("SELECT active,last_kind FROM study", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
-    ensure!(
-        current.mode != "study" || current.review == active,
-        Conflict::Attempt
-    );
-    let board = chess::board_at(&current.route, current.ply)?;
-    let mut ply = current.ply;
-    let rating = match action {
-        AnswerAction::Play(ref move_text) => {
-            let played = chess::parse_move(&board, move_text).map_err(|_| Conflict::IllegalMove)?;
-            let expected = chess::parse_move(&board, &current.route.moves[ply])?;
-            let mut after = board.clone();
-            after.play_unchecked(played);
-            let alternative = current.route.moves.len() == 1 && after.is_checkmate() && {
-                let mut prescribed = board;
-                prescribed.play_unchecked(expected);
-                prescribed.is_checkmate()
-            };
-            if played == expected || alternative {
-                ply = (ply + 2).min(current.route.moves.len());
-                (ply == current.route.moves.len()).then_some(Rating::Good)
-            } else {
-                Some(Rating::Again)
-            }
-        }
-        AnswerAction::Reveal => Some(Rating::Again),
-    };
+    if current.mode == "study" {
+        let active: Option<i64> = tx.query_row("SELECT active FROM study", [], |r| r.get(0))?;
+        ensure!(current.review == active, Conflict::Attempt);
+    }
+    let (ply, rating, final_move) =
+        match chess::score_puzzle_move(&current.route, current.ply, action.played())? {
+            chess::PuzzleMove::Illegal => return Err(Conflict::IllegalMove.into()),
+            chess::PuzzleMove::Again => (current.ply, Some(Rating::Again), None),
+            chess::PuzzleMove::Continue { ply } => (ply, None, None),
+            chess::PuzzleMove::Solved { ply, alternate } => (ply, Some(Rating::Good), alternate),
+        };
     let mut reviewed = None;
     let result = if let Some(rating) = rating {
         let mut outcome = Outcome {
@@ -375,6 +365,11 @@ pub fn play(db: &mut Connection, input: Move, surface: Surface) -> Result<View> 
             } else {
                 None
             };
+            let previous: Option<String> = if matches!(rating, Rating::Again) {
+                tx.query_row("SELECT last_kind FROM study", [], |r| r.get(0))?
+            } else {
+                None
+            };
             let (repeat, day) = review::record_rating(
                 &tx,
                 &card,
@@ -389,11 +384,6 @@ pub fn play(db: &mut Connection, input: Move, surface: Surface) -> Result<View> 
             reviewed = Some(attempt);
         }
         Some(serde_json::to_string(&outcome)?)
-    } else {
-        None
-    };
-    let final_move = if matches!(rating, Some(Rating::Good)) && current.route.moves.len() == 1 {
-        action.played()
     } else {
         None
     };

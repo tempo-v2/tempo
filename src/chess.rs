@@ -89,6 +89,58 @@ pub fn board_at(route: &Route, ply: usize) -> Result<Chess> {
     Ok(board)
 }
 
+/// The result of interpreting one learner action in an issued solution.
+pub enum PuzzleMove {
+    Illegal,
+    Again,
+    Continue {
+        ply: usize,
+    },
+    Solved {
+        ply: usize,
+        alternate: Option<String>,
+    },
+}
+
+pub fn score_puzzle_move(route: &Route, ply: usize, played: Option<&str>) -> Result<PuzzleMove> {
+    let board = board_at(route, ply)?;
+    let expected = parse_move(
+        &board,
+        route.moves.get(ply).context("No solver move at this ply")?,
+    )?;
+    let Some(submitted) = played else {
+        return Ok(PuzzleMove::Again);
+    };
+    let Ok(played) = parse_move(&board, submitted) else {
+        return Ok(PuzzleMove::Illegal);
+    };
+    // Parsing can normalize a malformed input into a legal move.
+    if uci(played) != submitted {
+        return Ok(PuzzleMove::Illegal);
+    }
+    if played == expected {
+        let next = (ply + 2).min(route.moves.len());
+        return Ok(if next == route.moves.len() {
+            PuzzleMove::Solved {
+                ply: next,
+                alternate: None,
+            }
+        } else {
+            PuzzleMove::Continue { ply: next }
+        });
+    }
+    if ply + 1 == route.moves.len()
+        && board.clone().play(expected)?.is_checkmate()
+        && board.play(played)?.is_checkmate()
+    {
+        return Ok(PuzzleMove::Solved {
+            ply: ply + 1,
+            alternate: Some(uci(played)),
+        });
+    }
+    Ok(PuzzleMove::Again)
+}
+
 #[derive(Clone)]
 struct Line {
     board: Chess,

@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 12;
+const SCHEMA: i32 = 13;
 
 pub struct Database;
 
@@ -57,6 +57,7 @@ impl Database {
         db.execute_batch(include_str!("coverage_order.sql"))?;
         db.execute_batch(include_str!("gap_batches.sql"))?;
         db.execute_batch(include_str!("lichess_packs.sql"))?;
+        db.execute_batch(include_str!("lichess_start_revision.sql"))?;
         crate::games::upgrade(&db)?;
         db.execute_batch(include_str!("detectors.sql"))?;
         db.execute(
@@ -96,7 +97,10 @@ impl Database {
             if version < 11 {
                 tx.execute_batch(include_str!("gap_batches.sql"))?;
             }
-            tx.execute_batch(include_str!("lichess_packs.sql"))?;
+            if version < 12 {
+                tx.execute_batch(include_str!("lichess_packs.sql"))?;
+            }
+            tx.execute_batch(include_str!("lichess_start_revision.sql"))?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -131,6 +135,7 @@ impl Database {
         crate::games::upgrade(&tx)?;
         tx.execute_batch(include_str!("detectors.sql"))?;
         tx.execute_batch(include_str!("lichess_packs.sql"))?;
+        tx.execute_batch(include_str!("lichess_start_revision.sql"))?;
         let valid: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
             [],
