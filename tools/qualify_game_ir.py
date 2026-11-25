@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import socket
 import sqlite3
+import struct
 import subprocess
 import tempfile
 import threading
@@ -196,6 +197,7 @@ def verify_interrupted_upload(binary, predecessor, database):
     assert file.read_text() == payload
     assert sql(database, "SELECT count(*) FROM games") == [(1,)]
     sql(database, "DROP TRIGGER fixture_stop_upload")
+    previous_version, = sql(database, "PRAGMA user_version")[0]
     subprocess.run([binary, "migrate-games", database], check=True)
     assert sql(database, "SELECT cursor,upload_file FROM jobs WHERE id=?", [job]) == checkpoint
     with serve(binary, database) as api:
@@ -204,11 +206,93 @@ def verify_interrupted_upload(binary, predecessor, database):
         assert sql(database, "SELECT added,existing,rejected FROM jobs WHERE id=?", [job]) == [(2, 0, 0)]
         assert len(api("games")) == 2
         wait_until(lambda: not file.exists())
-    print("An interrupted schema-6 upload kept its original ID and staged checkpoint across the offline upgrade.")
+    print(f"An interrupted schema-{previous_version} upload kept its original ID and staged checkpoint across the offline upgrade.")
+    return previous_version
+
+
+def verify_archive_resume(binary, predecessor, database):
+    def game_ir(fen, played):
+        def square(text):
+            return ord(text[0]) - ord("a") + 8 * (int(text[1]) - 1)
+        move = square(played[:2]) | (square(played[2:]) << 6)
+        return struct.pack("<BHH", 1, len(fen), 1) + fen.encode() + struct.pack("<H", move)
+
+    neutral = game_ir("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "e2e4")
+    compared = game_ir(FEN, "e1e2")
+    prior_ids = [f"a{number:03d}" for number in range(64)]
+    # The last game by ID sits before the sealed game in ordinal order.
+    records = [(game, neutral) for game in prior_ids] + [("z", compared), ("m", compared)]
+    insert = """INSERT INTO games(id,white,black,learner_color,game_ir,occurrence,outcome)
+                VALUES (?,'Learner','Opponent','white',?,'[null,null,null,null]','1-0')"""
+    with serve(predecessor, database, worker=False) as api:
+        for number in range(118):
+            api("openings", {"name": f"Archived reference {number}", "color": "white",
+                "route": {"fen": FEN, "moves": ["d1d5"]}, "destination": {"kind": "new"}})
+        with sqlite3.connect(database) as db:
+            db.executemany(insert, records)
+            db.execute("""CREATE TRIGGER fixture_stop_sealed BEFORE UPDATE OF detector_game ON jobs
+                          WHEN OLD.detector_game='m' AND NEW.detector_game IS NULL
+                            AND OLD.operation='compare_all'
+                          BEGIN SELECT RAISE(ABORT, 'pause final sealed batch'); END""")
+        parent = api("games/jobs", {"provider": "archive", "operation": "scan"})["id"]
+
+    def lane(op):
+        return sql(database, """SELECT id,status,cursor,detector_game,upload_file,window_offset
+                                FROM jobs WHERE parent_id=? AND operation=?""", (parent, op))[0]
+
+    with serve(predecessor, database):
+        wait_until(lambda: lane("compare_all")[1] == "failed" and lane("capture_all")[1] == "done")
+    compare, _, stored, game, file, offset = lane("compare_all")
+    capture = lane("capture_all")[0]
+    assert json.loads(stored) == {"through": len(records), "after": prior_ids[-1]}
+    assert game == "m" and file and offset > 0
+    sealed = database.with_suffix(".uploads") / file
+    sealed_bytes = sealed.read_bytes()
+    assert sql(database, "SELECT count(*) FROM mismatches") == [(117,)]
+
+    with sqlite3.connect(database) as db:
+        db.execute("DROP TRIGGER fixture_stop_sealed")
+        db.execute("""CREATE TRIGGER fixture_stop_after_page BEFORE UPDATE OF detector_game ON jobs
+                      WHEN NEW.detector_game='z' AND OLD.operation='compare_all'
+                      BEGIN SELECT RAISE(ABORT, 'pause after committed compatibility page'); END""")
+        db.executemany(insert, ((f"b{number:06d}", neutral) for number in range(100_000)))
+    old_checkpoints = (lane("compare_all"), lane("capture_all"))
+    subprocess.run([binary, "migrate-games", database], check=True)
+    assert (lane("compare_all"), lane("capture_all")) == old_checkpoints
+    assert sealed.read_bytes() == sealed_bytes
+    refused = subprocess.run([predecessor, "serve", database, "0", "--no-worker"],
+                             capture_output=True, timeout=5)
+    assert refused.returncode != 0 and b"requires a newer release" in refused.stderr
+
+    with serve(binary, database) as api:
+        api(f"games/jobs/{parent}/retry", {})
+        attempt = api("study/next", {"after": None})
+        answer = {"attempt": attempt["attempt"], "dataset": attempt["dataset"], "played": None}
+        assert api("study/answer", answer)["rating"] == "Again"
+        assert api("study/next", {"after": attempt["attempt"], "dataset": attempt["dataset"]})
+        wait_until(lambda: lane("compare_all")[1] == "failed")
+        checkpoint = json.loads(lane("compare_all")[2])
+        assert checkpoint == {"v2": {"through": len(records), "after_ordinal": 64, "legacy_after_id": "m"}}
+        assert sql(database, "SELECT count(*) FROM mismatches") == [(118,)]
+        assert lane("capture_all") == old_checkpoints[1]
+    sql(database, "DROP TRIGGER fixture_stop_after_page")
+
+    with serve(binary, database) as api:
+        api(f"games/jobs/{parent}/retry", {})
+        wait_until(lambda: sql(database, "SELECT status FROM jobs WHERE id=?", [parent]) == [("done",)])
+        for job in (compare, capture):
+            completed = sql(database, "SELECT game_id FROM job_games WHERE job_id=? AND scanned=1 ORDER BY game_id", [job])
+            assert completed == [(game,) for game in sorted(game for game, _ in records)]
+        assert sql(database, "SELECT added FROM jobs WHERE id=?", [parent]) == [(len(records),)]
+        assert sql(database, "SELECT game_id,count(*) FROM mismatches GROUP BY game_id ORDER BY game_id") == [("m", 118), ("z", 118)]
+        assert sql(database, "SELECT count(*) FROM attempts WHERE result IS NOT NULL") == [(1,)]
+    print("Schema-7 rescan resumed a partial seal and restarted after a completed-prefix page. "
+          "Both lanes kept exact membership, findings and parent counts across 100,000 later games. "
+          "Study Next and Answer completed during recovery.")
 
 
 def verify_migration(binary, predecessor_database, destination):
-    snapshot = destination.with_name("schema6-snapshot.sqlite3")
+    snapshot = destination.with_name("predecessor-snapshot.sqlite3")
     with sqlite3.connect(predecessor_database.as_uri() + "?mode=ro", uri=True) as source:
         with sqlite3.connect(snapshot) as copy:
             source.backup(copy)
@@ -219,25 +303,28 @@ def verify_migration(binary, predecessor_database, destination):
     subprocess.run([binary, "migrate-games", destination], check=True)
     with sqlite3.connect(destination) as db:
         db.execute("ATTACH DATABASE ? AS previous", (snapshot.as_uri() + "?mode=ro",))
-        assert db.execute("PRAGMA user_version").fetchone() == (7,)
+        previous_version, = db.execute("PRAGMA previous.user_version").fetchone()
+        assert db.execute("PRAGMA user_version").fetchone() == (8,)
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert not db.execute("PRAGMA foreign_key_check").fetchall()
         tables = db.execute("SELECT name FROM previous.sqlite_schema WHERE type='table'").fetchall()
         for (table,) in tables:
             fields = [v[1] for v in db.execute("SELECT * FROM pragma_table_info(?, 'previous')", (table,))]
-            if table == "games":
+            if table == "games" and previous_version < 7:
                 fields.remove("route")
                 fields.append("rowid")
             columns = ", ".join(f'"{field}"' for field in fields)
             for a, b in [("main", "previous"), ("previous", "main")]:
                 sql_diff = f'SELECT {columns} FROM {a}."{table}" EXCEPT SELECT {columns} FROM {b}."{table}" LIMIT 1'
                 assert not db.execute(sql_diff).fetchall(), table
-        rows, byte_count = db.execute("SELECT count(*), sum(length(game_ir)) FROM games").fetchone()
-        old_bytes = db.execute("SELECT sum(length(route)) FROM previous.games").fetchone()[0]
-        assert byte_count < old_bytes
+        rows, = db.execute("SELECT count(*) FROM games").fetchone()
+        if previous_version < 7:
+            byte_count, = db.execute("SELECT sum(length(game_ir)) FROM games").fetchone()
+            old_bytes = db.execute("SELECT sum(length(route)) FROM previous.games").fetchone()[0]
+            assert byte_count < old_bytes
     with serve(binary, destination, worker=False) as api:
         assert all(api(route) is not None for route in ("health", "games", "games/jobs", "study/counts"))
-    print(f"Schema 6 → 7 preserved {rows:,} games and all predecessor semantic rows. Route payloads {old_bytes:,} → {byte_count:,} bytes.")
+    print(f"Schema {previous_version} → 8 preserved {rows:,} games and all {len(tables)} predecessor tables.")
 
 
 if __name__ == "__main__":
@@ -251,6 +338,9 @@ if __name__ == "__main__":
         if options.predecessor_database:
             verify_migration(options.binary.resolve(), options.predecessor_database.resolve(), root / "converted.sqlite3")
         if options.predecessor_binary:
-            verify_interrupted_upload(options.binary.resolve(), options.predecessor_binary.resolve(), root / "unfinished.sqlite3")
+            predecessor = options.predecessor_binary.resolve()
+            previous_version = verify_interrupted_upload(options.binary.resolve(), predecessor, root / "unfinished.sqlite3")
+            if previous_version == 7:
+                verify_archive_resume(options.binary.resolve(), predecessor, root / "rescan.sqlite3")
         verify_games(options.binary.resolve(), root / "games.sqlite3")
         verify_browse(options.binary.resolve(), root / "browse.sqlite3")

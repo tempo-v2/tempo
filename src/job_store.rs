@@ -329,6 +329,13 @@ pub fn stage_inline_upload(db: &mut Connection, id: i64, file: &str) -> Result<(
     Ok(())
 }
 
+pub const ARCHIVE_RESUME_PAGE: u8 = 64;
+
+pub struct ArchiveGame {
+    pub ordinal: i64,
+    pub id: String,
+}
+
 pub struct JobReads(Connection);
 impl JobReads {
     pub fn open(path: &Path) -> Result<Self> {
@@ -385,20 +392,35 @@ impl JobReads {
     pub fn archive_end(&self) -> Result<i64> {
         Ok(self
             .0
-            .query_row("SELECT coalesce(max(rowid),0) FROM games", [], |row| {
+            .query_row("SELECT coalesce(max(ordinal),0) FROM games", [], |row| {
                 row.get(0)
             })?)
     }
 
-    pub fn archive_next(&self, after: &str, through: i64) -> Result<Option<String>> {
+    pub fn archive_page(&self, after: i64, through: i64, limit: u8) -> Result<Vec<ArchiveGame>> {
+        ensure!(
+            (1..=ARCHIVE_RESUME_PAGE).contains(&limit),
+            "invalid archive page size"
+        );
+        let mut query = self.0.prepare_cached(
+            "SELECT ordinal,id FROM games
+             WHERE ordinal>?1 AND ordinal<=?2 ORDER BY ordinal LIMIT ?3",
+        )?;
+        let rows = query.query_map(params![after, through, limit], |row| {
+            Ok(ArchiveGame {
+                ordinal: row.get(0)?,
+                id: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn archive_ordinal(&self, id: &str) -> Result<i64> {
         Ok(self
             .0
-            .query_row(
-                "SELECT id FROM games WHERE id>?1 AND rowid<=?2 ORDER BY id LIMIT 1",
-                params![after, through],
-                |row| row.get(0),
-            )
-            .optional()?)
+            .query_row("SELECT ordinal FROM games WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
     }
 
     pub fn detector_plan(
@@ -434,6 +456,76 @@ impl JobReads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_page_work_is_independent_of_games_past_the_cutoff() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(include_str!("game_ir.sql"))?;
+        db.execute_batch(
+            "ALTER TABLE games_v7 RENAME TO games;
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<65)
+             INSERT INTO games(id,white,black,learner_color,game_ir,occurrence,outcome)
+             SELECT printf('z%06d',i),'w','b','white',zeroblob(8),'[]','*' FROM n",
+        )?;
+        let db = JobReads(db);
+        let operations = [(0, 65, 1), (65, 65, 1), (0, 65, ARCHIVE_RESUME_PAGE)];
+        let mut baseline = Vec::new();
+        for with_new_games in [false, true] {
+            if with_new_games {
+                db.0.execute_batch(
+                    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
+                     INSERT INTO games(id,white,black,learner_color,game_ir,occurrence,outcome)
+                     SELECT printf('a%06d',i),'w','b','white',zeroblob(8),'[]','*' FROM n",
+                )?;
+            }
+            let steps = Arc::new(AtomicUsize::new(0));
+            let count = steps.clone();
+            db.0.progress_handler(
+                1,
+                Some(move || {
+                    count.fetch_add(1, Relaxed);
+                    false
+                }),
+            );
+            for (index, (after, through, limit)) in operations.into_iter().enumerate() {
+                let page = db.archive_page(after, through, limit)?;
+                let work = steps.swap(0, Relaxed);
+                let actual: Vec<_> = page
+                    .into_iter()
+                    .map(|game| (game.ordinal, game.id))
+                    .collect();
+                let expected: Vec<_> = ((after + 1)..=through)
+                    .take(usize::from(limit))
+                    .map(|ordinal| (ordinal, format!("z{ordinal:06}")))
+                    .collect();
+                assert_eq!(actual, expected);
+                assert!(work <= if limit == 1 { 128 } else { 1_000 }, "{work} steps");
+                if with_new_games {
+                    assert!(
+                        work <= baseline[index] + 8,
+                        "VM work grew from {} to {work}",
+                        baseline[index]
+                    );
+                } else {
+                    baseline.push(work);
+                }
+                eprintln!(
+                    "archive page after {after}, limit {limit}, new games {with_new_games}: {work} steps"
+                );
+            }
+            db.0.progress_handler(0, None::<fn() -> bool>);
+        }
+        let page = db.archive_page(65, 66, 1)?;
+        assert_eq!(page.len(), 1);
+        let game = &page[0];
+        assert_eq!((game.ordinal, game.id.as_str()), (66, "a000001"));
+        Ok(())
+    }
 
     #[test]
     fn queued_turns_migrate_and_rotate_in_durable_order() -> Result<()> {

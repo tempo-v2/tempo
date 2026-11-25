@@ -62,22 +62,46 @@ function grades(db) {
     "SELECT count(*) FROM attempts WHERE result IS NOT NULL"], { encoding: "utf8" }));
 }
 
+function pendingAnswers() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("tempo-study-answer-journal", 1);
+    request.onerror = () => reject(request.error);
+    request.onupgradeneeded = () => request.transaction.abort();
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction("pending", "readonly");
+      const rows = transaction.objectStore("pending").getAll();
+      transaction.oncomplete = () => { db.close(); resolve(rows.result); };
+      transaction.onabort = () => { db.close(); reject(transaction.error); };
+    };
+  });
+}
+
 async function predecessorRecovery(browser, db, accepted) {
   const port = await unusedPort();
   const page = await browser.newPage();
   let original;
+  let previousSchema;
   try {
     await serve(predecessor, db, port, async (origin, api) => {
       await seed(api);
+      previousSchema = Number(execFileSync("sqlite3", ["-readonly", db, "PRAGMA user_version"]));
       await page.route(answerPattern, async route => {
+        original = route.request().postDataJSON();
         if (accepted) assert.equal((await route.fetch()).status(), 200);
         await route.abort();
       });
       await page.goto(origin);
       await reveal(page).click();
       await retry(page).waitFor();
-      original = await page.evaluate(() => JSON.parse(localStorage.getItem("tempo.pending-answer.v2")));
       assert.ok(original?.dataset);
+      if (previousSchema < 7) {
+        assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem("tempo.pending-answer.v2"))), original);
+      } else {
+        assert.deepEqual(await page.evaluate(pendingAnswers), [
+          { version: 1, dataset: original.dataset, attempt: original.attempt, action: { kind: "reveal" } },
+        ]);
+      }
       assert.equal(grades(db), accepted ? 1 : 0);
       await page.unroute(answerPattern);
     });
@@ -89,7 +113,7 @@ async function predecessorRecovery(browser, db, accepted) {
       await next(page).waitFor();
       assert.equal(grades(db), 1);
       assert.deepEqual(await page.evaluate(() =>
-        JSON.parse(localStorage.getItem("tempo.pending-answer.v2"))), original);
+        JSON.parse(localStorage.getItem("tempo.pending-answer.v2"))), previousSchema < 7 ? original : null);
     });
   } finally {
     await page.context().close();
@@ -303,7 +327,7 @@ async function mixedTabs(browser, db) {
     dropCurrent.resolve();
     await context.close();
   }
-  console.log("A still-loaded schema-6 tab cleared its legacy scalar after cutover while the new tab retained and replayed its newer Answer.");
+  console.log("A still-loaded predecessor tab finished its Answer after cutover while the new tab retained and replayed its newer Answer.");
 }
 
 async function invalidCurrentReply(browser, db) {
