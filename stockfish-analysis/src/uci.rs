@@ -1,10 +1,10 @@
 use super::{Analysis, Error, Line, MODE, Score, Search};
 use shakmaty::{Chess, Color, EnPassantMode, Position, fen::Fen, uci::UciMove};
-use std::{collections::HashSet, future::Future, path::Path, process::Stdio};
+use std::{collections::HashSet, future::Future, path::Path, process::Stdio, time::Instant};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdout, Command},
-    time::{Instant, timeout_at},
+    time::timeout_at,
 };
 
 const MAX_LINE_BYTES: usize = 8 * 1024;
@@ -31,7 +31,7 @@ pub(super) async fn analyze(
     let result = tokio::select! {
         biased;
         () = cancel => Err(Error::Cancelled),
-        result = timeout_at(deadline, exchange(&mut child, board, search)) => {
+        result = timeout_at(deadline.into(), exchange(&mut child, board, search)) => {
             result.unwrap_or(Err(Error::Timeout))
         }
     };

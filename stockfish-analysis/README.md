@@ -41,7 +41,8 @@ becomes a successful comparison.
 Share one `Stockfish` instance or its clones for a composition-wide slot.
 The library uses Tokio and runs one engine per admitted request. Cancelling via
 `analyze_until` waits for cleanup. Dropping the future also requests
-cancellation, and the service remains busy until the child is reaped.
+cancellation, and the service remains busy until the child is reaped, even
+when the caller’s runtime shuts down.
 The result is transient and contains engine evidence for the caller to
 interpret. There is no dependency from the Lean serving binary to this crate.
 

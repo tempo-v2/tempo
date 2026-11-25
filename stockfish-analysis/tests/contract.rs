@@ -175,17 +175,57 @@ async fn contention_and_cancellation_keep_one_physical_slot() {
     let work = tokio::spawn(async move { service.analyze(start()).await });
     let pid = fixture.pid().await;
     work.abort();
+    timeout_reap(&pid).await;
+    assert_dead(&pid);
+}
+
+#[test]
+fn caller_runtime_shutdown_preserves_slot_through_reaping() {
+    use std::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    use tokio::runtime::Builder;
+
+    let fixture = Fixture::new("exec /bin/sleep 30");
+    let stockfish = fixture.stockfish();
+    let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+    let old_pid = runtime.block_on(async {
+        let service = stockfish.clone();
+        tokio::spawn(async move { service.analyze(start()).await });
+        fixture.pid().await
+    });
+    drop(runtime);
+
+    let replacement = Builder::new_current_thread().enable_all().build().unwrap();
+    let (stop, cancelled) = tokio::sync::oneshot::channel();
+    let mut work = pin!(stockfish.analyze_until(start(), async {
+        let _ = cancelled.await;
+    }));
+    let admission = {
+        let _enter = replacement.enter();
+        work.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    };
+    match admission {
+        Poll::Pending => {
+            assert_dead(&old_pid);
+            stop.send(()).unwrap();
+            assert_eq!(replacement.block_on(work), Err(Error::Cancelled));
+        }
+        Poll::Ready(result) => assert_eq!(result, Err(Error::Busy)),
+    }
+    replacement.block_on(timeout_reap(&old_pid));
+}
+
+async fn timeout_reap(pid: &str) {
     timeout(Duration::from_secs(2), async {
-        loop {
-            if !is_alive(&pid) {
-                break;
-            }
+        while is_alive(pid) {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    assert_dead(&pid);
 }
 
 #[tokio::test]

@@ -8,11 +8,12 @@ use std::{
     future::{Future, pending},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 use tokio::{
+    runtime,
     sync::{Semaphore, oneshot},
-    time::Instant,
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -163,18 +164,26 @@ impl Stockfish {
         let executable = self.executable.clone();
         let (mut reply, mut result) = oneshot::channel();
         let (stop, mut cancelled) = oneshot::channel();
-        tokio::spawn(async move {
-            let analysis = uci::analyze(&executable, board, search, deadline, async {
-                tokio::select! {
-                    _ = &mut cancelled => {}
-                    _ = reply.closed() => {}
-                }
+        // The engine and permit must outlive the caller's executor if it shuts down.
+        thread::Builder::new()
+            .name("tempo-stockfish".to_owned())
+            .spawn(move || {
+                let analysis = runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| Error::EngineUnavailable)
+                    .and_then(|worker| {
+                        worker.block_on(uci::analyze(&executable, board, search, deadline, async {
+                            tokio::select! {
+                                _ = &mut cancelled => {}
+                                _ = reply.closed() => {}
+                            }
+                        }))
+                    });
+                drop(slot);
+                let _ = reply.send(analysis);
             })
-            .await;
-            // Release only after physical cleanup, and before the caller receives a reply.
-            drop(slot);
-            let _ = reply.send(analysis);
-        });
+            .map_err(|_| Error::EngineUnavailable)?;
         tokio::pin!(cancel);
         tokio::select! {
             biased;
