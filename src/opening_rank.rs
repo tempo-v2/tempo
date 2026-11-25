@@ -146,59 +146,59 @@ impl StagedOrder {
         );
         let active = active_bank(db)?;
         let inactive = if active == "a" { "b" } else { "a" };
-        let mut q=db.prepare(&format!("SELECT card_id,rank,rank_{active},scope_{active},slot_{active},rank_{inactive},scope_{inactive},slot_{inactive}
-          FROM prepared_queue WHERE kind='opening' ORDER BY card_id"))?;
-        let mut rows = q.query([])?;
-        let mut placements = std::collections::BTreeMap::new();
-        let mut next = 0;
-        while let Some(row) = rows.next()? {
-            let base: Option<i64> = row.get(1)?;
-            let live = Placement {
-                rank: row.get(2)?,
-                scope: row.get(3)?,
-                slot: row.get(4)?,
-            };
-            let target = Placement {
-                rank: row.get(5)?,
-                scope: row.get(6)?,
-                slot: row.get(7)?,
-            };
-            next = next.max(live.rank.or(base).unwrap_or(0));
-            placements.insert(row.get::<_, String>(0)?, (base, live, target));
+        let mut next: i64 = db.query_row(&format!(
+            "SELECT coalesce(max(coalesce(rank_{active},rank)),0) FROM prepared_queue WHERE kind='opening'"
+        ), [], |row| row.get(0))?;
+        let mut addressed = db.prepare(&format!(
+            "SELECT coalesce(rank_{active},rank) FROM prepared_queue WHERE card_id=?1 AND kind='opening'"
+        ))?;
+        let mut reached: Vec<_> = reach.iter().collect();
+        reached.sort_unstable_by_key(|(id, _)| *id);
+        let mut cards = Vec::with_capacity(reached.len());
+        for (id, probability) in reached {
+            let rank = addressed.query_row([id], |row| row.get::<_, Option<i64>>(0))?;
+            let slot = rank.unwrap_or_else(|| {
+                next += 1;
+                next
+            });
+            cards.push((id.clone(), slot, *probability));
         }
-        let mut cards = vec![];
-        for (id, (base, live, _)) in &placements {
-            if let Some(probability) = reach.get(id) {
-                let slot = live.rank.or(*base).unwrap_or_else(|| {
-                    next += 1;
-                    next
-                });
-                cards.push((id.clone(), slot, *probability));
-            }
-        }
-        ensure!(
-            cards.len() == reach.len(),
-            "The forecast contains a retired card"
-        );
         let mut slots: Vec<_> = cards.iter().map(|(_, slot, _)| *slot).collect();
         slots.sort_unstable();
         cards.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
-        for (local, ((id, _, _), rank)) in cards.into_iter().zip(slots).enumerate() {
-            placements.get_mut(&id).unwrap().1 = Placement {
-                rank: Some(rank),
-                scope: Some(report.into()),
-                slot: Some(local as i64),
-            };
-        }
-        let changes = placements
+        let changes = cards
             .into_iter()
-            .filter_map(|(id, (_, live, target))| (live != target).then_some((id, live)))
+            .zip(slots)
+            .enumerate()
+            .map(|(local, ((id, _, _), rank))| {
+                (
+                    id,
+                    Placement {
+                        rank: Some(rank),
+                        scope: Some(report.into()),
+                        slot: Some(local as i64),
+                    },
+                )
+            })
             .collect();
         Ok(Self { inactive, changes })
     }
 
     pub fn stage(self, writer: &crate::writer::Writer) -> Result<i64> {
         let bank = self.inactive;
+        let active = if bank == "a" { "b" } else { "a" };
+        let reconcile = format!(
+            "UPDATE prepared_queue SET rank_{bank}=rank_{active},scope_{bank}=scope_{active},slot_{bank}=slot_{active}
+             WHERE card_id IN (SELECT card_id FROM prepared_queue INDEXED BY forecast_bank_difference
+               WHERE rank_a IS NOT rank_b OR scope_a IS NOT scope_b OR slot_a IS NOT slot_b LIMIT 128)"
+        );
+        loop {
+            let sql = reconcile.clone();
+            let rows = writer.background(move |db| Ok(db.execute(&sql, [])?))?;
+            if rows < 128 {
+                break;
+            }
+        }
         let sql = format!(
             "UPDATE prepared_queue SET rank_{bank}=?1,scope_{bank}=?2,slot_{bank}=?3 WHERE card_id=?4"
         );

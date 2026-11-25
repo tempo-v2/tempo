@@ -82,10 +82,11 @@ function ReplacementImpact({ impact }) {
 export function Gaps() {
   const [draft, setDraft] = useState(restore);
   const form = useRef(stored(storage));
+  const scanOwner = useRef(null);
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; };
+    return () => { mounted.current = false; scanOwner.current?.abort(); };
   }, []);
   const [books, setBooks] = useState([]);
   const [report,setReport] = useState(null);
@@ -155,8 +156,14 @@ export function Gaps() {
   }
   const book = draft.book ? books.find(b => b.id + "/" + b.color === draft.book) : books[0];
   async function scan(request, previous) {
-    const {id}=await api("coverage",request);
-    const next=await api("coverage/"+id+"/gaps");
+    if (!mounted.current) return;
+    scanOwner.current?.abort();
+    const controller = new AbortController();
+    scanOwner.current = controller;
+    const signal = controller.signal;
+    const {id}=await api("coverage",request,signal,{requireJson:true});
+    const next=await api("coverage/"+id+"/gaps",undefined,signal);
+    signal.throwIfAborted();
     setReport(next);clearPreview();
     if (reportId === id) setSummaryRetry(n => n + 1);
     update({report:id,index:null,pgn:"",replacements:noReplacements,previous:null});

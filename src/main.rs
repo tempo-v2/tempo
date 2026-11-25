@@ -61,6 +61,7 @@ type App = Arc<Runtime>;
 struct Runtime {
     database: PathBuf,
     opening_engine: Option<opening_engine::Endpoint>,
+    shutdown: tokio::sync::watch::Sender<bool>,
     writer: writer::Writer,
     staging: uploads::Staging,
     content_preparation: Arc<Semaphore>,
@@ -72,6 +73,7 @@ impl Runtime {
         Self {
             database,
             opening_engine: None,
+            shutdown: tokio::sync::watch::channel(false).0,
             writer,
             staging,
             content_preparation: Arc::new(Semaphore::new(2)),
@@ -108,6 +110,13 @@ impl IntoResponse for ApiError {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({"code":"stale_gap","error":self.0.to_string()})),
+            )
+                .into_response();
+        }
+        if let Some(error) = self.0.downcast_ref::<coverage::ScanFailure>() {
+            return (
+                error.status(),
+                Json(json!({"code":error,"error":error.to_string()})),
             )
                 .into_response();
         }
@@ -772,9 +781,16 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         }
         Err(error) => eprintln!("Tactic worker handoff unavailable: {error:#}"),
     }
+    let shutdown = runtime.shutdown.clone();
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let app = router(&path, port, Arc::new(runtime));
     println!("Tempo at http://127.0.0.1:{port}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::select! { _ = term.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+            shutdown.send_replace(true);
+        })
+        .await?;
     Ok(())
 }
 
