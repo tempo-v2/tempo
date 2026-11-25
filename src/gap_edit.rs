@@ -1,7 +1,7 @@
 use crate::{
     ApiError, ApiResult, App, Database, catalog, chess, coverage, prepare, write_db, writer,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use axum::{Json, extract::State};
 use pgn_reader::shakmaty::Position;
 use rusqlite::{Connection, OptionalExtension};
