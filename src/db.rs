@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 7;
+const SCHEMA: i32 = 8;
 
 pub struct Database;
 
@@ -59,7 +59,9 @@ impl Database {
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],
         )?;
-        db.execute_batch("PRAGMA application_id=1414352946; PRAGMA user_version=7; COMMIT;")?;
+        db.execute_batch("PRAGMA application_id=1414352946;")?;
+        db.pragma_update(None, "user_version", SCHEMA)?;
+        db.execute_batch("COMMIT;")?;
         Ok(db)
     }
 
@@ -76,6 +78,13 @@ impl Database {
             "this Tempo database requires a newer release"
         );
         if version == SCHEMA {
+            return Ok(());
+        }
+        if version == 7 {
+            // The ordinal cursor changes job interpretation, not the table layout.
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.pragma_update(None, "user_version", SCHEMA)?;
+            tx.commit()?;
             return Ok(());
         }
         // Replace the referenced parent table without cascading child rows.

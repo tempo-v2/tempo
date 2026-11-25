@@ -1,6 +1,6 @@
 use crate::{
     game_pipeline,
-    job_store::{self, FailedTurn, JobReads},
+    job_store::{self, ARCHIVE_RESUME_PAGE, ArchiveGame, FailedTurn, JobReads},
     providers::{self, Provider},
     scanner::{Detector, Observation},
     uploads::Staging,
@@ -134,17 +134,61 @@ fn detector_turn(
 ) -> Result<bool> {
     let id = job.id;
     let (version, sealed) = db.detector_checkpoint(id)?;
-    let mut cursor = if whole_archive {
-        Some(ArchiveCursor::load(db, db.cursor(id)?.as_deref())?)
+    let cursor = if whole_archive {
+        let cursor = ArchiveCheckpoint::decode(db.cursor(id)?.as_deref())?;
+        // Freeze older plain-ID checkpoints once before reading any archive work.
+        let cursor = match cursor {
+            ArchiveCheckpoint::Unfrozen { after } => {
+                let legacy = ArchiveCheckpoint::Legacy {
+                    through: db.archive_end()?,
+                    after,
+                };
+                let saved = if sealed.is_some() {
+                    legacy
+                } else {
+                    legacy.into_ordinal(db)?
+                };
+                yield_turn(
+                    writer,
+                    deadline,
+                    id,
+                    Some(serde_json::to_string(&saved)?),
+                    0,
+                )?;
+                return Ok(true);
+            }
+            legacy @ ArchiveCheckpoint::Legacy { .. } if sealed.is_none() => {
+                let saved = legacy.into_ordinal(db)?;
+                yield_turn(
+                    writer,
+                    deadline,
+                    id,
+                    Some(serde_json::to_string(&saved)?),
+                    0,
+                )?;
+                return Ok(true);
+            }
+            cursor => cursor,
+        };
+        Some(cursor)
     } else {
         None
     };
     if let Some((game, file)) = sealed {
         let (findings, after, finished) =
             read_detector_batch(staging, &file, job.window_offset, deadline)?;
-        if let Some(cursor) = cursor.as_mut() {
-            cursor.after.clone_from(&game);
-        }
+        let cursor = cursor
+            .map(|cursor| {
+                if !finished {
+                    return Ok(cursor);
+                }
+                let ordinal = db.archive_ordinal(&game)?;
+                cursor.after_game(ArchiveGame {
+                    ordinal,
+                    id: game.clone(),
+                })
+            })
+            .transpose()?;
         let batch = game_pipeline::DetectorBatch {
             job: id,
             detector,
@@ -167,16 +211,26 @@ fn detector_turn(
         }
         return Ok(true);
     }
-    let game = match cursor.as_ref() {
-        Some(cursor) => db.archive_next(&cursor.after, cursor.through)?,
-        None => db.pending_game(id)?,
+    let (game, next_cursor) = match cursor {
+        Some(ArchiveCheckpoint::Ordinal { mut v2 }) => match v2.next(db)? {
+            ArchiveStep::Game(game) => {
+                v2.after_ordinal = game.ordinal;
+                (Some(game.id), Some(ArchiveCheckpoint::Ordinal { v2 }))
+            }
+            ArchiveStep::SkipTo(ordinal) => {
+                v2.after_ordinal = ordinal;
+                let saved = serde_json::to_string(&ArchiveCheckpoint::Ordinal { v2 })?;
+                yield_turn(writer, deadline, id, Some(saved), 0)?;
+                return Ok(true);
+            }
+            ArchiveStep::Complete => (None, None),
+        },
+        Some(_) => bail!("archive checkpoint was not converted"),
+        None => (db.pending_game(id)?, None),
     };
     let Some(game) = game else { return Ok(false) };
     let bytes = db.detector_plan(&game, detector.program(version)?, deadline)?;
     if bytes.is_empty() {
-        if let Some(cursor) = cursor.as_mut() {
-            cursor.after.clone_from(&game);
-        }
         let batch = game_pipeline::DetectorBatch {
             job: id,
             detector,
@@ -187,7 +241,7 @@ fn detector_turn(
             after: 0,
             findings: Vec::new(),
             finished: true,
-            cursor: cursor
+            cursor: next_cursor
                 .map(|cursor| serde_json::to_string(&cursor))
                 .transpose()?,
         };
@@ -283,7 +337,7 @@ fn run(
             }
         }
         ("archive", "scan") => {
-            let cursor = ArchiveCursor::load(db, db.cursor(id)?.as_deref())?;
+            let cursor = ArchiveCheckpoint::decode(db.cursor(id)?.as_deref())?.into_ordinal(db)?;
             let saved = serde_json::to_string(&cursor)?;
             return writer.background_until(deadline, move |db| {
                 game_pipeline::start_scan(db, id, &saved)
@@ -344,20 +398,122 @@ fn yield_turn(
 }
 
 #[derive(Serialize, Deserialize)]
-struct ArchiveCursor {
-    through: i64,
-    after: String,
+#[serde(untagged, deny_unknown_fields)]
+enum ArchiveCheckpoint {
+    Ordinal {
+        v2: ArchiveCursor,
+    },
+    Legacy {
+        through: i64,
+        after: String,
+    },
+    #[serde(skip)]
+    Unfrozen {
+        after: String,
+    },
 }
 
-impl ArchiveCursor {
-    fn load(db: &JobReads, saved: Option<&str>) -> Result<Self> {
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveCursor {
+    through: i64,
+    after_ordinal: i64,
+    legacy_after_id: Option<String>,
+}
+
+impl ArchiveCheckpoint {
+    fn decode(saved: Option<&str>) -> Result<Self> {
         match saved {
-            Some(json) if json.starts_with('{') => Ok(serde_json::from_str(json)?),
-            after => Ok(Self {
-                through: db.archive_end()?,
+            Some(json) if json.starts_with('{') => {
+                let checkpoint = serde_json::from_str(json)?;
+                match &checkpoint {
+                    Self::Ordinal { v2 } => ensure!(
+                        (0..=v2.through).contains(&v2.after_ordinal),
+                        "invalid archive ordinal checkpoint"
+                    ),
+                    Self::Legacy { through, .. } => {
+                        ensure!(*through >= 0, "invalid archive cutoff")
+                    }
+                    Self::Unfrozen { .. } => unreachable!(),
+                }
+                Ok(checkpoint)
+            }
+            after => Ok(Self::Unfrozen {
                 after: after.unwrap_or_default().to_owned(),
             }),
         }
+    }
+
+    fn from_legacy(through: i64, after: String) -> Self {
+        Self::Ordinal {
+            v2: ArchiveCursor {
+                through,
+                after_ordinal: 0,
+                legacy_after_id: (!after.is_empty()).then_some(after),
+            },
+        }
+    }
+
+    fn into_ordinal(self, db: &JobReads) -> Result<Self> {
+        Ok(match self {
+            Self::Ordinal { .. } => self,
+            Self::Legacy { through, after } => Self::from_legacy(through, after),
+            Self::Unfrozen { after } => Self::from_legacy(db.archive_end()?, after),
+        })
+    }
+
+    fn after_game(self, game: ArchiveGame) -> Result<Self> {
+        match self {
+            Self::Ordinal { mut v2 } => {
+                ensure!(
+                    game.ordinal <= v2.through
+                        && game.ordinal > v2.after_ordinal
+                        && v2.includes_id(&game.id),
+                    "sealed game is outside its archive checkpoint"
+                );
+                v2.after_ordinal = game.ordinal;
+                Ok(Self::Ordinal { v2 })
+            }
+            Self::Legacy { through, after } => {
+                ensure!(
+                    game.ordinal <= through && game.id > after,
+                    "sealed game is outside its legacy archive checkpoint"
+                );
+                // The old traversal completed every ID up to this game, regardless of ordinal.
+                Ok(Self::from_legacy(through, game.id))
+            }
+            Self::Unfrozen { .. } => bail!("archive cutoff was not saved"),
+        }
+    }
+}
+
+enum ArchiveStep {
+    Game(ArchiveGame),
+    SkipTo(i64),
+    Complete,
+}
+
+impl ArchiveCursor {
+    fn includes_id(&self, id: &str) -> bool {
+        self.legacy_after_id
+            .as_deref()
+            .is_none_or(|after| id > after)
+    }
+
+    fn next(&self, db: &JobReads) -> Result<ArchiveStep> {
+        let limit = if self.legacy_after_id.is_some() {
+            ARCHIVE_RESUME_PAGE
+        } else {
+            1
+        };
+        let page = db.archive_page(self.after_ordinal, self.through, limit)?;
+        let last = page.last().map(|game| game.ordinal);
+        Ok(
+            match page.into_iter().find(|game| self.includes_id(&game.id)) {
+                Some(game) => ArchiveStep::Game(game),
+                None => last.map_or(ArchiveStep::Complete, ArchiveStep::SkipTo),
+            },
+        )
     }
 }
 
