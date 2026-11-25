@@ -66,7 +66,7 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
   </div>;
 }
 
-export function Replay({ route, color, ply, onPly, sounds }) {
+export function Replay({ route, color, ply, onPly, sounds, controlsTarget }) {
   const game = position(route, ply);
   const timeline = position(route).history({ verbose: true });
   function seek(next) {
@@ -78,8 +78,8 @@ export function Replay({ route, color, ply, onPly, sounds }) {
     }
     onPly(next);
   }
-  return <>
-    <ChessBoard game={game} orientation={color} identity="replay" />
+  const board = <ChessBoard game={game} orientation={color} identity="replay" />;
+  const controls = <>
     <div className="controls">
       <button disabled={ply === 0} onClick={() => seek(0)} aria-label="First position">⏮</button>
       <button disabled={ply === 0} onClick={() => seek(ply - 1)} aria-label="Previous move">◀</button>
@@ -92,4 +92,5 @@ export function Replay({ route, color, ply, onPly, sounds }) {
         onClick={() => seek(index + 1)}>{san}</button>)}
     </div>
   </>;
+  return <>{board}{controlsTarget ? createPortal(controls, controlsTarget) : controls}</>;
 }
