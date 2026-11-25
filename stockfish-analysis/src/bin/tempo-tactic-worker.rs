@@ -145,7 +145,7 @@ async fn serve_engine(
     engine: &Stockfish,
     admission: &Semaphore,
 ) -> Result<()> {
-    use wire::EngineReply;
+    use wire::{EngineMode, EngineReply};
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut reader = BufReader::new(&mut stream);
     let mut input = Vec::new();
@@ -169,7 +169,10 @@ async fn serve_engine(
                     Request {
                         fen: request.fen,
                         options: Options {
-                            coverage: Coverage::Top { count: 5 },
+                            coverage: match request.mode {
+                                EngineMode::TopFive => Coverage::Top { count: 5 },
+                                EngineMode::ScoredRoots => Coverage::All {},
+                            },
                             ..Options::default()
                         },
                     },
@@ -179,8 +182,42 @@ async fn serve_engine(
                 )
                 .await;
             match result {
-                Ok(Analysis::Evaluated { lines, .. }) => EngineReply::Ranked {
-                    first_moves: lines.into_iter().map(|line| line.first_move).collect(),
+                Ok(Analysis::Evaluated {
+                    engine,
+                    depth,
+                    lines,
+                }) => match request.mode {
+                    EngineMode::TopFive => EngineReply::Ranked {
+                        first_moves: lines.into_iter().map(|line| line.first_move).collect(),
+                    },
+                    EngineMode::ScoredRoots => EngineReply::Evaluated {
+                        engine,
+                        depth,
+                        lines: lines
+                            .into_iter()
+                            .map(|line| wire::Root {
+                                first_move: line.first_move,
+                                score: match line.score {
+                                    tempo_stockfish_analysis::Score::Centipawns { white } => {
+                                        wire::Score::Centipawns { white }
+                                    }
+                                    tempo_stockfish_analysis::Score::Mate { winner, moves } => {
+                                        wire::Score::Mate {
+                                            winner: match winner {
+                                                tempo_stockfish_analysis::Side::White => {
+                                                    wire::Side::White
+                                                }
+                                                tempo_stockfish_analysis::Side::Black => {
+                                                    wire::Side::Black
+                                                }
+                                            },
+                                            moves,
+                                        }
+                                    }
+                                },
+                            })
+                            .collect(),
+                    },
                 },
                 Ok(Analysis::Terminal { .. }) => EngineReply::Terminal,
                 Err(Error::Busy) => EngineReply::Busy,

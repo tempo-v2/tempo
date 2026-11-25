@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use pgn_reader::shakmaty::{Chess, Color, Position};
 use pgn_reader::{Nag, Outcome, RawComment, RawTag, Reader, SanPlus, Skip, Visitor};
 use serde::Serialize;
-use std::{fmt::Write, ops::ControlFlow};
+use std::{collections::HashSet, fmt::Write, ops::ControlFlow};
 
 pub fn numbered_move(board: &Chess, san: &str) -> String {
     let dots = if board.turn() == Color::White {
@@ -207,6 +207,7 @@ impl Visitor for ReadDocument {
 struct Repair<'a> {
     doc: &'a Document,
     anchor: &'a str,
+    recorded_nodes: Option<HashSet<usize>>,
     position: &'a str,
     reply: &'a str,
     trims: Vec<Trim>,
@@ -226,7 +227,11 @@ impl Repair<'_> {
         loop {
             let node = &self.doc.nodes[parent];
             let original_position = chess::position_id(&node.board);
-            reached |= original_position == self.anchor;
+            reached |= original_position == self.anchor
+                && self
+                    .recorded_nodes
+                    .as_ref()
+                    .is_none_or(|nodes| nodes.contains(&parent));
             let replace = reached
                 && original_position == self.position
                 && chess::position_id(&board) == self.position;
@@ -343,14 +348,41 @@ fn capture_line_comments(source: &str) -> (String, String, Vec<String>) {
     (normalized, format!("{{{prefix}"), comments)
 }
 
-pub fn correct(pgn: &str, anchor: &str, position: &str, reply: &str) -> Result<Correction> {
+pub fn correct(
+    pgn: &str,
+    anchor: &str,
+    recorded_moves: Option<&[String]>,
+    position: &str,
+    reply: &str,
+) -> Result<Correction> {
     let (with_comments, marker, comments) = capture_line_comments(pgn);
     let doc = Reader::new(with_comments.as_bytes())
         .read_game(&mut ReadDocument)?
         .context("PGN has no games")??;
+    let recorded_nodes = recorded_moves
+        .map(|moves| {
+            let mut nodes = vec![0];
+            for movement in moves {
+                let mut next = Vec::new();
+                for parent in nodes {
+                    let node = &doc.nodes[parent];
+                    let expected = chess::uci(chess::parse_move(&node.board, movement)?);
+                    next.extend(
+                        node.children
+                            .iter()
+                            .copied()
+                            .filter(|&child| doc.nodes[child].played == expected),
+                    );
+                }
+                nodes = next;
+            }
+            Ok::<_, anyhow::Error>(nodes.into_iter().collect())
+        })
+        .transpose()?;
     let mut repair = Repair {
         doc: &doc,
         anchor,
+        recorded_nodes,
         position,
         reply,
         trims: vec![],
@@ -400,12 +432,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn correction_preserves_an_earlier_visit_in_the_recorded_lead_in() -> Result<()> {
+        let original = "1. Nf3 Nf6 2. Ng1 Ng8 3. e4 *";
+        let game = chess::parse_gap_pgn(original)?;
+        let anchor = chess::position_id(&chess::board_at(&game.main, 4)?);
+        let corrected = correct(
+            original,
+            &anchor,
+            Some(&game.main.moves[..4]),
+            &anchor,
+            "d2d4",
+        )?;
+        assert_eq!(
+            chess::parse_gap_pgn(&corrected.pgn)?.main.moves,
+            ["g1f3", "g8f6", "f3g1", "f6g8", "d2d4"],
+        );
+        Ok(())
+    }
+
+    #[test]
     fn corrects_repeated_transposition_without_cutting_legal_siblings() -> Result<()> {
         let original = "[Event \"Practice\"]\n\n1.Nf3 Nc6 2.e4 e5 3.Nc3 Nf6 4.d4 {choice} ;line note with }\n (4.Bc4 a6 5.a3 $1) exd4 5.Nxd4 *";
         let game = chess::parse_gap_pgn(original)?;
         let anchor = chess::position_id(&chess::board_at(&game.main, 2)?);
         let conflict = chess::position_id(&chess::board_at(&game.main, 6)?);
-        let result = correct(original, &anchor, &conflict, "f1b5")?;
+        let result = correct(original, &anchor, None, &conflict, "f1b5")?;
         assert_eq!(result.trims.len(), 1);
         assert_eq!(result.trims[0].first_removed, "4... exd4");
         assert!(result.pgn.contains("{choice}"));
@@ -426,7 +477,7 @@ mod tests {
         let original = "[SetUp \"1\"]\n[FEN \"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 7\"]\n\n7... c5 8.Nf3 *";
         let original_route = chess::parse_gap_pgn(original)?.main;
         let position = chess::position_id(&chess::board_at(&original_route, 0)?);
-        let result = correct(original, &position, &position, "e7e5")?;
+        let result = correct(original, &position, None, &position, "e7e5")?;
         assert!(result.trims.is_empty());
         assert!(result.pgn.contains("7... e5 8. Nf3"));
         assert!(result.pgn.contains("[SetUp \"1\"]"));

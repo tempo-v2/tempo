@@ -77,6 +77,34 @@ pub async fn read_until<T: Serialize + 'static>(
     database: PathBuf,
     work: impl FnOnce(&mut Connection, &dyn Fn() -> bool) -> Result<T> + Send + 'static,
 ) -> Result<Vec<u8>> {
+    read_projected(reader, database, work, |value, deadline, cancelled| {
+        let mut output = JsonBody {
+            bytes: Vec::new(),
+            deadline,
+            cancelled,
+        };
+        serde_json::to_writer(&mut output, &value).map_err(|_| Unavailable)?;
+        ensure!(Instant::now() < deadline, Unavailable);
+        Ok(output.bytes)
+    })
+    .await
+}
+
+/// Intermediates bounded by the addressed operation's own row and field limits.
+pub async fn read_value<T: Send + 'static>(
+    reader: Reader,
+    database: PathBuf,
+    work: impl FnOnce(&mut Connection, &dyn Fn() -> bool) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    read_projected(reader, database, work, |value, _, _| Ok(value)).await
+}
+
+async fn read_projected<T: 'static, U: Send + 'static>(
+    reader: Reader,
+    database: PathBuf,
+    work: impl FnOnce(&mut Connection, &dyn Fn() -> bool) -> Result<T> + Send + 'static,
+    project: impl FnOnce(T, Instant, Arc<AtomicBool>) -> Result<U> + Send + 'static,
+) -> Result<U> {
     run(reader.slot(), DEADLINE, move |deadline, cancelled| {
         let mut db =
             Database::read_with_busy_timeout(&database, Duration::ZERO).map_err(|_| Unavailable)?;
@@ -96,14 +124,8 @@ pub async fn read_until<T: Serialize + 'static>(
                 error
             }
         })?;
-        let mut output = JsonBody {
-            bytes: Vec::new(),
-            deadline,
-            cancelled,
-        };
-        serde_json::to_writer(&mut output, &value).map_err(|_| Unavailable)?;
-        ensure!(Instant::now() < deadline, Unavailable);
-        Ok(output.bytes)
+        ensure!(!stopped(), Unavailable);
+        project(value, deadline, cancelled)
     })
     .await
 }

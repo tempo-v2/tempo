@@ -67,3 +67,6 @@ button.gap-recommended:not(:disabled) { background-color: #214d36; border-color:
 .gap-confirmation { border: 1px solid currentColor; border-radius: 0.4rem; padding: 0.65rem; margin-block: 0.75rem; }
 
 .similar-moves-board { width: min(100%, 240px); margin-block: .75rem; }
+
+.gap-review-table { overflow-x: auto; }
+.gap-review-table th, .gap-review-table td { padding: .3rem .65rem; text-align: left; }

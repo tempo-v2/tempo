@@ -180,6 +180,7 @@ pub fn backfill_views(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub mod review;
 mod scan;
 pub use catalog::authored_reply_revision as revision;
 pub use scan::{ScanFailure, start};
@@ -314,6 +315,12 @@ pub fn selected(c: &Connection, id: &str, index: usize) -> Result<(Scan, i64, Ga
         .nth(index % PAGE_SIZE)
         .context("Unknown coverage gap")?;
     Ok((scan, rev, gap))
+}
+
+pub fn recorded_lead_in(scan: &Scan, gap: &Gap) -> chess::Route {
+    let mut route = scan.route.clone();
+    route.moves.extend(gap.moves.iter().cloned());
+    route
 }
 
 #[derive(Deserialize)]

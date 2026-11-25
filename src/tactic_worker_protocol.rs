@@ -118,16 +118,58 @@ pub fn engine_path(database: &Path) -> PathBuf {
     socket_path(database).with_file_name("engine")
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    White,
+    Black,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Score {
+    Centipawns { white: i32 },
+    Mate { winner: Side, moves: u32 },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Root {
+    pub first_move: String,
+    pub score: Score,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineRequest {
     pub fen: String,
+    #[serde(default, skip_serializing_if = "EngineMode::is_default")]
+    pub mode: EngineMode,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineMode {
+    #[default]
+    TopFive,
+    ScoredRoots,
+}
+impl EngineMode {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::TopFive)
+    }
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum EngineReply {
-    Ranked { first_moves: Vec<String> },
+    Ranked {
+        first_moves: Vec<String>,
+    },
+    Evaluated {
+        engine: String,
+        depth: u8,
+        lines: Vec<Root>,
+    },
     Terminal,
     Busy,
     Unavailable,
