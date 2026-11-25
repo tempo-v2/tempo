@@ -231,6 +231,7 @@ async function saveReplyAcrossRemount(browser) {
       }));
     }, journal);
     let saves = 0;
+    let original;
     let scans = 0;
     let committed;
     let deliver;
@@ -238,6 +239,13 @@ async function saveReplyAcrossRemount(browser) {
     const saved = new Promise(resolve => { committed = resolve; });
     await page.route("**/api/coverage/save", async route => {
       saves++;
+      const request = route.request().postDataJSON();
+      if (saves === 1) {
+        original = request;
+        await route.fulfill({ json: { command: request.command, lines: [null] } });
+        return;
+      }
+      assert.deepEqual(request, original);
       const response = await route.fetch();
       committed(response.ok());
       await heldReply;
@@ -251,6 +259,10 @@ async function saveReplyAcrossRemount(browser) {
       await openGaps(page, origin);
       await page.getByRole("button", {name:"Preview", exact:true}).click();
       await page.getByRole("button", {name:"Save to repertoire", exact:true}).click();
+      await page.getByRole("alert").waitFor();
+      assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "0");
+      assert.deepEqual(await page.evaluate(key => JSON.parse(localStorage.getItem(key)), journal + ".save"), original);
+      await page.getByRole("button", {name:"Retry same save"}).click();
       assert.equal(await saved, true);
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
       await page.getByRole("button", {name:"Games", exact:true}).click();
@@ -264,7 +276,7 @@ async function saveReplyAcrossRemount(browser) {
       await page.getByRole("button", {name:"Retry scan", exact:true}).click();
       await page.getByRole("alert").waitFor();
       assert.equal(scans, 1);
-      assert.equal(saves, 1);
+      assert.equal(saves, 2);
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
     } finally {
       deliver();
@@ -312,7 +324,7 @@ async function applyReplyAcrossViews(browser) {
       let nextCommand;
       await second.route("**/api/coverage/apply-report/apply", async route => {
         nextCommand = route.request().postDataJSON();
-        await route.abort();
+        await route.fulfill({ json: { ...nextCommand, id: "apply-report" } });
       }, { times: 1 });
       await second.getByRole("button", { name: "Apply to opening order" }).click();
       await second.getByRole("alert").waitFor();
@@ -330,6 +342,61 @@ async function applyReplyAcrossViews(browser) {
       assert.equal(sql(db, "SELECT count(*) FROM applied_forecast"), "2");
     } finally {
       deliver();
+      await context.close();
+    }
+  });
+}
+
+async function laterGapAcrossTabs(browser) {
+  const db = path.join(folder, "later-gap.sqlite3");
+  await withServer(candidate, db, async (origin, api) => {
+    const repertoire = await addOpening(api, "Later page", ["e2e4", "e7e5", "g1f3"]);
+    seedReport(db, "later-report", repertoire, anchor, ["g1f3", "b8c6"]);
+    const first = Array.from({length: 30}, (_, index) => ({
+      fen: anchor.replace(" 2 2", " " + (10 + index) + " 2"), moves: ["g1f3", "b8c6"], probability: 1,
+    }));
+    const later = [
+      { fen: anchor, moves: ["g1f3", "b8c6"], probability: 0.43 },
+      { fen: anchor.replace(" 2 2", " 3 2"), moves: ["e2e4", "e7e5"], probability: 0.42 },
+    ];
+    sql(db, `UPDATE coverage_view SET header=json_set(header,'$.total',32) WHERE report_id='later-report';
+      UPDATE coverage_gap_page SET gaps=${quoted(JSON.stringify(first))} WHERE report_id='later-report';
+      INSERT INTO coverage_gap_page VALUES ('later-report',1,${quoted(JSON.stringify(later))});`);
+    const context = await browser.newContext();
+    await context.addInitScript(key => {
+      if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({ report: "later-report", index: 0 }));
+    }, journal);
+    const observer = await context.newPage();
+    const author = await context.newPage();
+    try {
+      await openGaps(observer, origin);
+      await openGaps(author, origin);
+      await author.getByRole("button", { name: "Show more gaps" }).click();
+      await author.getByRole("button", { name: /^42%/ }).click();
+      await observer.getByRole("link", { name: "Open line in Lichess" }).waitFor();
+      await observer.waitForFunction(() => document.querySelector("a[href*='e4']"));
+      await author.getByRole("button", { name: /^43%/ }).click();
+      await observer.waitForFunction(() => document.querySelector("a[href*='Nf3']"));
+      const editor = author.getByRole("textbox", { name: "Paste PGN from Lichess" });
+      await editor.fill("1. Nf3 Nc6 2. d4 *");
+      await author.getByRole("button", { name: "Preview", exact: true }).click();
+      let pending;
+      await author.route("**/api/coverage/save", async route => {
+        pending = route.request().postDataJSON();
+        await route.abort();
+      });
+      await author.getByRole("button", { name: "Save to repertoire", exact: true }).click();
+      await author.getByRole("alert").waitFor();
+      assert.equal(pending.draft.gap, 30);
+      await observer.route("**/api/coverage/save", async route => {
+        assert.deepEqual(route.request().postDataJSON(), pending);
+        await route.continue();
+      });
+      await observer.route("**/api/coverage", route => route.abort());
+      await observer.getByRole("button", { name: "Retry same save" }).click();
+      await observer.getByText("Continuation saved.", { exact: true }).waitFor();
+      assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
+    } finally {
       await context.close();
     }
   });
@@ -429,6 +496,7 @@ async function previousCommands() {
     browser = await chromium.launch({ executablePath: chrome, headless: true });
     await saveReplyAcrossRemount(browser);
     await applyReplyAcrossViews(browser);
+    await laterGapAcrossTabs(browser);
     await browserFlow(browser);
     await cancelledScans(browser);
     await previousCommands();

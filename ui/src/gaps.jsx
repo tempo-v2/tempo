@@ -120,7 +120,8 @@ export function Gaps() {
     };
   }, []);
   const [books, setBooks] = useState([]);
-  const [report,setReport] = useState(null);
+  const [loadedReport,setReport] = useState(null);
+  const [selectedGap, setSelectedGap] = useState(null);
   const [summary, setSummary] = useState(null);
   const [summaryRetry, setSummaryRetry] = useState(0);
   const [preview,setPreview] = useState(null);
@@ -140,8 +141,14 @@ export function Gaps() {
     refreshJournal();
   }
   const requestedReport = draft.pending?.draft.report ?? draft.report;
+  const report = loadedReport?.id === requestedReport ? loadedReport : null;
+  const pendingSave = draft.pending?.draft.report === report?.id ? draft.pending : null;
+  const gapIndex = pendingSave?.draft.gap ?? draft.index;
+  const gap = report?.gaps[gapIndex] ??
+    (selectedGap?.report === requestedReport && selectedGap?.index === gapIndex ? selectedGap?.gap : null);
+
   useEffect(() => {
-    const ctrl=new AbortController();
+    const ctrl = new AbortController();
     async function loadBooks() {
       let options = [], page;
       do {
@@ -157,27 +164,28 @@ export function Gaps() {
     return () => ctrl.abort();
   }, [reload]);
   useEffect(() => {
+    if (!requestedReport || (requestedReport === report?.id && !reload)) return;
     const ctrl = new AbortController();
-    async function loadReport() {
-      const saved = { ...form.current, pending: stored(storage + ".save") };
-      const reportId = saved.pending?.draft.report ?? saved.report;
-      if (!reportId) return;
-      const result = await api("coverage/" + reportId + "/gaps", undefined, ctrl.signal);
-      // Recover an editor opened on a later page without fetching intervening pages.
-      const index = saved.pending?.draft.gap ?? saved.index;
-      if (index >= result.gaps.length && index < result.total) {
-        const offset = Math.floor(index / 30) * 30;
-        const page = await api("coverage/" + reportId + "/gaps?offset=" + offset, undefined, ctrl.signal);
-        result.selectedGap = page.gaps[index - offset];
-      }
+    api("coverage/" + requestedReport + "/gaps", undefined, ctrl.signal).then(result => {
       const latest = restore();
-      if (!ctrl.signal.aborted && (latest.pending?.draft.report ?? latest.report) === reportId) setReport(result);
-    }
-    if (requestedReport !== report?.id || reload) {
-      void loadReport().catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
-    }
+      if (!ctrl.signal.aborted && (latest.pending?.draft.report ?? latest.report) === requestedReport) {
+        setReport(result);
+      }
+    }).catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
     return () => ctrl.abort();
   }, [reload, requestedReport]);
+  const needsGapPage = Boolean(report && gapIndex >= report.gaps.length && gapIndex < report.total);
+  useEffect(() => {
+    if (!needsGapPage) return;
+    const ctrl = new AbortController();
+    const offset = Math.floor(gapIndex / 30) * 30;
+    api("coverage/" + requestedReport + "/gaps?offset=" + offset, undefined, ctrl.signal)
+      .then(page => {
+        if (!ctrl.signal.aborted) setSelectedGap({ report: requestedReport, index: gapIndex, gap: page.gaps[gapIndex - offset] });
+      })
+      .catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
+    return () => ctrl.abort();
+  }, [reload, requestedReport, gapIndex, needsGapPage]);
   const reportId = report?.id;
   useEffect(() => {
     if (!reportId) return;
@@ -221,8 +229,6 @@ export function Gaps() {
     return {repertoire:book.id,color:book.color,through:Number(draft.through??10),
       route:{fen:history[0]?.before??game.fen(),moves:history.map(m=>m.lan)}};
   }
-  const pendingSave = draft.pending?.draft.report === report?.id ? draft.pending : null;
-  const gap=report?.gaps[pendingSave?.draft.gap ?? draft.index]??report?.selectedGap;
   function open(index) {
     const link=lead(report,report.gaps[index]);
     window.open(link.url,"_blank","noopener,noreferrer");
@@ -260,7 +266,8 @@ export function Gaps() {
       clearInterval(timer);
       progress.abort();
     }
-    if(receipt?.command!==command.command || !Array.isArray(receipt.lines) || !receipt.lines.length)
+    if (receipt?.command !== command.command || !Array.isArray(receipt.lines) || !receipt.lines.length ||
+        !receipt.lines.every(line => typeof line === "string" && line.length > 0))
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
     const previous = report.model_superseded ? null : report.authored;
     const accepted = await settleCommand("save", command, {
@@ -278,7 +285,10 @@ export function Gaps() {
     refreshJournal();
     try {
       const reply = await api("coverage/" + pending.report + "/apply", { command: pending.command });
-      if(reply?.command!==pending.command || reply.id!==pending.report)throw new Error("Retry applying the opening order.");
+      if (reply?.command !== pending.command || reply.id !== pending.report ||
+          !Number.isSafeInteger(reply.cards) || reply.cards < 0) {
+        throw new Error("Retry applying the opening order.");
+      }
       await settleCommand("apply", pending, { report: reply.id, cards: reply.cards });
     } catch(e) {
       if (e.code === "stale_gap" || e.code === "coverage_model_superseded") {
@@ -355,6 +365,7 @@ export function Gaps() {
     {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{status && <p role="status">{status}</p>}
     {!draft.applyCommand && appliedMessage && <p role="status">{appliedMessage}</p>}
     {draft.applyCommand && <button disabled={busy} onClick={() => run(() => applyOrder(draft.applyCommand))}>Retry applying order</button>}
+    {pendingSave && !gap && <button disabled={busy} onClick={() => run(() => save(pendingSave))}>Retry same save</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · {report.model}</p>
@@ -417,7 +428,7 @@ export function Gaps() {
       <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={blocked} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
       {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
         const page=await api("coverage/"+report.id+"/gaps?offset="+report.gaps.length);
-        setReport({...page,selectedGap:report.selectedGap,gaps:[...report.gaps,...page.gaps]});
+        setReport({...page,gaps:[...report.gaps,...page.gaps]});
       })}>Show more gaps</button>}
     </>}
   </section>;
