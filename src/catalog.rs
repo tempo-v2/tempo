@@ -428,18 +428,20 @@ pub fn apply_tactic(db: &Connection, plan: &TacticPlan) -> Result<String> {
     Ok(plan.id.clone())
 }
 
-pub fn answers_at(db: &Connection, position: &str, color: &str) -> Result<Vec<ReferenceAnswer>> {
+pub fn visit_answers_at(
+    db: &Connection,
+    position: &str,
+    color: &str,
+    mut visit: impl FnMut(ReferenceAnswer) -> Result<()>,
+) -> Result<()> {
     let mut q = db.prepare_cached("SELECT repertoire_id,answer_version,answers FROM active_cards WHERE position_id=?1 AND kind='opening' AND color=?2")?;
-    let rows = q.query_map(params![position, color], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
-    })?;
-    rows.map(|r| {
-        let (repertoire_id, answer_version, encoded) = r?;
-        Ok(ReferenceAnswer {
-            repertoire_id,
-            answer_version,
-            moves: serde_json::from_str(&encoded)?,
-        })
-    })
-    .collect()
+    let mut rows = q.query(params![position, color])?;
+    while let Some(row) = rows.next()? {
+        visit(ReferenceAnswer {
+            repertoire_id: row.get(0)?,
+            answer_version: row.get(1)?,
+            moves: serde_json::from_str(row.get_ref(2)?.as_str()?)?,
+        })?;
+    }
+    Ok(())
 }

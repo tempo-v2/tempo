@@ -1,11 +1,11 @@
-use crate::{chess, study::*};
+use crate::{chess, learning::Rating, study::*};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub fn current(db: &Connection) -> Result<Option<Review>> {
     let row = db
         .query_row(
-            "SELECT a.id,c.kind,c.title,c.color,c.fen,a.result,a.submission,c.context
+            "SELECT a.id,c.kind,c.title,c.color,c.fen,a.result,a.submission,c.context,c.played_move
         FROM study s JOIN attempts a ON a.id=s.active JOIN cards c ON c.id=a.card_id",
             [],
             |r| {
@@ -18,26 +18,22 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, Option<String>>(6)?,
                     r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(attempt, kind, title, color, fen, result, submission, context)| {
+        |(attempt, kind, title, color, fen, result, submission, context, played_in_game)| {
             let legal = chess::legal(&chess::position(&fen)?);
             let result = result
                 .as_deref()
-                .map(|saved| -> Result<_> {
-                    let played = submission
-                        .as_deref()
-                        .map(serde_json::from_str::<Option<String>>)
-                        .transpose()?
-                        .flatten();
-                    Ok(accepted_view(
-                        serde_json::from_str(saved)?,
+                .map(|saved| {
+                    serde_json::from_str::<AnswerReceipt>(saved)?.view(
                         &fen,
-                        played.as_deref(),
-                    ))
+                        submission.as_deref(),
+                        played_in_game,
+                    )
                 })
                 .transpose()?;
             // Opening context contains only authored moves before this issued decision.
@@ -113,41 +109,46 @@ pub fn issue(db: &Connection, card: Option<(&str, &str)>) -> Result<()> {
     Ok(())
 }
 
-pub fn begin_answer(db: &Connection, input: &Answer) -> Result<AnswerState> {
+pub fn begin_answer(db: &Connection, input: &AnswerIntentV1) -> Result<AnswerState> {
     check_dataset(Some(&input.dataset), &crate::db::dataset(db)?)?;
-    let (card, submission, accepted, fen, answers, played_in_game): (
+    type IssuedRow = (
         String,
         Option<String>,
         Option<String>,
         String,
         String,
         Option<String>,
-    ) = db.query_row(
-        "SELECT a.card_id,a.submission,a.result,c.fen,c.answers,c.played_move
-            FROM attempts a JOIN cards c ON c.id=a.card_id WHERE a.id=?1",
-        [input.attempt],
-        |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        },
-    )?;
-    let payload = serde_json::to_string(&input.played)?;
+    );
+    let (card, submission, accepted, fen, answers, played_in_game): IssuedRow = db
+        .query_row(
+            "SELECT a.card_id,a.submission,a.result,c.fen,c.answers,c.played_move
+             FROM attempts a JOIN cards c ON c.id=a.card_id WHERE a.id=?1",
+            [input.attempt],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(Conflict::Attempt)?;
     if let Some(saved) = accepted {
-        verify_replay(submission.as_deref(), &payload)?;
-        return Ok(AnswerState::Replayed(accepted_view(
-            serde_json::from_str(&saved)?,
+        let receipt: AnswerReceipt = serde_json::from_str(&saved)?;
+        receipt.verify(&fen, submission.as_deref(), &input.action)?;
+        return Ok(AnswerState::Replayed(receipt.view(
             &fen,
-            input.played.as_deref(),
-        )));
+            submission.as_deref(),
+            played_in_game,
+        )?));
     }
     let (active, previous_kind) = state(db)?;
-    ensure!(active == Some(input.attempt), "the active card changed");
+    ensure!(active == Some(input.attempt), Conflict::Attempt);
+    let action = input.action.canonical(&fen)?;
     let answers: Vec<String> = serde_json::from_str(&answers)?;
     Ok(AnswerState::Pending(IssuedAnswer {
         card,
@@ -155,32 +156,30 @@ pub fn begin_answer(db: &Connection, input: &Answer) -> Result<AnswerState> {
         answers,
         played_in_game,
         previous_kind,
-        payload,
+        action,
     }))
 }
 
 pub fn accept_answer(
     db: &Connection,
-    input: &Answer,
+    input: &AnswerIntentV1,
     issued: IssuedAnswer,
-    rating: &str,
-    repeat_after: Option<u8>,
+    rating: Rating,
+    repeat: RepeatDisposition,
 ) -> Result<AcceptedView> {
-    let result = Accepted {
-        rating: rating.into(),
-        repeat_after,
-        answers: issued.answers,
-        played_in_game: issued.played_in_game,
+    let receipt = AnswerReceipt::Versioned {
+        v1: AnswerResultV1 {
+            action: issued.action,
+            rating,
+            repeat,
+            answers: issued.answers,
+        },
     };
     db.execute(
-        "UPDATE attempts SET submission=?1,result=?2 WHERE id=?3",
-        params![
-            issued.payload,
-            serde_json::to_string(&result)?,
-            input.attempt
-        ],
+        "UPDATE attempts SET result=?1 WHERE id=?2",
+        params![serde_json::to_string(&receipt)?, input.attempt],
     )?;
-    Ok(accepted_view(result, &issued.fen, input.played.as_deref()))
+    receipt.view(&issued.fen, None, issued.played_in_game)
 }
 
 /// Read only the source identity of the issued card. Its answer remains private.

@@ -1,6 +1,7 @@
 mod catalog;
 mod chess;
 mod db;
+mod game_ir;
 mod game_pipeline;
 mod games;
 mod job_store;
@@ -45,6 +46,7 @@ type App = Arc<Runtime>;
 struct Runtime {
     database: PathBuf,
     writer: writer::Writer,
+    staging: uploads::Staging,
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
 
@@ -82,6 +84,13 @@ impl IntoResponse for ApiError {
                 Json(json!({
                     "code":"writer_busy", "error":self.0.to_string()
                 })),
+            )
+                .into_response();
+        }
+        if self.0.is::<uploads::Unavailable>() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"code":"staging_unavailable","error":self.0.to_string()})),
             )
                 .into_response();
         }
@@ -289,7 +298,7 @@ async fn archives(State(db): State<App>, Query(q): Query<Page>) -> ApiResult {
     with_db(db, move |c| games::archive(c, &q.after, 50)).await
 }
 async fn read_game(State(db): State<App>, UrlPath(id): UrlPath<String>) -> ApiResult {
-    with_db(db, move |c| games::read(c, &id)).await
+    with_db(db, move |c| games::replay(c, &id)).await
 }
 async fn job_views(State(db): State<App>) -> ApiResult {
     optional_view(db, optional_read::Reader::GamesStatus, |c| {
@@ -315,8 +324,8 @@ async fn upload_games(State(db): State<App>, Json(input): Json<GamesUpload>) -> 
     let username = jobs::valid_user(&input.username)
         .map_err(ApiError)?
         .to_owned();
-    let database = db.database.clone();
-    let mut staged = prepare(move || uploads::stage(&database, &input.pgn)).await?;
+    let staging = db.staging.clone();
+    let staged = prepare(move || staging.manual(&input.pgn)).await?;
     write_db(db, move |c| {
         let id = job_store::start(
             c,
@@ -325,7 +334,6 @@ async fn upload_games(State(db): State<App>, Json(input): Json<GamesUpload>) -> 
                 file: staged.id().to_owned(),
             },
         )?;
-        staged.commit();
         Ok(json!({"id":id}))
     })
     .await
@@ -377,8 +385,8 @@ async fn study_counts(State(db): State<App>) -> impl IntoResponse {
 async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> ApiResult {
     write_db(db, move |c| review::next(c, input)).await
 }
-async fn answer(State(db): State<App>, Json(input): Json<study::Answer>) -> ApiResult {
-    write_db(db, move |c| review::answer(c, input)).await
+async fn answer(State(db): State<App>, Json(input): Json<study::AnswerWire>) -> ApiResult {
+    write_db(db, move |c| review::answer(c, input.into())).await
 }
 async fn optional_view<T: Serialize>(
     db: App,
@@ -512,25 +520,17 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
                 }
             }
         })?;
-    let upload_db = db.clone();
-    std::thread::Builder::new()
-        .name("tempo-upload-cleanup".into())
-        .spawn(move || {
-            if let Err(error) =
-                Database::read(&upload_db).and_then(|read| uploads::reclaim(&upload_db, &read))
-            {
-                eprintln!("Unused Games upload cleanup failed: {error:#}");
-            }
-        })?;
+    let staging = uploads::Staging::start(&db)?;
     if !without_worker {
         let worker_db = db.clone();
         let worker_writer = writer.clone();
+        let worker_staging = staging.clone();
         let runtime = tokio::runtime::Handle::current();
         std::thread::Builder::new()
             .name("games-worker".into())
             .spawn(move || {
                 let _runtime = runtime.enter();
-                if let Err(error) = jobs::worker(&worker_db, worker_writer) {
+                if let Err(error) = jobs::worker(&worker_db, worker_writer, worker_staging) {
                     eprintln!("Games worker stopped: {error:#}");
                 }
             })?;
@@ -585,6 +585,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
         .with_state(Arc::new(Runtime {
             database: db,
             writer,
+            staging,
         }));
     println!("Tempo at http://127.0.0.1:{port}");
     axum::serve(listener, app).await?;
@@ -599,6 +600,11 @@ async fn main() -> Result<()> {
         [command, db, port] if command == "serve" => serve(db.into(), port.parse()?, false).await,
         [command, db, port, flag] if command == "serve" && flag == "--no-worker" => {
             serve(db.into(), port.parse()?, true).await
+        }
+        [command, db] if command == "migrate-games" => {
+            let path = Path::new(db);
+            let _lock = lock_database(path)?;
+            Database::migrate_games(path)
         }
         [command, source, dest] if command == "import-openings" => {
             let _lock = lock_database(Path::new(dest))?;
@@ -643,7 +649,7 @@ async fn main() -> Result<()> {
             opening_rank::replace(&mut database, snapshot)
         }
         _ => anyhow::bail!(
-            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT"
+            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT"
         ),
     }
 }

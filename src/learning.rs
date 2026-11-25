@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use fsrs::{FSRS, MemoryState};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum Rating {
     Good,
     Again,

@@ -4,7 +4,7 @@ use crate::{
     game_pipeline,
     jobs::{Job, JobView, NewJob, valid_user},
     providers::Provider,
-    scanner,
+    scanner::Program,
 };
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -37,10 +37,22 @@ pub fn save_settings(
 
 pub fn views(db: &Connection) -> Result<Vec<JobView>> {
     let mut q = db.prepare(
-        "SELECT id,provider,operation,status,added,existing,rejected,found,error FROM jobs
-        WHERE id IN (SELECT id FROM jobs ORDER BY id DESC LIMIT 12)
-           OR id IN (SELECT id FROM jobs WHERE status='failed' ORDER BY id DESC LIMIT 12)
-        ORDER BY id DESC",
+        "WITH visible(id) AS (
+            SELECT id FROM (
+                SELECT id FROM jobs INDEXED BY jobs_visible_latest
+                WHERE operation NOT IN ('compare_all','capture_all') ORDER BY id DESC LIMIT 12
+            ) UNION SELECT id FROM (
+                SELECT id FROM jobs INDEXED BY jobs_visible_failed
+                WHERE status='failed' AND operation NOT IN ('compare_all','capture_all')
+                ORDER BY id DESC LIMIT 12
+            ) UNION SELECT id FROM (
+                SELECT id FROM jobs INDEXED BY jobs_active_user
+                WHERE parent_id IS NULL AND operation!='publish' AND status IN ('queued','running')
+                LIMIT 4
+            )
+         )
+         SELECT j.id,j.provider,j.operation,j.status,j.added,j.existing,j.rejected,j.found,j.error
+         FROM visible v JOIN jobs j ON j.id=v.id ORDER BY j.id DESC",
     )?;
     let rows = q.query_map([], |r| {
         Ok(JobView {
@@ -134,14 +146,47 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
     if user_batch {
         check_user_job_capacity(&tx)?;
     }
-    ensure!(
+    let lanes = tx.execute(
+        "UPDATE jobs SET status='queued',error=NULL
+         WHERE parent_id=?1 AND operation IN ('compare_all','capture_all') AND status='failed'
+           AND EXISTS(SELECT 1 FROM jobs p WHERE p.id=?1 AND p.status='failed')",
+        [id],
+    )?;
+    if lanes != 0 {
         tx.execute(
-            "UPDATE jobs SET status='queued',error=NULL WHERE id=?1 AND status='failed'",
-            [id]
-        )? == 1,
-        "the job is not waiting for retry"
-    );
+            "UPDATE jobs SET status='running',error=NULL WHERE id=?1",
+            [id],
+        )?;
+    } else {
+        ensure!(
+            tx.execute(
+                "UPDATE jobs SET status='queued',error=NULL WHERE id=?1 AND status='failed'
+                 AND operation NOT IN ('compare_all','capture_all')",
+                [id],
+            )? == 1,
+            "the job is not waiting for retry"
+        );
+    }
     tx.commit()?;
+    Ok(())
+}
+
+/// The public archive scan remains running while its two child lanes rotate.
+fn refresh_scan_parent(db: &Connection, child: i64) -> Result<()> {
+    db.execute(
+        "UPDATE jobs SET
+         status=CASE
+           WHEN EXISTS(SELECT 1 FROM jobs lane WHERE lane.parent_id=jobs.id
+                        AND lane.operation IN ('compare_all','capture_all') AND lane.status='failed') THEN 'failed'
+           WHEN NOT EXISTS(SELECT 1 FROM jobs lane WHERE lane.parent_id=jobs.id
+                            AND lane.operation IN ('compare_all','capture_all') AND lane.status!='done') THEN 'done'
+           ELSE 'running' END,
+         error=(SELECT lane.error FROM jobs lane WHERE lane.parent_id=jobs.id
+                AND lane.operation IN ('compare_all','capture_all') AND lane.status='failed'
+                ORDER BY lane.id LIMIT 1)
+         WHERE id=(SELECT parent_id FROM jobs WHERE id=?1 AND operation IN ('compare_all','capture_all'))",
+        [child],
+    )?;
     Ok(())
 }
 
@@ -159,6 +204,7 @@ pub fn next(db: &mut Connection, failed: Option<&FailedTurn>) -> Result<Option<J
             "UPDATE jobs SET status='failed',error=?2 WHERE id=?1 AND status='running'",
             params![failed.job_id, failed.message],
         )?;
+        refresh_scan_parent(&tx, failed.job_id)?;
     }
     let job = tx.query_row("SELECT id,provider,username,operation,window_offset,window_rejected,replay_upload FROM jobs INDEXED BY jobs_ready_order WHERE status='queued' ORDER BY ready_order,id LIMIT 1",[],
         |r| Ok(Job { id:r.get(0)?,provider:r.get(1)?,username:r.get(2)?,operation:r.get(3)?,window_offset:r.get(4)?,window_rejected:r.get(5)?,replay_upload:r.get(6)? })).optional()?;
@@ -172,7 +218,10 @@ pub fn next(db: &mut Connection, failed: Option<&FailedTurn>) -> Result<Option<J
 pub fn recover_running(db: &mut Connection) -> Result<usize> {
     Ok(db.execute(
         "UPDATE jobs SET status='queued' WHERE id IN
-        (SELECT id FROM jobs WHERE status='running' ORDER BY id LIMIT 128)",
+        (SELECT id FROM jobs WHERE status='running' AND NOT (
+            provider='archive' AND operation='scan' AND EXISTS(
+                SELECT 1 FROM jobs lane WHERE lane.parent_id=jobs.id AND lane.operation='compare_all'
+            )) ORDER BY id LIMIT 128)",
         [],
     )?)
 }
@@ -196,6 +245,7 @@ pub fn complete(
           replay_upload=0,window_offset=0,window_rejected=0 WHERE id=?1",
         params![id, checkpoint.map_or(0, |(_, rejected)| rejected)],
     )?;
+    refresh_scan_parent(&tx, id)?;
     tx.commit()?;
     Ok(())
 }
@@ -351,13 +401,26 @@ impl JobReads {
             .optional()?)
     }
 
-    pub fn findings(
+    pub fn detector_plan(
         &self,
-        job: i64,
         game: &str,
+        detector: Program,
         deadline: Instant,
-    ) -> Result<Option<scanner::Findings>> {
-        game_pipeline::scan_findings(&self.0, job, game, deadline)
+    ) -> Result<Vec<u8>> {
+        game_pipeline::prepare_detector(&self.0, game, detector, deadline)
+    }
+
+    pub fn detector_checkpoint(&self, job: i64) -> Result<(i64, Option<(String, String)>)> {
+        let (version, game, file): (i64, Option<String>, Option<String>) = self.0.query_row(
+            "SELECT detector_version,detector_game,upload_file FROM jobs WHERE id=?1",
+            [job],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        ensure!(
+            game.is_some() == file.is_some(),
+            "incomplete sealed detector checkpoint"
+        );
+        Ok((version, game.zip(file)))
     }
 
     pub fn pending_game(&self, job: i64) -> Result<Option<String>> {
@@ -392,6 +455,7 @@ mod tests {
         db.execute_batch(include_str!("job_turns.sql"))?;
         db.execute_batch(include_str!("operation_bounds.sql"))?;
         db.execute_batch(include_str!("job_admission.sql"))?;
+        db.execute_batch(include_str!("detectors.sql"))?;
         assert_eq!(recover_running(&mut db)?, 1);
 
         assert_eq!(next(&mut db, None)?.unwrap().id, 1);
@@ -505,6 +569,14 @@ mod tests {
     fn recent_job_remains_visible_alongside_prior_failures() -> Result<()> {
         let db = Connection::open_in_memory()?;
         db.execute_batch(include_str!("schema.sql"))?;
+        db.execute_batch(include_str!("opening_policy.sql"))?;
+        db.execute_batch(include_str!("game_pipeline.sql"))?;
+        db.execute_batch(include_str!("job_turns.sql"))?;
+        db.execute_batch(include_str!("opening_order.sql"))?;
+        db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("operation_bounds.sql"))?;
+        db.execute_batch(include_str!("job_admission.sql"))?;
+        db.execute_batch(include_str!("detectors.sql"))?;
         for _ in 0..12 {
             db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('pgn','Learner','upload','failed')", [])?;
         }

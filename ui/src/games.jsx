@@ -110,7 +110,7 @@ export function Games({ jump, addOpening, settings, sounds }) {
         {error && <p className="error" role="alert">{error}</p>}
         {jobs.length > 0 && <details open><summary>Recent jobs</summary><ul className="items">{jobs.map((j) =>
           <li key={j.id}><strong>{j.operation === "publish" ? "Publish tactics" : j.provider === "archive" ? "Scan games" : labels[j.provider]}</strong> · {j.status}
-            <div>{j.operation === "publish" ? `${j.found} puzzles published` : j.provider === "archive" ? `${j.found} new findings` : `${j.added} added · ${j.existing} already present · ${j.rejected} rejected`}</div>
+            <div>{j.operation === "publish" ? `${j.found} puzzles published` : j.operation === "scan" ? `${j.added} games scanned · ${j.found} new findings` : j.provider === "archive" ? `${j.found} new findings` : `${j.added} added · ${j.existing} already present · ${j.rejected} rejected`}</div>
             {j.error && <p className="error">{j.error}</p>}
             {j.status === "failed" && <button disabled={busy} onClick={() => job(`games/jobs/${j.id}/retry`, {})}>Retry</button>}
           </li>)}</ul></details>}

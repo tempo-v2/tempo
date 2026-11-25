@@ -3,7 +3,9 @@ use crate::{
     chess, db,
     learning::{self, Rating},
     queue, queue_store,
-    study::{AcceptedView, Answer, AnswerState, Next, NextState, Review},
+    study::{
+        AcceptedView, AnswerIntentV1, AnswerState, Next, NextState, RepeatDisposition, Review,
+    },
     study_store,
 };
 use anyhow::Result;
@@ -19,13 +21,13 @@ pub fn counts(db: &mut Connection) -> Result<Option<queue::DisplayCounts>> {
     )
 }
 
-pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
+pub fn answer(db: &mut Connection, input: AnswerIntentV1) -> Result<AcceptedView> {
     let tx = db.transaction_with_behavior(Immediate)?;
     let issued = match study_store::begin_answer(&tx, &input)? {
         AnswerState::Replayed(view) => return Ok(view),
         AnswerState::Pending(issued) => issued,
     };
-    let rating = if chess::answer_matches(&issued.fen, &issued.answers, input.played.as_deref())? {
+    let rating = if chess::answer_matches(&issued.answers, issued.action.played()) {
         Rating::Good
     } else {
         Rating::Again
@@ -34,11 +36,11 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
     let prior = db::prior_review(&tx, &issued.card)?;
     let schedule = learning::schedule(rating, prior, now)?;
     db::save_review(&tx, &issued.card, now, schedule)?;
-    let mut repeat_after = None;
+    let mut repeat = RepeatDisposition::None;
     if matches!(rating, Rating::Again) && queue_store::can_repeat(&tx, &issued.card)? {
         let draw = queue::draw_repeat_offset();
         if queue_store::prepared(&tx)? {
-            repeat_after = Some(queue_store::place_repeat(
+            repeat = RepeatDisposition::Placed(queue_store::place_repeat(
                 &tx,
                 &issued.card,
                 issued.previous_kind.as_deref(),
@@ -54,9 +56,10 @@ pub fn answer(db: &mut Connection, input: Answer) -> Result<AcceptedView> {
                 now,
                 draw,
             )?;
+            repeat = RepeatDisposition::Deferred;
         }
     }
-    let accepted = study_store::accept_answer(&tx, &input, issued, rating.label(), repeat_after)?;
+    let accepted = study_store::accept_answer(&tx, &input, issued, rating, repeat)?;
     tx.commit()?;
     Ok(accepted)
 }
@@ -162,10 +165,10 @@ mod tests {
             let next_steps = steps.swap(0, Relaxed);
             answer(
                 &mut db,
-                Answer {
+                AnswerIntentV1 {
                     attempt: review.attempt,
                     dataset: review.dataset,
-                    played: None,
+                    action: crate::study::AnswerAction::Reveal,
                 },
             )?;
             Ok((review.title, next_steps, steps.load(Relaxed)))
@@ -235,10 +238,10 @@ mod tests {
         assert_eq!(review.title, "Title");
         let accepted = answer(
             &mut db,
-            Answer {
+            AnswerIntentV1 {
                 attempt: review.attempt,
                 dataset: review.dataset,
-                played: Some("e2e4".into()),
+                action: crate::study::AnswerAction::Play("e2e4".into()),
             },
         )?;
         assert_eq!(serde_json::to_value(accepted)?["rating"], "Good");
@@ -272,10 +275,10 @@ mod tests {
             },
         )?
         .unwrap();
-        let answer_command = || Answer {
+        let answer_command = || AnswerIntentV1 {
             attempt: review.attempt,
             dataset: "fixture".into(),
-            played: None,
+            action: crate::study::AnswerAction::Reveal,
         };
         let first = serde_json::to_value(answer(&mut db, answer_command())?)?;
         assert_eq!(first["rating"], "Again");
