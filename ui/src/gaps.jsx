@@ -130,6 +130,7 @@ export function Gaps() {
   const [busy,setBusy] = useState(false);
   const [error,setError] = useState("");
   const [message,setMessage] = useState("");
+  const [commandFeedback, setCommandFeedback] = useState(null);
   const [reload, setReload] = useState(0);
   function refreshJournal() {
     const current = restore();
@@ -196,9 +197,18 @@ export function Gaps() {
     return () => controller.abort();
   }, [reportId, reload, summaryRetry]);
   const currentSummary = summary?.id === reportId ? summary : null;
-  async function run(fn) {
-    setBusy(true);setError("");
-    try { await fn(); } catch(e){setError(e.message);} finally {setBusy(false);}
+  async function run(fn, command) {
+    setBusy(true);
+    setError("");
+    setCommandFeedback(null);
+    try {
+      await fn();
+    } catch (failure) {
+      if (command) setCommandFeedback({ command, error: failure.message });
+      else setError(failure.message);
+    } finally {
+      setBusy(false);
+    }
   }
   const book = draft.book ? books.find(b => b.id + "/" + b.color === draft.book) : books[0];
   async function scan(request, previous) {
@@ -234,8 +244,13 @@ export function Gaps() {
     window.open(link.url,"_blank","noopener,noreferrer");
     clearPreview();setMessage("");update({index,pgn:"",replacements:noReplacements});
   }
-  async function save(command, batched) {
-    setMessage(batched ? "Saving continuation in batches…" : "Saving continuation…");
+  function save(command, batched) {
+    return run(() => sendSave(command, batched), command.command);
+  }
+  async function sendSave(command, batched) {
+    setMessage("");
+    const showProgress = message => setCommandFeedback({ command: command.command, message });
+    showProgress(batched ? "Saving continuation in batches…" : "Saving continuation…");
     if (!await claimCommand("save", command)) {
       refreshJournal();
       setReload(n => n + 1);
@@ -246,7 +261,7 @@ export function Gaps() {
     const timer = command.replacements ? null : setInterval(async () => {
       try {
         const state = await api("coverage/save/" + command.command, undefined, progress.signal);
-        if (state && !progress.signal.aborted) setMessage(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
+        if (state && !progress.signal.aborted) showProgress(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
       } catch { /* The save command has its own acknowledgement. */ }
     }, 750);
     let receipt;
@@ -255,12 +270,13 @@ export function Gaps() {
     } catch(e) {
       const stale = e.code === "stale_gap" || e.code === "gap_save_interrupted";
       if(stale || e.code==="opening_reply_conflict" || e.code==="replacement_over_budget" || e.code==="replacement_preview_unavailable") {
-        await settleCommand("save", command);
-        refreshJournal();
-        clearPreview();
-        if (stale) setReport(old=>({...old,stale:true}));
+        if (await settleCommand("save", command)) {
+          clearPreview();
+          if (stale) setReport(old => old?.id === command.draft.report ? {...old, stale:true} : old);
+          setError(e.message);
+        }
+        return;
       }
-      setMessage("");
       throw e;
     } finally {
       clearInterval(timer);
@@ -275,9 +291,18 @@ export function Gaps() {
     });
     setMessage("");
     clearPreview();
-    if (accepted && stored(storage)?.report === command.draft.report) await scan(report.scan, previous);
+    if (accepted && stored(storage)?.report === command.draft.report) {
+      try {
+        await scan(report.scan, previous);
+      } catch (failure) {
+        if (mounted.current) setError(failure.message);
+      }
+    }
   }
-  async function applyOrder(pending) {
+  function applyOrder(pending) {
+    return run(() => sendApply(pending), pending.command);
+  }
+  async function sendApply(pending) {
     if (!await claimCommand("apply", pending)) {
       refreshJournal();
       return;
@@ -292,8 +317,8 @@ export function Gaps() {
       await settleCommand("apply", pending, { report: reply.id, cards: reply.cards });
     } catch(e) {
       if (e.code === "stale_gap" || e.code === "coverage_model_superseded") {
-        await settleCommand("apply", pending);
-        refreshJournal();
+        if (await settleCommand("apply", pending)) setError(e.message);
+        return;
       }
       throw e;
     }
@@ -352,7 +377,10 @@ export function Gaps() {
   const previous = saveAcknowledgement ? saveAcknowledgement.previous : draft.previous;
   const savedMessage = saveAcknowledgement?.replacement ? "Repertoire changes and continuation saved." : "Continuation saved.";
   const appliedMessage = applyAcknowledgement && "Applied opening order for "+applyAcknowledgement.cards+" reached cards. New cards use this order when Maia is selected in Settings.";
-  const status = message || (!draft.pending && saved && savedMessage);
+  const pendingFeedback = commandFeedback &&
+    [draft.pending?.command, draft.applyCommand?.command].includes(commandFeedback.command) ? commandFeedback : null;
+  const alert = error || pendingFeedback?.error;
+  const status = pendingFeedback?.message || (!draft.pending && saved && savedMessage) || message;
   const blocked = locked || report?.stale || Boolean(saved);
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
@@ -361,11 +389,11 @@ export function Gaps() {
       <label>Starting line (PGN) <input placeholder="1. e4 e5 2. Nf3 Nc6 3. Bc4" value={draft.line??""} onChange={e=>update({line:e.target.value})}/></label>
       <label>Through my move <input type="number" min="1" max="100" value={draft.through??10} onChange={e=>update({through:e.target.value})}/></label>
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
-    {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
+    {busy && <p role="status">Working…</p>}{alert && <p role="alert">{alert}</p>}
     {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{status && <p role="status">{status}</p>}
     {!draft.applyCommand && appliedMessage && <p role="status">{appliedMessage}</p>}
-    {draft.applyCommand && <button disabled={busy} onClick={() => run(() => applyOrder(draft.applyCommand))}>Retry applying order</button>}
-    {pendingSave && !gap && <button disabled={busy} onClick={() => run(() => save(pendingSave))}>Retry same save</button>}
+    {draft.applyCommand && <button disabled={busy} onClick={() => applyOrder(draft.applyCommand)}>Retry applying order</button>}
+    {pendingSave && !gap && <button disabled={busy} onClick={() => save(pendingSave)}>Retry same save</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · {report.model}</p>
@@ -373,7 +401,7 @@ export function Gaps() {
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
       {report.model_superseded && <p>Rescan with the current model before using these probabilities to set your opening order.</p>}
       {(report.model_superseded||report.stale||error||saved||previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : previous))}>Retry scan</button>}
-      <button disabled={blocked||report.model_superseded} onClick={()=>run(() => applyOrder({ report: report.id, command: crypto.randomUUID() }))}>Apply to opening order</button>
+      <button disabled={blocked||report.model_superseded} onClick={()=>applyOrder({ report: report.id, command: crypto.randomUUID() })}>Apply to opening order</button>
       {report.gaps.length>0 && <button disabled={blocked} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
@@ -382,13 +410,13 @@ export function Gaps() {
           <button disabled={blocked || !edit.pgn}
             onClick={() => run(() => previewDraft(edit, replacements))}>Preview</button>
           {pendingSave
-            ? <button disabled={busy} onClick={() => run(() => save(pendingSave))}>Retry same save</button>
+            ? <button disabled={busy} onClick={() => save(pendingSave)}>Retry same save</button>
             : hasReplacements
               ? <button disabled={blocked || !!trim || !replacement || replacement.over_budget || confirming}
                   onClick={() => setConfirmation(replacement.command)}>Review repertoire changes</button>
               : <button disabled={blocked || !!trim || !currentPreview || conflicts.length > 0 ||
                     currentPreview.responses.some(reply => reply.status === "conflict")}
-                  onClick={() => run(() => save({ draft: currentPreview.draft, command: currentPreview.command }, currentPreview.batched))}>Save to repertoire</button>}
+                  onClick={() => save({ draft: currentPreview.draft, command: currentPreview.command }, currentPreview.batched)}>Save to repertoire</button>}
         </div>
         {currentPreview && <p role="status">{currentPreview.new_replies} new {currentPreview.new_replies === 1 ? "reply" : "replies"} · {conflicts.length ? `${conflicts.length} ${conflicts.length === 1 ? "conflict" : "conflicts"}` : "No remaining conflicts"}</p>}
         {!!conflicts.length && <ol className="gap-conflict-list">{conflicts.map(conflict =>
@@ -418,10 +446,10 @@ export function Gaps() {
           {replacement.over_budget && <p>This change is too large to save at once. Split the PGN and preview again.</p>}
           {confirming && <div className="controls">
             <button disabled={blocked} onClick={() => setConfirmation(null)}>Cancel</button>
-            <button disabled={blocked} onClick={() => run(() => save({
+            <button disabled={blocked} onClick={() => save({
               draft: currentPreview.draft, replacements, command: replacement.command, revision: replacement.revision,
               line_revision: replacement.line_revision,
-            }))}>Confirm repertoire changes and save</button>
+            })}>Confirm repertoire changes and save</button>
           </div>}
         </section>}
       </section>}

@@ -395,6 +395,9 @@ async function laterGapAcrossTabs(browser) {
       await observer.route("**/api/coverage", route => route.abort());
       await observer.getByRole("button", { name: "Retry same save" }).click();
       await observer.getByText("Continuation saved.", { exact: true }).waitFor();
+      await author.getByText("Continuation saved.", { exact: true }).waitFor();
+      assert.equal(await author.getByRole("alert").count(), 0);
+      assert.equal(await author.getByText(/Saving continuation/).count(), 0);
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
     } finally {
       await context.close();
