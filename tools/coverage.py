@@ -64,13 +64,16 @@ def forecast(data, predict, limit=3000):
         raise ValueError("Choose a horizon that includes another move of yours")
     cards = {key(chess.Board(card["fen"])): card for card in data["cards"]}
     sequence = itertools.count()
-    pending = [(-1., next(sequence), start, (), ())]
+    pending = [(-1., next(sequence), (), ())]
     gaps, reach, completed = {}, {}, {}
     ended = conflict = 0.
     for _ in range(limit):
         if not pending:
             break
-        negative, _, board, line, path = heapq.heappop(pending)
+        negative, _, line, path = heapq.heappop(pending)
+        board = start.copy()
+        for move in line:
+            board.push_uci(move)
         mass = -negative
         if board.is_game_over():
             ended += mass
@@ -100,9 +103,7 @@ def forecast(data, predict, limit=3000):
                 raise ValueError("Incomplete legal move distribution")
         for move, probability in choices.items():
             if probability > 0:
-                child = board.copy(stack=True)
-                child.push_uci(move)
-                heapq.heappush(pending, (-mass * probability, next(sequence), child, (*line, move), path))
+                heapq.heappush(pending, (-mass * probability, next(sequence), (*line, move), path))
     return dict(gaps=sorted(gaps.values(), key=lambda gap: -gap["probability"]),
                 reach=reach, paths=list(completed.items()), ended=ended, conflict=conflict,
                 unresolved=conflict + sum(-entry[0] for entry in pending))

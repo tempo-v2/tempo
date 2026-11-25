@@ -298,8 +298,9 @@ export function Study({ openGame, sounds }) {
   function answer(played) {
     const intent = answerIntent({ attempt: card.attempt, dataset: card.dataset, played });
     run(async () => {
-      await saveAnswer(intent);
+      // Render the drop in the same update that locks the board.
       if (played) setSubmitted({ key: attemptKey, move: played });
+      await saveAnswer(intent);
       const result = await deliverAnswer(intent, card.fen);
       if (!mounted.current) return;
       if (!result) {
