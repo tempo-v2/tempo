@@ -223,3 +223,57 @@ impl StagedOrder {
         Ok(i64::from(bank == "b"))
     }
 }
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn rank_preparation_seeks_only_the_forecast_cards_and_peak() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let db = crate::db::Database::init(&directory.path().join("rank.sqlite3"))?;
+        db.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+        UPDATE prepared_queue_state SET ready=1;
+        INSERT INTO prepared_queue(card_id,kind,active,reserved,rank) VALUES
+            ('old','opening',1,0,2),('new','opening',1,0,NULL),('outside','opening',0,0,100);",
+        )?;
+        let reach = [("new".to_owned(), 0.75), ("old".to_owned(), 0.25)].into();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let observe = || -> Result<usize> {
+            let counter = steps.clone();
+            counter.store(0, Ordering::Relaxed);
+            db.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let plan = StagedOrder::prepare(&db, "report", &reach)?;
+            db.progress_handler(0, None::<fn() -> bool>);
+            assert_eq!(
+                plan.changes
+                    .iter()
+                    .map(|(id, p)| (id.as_str(), p.rank))
+                    .collect::<Vec<_>>(),
+                [("new", Some(2)), ("old", Some(101))]
+            );
+            Ok(steps.load(Ordering::Relaxed))
+        };
+        let before = observe()?;
+        db.execute_batch("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<20000)
+            INSERT INTO prepared_queue(card_id,kind,active,reserved)
+            SELECT printf('extra%05d',i),CASE WHEN i%2=0 THEN 'opening' ELSE 'tactic' END,(i%4<2),0 FROM n;")?;
+        let after = observe()?;
+        eprintln!(
+            "Apply preparation SQLite VM steps: {before} before, {after} after 20,000 unrelated rows"
+        );
+        assert!(after <= before + 10);
+        Ok(())
+    }
+}

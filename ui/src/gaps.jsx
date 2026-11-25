@@ -166,7 +166,7 @@ export function Gaps() {
     signal.throwIfAborted();
     setReport(next);clearPreview();
     if (reportId === id) setSummaryRetry(n => n + 1);
-    update({report:id,index:null,pgn:"",replacements:noReplacements,previous:null});
+    update({report:id,index:null,pgn:"",replacements:noReplacements,previous:null,savedReport:null});
     if(previous!=null)setMessage("Saved. Authored coverage moved from "+percent(previous)+" to "+percent(next.authored)+".");
   }
   function inputScan() {
@@ -221,7 +221,7 @@ export function Gaps() {
     setMessage(command.replacements ? "Repertoire changes and continuation saved." : "Continuation saved.");
     await clearCommand("save", command);
     const previous = report.model_superseded ? null : report.authored;
-    update({previous});
+    update({previous,savedReport:command.draft.report});
     clearPreview();
     await scan(report.scan,previous);
   }
@@ -302,7 +302,7 @@ export function Gaps() {
       <label>Through my move <input type="number" min="1" max="100" value={draft.through??10} onChange={e=>update({through:e.target.value})}/></label>
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
     {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
-    {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{message && <p role="status">{message}</p>}
+    {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{(message || (draft.savedReport && draft.savedReport === report?.id)) && <p role="status">{message || "Continuation saved."}</p>}
     {draft.applyCommand && <button disabled={busy} onClick={() => run(() => applyOrder(draft.applyCommand))}>Retry applying order</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>

@@ -1,6 +1,5 @@
 use crate::{
-    ApiError, ApiResult, App, Database, ViewResult, catalog, chess, optional_read,
-    optional_view,
+    ApiError, ApiResult, App, Database, ViewResult, catalog, chess, optional_read, optional_view,
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -185,22 +184,6 @@ mod scan;
 pub use catalog::authored_reply_revision as revision;
 pub use scan::{ScanFailure, start};
 
-pub fn load(c: &Connection, id: &str) -> Result<(Scan, i64, Forecast)> {
-    let (request, rev, report): (String, i64, String) = c
-        .query_row(
-            "SELECT request,revision,report FROM coverage_report WHERE id=?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?
-        .context("Run the coverage scan again.")?;
-    Ok((
-        serde_json::from_str(&request)?,
-        rev,
-        serde_json::from_str(&report)?,
-    ))
-}
-
 #[derive(Default, Deserialize)]
 pub struct Page {
     #[serde(default)]
@@ -355,25 +338,23 @@ pub async fn apply(
         );
         let mut db = Database::read(&app.database)?;
         let tx = db.transaction()?;
-        let (scan, rev, forecast) = load(&tx, &id)?;
-        let reply = json!({"id":id,"command":input.command,"cards":forecast.reach.len()});
-        let prior: Option<String> = tx
-            .query_row(
-                "SELECT report FROM applied_forecast WHERE command=?1",
-                [&input.command],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(prior) = prior {
+        let prior: Option<(String,usize)> = tx.query_row(
+            "SELECT a.report,i.card_count FROM applied_forecast a JOIN coverage_rank_input i ON i.report_id=a.report WHERE command=?1",
+            [&input.command], |row| Ok((row.get(0)?,row.get(1)?))
+        ).optional()?;
+        if let Some((prior,count))=prior {
             ensure!(prior == id, "Apply identity already used");
-            return Ok(reply);
+            return Ok(json!({"id":id,"command":input.command,"cards":count}));
         }
-        ensure!(forecast.model.is_current(), SupersededModel);
-        ensure!(
-            revision(&tx, &scan.repertoire)? == rev,
-            crate::gap_edit::Stale
-        );
-        let order = crate::opening_rank::StagedOrder::prepare(&tx, &id, &forecast.reach)?;
+        let (scan,rev)=scan_metadata(&tx,&id)?;
+        let (model,reach):(String,String)=tx.query_row(
+            "SELECT v.model_id,i.reach FROM coverage_view v JOIN coverage_rank_input i USING(report_id) WHERE report_id=?1",
+            [&id],|row| Ok((row.get(0)?,row.get(1)?)))?;
+        ensure!(serde_json::from_str::<ForecastModel>(&model)?.is_current(), SupersededModel);
+        ensure!(revision(&tx,&scan.repertoire)?==rev,crate::gap_edit::Stale);
+        let reach: HashMap<String,f64>=serde_json::from_str(&reach)?;
+        let reply=json!({"id":id,"command":input.command,"cards":reach.len()});
+        let order=crate::opening_rank::StagedOrder::prepare(&tx,&id,&reach)?;
         tx.commit()?;
         let bank = order.stage(&app.writer)?;
         app.writer.background(move |c| {
@@ -549,6 +530,7 @@ mod tests {
         }
 
         backfill_views(&c)?;
+        c.execute("INSERT INTO coverage_rank_input SELECT id,json_extract(report,'$.reach'),1 FROM coverage_report", [])?;
         let accepted = "11111111-1111-4111-8111-111111111111";
         let next = "22222222-2222-4222-8222-222222222222";
         c.execute("INSERT INTO applied_forecast VALUES (?1,'old')", [accepted])?;

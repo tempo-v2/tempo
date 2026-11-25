@@ -11,3 +11,11 @@ UPDATE prepared_queue SET rank_a=rank_b,scope_a=scope_b,slot_a=slot_b
  AND (SELECT bank FROM forecast_order_state WHERE singleton=1)=1;
 CREATE INDEX forecast_peak_b ON prepared_queue(coalesce(rank_b,rank))
  WHERE kind='opening';
+
+CREATE TABLE coverage_rank_input(
+ report_id TEXT PRIMARY KEY REFERENCES coverage_report(id),
+ reach TEXT NOT NULL, card_count INTEGER NOT NULL CHECK(card_count >= 0)
+) STRICT;
+INSERT INTO coverage_rank_input
+ SELECT id, json_extract(report,'$.reach'), (SELECT count(*) FROM json_each(report,'$.reach'))
+ FROM coverage_report;

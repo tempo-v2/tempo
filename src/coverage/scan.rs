@@ -23,28 +23,32 @@ static SLOT: Semaphore = Semaphore::const_new(1);
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanFailure {
-    CoverageBusy,
-    CoverageTimeout,
-    CoverageTooLarge,
-    CoverageCancelled,
+    #[serde(rename = "coverage_busy")]
+    Busy,
+    #[serde(rename = "coverage_timeout")]
+    Timeout,
+    #[serde(rename = "coverage_too_large")]
+    TooLarge,
+    #[serde(rename = "coverage_cancelled")]
+    Cancelled,
 }
 
 impl ScanFailure {
     pub fn status(self) -> StatusCode {
         match self {
-            Self::CoverageBusy | Self::CoverageCancelled => StatusCode::SERVICE_UNAVAILABLE,
-            Self::CoverageTimeout => StatusCode::GATEWAY_TIMEOUT,
-            Self::CoverageTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Busy | Self::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
 }
 impl std::fmt::Display for ScanFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::CoverageBusy => "A coverage scan is already running. Retry after it finishes.",
-            Self::CoverageTimeout => "The coverage scan timed out. Retry with a shorter horizon.",
-            Self::CoverageTooLarge => "Coverage model input or output exceeds 32 MiB.",
-            Self::CoverageCancelled => "Coverage scan cancelled.",
+            Self::Busy => "A coverage scan is already running. Retry after it finishes.",
+            Self::Timeout => "The coverage scan timed out. Retry with a shorter horizon.",
+            Self::TooLarge => "Coverage model input or output exceeds 32 MiB.",
+            Self::Cancelled => "Coverage scan cancelled.",
         })
     }
 }
@@ -58,19 +62,19 @@ struct Lifetime {
 }
 impl Lifetime {
     fn check(&self) -> Result<()> {
-        ensure!(Instant::now() < self.deadline, ScanFailure::CoverageTimeout);
+        ensure!(Instant::now() < self.deadline, ScanFailure::Timeout);
         ensure!(
             self.caller.has_changed().is_ok() && !*self.shutdown.borrow(),
-            ScanFailure::CoverageCancelled
+            ScanFailure::Cancelled
         );
         Ok(())
     }
 
     async fn stopped(mut self) -> ScanFailure {
         tokio::select! {
-            _ = tokio::time::sleep_until(self.deadline.into()) => ScanFailure::CoverageTimeout,
-            _ = self.caller.changed() => ScanFailure::CoverageCancelled,
-            _ = self.shutdown.wait_for(|stop| *stop) => ScanFailure::CoverageCancelled,
+            _ = tokio::time::sleep_until(self.deadline.into()) => ScanFailure::Timeout,
+            _ = self.caller.changed() => ScanFailure::Cancelled,
+            _ = self.shutdown.wait_for(|stop| *stop) => ScanFailure::Cancelled,
         }
     }
 }
@@ -119,8 +123,8 @@ fn snapshot(path: &Path, scan: &Scan, life: &Lifetime) -> Result<Snapshot> {
             "answers":serde_json::from_str::<Vec<String>>(row.get_ref(2)?.as_str()?)?,"quarantined":row.get::<_,bool>(3)?});
         let bytes = serde_json::to_vec(&card)?;
         ensure!(
-            input.len() + bytes.len() + 3 <= BYTES,
-            ScanFailure::CoverageTooLarge
+            input.len() + bytes.len() + 2 <= BYTES,
+            ScanFailure::TooLarge
         );
         input.extend_from_slice(&bytes);
         input.push(b',');
@@ -157,7 +161,7 @@ async fn evaluate(mut command: Command, input: Vec<u8>, life: &Lifetime) -> Resu
                 .take(BYTES as u64 + 1)
                 .read_to_end(&mut bytes)
                 .await?;
-            ensure!(bytes.len() <= BYTES, ScanFailure::CoverageTooLarge);
+            ensure!(bytes.len() <= BYTES, ScanFailure::TooLarge);
             Ok::<_, anyhow::Error>(bytes)
         };
         let (_, bytes) = tokio::try_join!(write, read)?;
@@ -202,12 +206,19 @@ fn run(app: App, mut scan: Scan, life: Lifetime) -> Result<String> {
         .arg(include_str!("../../tools/coverage.py"))
         .arg(&root);
     let runtime = tokio::runtime::Handle::current();
-    let bytes = runtime.block_on(evaluate(command, input, &life))?;
+    // The service reactor can stop after the client disconnects during shutdown.
+    // Keep a process driver alive until this physical worker reaps its child.
+    let child_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let bytes = child_runtime.block_on(evaluate(command, input, &life))?;
     life.check()?;
     let forecast: Forecast = serde_json::from_slice(&bytes)?;
     ensure!(forecast.model.is_current(), "Unexpected forecast model");
     let projection = Projection::prepare(&forecast)?;
     let report = serde_json::to_string(&forecast)?;
+    let reach = serde_json::to_string(&forecast.reach)?;
+    let card_count = forecast.reach.len();
     life.check()?;
     let reply = app.writer.submit(false, move |c: &mut Connection| {
         life.check()?;
@@ -229,6 +240,10 @@ fn run(app: App, mut scan: Scan, life: Lifetime) -> Result<String> {
         )? != 0
         {
             projection.insert(&tx, &id)?;
+            tx.execute(
+                "INSERT INTO coverage_rank_input VALUES(?1,?2,?3)",
+                (&id, reach, card_count),
+            )?;
         }
         ensure!(
             tx.total_changes() - before <= 128,
@@ -244,7 +259,7 @@ fn run(app: App, mut scan: Scan, life: Lifetime) -> Result<String> {
 pub async fn start(State(app): State<App>, Json(scan): Json<Scan>) -> ApiResult {
     let permit = SLOT
         .try_acquire()
-        .map_err(|_| ApiError(ScanFailure::CoverageBusy.into()))?;
+        .map_err(|_| ApiError(ScanFailure::Busy.into()))?;
     let (owner, caller) = watch::channel(());
     let life = Lifetime {
         deadline: Instant::now() + BUDGET,
@@ -258,8 +273,43 @@ pub async fn start(State(app): State<App>, Json(scan): Json<Scan>) -> ApiResult 
     });
     let result = tokio::time::timeout_at(deadline.into(), worker)
         .await
-        .map_err(|_| ApiError(ScanFailure::CoverageTimeout.into()))?
+        .map_err(|_| ApiError(ScanFailure::Timeout.into()))?
         .map_err(|e| ApiError(e.into()))?;
     drop(owner);
     Ok(Json(json!({"id":result.map_err(ApiError)?})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_parent_deadline_reaps_a_child_blocked_on_model_input() -> Result<()> {
+        let (_owner, caller) = watch::channel(());
+        let (_service, shutdown) = watch::channel(false);
+        let folder = tempfile::tempdir()?;
+        let pid = folder.path().join("model.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec /bin/sleep 60", "model"])
+            .arg(&pid);
+        let life = Lifetime {
+            deadline: Instant::now() + Duration::from_millis(300),
+            caller,
+            shutdown,
+        };
+        let error = evaluate(command, vec![0; 1024 * 1024], &life)
+            .await
+            .unwrap_err();
+        assert!(matches!(error.downcast_ref(), Some(ScanFailure::Timeout)));
+        let pid = std::fs::read_to_string(pid)?;
+        assert!(
+            !std::process::Command::new("ps")
+                .args(["-p", pid.trim()])
+                .output()?
+                .status
+                .success()
+        );
+        Ok(())
+    }
 }
