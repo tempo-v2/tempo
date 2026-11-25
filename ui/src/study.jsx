@@ -109,15 +109,16 @@ function decodeStudyReply(body, dataset) {
     throw new Error(incomplete);
   }
   const result = body.result === null ? null : decodeResult(body.result, incomplete);
-  // The board and feedback render these moves from the issued position.
-  // Validate that projection before replacing the last rendered card.
+  // The server supplies the allowed moves. Verify that the board can render
+  // those moves and the feedback from this position before replacing the card.
+  let playable;
   try {
-    const board = new Chess(body.fen);
-    for (const move of result?.answers ?? []) {
-      play(board, move);
-      board.undo();
-    }
+    playable = new Set(new Chess(body.fen).moves({ verbose: true }).map((move) => move.lan));
   } catch {
+    throw new Error(incomplete);
+  }
+  if (body.legal.some((move) => !playable.has(move)) ||
+      result?.answers.some((move) => !playable.has(move))) {
     throw new Error(incomplete);
   }
   return {

@@ -399,7 +399,11 @@ async function incompleteNextReply(browser, db, failure) {
           await route.fulfill({ status: 200, contentType: "application/json", body: '{"attempt":' });
           return;
         }
-        const result = failure === "unplayable"
+        if (failure === "unplayable-input") {
+          await route.fulfill({ status: 200, json: { ...issued, legal: [...issued.legal, "a1a8"] } });
+          return;
+        }
+        const result = failure === "unplayable-answer"
           ? { rating: "Again", answers: ["a1a8"], repeat_after: null }
           : undefined;
         await route.fulfill({ status: 200, json: { ...issued, result } });
@@ -542,7 +546,7 @@ async function browserReads(browser, db) {
     await mixedTabs(browser, path.join(root, "mixed.db"));
     await browserReads(browser, path.join(root, "browse.db"));
     await invalidCurrentReply(browser, path.join(root, "invalid-current.db"));
-    for (const failure of ["truncated", "missing-result", "unplayable"]) {
+    for (const failure of ["truncated", "missing-result", "unplayable-answer", "unplayable-input"]) {
       await incompleteNextReply(browser, path.join(root, failure + "-next.db"), failure);
     }
     await incompleteStartupNext(browser, path.join(root, "startup-next.db"));
