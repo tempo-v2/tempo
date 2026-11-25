@@ -91,7 +91,10 @@ function decodeOpeningPreview(body) {
   }
   const route = { fen: body.fen, moves: body.moves };
   try {
-    position(route);
+    const game = new Chess(route.fen);
+    for (const move of route.moves) {
+      if (play(game, move).lan !== move) throw new Error(incomplete);
+    }
   } catch {
     throw new Error(incomplete);
   }

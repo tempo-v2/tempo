@@ -669,9 +669,11 @@ async function openingPreview(browser, db) {
       await page.evaluate(() => window.finishOpeningFileRead(false));
       assert.equal(await input.inputValue(), olderPgn);
 
+      const initialFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
       for (const malformed of [
         { fen: "invalid", moves: [] },
-        { fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", moves: ["a1a8"] },
+        { fen: initialFen, moves: ["a1a8"] },
+        { fen: initialFen, moves: ["e2e4garbage"] },
       ]) {
         await page.route(previewPattern, route => route.fulfill({ json: malformed }), { times: 1 });
         const reply = page.waitForResponse(response => response.url().endsWith("/api/openings/pgn"));
