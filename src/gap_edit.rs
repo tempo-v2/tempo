@@ -87,7 +87,7 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
         }
         plans.push(plan);
         ensure!(
-            plans.len() + 2 * rows.iter().filter(|r| r["status"] == "new").count() <= 128,
+            1 + plans.len() + 3 * rows.iter().filter(|r| r["status"] == "new").count() <= 128,
             catalog::OverBudget
         );
     }
