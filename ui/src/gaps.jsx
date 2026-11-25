@@ -34,6 +34,14 @@ function lead(report, gap) {
   const pgn = board.pgn().replaceAll("+", "");
   return { text:notation(board) || board.fen(), url:"https://lichess.org/analysis/pgn/" + encodeURIComponent(pgn) + "?color=" + report.scan.color };
 }
+function downloadGap(payload) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload)], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "tempo-gap.json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 const percent = n => (100*n).toLocaleString(undefined,{maximumFractionDigits:2}) + "%";
 const range = (value, unknown) => percent(value) + (unknown > 0.000001 ? " – " + percent(Math.min(1,value+unknown)) : "");
 
@@ -125,11 +133,11 @@ export function Gaps() {
     try {
       receipt=await api("coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
-      if(e.code==="stale_gap") {
+      if(e.code==="stale_gap" || e.code==="gap_offline_required") {
         await clearCommand("save", command);
         refreshJournal();
         setPreview(null);
-        setReport(old=>({...old,stale:true}));
+        if (e.code === "stale_gap") setReport(old=>({...old,stale:true}));
       }
       throw e;
     }
@@ -189,7 +197,12 @@ export function Gaps() {
         <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{setPreview(null);update({pgn:e.target.value});}}/></label>
         <button disabled={locked||report.stale||!edit.pgn} onClick={()=>run(async()=>setPreview({ ...await api("coverage/preview",edit), draft: edit }))}>Preview</button>
         {currentPreview && <><ul>{currentPreview.responses.map(r=><li key={r.position}>{r.move} · {r.status}</li>)}</ul>
-          <button disabled={locked||currentPreview.responses.some(r=>r.status==="conflict")} onClick={()=>run(()=>save({draft:currentPreview.draft,command:currentPreview.command}))}>Save to repertoire</button></>}
+          {currentPreview.requires_offline ? <>
+            <p>This continuation exceeds the online save limit. Download the previewed continuation for offline import.</p>
+            <button disabled={locked || report.stale || currentPreview.responses.some(r => r.status === "conflict")}
+              onClick={() => downloadGap({ draft: currentPreview.draft, command: currentPreview.command })}>Download gap for offline import</button>
+          </> : <button disabled={locked || report.stale || currentPreview.responses.some(r => r.status === "conflict")}
+            onClick={() => run(() => save({ draft: currentPreview.draft, command: currentPreview.command }))}>Save to repertoire</button>}</>}
         {pendingSave && <button disabled={busy} onClick={()=>run(()=>save(pendingSave))}>Retry same save</button>}
       </section>}
       <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>

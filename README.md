@@ -89,6 +89,14 @@ opening save payload (name, color, route and destination). The `tactic` form
 takes the same PGN and name input as the browser. These commands hold the
 service's database lock and use the same atomic validation and conflict checks.
 
+For an oversized continuation in Openings → Gaps, preview the PGN and choose
+**Download gap for offline import**. Stop Tempo and run
+`tempo import-content DATABASE gap tempo-gap.json` with the exported file.
+Use the same database and rescan if the repertoire has changed since the
+original report. The command imports matching branches together, enforces the
+same conflict rules as online Save, and replays the saved receipt on retry.
+Restart Tempo and rescan to see the new coverage.
+
 A service backup that must resume queued PGN uploads includes the SQLite
 database and its adjacent `.uploads` directory. Stop the service before
 copying both for a coordinated release or rollback. The `opening-rank-apply`
