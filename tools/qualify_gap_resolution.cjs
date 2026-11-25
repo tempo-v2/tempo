@@ -26,9 +26,13 @@ function seedReport(db, id, repertoire, fen, moves) {
   const scan = JSON.stringify({ repertoire, color: "white", route: { fen: start, moves: [] }, through: 6 });
   const gaps = JSON.stringify([{ fen, moves, probability: 1 }]);
   const header = JSON.stringify({ model: "Maia-3", model_superseded: false, authored: 0, ended: 0, conflict: 0, unresolved: 0, total: 1 });
+  const modelId = "maia3-5m-1500-history-v1";
+  const hasModel = sql(db, "SELECT count(*) FROM pragma_table_info('coverage_view') WHERE name='model_id'") === "1";
+  const report = JSON.stringify({ model: modelId, gaps: JSON.parse(gaps), reach: {}, paths: [], ended: 0, conflict: 0, unresolved: 0 });
+  const projectedModel = hasModel ? "," + quoted(JSON.stringify(modelId)) : "";
   sql(db, `INSERT INTO coverage_report
-    VALUES (${quoted(id)},${quoted(repertoire)}, (SELECT revision FROM coverage_revision WHERE repertoire=${quoted(repertoire)}),${quoted(scan)},'{}');
-    INSERT INTO coverage_view VALUES (${quoted(id)},${quoted(header)},'{"cards":[],"paths":[]}');
+    VALUES (${quoted(id)},${quoted(repertoire)}, (SELECT revision FROM coverage_revision WHERE repertoire=${quoted(repertoire)}),${quoted(scan)},${quoted(report)});
+    INSERT INTO coverage_view VALUES (${quoted(id)},${quoted(header)},'{"cards":[],"paths":[]}'${projectedModel});
     INSERT INTO coverage_gap_page VALUES (${quoted(id)},0,${quoted(gaps)});`);
 }
 

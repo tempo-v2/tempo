@@ -56,6 +56,10 @@ enum ForecastModel {
 }
 
 impl ForecastModel {
+    fn is_current(self) -> bool {
+        self == Self::Maia3
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Maia2 => "Maia-2 Rapid 1500/1500",
@@ -80,6 +84,7 @@ const MAX_NODES: usize = 3000;
 const MAX_PATH: usize = 100;
 
 struct Projection {
+    model: ForecastModel,
     header: String,
     studied: String,
     pages: Vec<String>,
@@ -129,7 +134,6 @@ impl Projection {
             "Coverage summary exceeds its byte budget"
         );
         let header = serde_json::to_string(&json!({
-            "model": forecast.model.label(), "model_superseded": forecast.model != ForecastModel::Maia3,
             "authored": authored, "ended": forecast.ended, "conflict": forecast.conflict,
             "unresolved": forecast.unresolved, "total": forecast.gaps.len()
         }))?;
@@ -146,6 +150,7 @@ impl Projection {
             })
             .collect::<Result<_>>()?;
         Ok(Self {
+            model: forecast.model,
             header,
             studied,
             pages,
@@ -154,8 +159,13 @@ impl Projection {
 
     fn insert(&self, db: &Connection, id: &str) -> Result<()> {
         db.execute(
-            "INSERT INTO coverage_view VALUES(?1,?2,?3)",
-            (id, &self.header, &self.studied),
+            "INSERT INTO coverage_view VALUES(?1,?2,?3,?4)",
+            (
+                id,
+                &self.header,
+                &self.studied,
+                serde_json::to_string(&self.model)?,
+            ),
         )?;
         let mut insert = db.prepare_cached("INSERT INTO coverage_gap_page VALUES(?1,?2,?3)")?;
         for (page, gaps) in self.pages.iter().enumerate() {
@@ -243,10 +253,7 @@ fn evaluate(input: Value) -> Result<Forecast> {
         "Maia could not finish this scan. Check the host model setup and retry."
     );
     let forecast: Forecast = serde_json::from_slice(&output.stdout)?;
-    ensure!(
-        forecast.model == ForecastModel::Maia3,
-        "Unexpected forecast model"
-    );
+    ensure!(forecast.model.is_current(), "Unexpected forecast model");
     Ok(forecast)
 }
 
@@ -350,12 +357,15 @@ fn gap_chunk(db: &Connection, id: &str, page: usize) -> Result<Vec<Gap>> {
 
 fn page_view(db: &Connection, id: &str, offset: usize) -> Result<Value> {
     let (scan, rev) = scan_metadata(db, id)?;
-    let encoded: String = db.query_row(
-        "SELECT header FROM coverage_view WHERE report_id=?1",
+    let (encoded, model): (String, String) = db.query_row(
+        "SELECT header,model_id FROM coverage_view WHERE report_id=?1",
         [id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let model: ForecastModel = serde_json::from_str(&model)?;
     let mut header: Value = serde_json::from_str(&encoded)?;
+    header["model"] = json!(model.label());
+    header["model_superseded"] = json!(!model.is_current());
     let total = header["total"]
         .as_u64()
         .context("Missing coverage gap count")? as usize;
@@ -481,7 +491,7 @@ pub async fn apply(
             ensure!(prior == id, "Apply identity already used");
             return Ok(reply);
         }
-        ensure!(forecast.model == ForecastModel::Maia3, SupersededModel);
+        ensure!(forecast.model.is_current(), SupersededModel);
         ensure!(
             revision(&tx, &scan.repertoire)? == rev,
             crate::gap_edit::Stale

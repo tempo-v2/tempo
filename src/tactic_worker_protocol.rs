@@ -34,6 +34,25 @@ pub enum Request {
     Retry { work: Work, error: Failure },
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubmitReply {
+    Ok { outcome: Verdict },
+    InvalidEvidence,
+    StaleWork,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Kept,
+    Narrowed,
+    Published,
+    Equivalent,
+    BestOutsideCandidates,
+    PlayedBest,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Failure {

@@ -94,9 +94,21 @@ async fn handle(
     let response = match reply {
         Ok(reply) => reply,
         Err(error) if error.is::<capture_publication::InvalidEvidence>() => {
-            json!({"status":"invalid_evidence"})
+            serde_json::to_value(wire::SubmitReply::InvalidEvidence)?
         }
-        Err(error) if error.is::<crate::writer::Unavailable>() => json!({"status":"unavailable"}),
+        Err(error) if error.is::<capture_publication::StaleWork>() => {
+            serde_json::to_value(wire::SubmitReply::StaleWork)?
+        }
+        Err(error)
+            if error.is::<crate::writer::Unavailable>()
+                || error.chain().any(|cause| {
+                    matches!(cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(failure, _)) if matches!(failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+                }) =>
+        {
+            json!({"status":"unavailable"})
+        }
         Err(error) => {
             eprintln!("Tactic worker request: {error:#}");
             json!({"status":"error"})
@@ -132,12 +144,14 @@ fn dispatch(
         }
         Request::Submit { work, evidence } => {
             let Ok(evidence) = serde_json::from_value(evidence) else {
-                return Ok(json!({"status":"invalid_evidence"}));
+                return Ok(serde_json::to_value(wire::SubmitReply::InvalidEvidence)?);
             };
             let outcome = writer.background_until(deadline, move |db| {
                 capture_publication::submit(db, &work, &evidence)
             })?;
-            Ok(json!({"status":"ok","outcome":outcome}))
+            Ok(serde_json::to_value(wire::SubmitReply::Ok {
+                outcome: serde_json::from_value(json!(outcome))?,
+            })?)
         }
         Request::Retry { work, error } => {
             writer.background_until(deadline, move |db| {

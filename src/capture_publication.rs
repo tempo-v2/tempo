@@ -4,7 +4,7 @@ use crate::{
     tactic_qualification::{self, Decision, Evidence},
     tactic_worker_protocol::{Failure, Work},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
 use serde_json::{Value, json};
 
@@ -83,13 +83,22 @@ pub fn next(db: &Connection, now: i64) -> Result<Option<Work>> {
     Ok(candidate(db, &game, ply)?.map(|candidate| candidate.work))
 }
 
+#[derive(Debug)]
+pub struct StaleWork;
+impl std::fmt::Display for StaleWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Unknown or stale tactic work")
+    }
+}
+impl std::error::Error for StaleWork {}
+
 fn addressed(db: &Connection, work: &Work) -> Result<Candidate> {
-    let candidate = candidate(db, &work.game, work.ply)?.context("Unknown tactic work")?;
+    let candidate = candidate(db, &work.game, work.ply)?.ok_or(StaleWork)?;
     ensure!(
         work.token == candidate.work.token
             && work.fen == candidate.work.fen
             && work.depth == candidate.work.depth,
-        "Stale tactic work"
+        StaleWork
     );
     Ok(candidate)
 }
