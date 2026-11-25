@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 
+#[derive(Debug)]
+pub struct Stale;
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The repertoire changed. Rescan and preview again.")
+    }
+}
+impl std::error::Error for Stale {}
+
 #[derive(Serialize, Deserialize)]
 pub struct Draft {
     report: String,
@@ -156,7 +165,7 @@ pub async fn save(State(app): State<App>, Json(input): Json<Save>) -> ApiResult 
         }
         ensure!(
             coverage::revision(&tx, &edit.repertoire)? == edit.revision,
-            "Repertoire changed. Rescan and preview again."
+            Stale
         );
         let mut lines = vec![];
         for plan in &edit.plans {

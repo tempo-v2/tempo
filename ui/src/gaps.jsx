@@ -28,11 +28,9 @@ export function Gaps() {
   const [error,setError] = useState("");
   const [message,setMessage] = useState("");
   function update(patch) {
-    setDraft(old => {
-      const next={...old,...patch};
+    const next={...restore(),...patch};
       localStorage.setItem(storage, JSON.stringify(next));
-      return next;
-    });
+    setDraft(next);
   }
   useEffect(() => {
     const ctrl=new AbortController();
@@ -77,7 +75,18 @@ export function Gaps() {
   }
   async function save(command) {
     update({pending:command});
-    await api("coverage/save",command,undefined,{requireJson:true});
+    let receipt;
+    try {
+      receipt=await api("coverage/save",command,undefined,{requireJson:true});
+    } catch(e) {
+      if(e.code==="stale_gap") {
+        update({pending:null});setPreview(null);
+        setReport(old=>({...old,stale:true}));
+      }
+      throw e;
+    }
+    if(receipt?.command!==command.command || !Array.isArray(receipt.lines) || !receipt.lines.length)
+      throw new Error("Save acknowledgement was incomplete. Retry the same save.");
     setMessage("Continuation saved. Refreshing coverage…");
     update({pending:null,previous:report.authored});setPreview(null);
     await scan(report.scan,report.authored);
