@@ -251,7 +251,13 @@ pub fn analyze_until(
 }
 
 pub fn snapshot(db: &Connection, repertoire_id: &str, color: &str) -> anyhow::Result<RepertoireIr> {
-    catalog::existing_repertoire(db, repertoire_id, color).map_err(|_| Error::InvalidRequest)?;
+    catalog::existing_repertoire(db, repertoire_id, color).map_err(|error| {
+        if error.is::<catalog::MissingRepertoire>() {
+            Error::InvalidRequest.into()
+        } else {
+            error
+        }
+    })?;
     let basis = Basis {
         dataset: db::dataset(db)?,
         repertoire_id: repertoire_id.into(),
