@@ -21,3 +21,4 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tower-http = { version = "0.6", features = ["fs"] }
 
 [workspace]
+members = ["stockfish-analysis"]
