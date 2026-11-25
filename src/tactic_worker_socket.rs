@@ -87,6 +87,7 @@ async fn handle(
         .await??;
         return Ok(());
     }
+    let read_only = matches!(request, Request::Status | Request::Next);
     let reply =
         tokio::task::spawn_blocking(move || dispatch(request, &database, &writer, deadline))
             .await?;
