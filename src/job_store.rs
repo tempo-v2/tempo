@@ -1,5 +1,4 @@
 use crate::{
-    catalog,
     db::Database,
     game_pipeline,
     jobs::{Job, JobView, NewJob, valid_user},
@@ -447,10 +446,6 @@ impl JobReads {
 
     pub fn pending_game(&self, job: i64) -> Result<Option<String>> {
         game_pipeline::pending_game(&self.0, job)
-    }
-
-    pub fn publication_batch(&self, game: &str) -> Result<Vec<catalog::TacticPlan>> {
-        game_pipeline::publication_batch(&self.0, game)
     }
 }
 #[cfg(test)]

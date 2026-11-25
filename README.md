@@ -9,10 +9,10 @@ reviews published opening and tactic cards using Good, Again, and FSRS.
 | Operation | Owner, inputs and effect |
 | --- | --- |
 | Import games | Games accepts public provider account or PGN plus learner identity. The same canonical game and learner side reuse an archive record. The worker saves each canonical game and queues its scan in the same transaction. Import completes after archive acceptance. |
-| Scan | The scanner compares legal played moves against each matching repertoire independently and saves answer-versioned observations. A separate publication job turns saved missed captures into puzzles through the same Tactics intake used by manual PGN upload. |
+| Scan | The scanner compares legal played moves against each matching repertoire independently and saves answer-versioned observations. Missed-capture findings wait for the [standalone tactic worker](stockfish-analysis/README.md#generated-tactic-publication-worker). Tactics publishes a finding only when a proposed capture is the unique best move at depth 10, with every alternative outside the 30-centipawn window. |
 | Save opening | Openings validates legal routes and publishes one response card at each learner decision. The destination selects a repertoire. A matching reply reuses the card, and a different reply at the same position returns a conflict. Existing conflicts are quarantined. |
 | Publish tactic | Tactics validates every move of the supplied PGN and publishes the solver position and accepted moves. Stable content identity makes imports and worker replay idempotent. |
-| Review | Study issues one durable attempt against one immutable published card. The first legal answer or reveal accepts one Good/Again, writes FSRS and the repeat placement atomically, and saves a replayable receipt. Next is a separate operation. Source details are read separately after acceptance. |
+| Review | Study issues one durable attempt with a fixed answer set for the published card. The first legal answer or reveal accepts one Good/Again, writes FSRS and the repeat placement atomically, and saves a replayable receipt. Next is a separate operation. Source details are read separately after acceptance. |
 | Import old openings | One-time offline command takes a consistent read-only snapshot. It verifies and copies current repertoire content and starts schedules fresh. The new runtime cannot open a legacy database. |
 
 Position IDs hash a canonical orthodox position with side to move,

@@ -6,7 +6,7 @@ use crate::{
     job_store,
     scanner::{self, Detector, Observation, Program},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
 
 fn stage(db: &Connection, parent: i64, operation: &str) -> Result<i64> {
@@ -178,8 +178,9 @@ pub fn seal_detector(db: &mut Connection, job: i64, game: &str, file: &str) -> R
     Ok(())
 }
 
-// Final capture apply can write eleven additional rows, including ready-order triggers.
-pub const MAX_FINDINGS_PER_APPLY: usize = 117;
+// A new capture can write both a finding and a qualification row.
+// Keep the remaining eight writes available for the scan checkpoint.
+pub const MAX_FINDINGS_PER_APPLY: usize = 60;
 const MAX_APPLY_ROWS: u64 = 128;
 
 pub struct DetectorBatch {
@@ -282,17 +283,6 @@ pub fn apply_detector(db: &mut Connection, batch: &DetectorBatch) -> Result<()> 
         }
     }
     if batch.finished {
-        if batch.detector == Detector::Capture {
-            let pending: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM missed_captures m WHERE game_id=?1 AND NOT EXISTS
-                  (SELECT 1 FROM tactics t WHERE t.game_id=m.game_id AND t.game_ply=m.ply))",
-                [&batch.game],
-                |row| row.get(0),
-            )?;
-            if pending {
-                enqueue(&tx, batch.job, "publish", &batch.game)?;
-            }
-        }
         complete(&tx, batch.job, &batch.game)?;
         if batch.cursor.is_some() {
             let sibling = match batch.detector {
@@ -326,68 +316,6 @@ fn complete(db: &Connection, job: i64, game: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn publication_batch(db: &Connection, game: &str) -> Result<Vec<catalog::TacticPlan>> {
-    let mut query = db.prepare(
-        "SELECT ply,fen,position_id,played_move,captures FROM missed_captures m
-         WHERE game_id=?1
-           AND detector_version=(SELECT min(prior.detector_version) FROM missed_captures prior
-               WHERE prior.game_id=m.game_id AND prior.ply=m.ply)
-           AND NOT EXISTS (
-           SELECT 1 FROM tactics t WHERE t.game_id=m.game_id AND t.game_ply=m.ply
-         ) ORDER BY ply LIMIT 24",
-    )?;
-    let mut rows = query.query([game])?;
-    let mut plans = Vec::new();
-    while let Some(row) = rows.next()? {
-        let ply: usize = row.get(0)?;
-        let fen: String = row.get(1)?;
-        let position: String = row.get(2)?;
-        let played: String = row.get(3)?;
-        let answers: Vec<String> = serde_json::from_str(row.get_ref(4)?.as_str()?)?;
-        let first = answers
-            .first()
-            .context("missed capture has no accepted move")?;
-        ensure!(
-            chess::position_id(&chess::position(&fen)?) == position,
-            "saved capture position changed"
-        );
-        plans.push(catalog::prepare_tactic(catalog::TacticInput {
-            name: &format!("Missed capture · move {}", ply / 2 + 1),
-            route: &chess::Route {
-                fen,
-                moves: vec![first.clone()],
-            },
-            answers: &answers,
-            source: Some((game, ply, &played)),
-        })?);
-    }
-    Ok(plans)
-}
-
-pub fn publish_batch(
-    db: &mut Connection,
-    job: i64,
-    game: &str,
-    plans: &[catalog::TacticPlan],
-) -> Result<bool> {
-    ensure!(plans.len() <= 24, "publication batch exceeds row budget");
-    let tx = db.transaction_with_behavior(Immediate)?;
-    for plan in plans {
-        catalog::apply_tactic(&tx, plan)?;
-    }
-    tx.execute(
-        "UPDATE jobs SET found=found+?1 WHERE id=?2",
-        params![plans.len(), job],
-    )?;
-    let done = plans.len() < 24;
-    if done {
-        complete(&tx, job, game)?;
-    }
-    job_store::yield_turn(&tx, job, None, 0)?;
-    tx.commit()?;
-    Ok(done)
-}
-
 /// Transfer unfinished pre-split work in the schema upgrade transaction.
 pub fn recover_legacy(db: &Connection) -> Result<()> {
     let mut query = db.prepare(
@@ -404,7 +332,6 @@ pub fn recover_legacy(db: &Connection) -> Result<()> {
          ORDER BY m.game_id,m.ply",
     )?;
     let mut rows = query.query([])?;
-    let mut batch = None;
     while let Some(row) = rows.next()? {
         let game: String = row.get(0)?;
         let ply: usize = row.get(1)?;
@@ -418,19 +345,6 @@ pub fn recover_legacy(db: &Connection) -> Result<()> {
             "UPDATE missed_captures SET fen=?3 WHERE game_id=?1 AND ply=?2",
             params![game, ply, chess::fen(&board)],
         )?;
-        let job = match batch {
-            Some(job) => job,
-            None => {
-                db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('archive','','publish','queued')", [])?;
-                let id = db.last_insert_rowid();
-                batch = Some(id);
-                id
-            }
-        };
-        db.execute(
-            "INSERT OR IGNORE INTO job_games(job_id,game_id) VALUES (?1,?2)",
-            params![job, game],
-        )?;
     }
     Ok(())
 }
@@ -438,16 +352,6 @@ pub fn recover_legacy(db: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn publish_game(db: &mut Connection, job: i64, game: &str) -> Result<()> {
-        loop {
-            let plans = publication_batch(db, game)?;
-            if publish_batch(db, job, game, &plans)? {
-                break;
-            }
-        }
-        Ok(())
-    }
 
     fn initialize_fixture(db: &Connection) -> Result<()> {
         db.execute_batch(include_str!("schema.sql"))?;
@@ -460,6 +364,9 @@ mod tests {
         db.execute_batch(include_str!("operation_bounds.sql"))?;
         games::upgrade(db)?;
         db.execute_batch(include_str!("detectors.sql"))?;
+        db.execute_batch(include_str!("card_availability.sql"))?;
+        db.execute_batch(include_str!("tactic_qualification.sql"))?;
+        db.execute("INSERT INTO metadata VALUES ('fixture')", [])?;
         Ok(())
     }
 
@@ -514,7 +421,8 @@ mod tests {
                 cursor: Some("advanced".into()),
             },
         )?;
-        assert_eq!(db.total_changes() - before, MAX_APPLY_ROWS);
+        let changes = db.total_changes() - before;
+        assert!(changes > 2 * MAX_FINDINGS_PER_APPLY as u64 && changes <= MAX_APPLY_ROWS);
         Ok(())
     }
 
@@ -558,23 +466,14 @@ mod tests {
         };
         apply_detector(&mut db, &batch)?;
         assert!(apply_detector(&mut db, &batch).is_err());
-        let publish = stage(&db, scan, "publish")?;
-        db.execute_batch("CREATE TRIGGER fail_publish BEFORE INSERT ON tactics BEGIN SELECT raise(abort,'fixture failure'); END;")?;
-        assert!(publish_game(&mut db, publish, &game.game.id).is_err());
         assert!(pending_game(&db, scan)?.is_none());
-        assert_eq!(
-            pending_game(&db, publish)?.as_deref(),
-            Some(game.game.id.as_str())
-        );
         assert_eq!(
             db.query_row("SELECT count(*) FROM missed_captures", [], |r| r
                 .get::<_, usize>(0))?,
             1
         );
-        db.execute_batch("DROP TRIGGER fail_publish;")?;
-        publish_game(&mut db, publish, &game.game.id)?;
-        publish_game(&mut db, publish, &game.game.id)?;
-        assert!(pending_game(&db, publish)?.is_none());
+        assert!(catalog::tactics(&db, "")?.is_empty());
+        crate::capture_publication::test_support::publish_fixture(&mut db)?;
         let original_tactic: (String, String) =
             db.query_row("SELECT id, route FROM tactics", [], |row| {
                 Ok((row.get(0)?, row.get(1)?))

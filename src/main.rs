@@ -1,3 +1,4 @@
+mod capture_publication;
 mod catalog;
 mod chess;
 mod coverage;
@@ -21,6 +22,9 @@ mod review;
 mod scanner;
 mod study;
 mod study_store;
+mod tactic_qualification;
+mod tactic_worker_protocol;
+mod tactic_worker_socket;
 mod uploads;
 mod writer;
 
@@ -716,6 +720,9 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
                     eprintln!("Games worker stopped: {error:#}");
                 }
             })?;
+    }
+    if let Err(error) = tactic_worker_socket::start(&db, writer.clone()) {
+        eprintln!("Tactic worker handoff unavailable: {error:#}");
     }
     let app = router(&path, port, Arc::new(Runtime::new(db, writer, staging)));
     println!("Tempo at http://127.0.0.1:{port}");
