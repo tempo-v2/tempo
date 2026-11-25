@@ -428,8 +428,7 @@ mod tests {
         assert_eq!(replay["command"], accepted);
         let rejected = order("old", next)
             .await
-            .err()
-            .expect("old report accepted")
+            .expect_err("old report accepted")
             .into_response();
         assert_eq!(rejected.status(), axum::http::StatusCode::CONFLICT);
         let body: Value = serde_json::from_slice(&to_bytes(rejected.into_body(), 65_536).await?)?;
