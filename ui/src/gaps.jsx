@@ -494,10 +494,10 @@ export function Gaps() {
       <button disabled={blocked||report.model_superseded} onClick={()=>applyOrder({ report: report.id, command: crypto.randomUUID() })}>Apply to opening order</button>
       {report.gaps.length>0 && <button disabled={blockedSelection} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
-        {!draft.pending && !draft.applyCommand && !saved && <GapReview
+        {!saved && <GapReview
           key={JSON.stringify([viewIdentity(draft), gapIndex])}
           report={report.id} index={gapIndex} fen={gap.fen} color={report.scan.color}
-          start={reviewStart} staged={staged ? draft.stagedReply.movement : null}
+          start={reviewStart} staged={staged ? draft.stagedReply.movement : null} canReview={!locked}
           canStage={!blocked && !hasReplacements && (!draft.pgn?.trim() || !!staged)}
           canRescan={!locked} onStage={stageReply}
           onRescan={() => run(() => scan(report.scan))} />}

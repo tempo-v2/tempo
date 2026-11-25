@@ -9,7 +9,7 @@ function evaluation(score) {
   return score.white > 0 ? "+" + value : value;
 }
 
-export function GapReview({ report, index, fen, color, start, staged, canStage, canRescan, onStage, onRescan }) {
+export function GapReview({ report, index, fen, color, start, staged, canReview, canStage, canRescan, onStage, onRescan }) {
   const [retry, setRetry] = useState(0);
   const [review, setReview] = useState(null);
   const [selection, setSelection] = useState(null);
@@ -63,7 +63,7 @@ export function GapReview({ report, index, fen, color, start, staged, canStage, 
     </div>
     {loading && <p role="status">Reviewing moves…</p>}
     {!loading && (!review || unavailable) &&
-      <button type="button" onClick={() => setRetry(value => value + 1)}>{review ? "Retry review" : "Review moves"}</button>}
+      <button type="button" disabled={!canReview} onClick={() => setRetry(value => value + 1)}>{review ? "Retry review" : "Review moves"}</button>}
     {unavailable && <p>Move review is temporarily unavailable.</p>}
     {review?.status === "covered" && <p>Already covered · {review.san}</p>}
     {review?.status === "conflict" && <p>This position has an unresolved repertoire conflict.</p>}
