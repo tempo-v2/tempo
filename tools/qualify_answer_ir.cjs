@@ -306,6 +306,70 @@ async function mixedTabs(browser, db) {
   console.log("A still-loaded schema-6 tab cleared its legacy scalar after cutover while the new tab retained and replayed its newer Answer.");
 }
 
+async function browserReads(browser, db) {
+  await serve(candidate, db, await unusedPort(), async origin => {
+    const page = await browser.newPage();
+    const firstList = Promise.withResolvers();
+    const releaseFirst = Promise.withResolvers();
+    const statusRefresh = Promise.withResolvers();
+    let lists = 0;
+    let statuses = 0;
+    let posts = 0;
+    const row = (id, white) => ({
+      id, white, black: "Opponent", learner_color: "white",
+      route: { fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", moves: ["e2e4"] }
+    });
+    try {
+      await page.route("**/api/games/jobs", async route => {
+        if (route.request().method() === "POST") {
+          posts++;
+          await route.fulfill({ json: { id: 1 } });
+          return;
+        }
+        const added = ++statuses;
+        await route.fulfill({ json: [{ id: 1, operation: "all", provider: "lichess", status: "running", added }] });
+        if (added === 2) statusRefresh.resolve();
+      });
+      await page.route("**/api/games", async route => {
+        const read = ++lists;
+        if (read === 1) {
+          firstList.resolve();
+          await releaseFirst.promise;
+          await route.fulfill({ json: [row("old", "Obsolete")] });
+        } else if (read === 3) {
+          await route.fulfill({ status: 503, json: { code: "view_unavailable", error: "Browse busy" } });
+        } else {
+          await route.fulfill({ json: [row("new", "Current")] });
+        }
+      });
+      await page.goto(origin);
+      await page.getByRole("button", { name: "Games", exact: true }).click();
+      await firstList.promise;
+      await page.getByText("1 added", { exact: false }).waitFor();
+      await page.getByRole("button", { name: "Import all games" }).first().click();
+      await statusRefresh.promise;
+      await page.getByText("2 added", { exact: false }).waitFor();
+      assert.equal(lists, 1, "status invalidation started a concurrent archive request");
+      releaseFirst.resolve();
+      await page.getByRole("button", { name: "Current vs Opponent" }).waitFor();
+      assert.equal(lists, 2);
+      assert.equal(await page.getByRole("button", { name: "Obsolete vs Opponent" }).count(), 0);
+      await page.getByRole("button", { name: "Import all games" }).first().click();
+      const retryList = page.getByRole("button", { name: "Retry list" });
+      await retryList.waitFor();
+      assert.equal(await page.getByRole("button", { name: "Current vs Opponent" }).count(), 1);
+      await retryList.click();
+      await retryList.waitFor({ state: "hidden" });
+      assert.equal(lists, 4);
+      assert.equal(posts, 2);
+    } finally {
+      releaseFirst.resolve();
+      await page.context().close();
+    }
+  });
+  console.log("Mounted Games coalesced status invalidation, retained its page on failure, and retried the read alone.");
+}
+
 (async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tempo-answer-ir-"));
   let browser;
@@ -317,6 +381,7 @@ async function mixedTabs(browser, db) {
     await predecessorRecovery(browser, path.join(root, "undelivered.db"), false);
     await twoTabs(browser, path.join(root, "concurrent.db"));
     await mixedTabs(browser, path.join(root, "mixed.db"));
+    await browserReads(browser, path.join(root, "browse.db"));
     console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, incomplete reply replay, and Next-only retry passed.");
   } finally {
     if (browser) await browser.close();

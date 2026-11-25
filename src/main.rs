@@ -123,22 +123,6 @@ impl IntoResponse for ApiError {
     }
 }
 
-async fn with_db<T: Serialize + Send + 'static>(
-    db: App,
-    f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-) -> ApiResult {
-    let result = tokio::task::spawn_blocking(move || {
-        let mut connection = Database::read(&db.database)?;
-        f(&mut connection)
-    })
-    .await
-    .map_err(|e| ApiError(e.into()))?
-    .map_err(ApiError)?;
-    Ok(Json(
-        serde_json::to_value(result).map_err(|e| ApiError(e.into()))?,
-    ))
-}
-
 async fn write_db<T: Serialize + Send + 'static>(
     app: App,
     apply: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
@@ -174,8 +158,11 @@ struct Page {
     after: String,
 }
 
-async fn openings(State(db): State<App>, Query(q): Query<Page>) -> ApiResult {
-    with_db(db, move |c| catalog::openings(c, &q.after)).await
+async fn openings(State(db): State<App>, Query(q): Query<Page>) -> ViewResult {
+    optional_view(db, optional_read::Reader::Openings, move |c| {
+        catalog::openings(c, &q.after)
+    })
+    .await
 }
 #[derive(Deserialize)]
 struct SaveOpening {
@@ -200,7 +187,7 @@ struct RepertoirePage {
     color: String,
 }
 
-async fn repertoires(State(db): State<App>, Query(page): Query<RepertoirePage>) -> ApiResult {
+async fn repertoires(State(db): State<App>, Query(page): Query<RepertoirePage>) -> ViewResult {
     optional_view(db, optional_read::Reader::Repertoires, move |c| {
         catalog::repertoires(c, &page.after, &page.color)
     })
@@ -260,8 +247,11 @@ async fn preview_opening(Json(input): Json<PgnInput>) -> ApiResult {
     Ok(Json(json!(result)))
 }
 
-async fn tactics(State(db): State<App>, Query(q): Query<Page>) -> ApiResult {
-    with_db(db, move |c| catalog::tactics(c, &q.after)).await
+async fn tactics(State(db): State<App>, Query(q): Query<Page>) -> ViewResult {
+    optional_view(db, optional_read::Reader::Tactics, move |c| {
+        catalog::tactics(c, &q.after)
+    })
+    .await
 }
 fn prepare_puzzle(input: PgnInput) -> Result<catalog::TacticPlan> {
     ensure!(input.pgn.len() <= jobs::MAX_PGN, "PGN exceeds 64 MiB");
@@ -294,13 +284,19 @@ async fn save_tactic(State(db): State<App>, Json(input): Json<PgnInput>) -> ApiR
     write_db(db, move |c| Ok(json!({"id":apply_puzzle(c,&plan)?}))).await
 }
 
-async fn archives(State(db): State<App>, Query(q): Query<Page>) -> ApiResult {
-    with_db(db, move |c| games::archive(c, &q.after, 50)).await
+async fn archives(State(db): State<App>, Query(q): Query<Page>) -> ViewResult {
+    optional_view(db, optional_read::Reader::GamesArchive, move |c| {
+        games::archive(c, &q.after, 50)
+    })
+    .await
 }
-async fn read_game(State(db): State<App>, UrlPath(id): UrlPath<String>) -> ApiResult {
-    with_db(db, move |c| games::replay(c, &id)).await
+async fn read_game(State(db): State<App>, UrlPath(id): UrlPath<String>) -> ViewResult {
+    optional_view(db, optional_read::Reader::GameReplay, move |c| {
+        games::replay(c, &id)
+    })
+    .await
 }
-async fn job_views(State(db): State<App>) -> ApiResult {
+async fn job_views(State(db): State<App>) -> ViewResult {
     optional_view(db, optional_read::Reader::GamesStatus, |c| {
         job_store::views(c)
     })
@@ -349,8 +345,11 @@ async fn retry_job(
     })
     .await
 }
-async fn settings(State(db): State<App>) -> ApiResult {
-    with_db(db, move |c| job_store::settings(c)).await
+async fn settings(State(db): State<App>) -> ViewResult {
+    optional_view(db, optional_read::Reader::ProviderSettings, move |c| {
+        job_store::settings(c)
+    })
+    .await
 }
 async fn save_settings(
     State(db): State<App>,
@@ -362,8 +361,11 @@ async fn save_settings(
     })
     .await
 }
-async fn new_opening_settings(State(db): State<App>) -> ApiResult {
-    with_db(db, |c| queue_store::new_opening_settings(c)).await
+async fn new_opening_settings(State(db): State<App>) -> ViewResult {
+    optional_view(db, optional_read::Reader::OpeningSettings, |c| {
+        queue_store::new_opening_settings(c)
+    })
+    .await
 }
 
 async fn save_new_opening_settings(
@@ -373,8 +375,11 @@ async fn save_new_opening_settings(
     write_db(db, |c| queue_store::save_new_opening_settings(c, input)).await
 }
 
-async fn current(State(db): State<App>) -> ApiResult {
-    with_db(db, move |c| study_store::current(c)).await
+async fn current(State(db): State<App>) -> ViewResult {
+    optional_view(db, optional_read::Reader::CurrentStudy, move |c| {
+        study_store::current(c)
+    })
+    .await
 }
 async fn study_counts(State(db): State<App>) -> impl IntoResponse {
     let response = optional_view(db, optional_read::Reader::Counts, review::counts)
@@ -388,20 +393,24 @@ async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> A
 async fn answer(State(db): State<App>, Json(input): Json<study::AnswerWire>) -> ApiResult {
     write_db(db, move |c| review::answer(c, input.into())).await
 }
-async fn optional_view<T: Serialize>(
+type ViewResult = std::result::Result<Response, ApiError>;
+
+async fn optional_view<T: Serialize + 'static>(
     db: App,
     reader: optional_read::Reader,
     work: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-) -> ApiResult {
-    optional_read::read(reader, db.database.clone(), move |c| {
-        Ok(serde_json::to_value(work(c)?)?)
-    })
-    .await
-    .map(Json)
-    .map_err(|error| ApiError(error.into()))
+) -> ViewResult {
+    let bytes = optional_read::read(reader, db.database.clone(), work)
+        .await
+        .map_err(ApiError)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response())
 }
 
-async fn context(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult {
+async fn context(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ViewResult {
     optional_view(db, optional_read::Reader::StudyContext, move |c| {
         let source = study_store::context_source(c, id)?;
         let mut context = source.context;
@@ -418,7 +427,7 @@ async fn context(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult 
     .await
 }
 
-async fn opponent_move(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ApiResult {
+async fn opponent_move(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> ViewResult {
     optional_view(db, optional_read::Reader::StudyContext, move |c| {
         let Some(anchor) = study_store::game_anchor(c, id)? else {
             return Ok(None);

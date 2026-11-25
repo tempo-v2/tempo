@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { api, fileText } from "./api.js";
+import { api, fileText, readView, visibleRead } from "./api.js";
 import { Replay } from "./board.jsx";
 import { More, useList } from "./library.jsx";
 
@@ -15,6 +15,23 @@ export function Games({ jump, addOpening, settings, sounds }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const refreshJobs = useRef(null);
+  const cancelReplay = useRef(null);
+  const [replayFailure, setReplayFailure] = useState(null);
+  function openReplay(selection) {
+    cancelReplay.current?.();
+    setReplayFailure(null);
+    cancelReplay.current = visibleRead(async (signal) => {
+      try {
+        const result = await readView("games/archive/" + encodeURIComponent(selection.id), signal);
+        if (signal.aborted) return;
+        setGame(result);
+        setPly(Math.min(selection.ply ?? 0, result.route.moves.length));
+        setReplayFailure(null);
+      } catch (failure) {
+        if (!signal.aborted) setReplayFailure({ selection, message: failure.message });
+      }
+    });
+  }
   useEffect(() => {
     let live = true;
     let timer;
@@ -28,7 +45,7 @@ export function Games({ jump, addOpening, settings, sounds }) {
       pending = request;
       dirty = false;
       try {
-        const result = await api("games/jobs", undefined, request.signal);
+        const result = await readView("games/jobs", request.signal);
         if (!live || request.signal.aborted) return;
         const fingerprint = JSON.stringify(result.map(({ id, added, status }) => [id, added, status]));
         if (prior && prior !== fingerprint) list.load();
@@ -64,12 +81,8 @@ export function Games({ jump, addOpening, settings, sounds }) {
     };
   }, []);
   useEffect(() => {
-    if (!jump) return;
-    let active = true;
-    api("games/archive/" + jump.id).then((result) => {
-      if (active) { setGame(result); setPly(Math.min(jump.ply ?? 0, result.route.moves.length)); }
-    }).catch((error) => { if (active) setError(error.message); });
-    return () => { active = false; };
+    if (jump) openReplay(jump);
+    return () => cancelReplay.current?.();
   }, [jump]);
   async function job(path, body) {
     setBusy(true); setError("");
@@ -114,8 +127,12 @@ export function Games({ jump, addOpening, settings, sounds }) {
             {j.error && <p className="error">{j.error}</p>}
             {j.status === "failed" && <button disabled={busy} onClick={() => job(`games/jobs/${j.id}/retry`, {})}>Retry</button>}
           </li>)}</ul></details>}
-        {!list.rows.length && <p>No games imported yet.</p>}
-        <ul className="items">{list.rows.map((row) => <li key={row.id}><button onClick={() => { setGame(row); setPly(0); }}>
+        {replayFailure && <p className="error" role="alert">{replayFailure.message}{" "}
+          <button onClick={() => openReplay(replayFailure.selection)}>Retry replay</button></p>}
+        {!list.rows.length && !list.busy && !list.error && <p>No games imported yet.</p>}
+        <ul className="items">{list.rows.map((row) => <li key={row.id}><button onClick={() => {
+          cancelReplay.current?.(); setReplayFailure(null); setGame(row); setPly(0);
+        }}>
           {row.white} vs {row.black} <small>{row.played_on}</small>
         </button></li>)}</ul>
         <More list={list} />
