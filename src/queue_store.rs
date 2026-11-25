@@ -631,6 +631,35 @@ mod tests {
     }
 
     #[test]
+    fn future_high_ranked_reviews_do_not_expand_due_selection_work() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("prepared_queue.sql"),
+            include_str!("coverage_order.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<4095)
+            INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+            SELECT printf('%04d',i),'opening','','white','','','[]' FROM n;
+            INSERT INTO learning SELECT id,1,1,0,CASE WHEN id='4095' THEN 10 ELSE 20 END FROM cards;
+            UPDATE prepared_queue SET scope_b='scan',slot_b=CAST(card_id AS INTEGER),
+                rank_b=CAST(card_id AS INTEGER)+1;
+            UPDATE forecast_order_state SET bank=1;
+            ANALYZE;",
+        )?;
+        // Interrupt an accidental scan across the future high-ranked cards.
+        db.progress_handler(2000, Some(|| true));
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "4095");
+        assert_eq!(select(&db, None, 20)?.unwrap().0, "0000");
+        Ok(())
+    }
+
+    #[test]
     fn spacing_clamps_to_the_remaining_deck() {
         assert_eq!(repeat_offset(5, 20), 5);
         assert_eq!(repeat_offset(20, 20), 20);
