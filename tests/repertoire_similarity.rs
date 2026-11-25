@@ -79,6 +79,11 @@ fn compares_exact_special_move_identity() {
         query(castle, &[(castle, "e1g1")]).1["moves"][0]["first_move"],
         "e1g1"
     );
+    let check = "7k/P7/8/8/8/8/8/7K w - - 0 1";
+    assert_eq!(
+        query(check, &[(check, "a7a8q")]).1["moves"][0]["san"],
+        "a8=Q+"
+    );
     let promotion = "7k/P7/8/8/8/8/8/7K w - - 0 1";
     assert_eq!(
         query(promotion, &[(promotion, "a7a8n")]).1["moves"][0]["first_move"],

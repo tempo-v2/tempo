@@ -1,6 +1,6 @@
 //! Read-only similarity evidence for one repertoire's authored replies.
 use crate::{catalog, chess, db};
-use pgn_reader::shakmaty::{ByColor, ByRole, Chess, Position, Role, san::San};
+use pgn_reader::shakmaty::{ByColor, ByRole, Chess, Position, Role, san::SanPlus};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Read};
@@ -214,7 +214,7 @@ pub fn analyze_until(
             reply.movement.clone(),
             Candidate {
                 first_move: reply.movement,
-                san: San::from_move(&board, movement).to_string(),
+                san: SanPlus::from_move(board.clone(), movement).to_string(),
                 distance: score,
                 example: Example {
                     position_id,
