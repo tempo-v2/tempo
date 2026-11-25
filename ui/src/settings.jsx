@@ -93,7 +93,7 @@ function NewOpeningSettings() {
       <label>New card order
         <select value={settings.ordering} disabled={saving}
           onChange={(event) => setSettings({ ...settings, ordering: event.target.value })}>
-          <option value="maia">Maia · earlier moves, then most likely</option>
+          <option value="maia">Maia · saved opening order</option>
           <option value="standard">Standard</option>
         </select>
       </label>

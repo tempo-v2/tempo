@@ -146,3 +146,11 @@ Open a gap in Lichess, extend the line and paste its exported PGN in Tempo.
 Preview shows the learner replies below the selected position, including legal
 transpositions and variations. Save commits those lines together. Scanning and
 previewing leave the repertoire and learning history untouched.
+
+After a scan, **Apply to opening order** ranks reached opening cards by their
+estimated chance of occurring. New cards use the saved order when Settings →
+New openings uses Maia. Within an applied group, the due selector chooses the
+highest-ranked eligible review when the next due opening belongs to that
+group. The command preserves committed attempts, Again placement and FSRS due
+times. Rank preparation runs outside the writer and activates in one commit
+after bounded staging turns.

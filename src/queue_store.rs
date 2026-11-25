@@ -51,6 +51,7 @@ pub fn select(
         || new_opening_settings(db),
         |kind, candidates| {
             Ok(match candidates {
+                Candidates::Due if kind == CardKind::Opening => return due_opening(db, now),
                 Candidates::Due => db
                     .prepare_cached(&format!(
                         "SELECT card_id {PREPARED_DUE} ORDER BY due_at,card_id LIMIT 1"
@@ -63,16 +64,60 @@ pub fn select(
                     ))?
                     .query_row([kind.as_str()], |r| r.get(0))
                     .optional(),
-                Candidates::NewByRank => db
+                Candidates::NewByRank => {
+                    let bank = crate::opening_rank::active_bank(db)?;
+                    db
                     .prepare_cached(&format!(
-                        "SELECT card_id {PREPARED_UNSEEN} AND rank IS NOT NULL ORDER BY rank,card_id LIMIT 1"
+                        "SELECT card_id {PREPARED_UNSEEN} AND coalesce(rank_{bank},rank) IS NOT NULL ORDER BY coalesce(rank_{bank},rank),card_id LIMIT 1"
                     ))?
                     .query_row([kind.as_str()], |r| r.get(0))
-                    .optional(),
+                    .optional()
+                }
             }?)
         },
     )?;
     Ok(chosen.map(|(id, kind)| (id, kind.as_str().to_owned())))
+}
+
+// The earliest due slot determines which applied forecast, if any, can reorder it.
+fn due_opening(db: &Connection, now: i64) -> Result<Option<String>> {
+    let bank = crate::opening_rank::active_bank(db)?;
+    let head: Option<(String, Option<String>)> = db
+        .prepare_cached(&format!(
+            "SELECT card_id,scope_{bank} {PREPARED_DUE} ORDER BY due_at,card_id LIMIT 1"
+        ))?
+        .query_row(params!["opening", now], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((id, group)) = head else {
+        return Ok(None);
+    };
+    let Some(group) = group else {
+        return Ok(Some(id));
+    };
+    // Four indexed time-range probes per level; six levels span all 3,000 scan nodes.
+    let mut prefix = 0;
+    for shift in [10, 8, 6, 4, 2, 0] {
+        let mut lookup = db.prepare_cached(&format!(
+            "SELECT card_id FROM prepared_queue
+          WHERE scope_{bank}=?1 AND (slot_{bank} >> {shift})=?2
+            AND active=1 AND reserved=0 AND due_at IS NOT NULL AND due_at<=?3 LIMIT 1"
+        ))?;
+        let mut next = None;
+        for child in prefix * 4..prefix * 4 + 4 {
+            let found = lookup
+                .query_row(params![group, child, now], |r| r.get::<_, String>(0))
+                .optional()?;
+            if let Some(card) = found {
+                if shift == 0 {
+                    return Ok(Some(card));
+                }
+                next = Some(child);
+                break;
+            }
+        }
+        prefix = next.ok_or_else(|| anyhow::anyhow!("Prepared forecast slot is missing"))?;
+    }
+    unreachable!("the final level selects a card")
 }
 
 pub fn can_repeat(db: &Connection, card: &str) -> Result<bool> {
@@ -218,7 +263,7 @@ pub fn seed_batch(db: &mut Connection) -> Result<bool> {
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut insert = tx.prepare_cached(
-        "INSERT OR IGNORE INTO prepared_queue
+        "INSERT OR IGNORE INTO prepared_queue(card_id,kind,active,due_at,rank,reserved)
          SELECT c.id,c.kind,NOT c.quarantined,l.due_at,o.rank,d.card_id IS NOT NULL
          FROM cards c LEFT JOIN learning l ON l.card_id=c.id
          LEFT JOIN opening_order o ON o.card_id=c.id LEFT JOIN deck d ON d.card_id=c.id
@@ -292,6 +337,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
         }
@@ -409,6 +455,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
         }
@@ -498,6 +545,7 @@ mod tests {
             )?;
         }
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("coverage_order.sql"))?;
         assert!(!seed_batch(&mut db)?);
         assert!(!prepared(&db)?);
         db.execute("INSERT INTO learning VALUES ('0001',1,1,1,9)", [])?;
@@ -527,6 +575,7 @@ mod tests {
         db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("coverage_order.sql"))?;
         db.execute_batch(
             "INSERT INTO cards (id,kind,title,color,fen,position_id,answers) VALUES
                 ('a','opening','First by id','white','','a','[]'),
@@ -578,6 +627,35 @@ mod tests {
         assert_eq!(select(&db, None, 10)?.unwrap().0, "b");
         db.execute("INSERT INTO learning VALUES ('b',2,2,0,20)", [])?;
         assert_eq!(select(&db, None, 10)?.unwrap().0, "t");
+        Ok(())
+    }
+
+    #[test]
+    fn future_high_ranked_reviews_do_not_expand_due_selection_work() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("opening_policy.sql"),
+            include_str!("opening_order.sql"),
+            include_str!("prepared_queue.sql"),
+            include_str!("coverage_order.sql"),
+        ] {
+            db.execute_batch(schema)?;
+        }
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<4095)
+            INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+            SELECT printf('%04d',i),'opening','','white','','','[]' FROM n;
+            INSERT INTO learning SELECT id,1,1,0,CASE WHEN id='4095' THEN 10 ELSE 20 END FROM cards;
+            UPDATE prepared_queue SET scope_b='scan',slot_b=CAST(card_id AS INTEGER),
+                rank_b=CAST(card_id AS INTEGER)+1;
+            UPDATE forecast_order_state SET bank=1;
+            ANALYZE;",
+        )?;
+        // Interrupt an accidental scan across the future high-ranked cards.
+        db.progress_handler(2000, Some(|| true));
+        assert_eq!(select(&db, None, 10)?.unwrap().0, "4095");
+        assert_eq!(select(&db, None, 20)?.unwrap().0, "0000");
         Ok(())
     }
 

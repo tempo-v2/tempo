@@ -8,20 +8,20 @@ function stored(key) {
   try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
 }
 function restore() {
-  return { ...stored(storage), pending: stored(storage + ".save") };
+  return { ...stored(storage), pending: stored(storage + ".save"), applyCommand: stored(storage + ".apply") };
 }
-async function claimSave(command) {
-  return navigator.locks.request(storage + ".save", () => {
-    const key = storage + ".save";
+async function claimCommand(kind, command) {
+  return navigator.locks.request(storage + "." + kind, () => {
+    const key = storage + "." + kind;
     const current = stored(key);
     if (current) return current.command === command.command;
     localStorage.setItem(key, JSON.stringify(command));
     return true;
   });
 }
-async function clearSave(command) {
-  await navigator.locks.request(storage + ".save", () => {
-    const key = storage + ".save";
+async function clearCommand(kind, command) {
+  await navigator.locks.request(storage + "." + kind, () => {
+    const key = storage + "." + kind;
     if (stored(key)?.command === command.command) localStorage.removeItem(key);
   });
 }
@@ -48,7 +48,7 @@ export function Gaps() {
   const [message,setMessage] = useState("");
   const [reload, setReload] = useState(0);
   function refreshJournal() {
-    setDraft({ ...form.current, pending: stored(storage + ".save") });
+    setDraft({ ...form.current, pending: stored(storage + ".save"), applyCommand: stored(storage + ".apply") });
   }
   function update(patch) {
     form.current = { ...form.current, ...patch };
@@ -115,7 +115,7 @@ export function Gaps() {
     setPreview(null);setMessage("");update({index,pgn:""});
   }
   async function save(command) {
-    if (!await claimSave(command)) {
+    if (!await claimCommand("save", command)) {
       refreshJournal();
       setReload(n => n + 1);
       return;
@@ -126,7 +126,7 @@ export function Gaps() {
       receipt=await api("coverage/save",command,undefined,{requireJson:true});
     } catch(e) {
       if(e.code==="stale_gap") {
-        await clearSave(command);
+        await clearCommand("save", command);
         refreshJournal();
         setPreview(null);
         setReport(old=>({...old,stale:true}));
@@ -137,12 +137,32 @@ export function Gaps() {
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
     setReport(old=>({...old,stale:true}));
     setMessage("Continuation saved. Refreshing coverage…");
-    await clearSave(command);
+    await clearCommand("save", command);
     update({previous:report.authored});
     setPreview(null);
     await scan(report.scan,report.authored);
   }
-  const locked=busy || !!draft.pending;
+  async function applyOrder(pending) {
+    if (!await claimCommand("apply", pending)) {
+      refreshJournal();
+      return;
+    }
+    refreshJournal();
+    try {
+      const reply = await api("coverage/" + pending.report + "/apply", { command: pending.command });
+      if(reply?.command!==pending.command || reply.id!==pending.report)throw new Error("Retry applying the opening order.");
+      await clearCommand("apply", pending);
+      refreshJournal();
+      setMessage("Applied opening order for "+reply.cards+" reached cards. New cards use this order when Maia is selected in Settings.");
+    } catch(e) {
+      if (e.code === "stale_gap") {
+        await clearCommand("apply", pending);
+        refreshJournal();
+      }
+      throw e;
+    }
+  }
+  const locked=busy || !!draft.pending || !!draft.applyCommand;
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
   const currentPreview = preview && preview.draft.report === edit.report &&
     preview.draft.gap === edit.gap && preview.draft.pgn === edit.pgn ? preview : null;
@@ -155,12 +175,14 @@ export function Gaps() {
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
     {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
     {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{message && <p role="status">{message}</p>}
+    {draft.applyCommand && <button disabled={busy} onClick={() => run(() => applyOrder(draft.applyCommand))}>Retry applying order</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · Maia-2 Rapid 1500/1500</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {range(report.studied,report.unresolved)}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
       {(report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,draft.previous))}>Retry scan</button>}
+      <button disabled={locked||report.stale} onClick={()=>run(() => applyOrder({ report: report.id, command: crypto.randomUUID() }))}>Apply to opening order</button>
       {report.gaps.length>0 && <button disabled={locked||report.stale} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
