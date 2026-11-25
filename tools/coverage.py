@@ -1,4 +1,5 @@
 """Batch forecast. Input is an immutable Openings snapshot; no Tempo database access."""
+import contextlib
 import hashlib
 import heapq
 import itertools
@@ -110,4 +111,6 @@ def forecast(data, predict, limit=3000):
 if __name__ == "__main__":
     signal.alarm(300)
     root = pathlib.Path(sys.argv[1])
-    print(json.dumps(forecast(json.load(sys.stdin), maia(root)), allow_nan=False))
+    with contextlib.redirect_stdout(sys.stderr):
+        report = forecast(json.load(sys.stdin), maia(root))
+    print(json.dumps(report, allow_nan=False))
