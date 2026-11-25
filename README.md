@@ -94,6 +94,19 @@ database and its adjacent `.uploads` directory. Stop the service before
 copying both for a coordinated release or rollback. The `opening-rank-apply`
 and legacy opening import commands also require exclusive database ownership.
 
+## Archive conversion and recovery
+
+With the service stopped, run `tempo migrate-games DATABASE` on the existing
+Lean database before starting this release. The command acquires the service
+lock and converts archived routes to the versioned packed format in one
+transaction. It preserves game IDs, staged uploads, saved Study receipts and
+Learning. Keep the stopped database and adjacent `.uploads` directory together
+for recovery. The schema-6 executable belongs with its matching schema-6 backup.
+
+Reload active Study tabs during cutover. The current browser imports surviving
+predecessor pending Answers into its per-intent journal. An accepted Answer
+can be recovered independently of loading the next card.
+
 ## Provider turns and repertoire choices
 
 A provider job freezes its window inventory, stages each nonempty download

@@ -1,6 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api } from "./api.js";
+import {
+  answerIntent, answerPayload, importPredecessorAnswer, nextSavedAnswer, resolveAnswer, saveAnswer,
+} from "./answer-journal.js";
 import { ChessBoard, play } from "./board.jsx";
 import { moveCue } from "./sounds.js";
 
@@ -81,6 +84,22 @@ function useStudyCounts() {
   return [counts, invalidate];
 }
 
+// A typed terminal reply ends this exact intent. Transport failure keeps it pending.
+async function deliverAnswer(intent) {
+  let result;
+  try {
+    result = await api("study/answer", answerPayload(intent));
+    if (!["Good", "Again"].includes(result?.rating)) {
+      throw new Error("The Answer reply was incomplete. Retry.");
+    }
+  } catch (error) {
+    if (!["stale_dataset", "stale_attempt", "answer_conflict"].includes(error.code)) throw error;
+  }
+  // A failed journal cleanup can cause an exact replay. Acceptance stays authoritative.
+  void resolveAnswer(intent).catch(() => {});
+  return result;
+}
+
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
   const [counts, invalidateCounts] = useStudyCounts();
@@ -135,23 +154,15 @@ export function Study({ openGame, sounds }) {
   useEffect(() => {
     mounted.current = true;
     run(async () => {
-      const unresolved = localStorage.getItem("tempo.pending-answer.v2");
-      let replayAccepted = false;
-      if (unresolved) {
-        try {
-          await api("study/answer", JSON.parse(unresolved));
-          replayAccepted = true;
-          invalidateCounts.current?.();
-        }
-        catch (error) {
-          if (!["stale_dataset", "answer_conflict"].includes(error.code)) throw error;
-        }
-        localStorage.removeItem("tempo.pending-answer.v2");
+      await importPredecessorAnswer();
+      let intent;
+      while ((intent = await nextSavedAnswer(intent))) {
+        await deliverAnswer(intent);
       }
       const active = await api("study");
       setCard(active ?? await api("study/next", { after: null }));
       setLoaded(true);
-      if (!replayAccepted || !active) invalidateCounts.current?.();
+      invalidateCounts.current?.();
     });
     return () => { mounted.current = false; sounds.cancel(); };
   }, []);
@@ -204,13 +215,18 @@ export function Study({ openGame, sounds }) {
   }, []);
 
   function answer(played) {
-    const submission = { attempt: card.attempt, dataset: card.dataset, played };
+    const intent = answerIntent({ attempt: card.attempt, dataset: card.dataset, played });
     run(async () => {
+      await saveAnswer(intent);
       if (played) setSubmitted({ key: attemptKey, move: played });
-      localStorage.setItem("tempo.pending-answer.v2", JSON.stringify(submission));
-      const result = await api("study/answer", submission);
-      localStorage.removeItem("tempo.pending-answer.v2");
+      const result = await deliverAnswer(intent);
       if (!mounted.current) return;
+      if (!result) {
+        setSubmitted(null);
+        setCard(await api("study"));
+        invalidateCounts.current?.();
+        return;
+      }
       setCard((old) => ({ ...old, result }));
       invalidateCounts.current?.();
       if (result.display_move) {

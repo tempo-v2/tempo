@@ -21,6 +21,7 @@ pub struct Pgn {
     pub main: Route,
     pub variations: Vec<Route>,
     pub finished: bool,
+    pub terminal_outcome: Option<pgn_reader::Outcome>,
 }
 
 pub fn position(fen: &str) -> Result<Chess> {
@@ -54,12 +55,9 @@ pub fn uci(m: Move) -> String {
     UciMove::from_move(m, MODE).to_string()
 }
 
-pub fn answer_matches(fen: &str, accepted: &[String], played: Option<&str>) -> Result<bool> {
-    let Some(played) = played else {
-        return Ok(false);
-    };
-    let board = position(fen)?;
-    Ok(accepted.contains(&uci(parse_move(&board, played)?)))
+/// Both the issued answer set and the already validated submission use canonical UCI.
+pub fn answer_matches(accepted: &[String], played: Option<&str>) -> bool {
+    played.is_some_and(|played| accepted.iter().any(|answer| answer == played))
 }
 
 pub fn legal(board: &Chess) -> Vec<String> {
@@ -104,7 +102,7 @@ struct Movetext {
     current: Line,
     stack: Vec<Line>,
     variations: Vec<Route>,
-    finished: bool,
+    terminal_outcome: Option<pgn_reader::Outcome>,
     moves_read: usize,
 }
 
@@ -156,7 +154,7 @@ impl Visitor for Parser {
                 },
                 stack: vec![],
                 variations: vec![],
-                finished: false,
+                terminal_outcome: None,
                 moves_read: 0,
             }),
             Err(error) => ControlFlow::Break(Err(error)),
@@ -228,7 +226,7 @@ impl Visitor for Parser {
         outcome: pgn_reader::Outcome,
     ) -> ControlFlow<Self::Output> {
         if text.stack.is_empty() {
-            text.finished = !matches!(outcome, pgn_reader::Outcome::Unknown);
+            text.terminal_outcome = Some(outcome);
         }
         ControlFlow::Continue(())
     }
@@ -236,7 +234,9 @@ impl Visitor for Parser {
     fn end_game(&mut self, text: Movetext) -> Self::Output {
         ensure!(!text.current.moves.is_empty(), "PGN has no moves");
         ensure!(text.stack.is_empty(), "unclosed PGN variation");
-        let finished = text.finished
+        let finished = text
+            .terminal_outcome
+            .is_some_and(|outcome| !matches!(outcome, pgn_reader::Outcome::Unknown))
             || text
                 .tags
                 .get("Result")
@@ -249,6 +249,7 @@ impl Visitor for Parser {
             },
             variations: text.variations,
             finished,
+            terminal_outcome: text.terminal_outcome,
         })
     }
 }

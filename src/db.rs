@@ -2,6 +2,8 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
+const SCHEMA: i32 = 7;
+
 pub struct Database;
 
 impl Database {
@@ -28,32 +30,16 @@ impl Database {
 
     pub fn init(path: &Path) -> Result<Connection> {
         if path.exists() {
-            let mut db = Self::open(path)?;
-            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            tx.execute_batch(include_str!("opening_order.sql"))?;
-            let version =
-                tx.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?;
-            ensure!(version <= 6, "this Tempo database requires a newer release");
-            if version < 1 {
-                tx.execute_batch(include_str!("opening_policy.sql"))?;
-            }
-            if version < 2 {
-                tx.execute_batch(include_str!("game_pipeline.sql"))?;
-                crate::game_pipeline::recover_legacy(&tx)?;
-            }
-            if version < 3 {
-                tx.execute_batch(include_str!("prepared_queue.sql"))?;
-            }
-            if version < 4 {
-                tx.execute_batch(include_str!("job_turns.sql"))?;
-            }
-            if version < 5 {
-                tx.execute_batch(include_str!("operation_bounds.sql"))?;
-            }
-            if version < 6 {
-                tx.execute_batch(include_str!("job_admission.sql"))?;
-            }
-            tx.commit()?;
+            let db = Self::open(path)?;
+            let version = Self::version(&db)?;
+            ensure!(
+                version <= SCHEMA,
+                "this Tempo database requires a newer release"
+            );
+            ensure!(
+                version == SCHEMA,
+                "stop Tempo and run tempo migrate-games DATABASE before serving this database"
+            );
             return Ok(db);
         }
         let db = Connection::open(path)?;
@@ -67,12 +53,70 @@ impl Database {
         db.execute_batch(include_str!("job_turns.sql"))?;
         db.execute_batch(include_str!("operation_bounds.sql"))?;
         db.execute_batch(include_str!("job_admission.sql"))?;
+        crate::games::upgrade(&db)?;
+        db.execute_batch(include_str!("detectors.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],
         )?;
-        db.execute_batch("PRAGMA application_id=1414352946; COMMIT;")?;
+        db.execute_batch("PRAGMA application_id=1414352946; PRAGMA user_version=7; COMMIT;")?;
         Ok(db)
+    }
+
+    fn version(db: &Connection) -> Result<i32> {
+        Ok(db.pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// The caller holds the same exclusive file lock as the running service.
+    pub fn migrate_games(path: &Path) -> Result<()> {
+        let mut db = Self::open(path)?;
+        let version = Self::version(&db)?;
+        ensure!(
+            version <= SCHEMA,
+            "this Tempo database requires a newer release"
+        );
+        if version == SCHEMA {
+            return Ok(());
+        }
+        // Replace the referenced parent table without cascading child rows.
+        // Check the complete replacement before committing the upgrade.
+        db.pragma_update(None, "foreign_keys", false)?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(include_str!("opening_order.sql"))?;
+        if version < 1 {
+            tx.execute_batch(include_str!("opening_policy.sql"))?;
+        }
+        if version < 2 {
+            tx.execute_batch(include_str!("game_pipeline.sql"))?;
+            crate::game_pipeline::recover_legacy(&tx)?;
+        }
+        if version < 3 {
+            tx.execute_batch(include_str!("prepared_queue.sql"))?;
+        }
+        if version < 4 {
+            tx.execute_batch(include_str!("job_turns.sql"))?;
+        }
+        if version < 5 {
+            tx.execute_batch(include_str!("operation_bounds.sql"))?;
+        }
+        if version < 6 {
+            tx.execute_batch(include_str!("job_admission.sql"))?;
+        }
+        crate::games::upgrade(&tx)?;
+        tx.execute_batch(include_str!("detectors.sql"))?;
+        let valid: bool = tx.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            valid,
+            "foreign-key check failed after converting the archive"
+        );
+        tx.pragma_update(None, "user_version", SCHEMA)?;
+        tx.commit()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        Ok(())
     }
 
     fn configure(db: &Connection) -> Result<()> {

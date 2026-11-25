@@ -156,7 +156,7 @@ pub fn upload_record<R: std::io::Read + std::io::Seek>(
     input: R,
     offset: u64,
     user: &str,
-) -> Result<Option<(Option<games::Game>, u64)>> {
+) -> Result<Option<(Option<games::Candidate>, u64)>> {
     Ok(chess::pgn_record(input, offset)?.map(|(parsed, next)| {
         (
             parsed.and_then(|game| games::archive_game(game, user)).ok(),
@@ -222,7 +222,7 @@ mod tests {
             upload_record(std::io::Cursor::new(pgn), 0, "Learner")?.context("first record")?;
         let (second, end) = upload_record(std::io::Cursor::new(pgn), cursor, "Learner")?
             .context("second record")?;
-        assert_ne!(first.unwrap().id, second.unwrap().id);
+        assert_ne!(first.unwrap().game.mainline, second.unwrap().game.mainline);
         assert!(upload_record(std::io::Cursor::new(pgn), end, "Learner")?.is_none());
         Ok(())
     }

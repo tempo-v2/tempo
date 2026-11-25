@@ -2,6 +2,8 @@ use crate::{
     game_pipeline,
     job_store::{self, FailedTurn, JobReads},
     providers::{self, Provider},
+    scanner::{Detector, Observation},
+    uploads::Staging,
     writer::Writer,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -9,6 +11,7 @@ use chrono::Utc;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::Path,
     time::{Duration, Instant},
 };
@@ -65,7 +68,7 @@ pub fn valid_user(user: &str) -> Result<&str> {
     Ok(user)
 }
 
-pub fn worker(path: &Path, writer: Writer) -> Result<()> {
+pub fn worker(path: &Path, writer: Writer, staging: Staging) -> Result<()> {
     let db = JobReads::open(path)?;
     loop {
         match writer.background_until(Instant::now() + CLAIM_WAIT, job_store::recover_running) {
@@ -87,15 +90,24 @@ pub fn worker(path: &Path, writer: Writer) -> Result<()> {
         }) {
             Ok(Some(job)) => {
                 let deadline = Instant::now() + GAME_TURN;
-                failed = db
-                    .within_turn(deadline, || {
-                        run(path, &db, &writer, &client, &job, deadline)
-                    })
-                    .err()
-                    .map(|error| FailedTurn {
-                        job_id: job.id,
-                        message: error.to_string(),
-                    });
+                let result = db.within_turn(deadline, || {
+                    run(&db, &writer, &client, &staging, &job, deadline)
+                });
+                // Temporary staging pressure leaves the existing job at its
+                // committed checkpoint. Rotate so a cleanup never owns the runner.
+                let result = match result {
+                    Err(error) if error.is::<crate::uploads::Unavailable>() => {
+                        let turned =
+                            yield_turn(&writer, Instant::now() + CLAIM_WAIT, job.id, None, 0);
+                        std::thread::sleep(Duration::from_millis(100));
+                        turned
+                    }
+                    result => result,
+                };
+                failed = result.err().map(|error| FailedTurn {
+                    job_id: job.id,
+                    message: error.to_string(),
+                });
             }
             Ok(None) => {
                 failed = None;
@@ -109,49 +121,117 @@ pub fn worker(path: &Path, writer: Writer) -> Result<()> {
     }
 }
 
-fn scan_game(
+/// Each worker turn either seals one immutable game analysis or applies one
+/// batch from the exact sealed file. Repertoire edits cannot change a retry.
+fn detector_turn(
     db: &JobReads,
     writer: &Writer,
-    job: i64,
-    game: String,
-    cursor: Option<String>,
+    staging: &Staging,
+    job: &Job,
+    detector: Detector,
+    whole_archive: bool,
     deadline: Instant,
-) -> Result<()> {
-    let Some(found) = db.findings(job, &game, deadline)? else {
-        return yield_turn(writer, deadline, job, cursor, 0);
+) -> Result<bool> {
+    let id = job.id;
+    let (version, sealed) = db.detector_checkpoint(id)?;
+    let mut cursor = if whole_archive {
+        Some(ArchiveCursor::load(db, db.cursor(id)?.as_deref())?)
+    } else {
+        None
     };
-    let save = |mismatches: Vec<_>, captures: Vec<_>| {
-        let game = game.clone();
+    if let Some((game, file)) = sealed {
+        let (findings, after, finished) =
+            read_detector_batch(staging, &file, job.window_offset, deadline)?;
+        if let Some(cursor) = cursor.as_mut() {
+            cursor.after.clone_from(&game);
+        }
+        let batch = game_pipeline::DetectorBatch {
+            job: id,
+            detector,
+            version,
+            game,
+            file: Some(file),
+            before: job.window_offset,
+            after,
+            findings,
+            finished,
+            cursor: cursor
+                .map(|cursor| serde_json::to_string(&cursor))
+                .transpose()?,
+        };
         writer.background_until(deadline, move |db| {
-            game_pipeline::save_findings(db, job, &game, &mismatches, &captures)
-        })
+            game_pipeline::apply_detector(db, &batch)
+        })?;
+        if finished {
+            staging.released();
+        }
+        return Ok(true);
+    }
+    let game = match cursor.as_ref() {
+        Some(cursor) => db.archive_next(&cursor.after, cursor.through)?,
+        None => db.pending_game(id)?,
     };
-    let mut mismatches = found.mismatches.into_iter();
-    loop {
-        let batch: Vec<_> = mismatches.by_ref().take(120).collect();
-        if batch.is_empty() {
-            break;
+    let Some(game) = game else { return Ok(false) };
+    let bytes = db.detector_plan(&game, detector.program(version)?, deadline)?;
+    if bytes.is_empty() {
+        if let Some(cursor) = cursor.as_mut() {
+            cursor.after.clone_from(&game);
         }
-        save(batch, Vec::new())?;
+        let batch = game_pipeline::DetectorBatch {
+            job: id,
+            detector,
+            version,
+            game,
+            file: None,
+            before: job.window_offset,
+            after: 0,
+            findings: Vec::new(),
+            finished: true,
+            cursor: cursor
+                .map(|cursor| serde_json::to_string(&cursor))
+                .transpose()?,
+        };
+        writer.background_until(deadline, move |db| {
+            game_pipeline::apply_detector(db, &batch)
+        })?;
+        return Ok(true);
     }
-    let mut captures = found.captures.into_iter();
-    loop {
-        let batch: Vec<_> = captures.by_ref().take(120).collect();
-        if batch.is_empty() {
-            break;
-        }
-        save(Vec::new(), batch)?;
-    }
+    let staged = staging.worker(&bytes)?;
     writer.background_until(deadline, move |db| {
-        game_pipeline::finish_scan(db, job, &game, cursor.as_deref())
-    })
+        game_pipeline::seal_detector(db, id, &game, staged.id())
+    })?;
+    Ok(true)
+}
+
+fn read_detector_batch(
+    staging: &Staging,
+    file: &str,
+    offset: u64,
+    deadline: Instant,
+) -> Result<(Vec<Observation>, u64, bool)> {
+    let mut input = BufReader::new(staging.open(file, deadline)?);
+    input.seek(SeekFrom::Start(offset))?;
+    let mut findings = Vec::with_capacity(120);
+    let mut after = offset;
+    let mut line = Vec::new();
+    for _ in 0..120 {
+        line.clear();
+        let read = (&mut input).take(64 * 1024).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok((findings, after, true));
+        }
+        ensure!(line.last() == Some(&b'\n'), "invalid detector record");
+        findings.push(serde_json::from_slice(&line)?);
+        after += read as u64;
+    }
+    Ok((findings, after, input.fill_buf()?.is_empty()))
 }
 
 fn run(
-    path: &Path,
     db: &JobReads,
     writer: &Writer,
     client: &Client,
+    staging: &Staging,
     job: &Job,
     deadline: Instant,
 ) -> Result<()> {
@@ -172,18 +252,14 @@ fn run(
             let Some(upload) = upload else {
                 let pgn = db.inline_upload(id)?.context("PGN is missing")?;
                 ensure!(Instant::now() < deadline, "Games turn timed out.");
-                let mut staged = crate::uploads::stage(path, &pgn)?;
+                let staged = staging.manual(&pgn)?;
                 return writer.background_until(deadline, move |db| {
                     job_store::stage_inline_upload(db, id, staged.id())?;
-                    staged.commit();
                     Ok(())
                 });
             };
-            let record = providers::upload_record(
-                crate::uploads::open(path, &upload, deadline)?,
-                offset,
-                &job.username,
-            )?;
+            let record =
+                providers::upload_record(staging.open(&upload, deadline)?, offset, &job.username)?;
             let replay = job.replay_upload;
             match record {
                 Some((Some(game), next)) => {
@@ -207,22 +283,16 @@ fn run(
             }
         }
         ("archive", "scan") => {
-            let mut cursor = ArchiveCursor::load(db, db.cursor(id)?.as_deref())?;
-            if let Some(game) = db.archive_next(&cursor.after, cursor.through)? {
-                cursor.after.clone_from(&game);
-                return scan_game(
-                    db,
-                    writer,
-                    id,
-                    game,
-                    Some(serde_json::to_string(&cursor)?),
-                    deadline,
-                );
-            }
+            let cursor = ArchiveCursor::load(db, db.cursor(id)?.as_deref())?;
+            let saved = serde_json::to_string(&cursor)?;
+            return writer.background_until(deadline, move |db| {
+                game_pipeline::start_scan(db, id, &saved)
+            });
         }
-        ("archive", "scan_new") => {
-            if let Some(game) = db.pending_game(id)? {
-                return scan_game(db, writer, id, game, None, deadline);
+        ("archive", operation) if Detector::from_job(operation).is_some() => {
+            let (detector, whole_archive) = Detector::from_job(operation).unwrap();
+            if detector_turn(db, writer, staging, job, detector, whole_archive, deadline)? {
+                return Ok(());
             }
         }
         ("archive", "publish") => {
@@ -236,10 +306,10 @@ fn run(
         }
         (name, "all" | "new") => {
             return provider_turn(
-                path,
                 db,
                 writer,
                 client,
+                staging,
                 job,
                 Provider::named(name).context("unknown provider")?,
                 deadline,
@@ -252,8 +322,8 @@ fn run(
     writer.background_until(deadline, move |db| {
         job_store::complete(db, id, &provider, &username, None)
     })?;
-    if let Some(file) = upload_file {
-        crate::uploads::remove(path, &file);
+    if upload_file.is_some() {
+        staging.released();
     }
     Ok(())
 }
@@ -323,10 +393,10 @@ impl ProviderCursor {
 }
 
 fn provider_turn(
-    path: &Path,
     db: &JobReads,
     writer: &Writer,
     client: &Client,
+    staging: &Staging,
     job: &Job,
     provider: Provider,
     deadline: Instant,
@@ -335,7 +405,7 @@ fn provider_turn(
     let id = job.id;
     let upload = db.upload(id)?;
     if let Some(file) = &upload {
-        let input = crate::uploads::open(path, file, deadline)?;
+        let input = staging.open(file, deadline)?;
         match providers::upload_record(input, job.window_offset, &job.username)? {
             Some((Some(game), offset)) => {
                 writer.background_until(deadline, move |db| {
@@ -405,11 +475,10 @@ fn provider_turn(
         let pgn = Provider::download(client, window, deadline)?;
         if !pgn.trim().is_empty() {
             ensure!(Instant::now() < deadline, "Provider turn timed out.");
-            let mut staged = crate::uploads::stage(path, &pgn)?;
+            let staged = staging.worker(pgn.as_bytes())?;
             let saved = serde_json::to_string(&cursor)?;
             writer.background_until(deadline, move |db| {
                 job_store::checkpoint_provider_window(db, id, &saved, Some(staged.id()), 0)?;
-                staged.commit();
                 Ok(())
             })?;
             return Ok(());
@@ -420,8 +489,8 @@ fn provider_turn(
     writer.background_until(deadline, move |db| {
         job_store::checkpoint_provider_window(db, id, &saved, None, rejected)
     })?;
-    if let Some(file) = upload {
-        crate::uploads::remove(path, &file);
+    if upload.is_some() {
+        staging.released();
     }
     Ok(())
 }
