@@ -256,8 +256,24 @@ async function saveReplyAcrossViews(browser, remount) {
       scans++;
       await route.abort();
     });
+    let releasePreview;
     try {
       await openGaps(page, origin);
+      let observer;
+      if (remount) {
+        observer = await context.newPage();
+        await openGaps(observer, origin);
+        let previewStarted;
+        const previewReady = new Promise(resolve => { previewStarted = resolve; });
+        const heldPreview = new Promise(resolve => { releasePreview = resolve; });
+        await observer.route("**/api/coverage/preview", async route => {
+          previewStarted();
+          await heldPreview;
+          await route.abort();
+        });
+        await observer.getByRole("button", { name: "Preview", exact: true }).click();
+        await previewReady;
+      }
       await page.getByRole("button", {name:"Preview", exact:true}).click();
       await page.getByRole("button", {name:"Save to repertoire", exact:true}).click();
       await page.getByRole("alert").waitFor();
@@ -282,6 +298,15 @@ async function saveReplyAcrossViews(browser, remount) {
       await page.getByText("Continuation saved.", {exact:true}).waitFor({timeout:3000});
       assert.equal(await retry.count(), 0);
       assert.equal(await page.getByText("Working…", {exact:true}).count(), 0);
+      if (observer) {
+        await observer.getByText("Continuation saved.", { exact: true }).waitFor();
+        assert.equal(await observer.getByRole("button", {name:"Retry scan", exact:true}).isEnabled(), true);
+        const discarded = observer.waitForEvent("requestfailed", request => request.url().endsWith("/api/coverage/preview"));
+        releasePreview();
+        await discarded;
+        await observer.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        assert.equal(await observer.getByRole("alert").count(), 0);
+      }
       assert.equal(scans, 0);
       await page.getByRole("button", {name:"Retry scan", exact:true}).click({timeout:3000});
       await page.getByRole("alert").waitFor();
@@ -297,6 +322,7 @@ async function saveReplyAcrossViews(browser, remount) {
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
     } finally {
       deliver();
+      releasePreview?.();
       await context.close();
     }
   });

@@ -16,6 +16,16 @@ function restore() {
     applyAcknowledgement: stored(storage + ".applied"),
   };
 }
+function reportOf(draft) {
+  return draft.pending?.draft.report ?? draft.report;
+}
+
+function viewIdentity(draft) {
+  const report = reportOf(draft);
+  const accepted = draft.saveAcknowledgement?.report === report ? draft.saveAcknowledgement?.command : null;
+  return JSON.stringify([report, accepted]);
+}
+
 const journalChanged = storage + ".changed";
 const acknowledgementKey = kind => storage + (kind === "save" ? ".saved" : ".applied");
 
@@ -101,7 +111,6 @@ function ReplacementImpact({ impact }) {
 
 export function Gaps() {
   const [draft, setDraft] = useState(restore);
-  const form = useRef(stored(storage));
   const scanOwner = useRef(null);
   const mounted = useRef(false);
   useEffect(() => {
@@ -114,7 +123,7 @@ export function Gaps() {
     refreshJournal();
     return () => {
       mounted.current = false;
-      scanOwner.current?.abort();
+      scanOwner.current?.controller.abort();
       window.removeEventListener(journalChanged, refreshJournal);
       window.removeEventListener("storage", storageChanged);
     };
@@ -135,18 +144,16 @@ export function Gaps() {
   const [reload, setReload] = useState(0);
   function refreshJournal() {
     const current = restore();
-    form.current = current;
+    if (scanOwner.current && scanOwner.current.view !== viewIdentity(current)) {
+      scanOwner.current.controller.abort();
+    }
     setDraft(current);
   }
   function update(patch) {
     localStorage.setItem(storage, JSON.stringify({ ...stored(storage), ...patch }));
     refreshJournal();
   }
-  const requestedReport = draft.pending?.draft.report ?? draft.report;
-  function currentReport() {
-    const latest = restore();
-    return latest.pending?.draft.report ?? latest.report;
-  }
+  const requestedReport = reportOf(draft);
   const report = loadedReport?.id === requestedReport ? loadedReport : null;
   const pendingSave = draft.pending?.draft.report === report?.id ? draft.pending : null;
   const gapIndex = pendingSave?.draft.gap ?? draft.index;
@@ -173,7 +180,7 @@ export function Gaps() {
     if (!requestedReport || (requestedReport === report?.id && !reload)) return;
     const ctrl = new AbortController();
     api("coverage/" + requestedReport + "/gaps", undefined, ctrl.signal).then(result => {
-      if (!ctrl.signal.aborted && currentReport() === requestedReport) {
+      if (!ctrl.signal.aborted && reportOf(restore()) === requestedReport) {
         setReport(result);
       }
     }).catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
@@ -201,8 +208,8 @@ export function Gaps() {
     return () => controller.abort();
   }, [reportId, reload, summaryRetry]);
   const currentSummary = summary?.id === reportId ? summary : null;
-  async function run(fn, { command, report: workReport } = {}) {
-    const task = { command, report: workReport };
+  async function run(fn, { command } = {}) {
+    const task = command ? { command } : { view: viewIdentity(restore()) };
     running.current = task;
     setWork(task);
     setError("");
@@ -210,7 +217,7 @@ export function Gaps() {
     try {
       await fn();
     } catch (failure) {
-      if (running.current !== task || (workReport && currentReport() !== workReport)) return;
+      if (running.current !== task || (task.view && task.view !== viewIdentity(restore()))) return;
       if (command) setCommandFeedback({ command, error: failure.message });
       else setError(failure.message);
     } finally {
@@ -223,9 +230,9 @@ export function Gaps() {
   const book = draft.book ? books.find(b => b.id + "/" + b.color === draft.book) : books[0];
   async function scan(request, previous) {
     if (!mounted.current) return;
-    scanOwner.current?.abort();
+    scanOwner.current?.controller.abort();
     const controller = new AbortController();
-    scanOwner.current = controller;
+    scanOwner.current = { controller, view: viewIdentity(restore()) };
     const signal = controller.signal;
     const scanDraft = localStorage.getItem(storage);
     const acceptedSave = localStorage.getItem(acknowledgementKey("save"));
@@ -337,8 +344,7 @@ export function Gaps() {
     }
   }
   const isPending = command => command === draft.pending?.command || command === draft.applyCommand?.command;
-  const busy = !!work && (!work.command || isPending(work.command)) &&
-    (!work.report || work.report === requestedReport);
+  const busy = !!work && (work.command ? isPending(work.command) : work.view === viewIdentity(draft));
   const locked = busy || !!draft.pending || !!draft.applyCommand;
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
   const replacements = draft.replacements ?? noReplacements;
@@ -350,9 +356,11 @@ export function Gaps() {
     setConfirmation(null);
   }
   function isCurrent(candidate, choices) {
-    return mounted.current && form.current?.report === candidate.report && form.current?.index === candidate.gap &&
-      form.current?.pgn === candidate.pgn &&
-      JSON.stringify(form.current?.replacements ?? noReplacements) === JSON.stringify(choices);
+    const latest = restore();
+    return mounted.current && latest.report === candidate.report && latest.index === candidate.gap &&
+      latest.pgn === candidate.pgn && latest.saveAcknowledgement?.report !== candidate.report &&
+      latest.savedReport !== candidate.report &&
+      JSON.stringify(latest.replacements ?? noReplacements) === JSON.stringify(choices);
   }
   async function previewDraft(candidate, choices) {
     clearPreview();
@@ -386,13 +394,14 @@ export function Gaps() {
   function showMoreGaps() {
     const { id, gaps } = report;
     const offset = gaps.length;
+    const view = viewIdentity(restore());
     return run(async () => {
       const page = await api("coverage/" + id + "/gaps?offset=" + offset);
-      if (!mounted.current || currentReport() !== id || page.id !== id) return;
+      if (!mounted.current || viewIdentity(restore()) !== view || page.id !== id) return;
       setReport(current => current?.id === id && current.gaps.length === offset
         ? { ...page, gaps: [...current.gaps, ...page.gaps] }
         : current);
-    }, { report: id });
+    });
   }
   const currentPreview = preview && isCurrent(preview.draft, preview.choices) ? preview : null;
   const conflicts = currentPreview?.conflicts ?? [];
