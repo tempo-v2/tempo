@@ -72,20 +72,29 @@ impl Occurrence {
                 .ok()
                 .map(|time| time.format("%H:%M:%S").to_string())
         });
-        let round = pgn.tags.get("Round").and_then(|round| {
-            let components = round
-                .trim()
+        let round = pgn.tags.get("Round").and_then(|value| {
+            let name = value.split_whitespace().collect::<Vec<_>>().join(" ");
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "" | "?" | "-" | "*" | "n/a" | "unknown"
+            ) {
+                return None;
+            }
+            if name
                 .split('.')
-                .map(str::parse::<u32>)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .ok()?;
-            Some(
-                components
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join("."),
-            )
+                .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+            {
+                return Some(
+                    name.split('.')
+                        .map(|part| {
+                            let number = part.trim_start_matches('0');
+                            if number.is_empty() { "0" } else { number }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
+            }
+            Some(name.to_ascii_lowercase())
         });
         Self([utc, utc_time, date("Date"), round])
     }
@@ -546,6 +555,20 @@ mod tests {
         assert_eq!(summarize([read(&db, &first)?, read(&db, &second)?]), (4, 1));
         assert!(intake("", "*").is_err());
         assert!(intake("[Result \"1-0\"]\n", "0-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn named_rounds_distinguish_otherwise_identical_games() -> Result<()> {
+        let db = archive_store()?;
+        let semifinal = intake("[Round \" Semifinal \"]\n", "1-0")?;
+        let spelling = intake("[Round \"SEMIFINAL\"]\n", "1-0")?;
+        let final_round = intake("[Round \"Final\"]\n", "1-0")?;
+        let unknown = intake("[Round \"?\"]\n", "1-0")?;
+        let first = id(accept_game(&db, &semifinal)?);
+        assert_eq!(id(accept_game(&db, &spelling)?), first);
+        assert_ne!(id(accept_game(&db, &final_round)?), first);
+        assert_eq!(id(accept_game(&db, &unknown)?), first);
         Ok(())
     }
 

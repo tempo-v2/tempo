@@ -248,6 +248,63 @@ async function titleInvariance(browser, root) {
   }
   console.log("Mounted Study: original, renamed and blank titles preserved exact Good/Again commands, receipt, relative schedule and continuation.");
 }
+async function mixedTabs(browser, db) {
+  const port = await unusedPort();
+  const context = await browser.newContext();
+  const old = await context.newPage();
+  const current = await context.newPage();
+  const accepted = Promise.withResolvers();
+  const releaseOld = Promise.withResolvers();
+  const submitted = Promise.withResolvers();
+  const dropCurrent = Promise.withResolvers();
+  try {
+    await serve(predecessor, db, port, async (origin, api) => {
+      await seed(api);
+      await old.route(answerPattern, async route => {
+        const response = await route.fetch();
+        assert.equal(response.status(), 200);
+        accepted.resolve(route.request().postDataJSON());
+        await releaseOld.promise;
+        await route.fulfill({ response });
+      });
+      await old.goto(origin);
+      await reveal(old).click();
+      await accepted.promise;
+    });
+    const previous = await accepted.promise;
+    execFileSync(candidate, ["migrate-games", db]);
+    await serve(candidate, db, port, async (origin) => {
+      await current.goto(origin);
+      await current.reload();
+      assert.match(await current.locator("script[type=module]").getAttribute("src"), /\?v=/);
+      await next(current).click();
+      await current.route(answerPattern, async route => {
+        submitted.resolve(route.request().postDataJSON());
+        await dropCurrent.promise;
+        await route.abort();
+      });
+      await reveal(current).click();
+      const later = await submitted.promise;
+      assert.notEqual(later.attempt, previous.attempt);
+      releaseOld.resolve();
+      await next(old).waitFor();
+      assert.equal(await old.evaluate(() => localStorage.getItem("tempo.pending-answer.v2")), null);
+      dropCurrent.resolve();
+      await retry(current).waitFor();
+      await current.unroute(answerPattern);
+      const replay = current.waitForRequest(request => request.url().endsWith("/api/study/answer"));
+      await current.reload();
+      assert.deepEqual((await replay).postDataJSON(), later);
+      await next(current).waitFor();
+      assert.equal(grades(db), 2);
+    });
+  } finally {
+    releaseOld.resolve();
+    dropCurrent.resolve();
+    await context.close();
+  }
+  console.log("A still-loaded schema-6 tab cleared its legacy scalar after cutover while the new tab retained and replayed its newer Answer.");
+}
 
 (async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tempo-answer-ir-"));
@@ -259,6 +316,7 @@ async function titleInvariance(browser, root) {
     await predecessorRecovery(browser, path.join(root, "accepted.db"), true);
     await predecessorRecovery(browser, path.join(root, "undelivered.db"), false);
     await twoTabs(browser, path.join(root, "concurrent.db"));
+    await mixedTabs(browser, path.join(root, "mixed.db"));
     console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, incomplete reply replay, and Next-only retry passed.");
   } finally {
     if (browser) await browser.close();

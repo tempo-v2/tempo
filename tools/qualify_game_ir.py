@@ -145,6 +145,13 @@ def verify_games(binary, database):
                 assert sql(database, "SELECT status,added FROM jobs WHERE id=?", [new_scan]) == [("done", 2)]
                 assert sql(database, "SELECT count(*) FROM mismatches") == [(4,)]
                 assert len(api("tactics")) == 2
+                for stage, expected in [("Semifinal", (1, 0)), ("SEMIFINAL", (0, 1)),
+                                        ("Final", (1, 0)), ("?", (0, 1))]:
+                    pgn_text = pgn(f'[Round "{stage}"]\n').replace("Opponent", "NamedRounds")
+                    added = wait_until(lambda: api("games/uploads", {"username": "Learner", "pgn": pgn_text}))["id"]
+                    wait_until(settle)
+                    assert sql(database, "SELECT added,existing FROM jobs WHERE id=?", [added]) == [expected]
+                assert sql(database, "SELECT count(*) FROM games WHERE black='NamedRounds'") == [(2,)]
                 wait_until(lambda: not list(database.with_suffix(".uploads").iterdir()))
         finally:
             feed.shutdown()
