@@ -198,7 +198,9 @@ export function Gaps() {
         <button disabled={locked||report.stale||!edit.pgn} onClick={()=>run(async()=>setPreview({ ...await api("coverage/preview",edit), draft: edit }))}>Preview</button>
         {currentPreview && <><ul>{currentPreview.responses.map(r=><li key={r.position}>{r.move} · {r.status}</li>)}</ul>
           {currentPreview.requires_offline ? <>
-            <p>This continuation exceeds the online save limit. Download the previewed continuation for offline import.</p>
+            <p>{currentPreview.validation_deferred
+              ? "This PGN has too many expanded variations to preview online. The offline import will validate it before saving."
+              : "This continuation exceeds the online save limit. Download the previewed continuation for offline import."}</p>
             <button disabled={locked || report.stale || currentPreview.responses.some(r => r.status === "conflict")}
               onClick={() => downloadGap({ draft: currentPreview.draft, command: currentPreview.command })}>Download gap for offline import</button>
           </> : <button disabled={locked || report.stale || currentPreview.responses.some(r => r.status === "conflict")}

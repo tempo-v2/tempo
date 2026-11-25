@@ -34,7 +34,7 @@ struct Edit {
     preview: Value,
 }
 
-fn build(c: &Connection, draft: Draft) -> Result<Edit> {
+fn build(c: &Connection, draft: Draft, online: bool) -> Result<Edit> {
     ensure!(
         draft.pgn.len() <= 128 * 1024,
         "Paste one PGN up to 128 KiB."
@@ -42,9 +42,23 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
     let command = chess::id(&["gap-save-v1", &serde_json::to_string(&draft)?]);
     let (scan, revision, gap) = coverage::selected(c, &draft.report, draft.gap)?;
     let target = chess::position_id(&chess::position(&gap.fen)?);
-    let game = chess::parse_pgn(&draft.pgn, true, 1)?
-        .pop()
-        .context("Paste a PGN")??;
+    let game = match chess::parse_gap_pgn(&draft.pgn, online) {
+        Ok(game) => game,
+        Err(error) if error.is::<chess::ExpandedPgn>() => {
+            return Ok(Edit {
+                repertoire: scan.repertoire,
+                revision,
+                command: command.clone(),
+                plans: vec![],
+                requires_offline: true,
+                preview: json!({
+                    "command":command, "responses":[], "requires_offline":true,
+                    "validation_deferred":true
+                }),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let mut plans = vec![];
     let mut included = HashSet::new();
     let mut responses = BTreeMap::new();
@@ -115,7 +129,7 @@ async fn prepare_edit(app: &App, draft: Draft) -> Result<Edit, ApiError> {
         move || {
             let mut c = Database::read(&path)?;
             let tx = c.transaction()?;
-            build(&tx, draft)
+            build(&tx, draft, true)
         },
     )
     .await
@@ -173,7 +187,7 @@ pub fn import(c: &mut Connection, input: Save) -> Result<Value> {
     if let Some(prior) = receipt(c, &identity)? {
         return Ok(prior);
     }
-    let edit = build(c, input.draft)?;
+    let edit = build(c, input.draft, false)?;
     commit(c, edit, false)
 }
 

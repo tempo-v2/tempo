@@ -95,6 +95,8 @@ For an oversized continuation in Openings → Gaps, preview the PGN and choose
 Use the same database and rescan if the repertoire has changed since the
 original report. The command imports matching branches together, enforces the
 same conflict rules as online Save, and replays the saved receipt on retry.
+For PGNs whose expanded variations exceed the preview limit, the offline
+import performs the full validation before writing.
 Restart Tempo and rescan to see the new coverage.
 
 A service backup that must resume queued PGN uploads includes the SQLite
