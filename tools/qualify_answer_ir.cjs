@@ -63,6 +63,127 @@ function grades(db) {
     "SELECT count(*) FROM attempts WHERE result IS NOT NULL"], { encoding: "utf8" }));
 }
 
+async function studyDrop(browser, db, { fen, solution, from, to, piece, promotion, correction, retryLost }) {
+  await serve(candidate, db, await unusedPort(), async (origin, api) => {
+    await api("tactics", { name: "Study drop", pgn: `[SetUp "1"]\n[FEN "${fen}"]\n\n1. ${solution} *` });
+    const page = await browser.newPage();
+    const answerHeld = Promise.withResolvers();
+    const releaseAnswer = Promise.withResolvers();
+    const commands = [];
+    page.on("request", request => {
+      if (request.url().endsWith("/api/study/answer")) commands.push(request.postDataJSON());
+    });
+    try {
+      await page.route(answerPattern, async route => {
+        const response = await route.fetch();
+        answerHeld.resolve(response.status());
+        await releaseAnswer.promise;
+        if (retryLost) await route.abort();
+        else await route.fulfill({ response });
+      }, { times: 1 });
+      await page.goto(origin);
+      await reveal(page).waitFor();
+      await page.waitForFunction(() => !document.querySelector("cg-board piece.anim, cg-board piece.fading"));
+      const board = await page.locator("cg-board").boundingBox();
+      function center(square) {
+        return {
+          x: board.x + (square.charCodeAt(0) - 97 + 0.5) * board.width / 8,
+          y: board.y + (8 - Number(square[1]) + 0.5) * board.height / 8,
+        };
+      }
+      async function drag(start, end) {
+        const a = center(start), b = center(end);
+        await page.mouse.move(a.x, a.y);
+        await page.mouse.down();
+        await page.mouse.move(b.x, b.y, { steps: 12 });
+        await page.mouse.up();
+      }
+      await page.evaluate(({ from, to }) => {
+        window.dropFrame = () => [...document.querySelectorAll("cg-board piece")]
+          .filter(node => node.cgKey === from || node.cgKey === to)
+          .map(node => [node.cgKey, node.cgPiece, node.style.transform]);
+        window.dropFrames = [];
+        window.recordDrop = () => {
+          window.dropFrames.push(window.dropFrame());
+          requestAnimationFrame(window.recordDrop);
+        };
+        // Delay Study seeing the real IndexedDB commit before it can send Answer.
+        const transaction = IDBDatabase.prototype.transaction;
+        const complete = Object.getOwnPropertyDescriptor(IDBTransaction.prototype, "oncomplete");
+        IDBDatabase.prototype.transaction = function (...args) {
+          const tx = transaction.apply(this, args);
+          if (this.name === "tempo-study-answer-journal" && args[1] === "readwrite") {
+            IDBDatabase.prototype.transaction = transaction;
+            Object.defineProperty(tx, "oncomplete", {
+              set(handler) {
+                complete.set.call(tx, event => {
+                  window.releaseDropJournal = () => handler.call(tx, event);
+                });
+              },
+            });
+          }
+          return tx;
+        };
+      }, { from, to });
+      const before = await page.evaluate(() => window.dropFrame());
+      await drag(from, "h4");
+      await page.waitForFunction(before => JSON.stringify(window.dropFrame()) === JSON.stringify(before), before);
+      assert.deepEqual(commands, []);
+
+      await page.evaluate(() => document.addEventListener("mouseup", () => {
+        requestAnimationFrame(window.recordDrop);
+      }, { once: true }));
+      await drag(from, to);
+      if (promotion) {
+        const queen = page.getByRole("button", { name: "Queen", exact: true });
+        await queen.waitFor();
+        assert.deepEqual((await page.evaluate(() => window.dropFrame())).map(row => row.slice(0, 2)), [[to, "white pawn"]]);
+        await queen.click();
+      }
+      await page.waitForFunction(() => typeof window.releaseDropJournal === "function");
+      assert.deepEqual(commands, [], "Answer was sent before the journal completed");
+      await page.waitForFunction(() => window.dropFrames.length >= 2);
+      const landed = await page.evaluate(() => window.dropFrame());
+      assert.deepEqual(landed.map(row => row.slice(0, 2)), [[to, `white ${piece}`]], "drop reverted while saving Answer");
+      function assertLanded(frames) {
+        for (const frame of frames) {
+          const expected = promotion && frame[0]?.[1] === "white pawn"
+            ? [[to, "white pawn", landed[0][2]]] : landed;
+          assert.deepEqual(frame, expected, "the dropped piece moved again");
+        }
+      }
+
+      await page.evaluate(() => window.releaseDropJournal());
+      assert.equal(await answerHeld.promise, 200);
+      assert.deepEqual(await page.evaluate(() => window.dropFrame()), landed);
+      assert.equal(commands[0].played, from + to + (promotion ? "q" : ""));
+      assert.equal(grades(db), 1);
+      if (correction) assertLanded(await page.evaluate(() => window.dropFrames));
+      releaseAnswer.resolve();
+      if (retryLost) {
+        await retry(page).waitFor();
+        assert.deepEqual(await page.evaluate(() => window.dropFrame()), landed);
+        await retry(page).click();
+      }
+      await page.getByRole("status").getByText(correction ? "Again" : "Good", { exact: true }).waitFor();
+      if (correction) {
+        await page.waitForFunction(square => [...document.querySelectorAll("cg-board piece")]
+          .some(node => node.cgKey === square && node.cgPiece === "white rook"), correction);
+        const frames = await page.evaluate(() => window.dropFrames);
+        assert.ok(!frames.some(frame => frame.some(([square, role]) => square === from && role === "white rook")));
+      } else {
+        assertLanded(await page.evaluate(() => [...window.dropFrames, window.dropFrame()]));
+        assert.deepEqual(await page.evaluate(() => window.dropFrame()), landed);
+      }
+      assert.deepEqual(commands, retryLost ? [commands[0], commands[0]] : [commands[0]]);
+      assert.equal(grades(db), 1);
+    } finally {
+      releaseAnswer.resolve();
+      await page.context().close();
+    }
+  });
+}
+
 function pendingAnswers() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open("tempo-study-answer-journal", 1);
@@ -700,6 +821,16 @@ async function openingPreview(browser, db) {
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true, timeout: 15000 });
+    const rookFen = "4k3/n7/8/8/8/8/8/R3K3 w - - 0 1";
+    for (const [name, move] of Object.entries({
+      capture: { fen: rookFen, solution: "Rxa7", from: "a1", to: "a7", piece: "rook", retryLost: true },
+      quiet: { fen: rookFen, solution: "Ra2", from: "a1", to: "a2", piece: "rook" },
+      correction: { fen: rookFen, solution: "Rxa7", from: "a1", to: "a2", piece: "rook", correction: "a7" },
+      promotion: { fen: "r3k3/1P6/8/8/8/8/8/4K3 w - - 0 1", solution: "bxa8=Q+", from: "b7", to: "a8", piece: "queen", promotion: true },
+    })) {
+      await studyDrop(browser, path.join(root, `drop-${name}.db`), move);
+    }
+    console.log("Study drops stayed in place through journal, response and exact Answer retry. Quiet, illegal, correction and promotion paths passed.");
     await titleInvariance(browser, root);
     await incompleteReply(browser, path.join(root, "truncated.db"));
     await unplayableAnswerReply(browser, path.join(root, "unplayable-answer.db"));
