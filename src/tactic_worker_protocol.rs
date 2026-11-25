@@ -12,6 +12,10 @@ pub fn socket_path(database: &Path) -> PathBuf {
     database.with_extension("tq").join("io")
 }
 
+pub fn status_path(database: &Path) -> PathBuf {
+    socket_path(database).with_file_name("status")
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Work {
     pub game: String,

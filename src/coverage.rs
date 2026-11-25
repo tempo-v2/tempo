@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
@@ -26,7 +26,7 @@ pub struct Scan {
     through: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Gap {
     pub fen: String,
     moves: Vec<String>,
@@ -74,6 +74,107 @@ impl std::fmt::Display for SupersededModel {
     }
 }
 impl std::error::Error for SupersededModel {}
+
+const PAGE_SIZE: usize = 30;
+const MAX_NODES: usize = 3000;
+const MAX_PATH: usize = 100;
+
+struct Projection {
+    header: String,
+    studied: String,
+    pages: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StudyInput {
+    cards: Vec<String>,
+    paths: Vec<(Vec<usize>, f64)>,
+}
+
+impl Projection {
+    fn prepare(forecast: &Forecast) -> Result<Self> {
+        ensure!(
+            forecast.gaps.len() <= MAX_NODES && forecast.paths.len() <= MAX_NODES,
+            "Coverage forecast exceeds its node budget"
+        );
+        let mut ids = HashMap::new();
+        let mut cards = Vec::new();
+        let mut paths = Vec::new();
+        let mut authored = 0.0;
+        for (path, mass) in &forecast.paths {
+            ensure!(
+                path.len() <= MAX_PATH,
+                "Coverage path exceeds its move budget"
+            );
+            authored += mass;
+            let path = path
+                .iter()
+                .map(|card| {
+                    *ids.entry(card).or_insert_with(|| {
+                        let index = cards.len();
+                        cards.push(card.to_owned());
+                        index
+                    })
+                })
+                .collect();
+            paths.push((path, *mass));
+        }
+        ensure!(
+            cards.len() <= MAX_NODES,
+            "Coverage forecast exceeds its card budget"
+        );
+        let studied = serde_json::to_string(&StudyInput { cards, paths })?;
+        ensure!(
+            studied.len() <= 2 * 1024 * 1024,
+            "Coverage summary exceeds its byte budget"
+        );
+        let header = serde_json::to_string(&json!({
+            "model": forecast.model.label(), "model_superseded": forecast.model != ForecastModel::Maia3,
+            "authored": authored, "ended": forecast.ended, "conflict": forecast.conflict,
+            "unresolved": forecast.unresolved, "total": forecast.gaps.len()
+        }))?;
+        let pages = forecast
+            .gaps
+            .chunks(PAGE_SIZE)
+            .map(|page| {
+                let encoded = serde_json::to_string(page)?;
+                ensure!(
+                    encoded.len() <= 256 * 1024,
+                    "Coverage page exceeds its byte budget"
+                );
+                Ok(encoded)
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            header,
+            studied,
+            pages,
+        })
+    }
+
+    fn insert(&self, db: &Connection, id: &str) -> Result<()> {
+        db.execute(
+            "INSERT INTO coverage_view VALUES(?1,?2,?3)",
+            (id, &self.header, &self.studied),
+        )?;
+        let mut insert = db.prepare_cached("INSERT INTO coverage_gap_page VALUES(?1,?2,?3)")?;
+        for (page, gaps) in self.pages.iter().enumerate() {
+            insert.execute((id, page, gaps))?;
+        }
+        Ok(())
+    }
+}
+
+pub fn backfill_views(db: &Connection) -> Result<()> {
+    let mut query = db.prepare("SELECT id,report FROM coverage_report")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let forecast = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        Projection::prepare(&forecast)?.insert(db, &id)?;
+    }
+    Ok(())
+}
 
 pub fn revision(c: &Connection, rep: &str) -> Result<i64> {
     Ok(c.query_row(
@@ -173,7 +274,11 @@ pub async fn start(State(app): State<App>, Json(mut scan): Json<Scan>) -> ApiRes
         let report = if cached {
             None
         } else {
-            Some(serde_json::to_string(&evaluate(input)?)?)
+            let forecast = evaluate(input)?;
+            Some((
+                serde_json::to_string(&forecast)?,
+                Projection::prepare(&forecast)?,
+            ))
         };
         Ok((id, rev, report, scan))
     })
@@ -181,12 +286,14 @@ pub async fn start(State(app): State<App>, Json(mut scan): Json<Scan>) -> ApiRes
     .map_err(|e| ApiError(e.into()))?
     .map_err(ApiError)?;
     write_db(app, move |c| {
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
-            revision(c, &scan.repertoire)? == rev,
+            revision(&tx, &scan.repertoire)? == rev,
             "The repertoire changed. Retry scan."
         );
-        if let Some(report) = report {
-            c.execute(
+        if let Some((report, projection)) = &report {
+            let before = tx.total_changes();
+            if tx.execute(
                 "INSERT OR IGNORE INTO coverage_report VALUES(?1,?2,?3,?4,?5)",
                 (
                     &id,
@@ -195,8 +302,16 @@ pub async fn start(State(app): State<App>, Json(mut scan): Json<Scan>) -> ApiRes
                     serde_json::to_string(&scan)?,
                     report,
                 ),
-            )?;
+            )? != 0
+            {
+                projection.insert(&tx, &id)?;
+            }
+            ensure!(
+                tx.total_changes() - before <= 128,
+                "Coverage publication exceeds row budget"
+            );
         }
+        tx.commit()?;
         Ok(json!({"id":id}))
     })
     .await
@@ -207,6 +322,87 @@ pub struct Page {
     #[serde(default)]
     offset: usize,
 }
+fn scan_metadata(db: &Connection, id: &str) -> Result<(Scan, i64)> {
+    let (request, rev): (String, i64) = db
+        .query_row(
+            "SELECT request,revision FROM coverage_report WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .context("Run the coverage scan again.")?;
+    Ok((serde_json::from_str(&request)?, rev))
+}
+
+fn gap_chunk(db: &Connection, id: &str, page: usize) -> Result<Vec<Gap>> {
+    let encoded: Option<String> = db
+        .query_row(
+            "SELECT gaps FROM coverage_gap_page WHERE report_id=?1 AND page=?2",
+            (id, page),
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(encoded
+        .map(|json| serde_json::from_str(&json))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn page_view(db: &Connection, id: &str, offset: usize) -> Result<Value> {
+    let (scan, rev) = scan_metadata(db, id)?;
+    let encoded: String = db.query_row(
+        "SELECT header FROM coverage_view WHERE report_id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    let mut header: Value = serde_json::from_str(&encoded)?;
+    let total = header["total"]
+        .as_u64()
+        .context("Missing coverage gap count")? as usize;
+    let mut gaps = Vec::new();
+    if offset < total {
+        gaps.extend(
+            gap_chunk(db, id, offset / PAGE_SIZE)?
+                .into_iter()
+                .skip(offset % PAGE_SIZE),
+        );
+        if gaps.len() < PAGE_SIZE && offset + gaps.len() < total {
+            gaps.extend(
+                gap_chunk(db, id, offset / PAGE_SIZE + 1)?
+                    .into_iter()
+                    .take(PAGE_SIZE - gaps.len()),
+            );
+        }
+    }
+    header["stale"] = json!(revision(db, &scan.repertoire)? != rev);
+    header["id"] = json!(id);
+    header["scan"] = serde_json::to_value(scan)?;
+    header["gaps"] = serde_json::to_value(gaps)?;
+    Ok(header)
+}
+
+fn studied_coverage(db: &Connection, id: &str) -> Result<f64> {
+    let encoded: String = db.query_row(
+        "SELECT studied_input FROM coverage_view WHERE report_id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    let StudyInput { cards, paths } = serde_json::from_str(&encoded)?;
+    let mut seen = vec![false; cards.len()];
+    let mut query = db.prepare_cached(
+        "SELECT j.key FROM json_each(?1) j CROSS JOIN learning l WHERE l.card_id=j.value",
+    )?;
+    let mut rows = query.query([serde_json::to_string(&cards)?])?;
+    while let Some(row) = rows.next()? {
+        seen[row.get::<_, usize>(0)?] = true;
+    }
+    Ok(paths
+        .into_iter()
+        .filter(|(path, _)| path.iter().all(|&card| seen[card]))
+        .map(|(_, mass)| mass)
+        .sum())
+}
+
 pub async fn read(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -214,53 +410,39 @@ pub async fn read(
 ) -> ViewResult {
     optional_view(app, optional_read::Reader::Coverage, move |c| {
         let tx = c.transaction()?;
-        let (scan, rev, forecast) = load(&tx, &id)?;
-        let mut seen = HashSet::new();
-        let mut query =
-            tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM learning WHERE card_id=?1)")?;
-        for card in forecast
-            .paths
-            .iter()
-            .flat_map(|(path, _)| path)
-            .collect::<HashSet<_>>()
-        {
-            if query.query_row([card], |r| r.get::<_, bool>(0))? {
-                seen.insert(card);
-            }
-        }
-        let mut authored = 0.0;
-        let mut studied = 0.0;
-        for (path, mass) in &forecast.paths {
-            authored += mass;
-            if path.iter().all(|card| seen.contains(card)) {
-                studied += mass;
-            }
-        }
-        let total = forecast.gaps.len();
-        let gaps: Vec<_> = forecast
-            .gaps
-            .into_iter()
-            .skip(page.offset)
-            .take(30)
-            .collect();
-        Ok(json!({
-            "id":id, "stale":revision(&tx,&scan.repertoire)?!=rev, "scan":scan,
-            "model":forecast.model.label(), "model_superseded":forecast.model != ForecastModel::Maia3,
-            "authored":authored, "studied":studied, "ended":forecast.ended,
-            "conflict":forecast.conflict, "unresolved":forecast.unresolved,
-            "gaps":gaps, "total":total
-        }))
+        let mut view = page_view(&tx, &id, page.offset)?;
+        view["studied"] = json!(studied_coverage(&tx, &id)?);
+        Ok(view)
+    })
+    .await
+}
+
+pub async fn gaps(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    axum::extract::Query(page): axum::extract::Query<Page>,
+) -> ViewResult {
+    optional_view(app, optional_read::Reader::CoverageGaps, move |c| {
+        let tx = c.transaction()?;
+        page_view(&tx, &id, page.offset)
+    })
+    .await
+}
+
+pub async fn studied(State(app): State<App>, Path(id): Path<String>) -> ViewResult {
+    optional_view(app, optional_read::Reader::CoverageStudied, move |c| {
+        let tx = c.transaction()?;
+        Ok(json!({"id":id,"studied":studied_coverage(&tx, &id)?}))
     })
     .await
 }
 
 pub fn selected(c: &Connection, id: &str, index: usize) -> Result<(Scan, i64, Gap)> {
-    let (scan, rev, forecast) = load(c, id)?;
-    let gap = forecast
-        .gaps
+    let (scan, rev) = scan_metadata(c, id)?;
+    let gap = gap_chunk(c, id, index / PAGE_SIZE)?
         .into_iter()
-        .nth(index)
-        .context("Unknown gap")?;
+        .nth(index % PAGE_SIZE)
+        .context("Unknown coverage gap")?;
     Ok((scan, rev, gap))
 }
 
@@ -268,6 +450,7 @@ pub fn selected(c: &Connection, id: &str, index: usize) -> Result<(Scan, i64, Ga
 pub struct Apply {
     command: String,
 }
+
 pub async fn apply(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -336,6 +519,87 @@ mod tests {
     use super::*;
     use axum::{body::to_bytes, response::IntoResponse};
 
+    #[test]
+    fn coverage_pages_do_not_read_learning_or_forecast_and_summary_is_current() -> Result<()> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let directory = tempfile::tempdir()?;
+        let db = Database::init(&directory.path().join("views.sqlite"))?;
+        let scan = Scan {
+            repertoire: "fixture".into(),
+            color: "white".into(),
+            through: 10,
+            route: chess::Route {
+                fen: "fixture".into(),
+                moves: vec![],
+            },
+        };
+        let forecast = Forecast {
+            model: ForecastModel::Maia3,
+            gaps: (0..65)
+                .map(|index| Gap {
+                    fen: index.to_string(),
+                    moves: vec![],
+                    probability: 0.01,
+                })
+                .collect(),
+            reach: HashMap::new(),
+            paths: vec![
+                (vec!["first".into()], 0.25),
+                (vec!["first".into(), "second".into()], 0.5),
+            ],
+            ended: 0.0,
+            conflict: 0.0,
+            unresolved: 0.25,
+        };
+        db.execute(
+            "INSERT INTO coverage_report VALUES('fixture','fixture',0,?1,?2)",
+            (
+                serde_json::to_string(&scan)?,
+                serde_json::to_string(&forecast)?,
+            ),
+        )?;
+        backfill_views(&db)?;
+        db.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "learning",
+                ..
+            }
+            | AuthAction::Read {
+                table_name: "coverage_report",
+                column_name: "report",
+            }
+            | AuthAction::Read {
+                table_name: "coverage_view",
+                column_name: "studied_input",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }));
+        for (offset, length) in [(0, 30), (29, 30), (60, 5), (65, 0)] {
+            let page = page_view(&db, "fixture", offset)?;
+            let gaps = page["gaps"].as_array().unwrap();
+            assert_eq!(gaps.len(), length);
+            for (index, gap) in gaps.iter().enumerate() {
+                assert_eq!(gap["fen"], (offset + index).to_string());
+            }
+        }
+        assert_eq!(selected(&db, "fixture", 64)?.2.fen, "64");
+        db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert_eq!(studied_coverage(&db, "fixture")?, 0.0);
+        for card in ["first", "second", "unrelated"] {
+            db.execute(
+                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+                VALUES(?1,'tactic','fixture','white','fixture',?1,'[]')",
+                [card],
+            )?;
+            db.execute("INSERT INTO learning VALUES(?1,1,1,1,10)", [card])?;
+            assert_eq!(
+                studied_coverage(&db, "fixture")?,
+                if card == "first" { 0.25 } else { 0.75 }
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn old_report_preserves_commands_but_cannot_set_a_new_order() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -394,6 +658,7 @@ mod tests {
             )?;
         }
 
+        backfill_views(&c)?;
         let accepted = "11111111-1111-4111-8111-111111111111";
         let next = "22222222-2222-4222-8222-222222222222";
         c.execute("INSERT INTO applied_forecast VALUES (?1,'old')", [accepted])?;
