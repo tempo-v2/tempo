@@ -829,6 +829,18 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .with_state(app)
 }
 
+fn print_similarity(result: Result<impl Serialize, repertoire_similarity::Error>) -> Result<()> {
+    let value = match result {
+        Ok(value) => serde_json::to_string(&value)?,
+        Err(error) => {
+            println!("{}", json!({"status":"error","error":error}));
+            std::process::exit(1);
+        }
+    };
+    println!("{value}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -888,17 +900,17 @@ async fn main() -> Result<()> {
             Ok(())
         }
         [command] if command == "repertoire-similarity" => {
-            match repertoire_similarity::cli(io::stdin().lock()) {
-                Ok(result) => println!("{}", serde_json::to_string(&result)?),
-                Err(error) => {
-                    println!("{}", json!({"status":"error","error":error}));
-                    std::process::exit(1);
-                }
-            }
-            Ok(())
+            print_similarity(repertoire_similarity::cli(io::stdin().lock()))
         }
         [command, db, repertoire, color] if command == "repertoire-similarity-input" => {
-            repertoire_similarity::export(Path::new(db), repertoire, color)
+            print_similarity(
+                repertoire_similarity::export(Path::new(db), repertoire, color).map_err(|error| {
+                    error
+                        .downcast_ref()
+                        .copied()
+                        .unwrap_or(repertoire_similarity::Error::Unavailable)
+                }),
+            )
         }
         [command, db] if command == "opening-rank-input" => {
             let database = Database::read(Path::new(db))?;

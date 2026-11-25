@@ -174,7 +174,7 @@ pub fn analyze_until(
         .collect();
     let mut best: BTreeMap<String, Candidate> = BTreeMap::new();
     let mut authored = BTreeMap::new();
-    for reply in repertoire.replies {
+    for mut reply in repertoire.replies {
         if cancelled() {
             return Err(Error::Unavailable);
         }
@@ -189,13 +189,12 @@ pub fn analyze_until(
             return Err(Error::InvalidSnapshot);
         }
         let position_id = chess::position_id(&example);
-        if let Some(previous) = authored.insert(
-            position_id.clone(),
-            (reply.movement.clone(), reply.answer_version.clone()),
-        ) {
-            if previous != (reply.movement.clone(), reply.answer_version.clone()) {
-                return Err(Error::InvalidSnapshot);
-            }
+        let saved = (reply.movement.clone(), reply.answer_version.clone());
+        if authored
+            .insert(position_id.clone(), saved.clone())
+            .is_some_and(|prev| prev != saved)
+        {
+            return Err(Error::InvalidSnapshot);
         }
         if board.turn() != example.turn() {
             continue;
@@ -204,10 +203,11 @@ pub fn analyze_until(
             continue;
         };
         let score = distance(&board, &example);
-        if best
-            .get(&reply.movement)
-            .is_some_and(|old| (old.distance, &old.example.position_id) <= (score, &position_id))
-        {
+        reply.fen = chess::fen(&example);
+        if best.get(&reply.movement).is_some_and(|old| {
+            (old.distance, &old.example.position_id, &old.example.fen)
+                <= (score, &position_id, &reply.fen)
+        }) {
             continue;
         }
         best.insert(
@@ -218,7 +218,7 @@ pub fn analyze_until(
                 distance: score,
                 example: Example {
                     position_id,
-                    fen: chess::fen(&example),
+                    fen: reply.fen,
                     answer_version: reply.answer_version,
                 },
             },
@@ -269,13 +269,31 @@ pub fn snapshot(db: &Connection, repertoire_id: &str, color: &str) -> anyhow::Re
         if replies.len() == MAX_REPLIES {
             return Err(Error::WorkLimit.into());
         }
+        let fen = row.get_ref(0)?.as_str()?;
+        let answers = row.get_ref(1)?.as_str()?;
+        let answer_version = row.get_ref(2)?.as_str()?;
+        // Canonical rows fit below the byte budget even at the row limit.
+        if fen.len() > 256
+            || answers.len() > 32
+            || answer_version.len() > 128
+            || ![fen, answer_version].into_iter().all(|value| {
+                value.bytes().all(|byte| {
+                    byte == b' ' || (byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+                })
+            })
+        {
+            return Err(Error::InvalidSnapshot.into());
+        }
         let [movement]: [String; 1] =
-            serde_json::from_str(row.get_ref(1)?.as_str()?).map_err(|_| Error::InvalidSnapshot)?;
+            serde_json::from_str(answers).map_err(|_| Error::InvalidSnapshot)?;
         replies.push(Reply {
-            fen: row.get(0)?,
+            fen: fen.into(),
             movement,
-            answer_version: row.get(2)?,
+            answer_version: answer_version.into(),
         });
+    }
+    if basis.dataset.len() > 256 || basis.repertoire_id.len() > 256 {
+        return Err(Error::InvalidSnapshot.into());
     }
     Ok(RepertoireIr {
         schema_version: 1,
@@ -284,15 +302,14 @@ pub fn snapshot(db: &Connection, repertoire_id: &str, color: &str) -> anyhow::Re
     })
 }
 
-pub fn export(path: &std::path::Path, repertoire: &str, color: &str) -> anyhow::Result<()> {
+pub fn export(
+    path: &std::path::Path,
+    repertoire: &str,
+    color: &str,
+) -> anyhow::Result<RepertoireIr> {
     let db = db::Database::read(path)?;
     let tx = db.unchecked_transaction()?;
-    let ir = snapshot(&tx, repertoire, color)?;
-    drop(tx);
-    let bytes = serde_json::to_vec(&ir)?;
-    anyhow::ensure!(bytes.len() <= MAX_BYTES, Error::WorkLimit);
-    println!("{}", String::from_utf8(bytes)?);
-    Ok(())
+    snapshot(&tx, repertoire, color)
 }
 
 pub fn cli(input: impl Read) -> Result<Analysis, Error> {
