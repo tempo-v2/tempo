@@ -84,3 +84,31 @@ categories and 18,214 distinct Lichess IDs. Discovered Check produced 21
 packs through 3000–3100. Pins produced a final 3100+ pack reaching 3271.
 Castling and En Passant each start with a final 1000+ pack because their
 first band is short.
+
+## Lean implementation contract
+
+Packs publish from an explicit catalog artifact. Puzzle IDs determine shared
+first-play progress, and Chess determines solution versions and scoring.
+An accepted wrong move or Reveal ends scoring as Again. A complete clean
+line ends scoring as Good. Both Tactics and Study require the full line.
+Tactics practice has an explicit mode and leaves Learning alone. A pack
+refresh can replace membership and metadata. In-flight attempts and admitted
+Study cards retain their version. Move receipts survive refresh and restart.
+A display rename, another pack membership, or an imported game cannot change
+a score or due date. Changing a legal solver move can change the score.
+
+### Publish to Lean
+
+Build the locked Lean binary and use the managed stopped-service lifecycle.
+After taking a verified SQLite backup, migrate the retained database and run:
+
+```sh
+tempo import-lichess-packs /path/to/tempo.sqlite3 /path/to/lichess-packs.sqlite3
+```
+
+The command emits the catalog artifact's BLAKE3 identity and counts. The
+release ledger also records the SHA-256 of the SQLite file. Repeating the
+same import keeps its membership. A new artifact atomically replaces the
+visible membership. For the reference catalog, expect 1,332 packs and 18,214
+puzzle versions on first import. Reopen the app at **Tactics → Packs**. The
+normal runtime needs only the installed database and bundled UI assets.

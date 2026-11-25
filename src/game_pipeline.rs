@@ -455,6 +455,7 @@ mod tests {
         db.execute_batch(include_str!("game_pipeline.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("lichess_packs.sql"))?;
         db.execute_batch(include_str!("job_turns.sql"))?;
         db.execute_batch(include_str!("operation_bounds.sql"))?;
         games::upgrade(db)?;

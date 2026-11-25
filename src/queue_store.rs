@@ -155,11 +155,9 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
         counts.reviews +=
             due.query_row(params![kind.as_str(), now], |row| row.get::<_, usize>(0))?;
     }
-    // Again can add one card to the 20-slot spacing window. Without prepared
-    // membership, Next cannot issue another attempt while a repeat is deferred.
+    // The physical deck stays bounded. Deferred repeats are counted through a capped read.
     let exceeds_committed_bound = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM deck LIMIT 1 OFFSET 21)
-            OR EXISTS(SELECT 1 FROM repeat_obligation LIMIT 1 OFFSET 1)",
+        "SELECT EXISTS(SELECT 1 FROM deck LIMIT 1 OFFSET 21)",
         [],
         |row| row.get::<_, bool>(0),
     )?;
@@ -172,13 +170,13 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
     let mut committed = db.prepare(
         "WITH committed(card_id) AS (
             SELECT card_id FROM deck
-            UNION SELECT card_id FROM repeat_obligation
+            UNION SELECT card_id FROM (SELECT card_id FROM repeat_order ORDER BY seq LIMIT ?2)
             UNION SELECT ?1 WHERE ?1 IS NOT NULL
         )
         SELECT q.kind,q.due_at,q.reserved FROM committed c
         CROSS JOIN prepared_queue q ON q.card_id=c.card_id WHERE q.active=1",
     )?;
-    let mut rows = committed.query([unanswered])?;
+    let mut rows = committed.query(params![unanswered, SCAN_LIMIT])?;
     while let Some(row) = rows.next()? {
         let kind: String = row.get(0)?;
         counts.include_committed(card_kind(&kind)?, row.get(1)?, row.get(2)?, paused, now);
@@ -219,6 +217,16 @@ pub fn place_repeat(
         .last()
         .map(|(_, kind)| kind.clone())
         .or_else(|| previous_kind.map(str::to_owned));
+    // Tactics can place a repeat while Study is still waiting on a different card.
+    let unanswered = crate::study_store::unanswered_card(db)?;
+    let protected = if let Some(id) = &unanswered {
+        db.execute(
+            "UPDATE prepared_queue SET reserved=1 WHERE card_id=?1 AND reserved=0",
+            [id],
+        )? != 0
+    } else {
+        false
+    };
     while queued.len() < usize::from(draw) {
         let Some((id, kind)) = select(db, previous.as_deref(), now)? else {
             break;
@@ -227,6 +235,12 @@ pub fn place_repeat(
         db.execute("INSERT INTO deck VALUES (?1,?2)", params![slot, id])?;
         previous = Some(kind.clone());
         queued.push((slot, kind));
+    }
+    if protected {
+        db.execute(
+            "UPDATE prepared_queue SET reserved=0 WHERE card_id=?1",
+            [unanswered],
+        )?;
     }
     let offset = queue::repeat_offset(draw, queued.len());
     let slot = if let Some((slot, _)) = queued.get(usize::from(offset)) {
@@ -264,7 +278,7 @@ pub fn seed_batch(db: &mut Connection) -> Result<bool> {
     };
     let mut insert = tx.prepare_cached(
         "INSERT OR IGNORE INTO prepared_queue(card_id,kind,active,due_at,rank,reserved)
-         SELECT c.id,c.kind,NOT c.quarantined,l.due_at,o.rank,d.card_id IS NOT NULL
+         SELECT c.id,c.kind,NOT c.quarantined,l.due_at,o.rank,d.card_id IS NOT NULL OR EXISTS(SELECT 1 FROM repeat_obligation r WHERE r.card_id=c.id)
          FROM cards c LEFT JOIN learning l ON l.card_id=c.id
          LEFT JOIN opening_order o ON o.card_id=c.id LEFT JOIN deck d ON d.card_id=c.id
          WHERE c.id=?1",
@@ -305,9 +319,28 @@ pub fn defer_repeat(
     Ok(())
 }
 
+fn has_repeat_space(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM deck LIMIT 1 OFFSET 20)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+pub fn can_place_now(db: &Connection) -> Result<bool> {
+    Ok(prepared(db)?
+        && has_repeat_space(db)?
+        && db.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM repeat_obligation)",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?)
+}
 pub fn place_deferred(db: &Connection) -> Result<()> {
+    if !has_repeat_space(db)? {
+        return Ok(());
+    }
     let obligation = db.query_row(
-        "SELECT attempt_id,card_id,previous_kind,accepted_at,draw FROM repeat_obligation ORDER BY attempt_id LIMIT 1", [],
+        "SELECT o.attempt_id,o.card_id,o.previous_kind,o.accepted_at,o.draw FROM repeat_order q JOIN repeat_obligation o USING(attempt_id) ORDER BY q.seq LIMIT 1", [],
         |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,i64>(3)?,row.get::<_,u8>(4)?)),
     ).optional()?;
     let Some((attempt, card, previous, now, draw)) = obligation else {
@@ -329,6 +362,59 @@ mod tests {
     use crate::queue::repeat_offset;
 
     #[test]
+    fn full_deck_defers_multiple_repeats_in_acceptance_order() -> Result<()> {
+        let files = tempfile::tempdir()?;
+        let mut db = crate::db::Database::init(&files.path().join("tempo.sqlite3"))?;
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<23)
+            INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+             SELECT printf('t%02d',i),'tactic','','white','',printf('t%02d',i),'[]' FROM n;
+            INSERT INTO deck SELECT row_number() OVER (ORDER BY id),id FROM cards WHERE id<'t22';
+            INSERT INTO learning VALUES ('t22',1,1,1,2),('t23',1,1,1,2);
+            INSERT INTO attempts(id,card_id,result) VALUES (2,'t22','saved'),(1,'t23','saved');",
+        )?;
+        assert!(seed_batch(&mut db)?);
+        let tx = db.transaction()?;
+        defer_repeat(&tx, 2, "t22", None, 1, 5)?;
+        defer_repeat(&tx, 1, "t23", None, 1, 5)?;
+        place_deferred(&tx)?;
+        assert!(!can_place_now(&tx)?);
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM repeat_order", [], |r| r
+                .get::<_, i64>(0))?,
+            2
+        );
+        assert_eq!(select(&tx, None, 3)?, None);
+        assert!(counts(&tx, 3, None)?.is_some());
+        consume(&tx, "t01")?;
+        place_deferred(&tx)?;
+        assert!(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deck WHERE card_id='t22')",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?);
+        assert_eq!(
+            tx.query_row("SELECT card_id FROM repeat_order", [], |r| r
+                .get::<_, String>(0))?,
+            "t23"
+        );
+        consume(&tx, "t02")?;
+        place_deferred(&tx)?;
+        assert!(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deck WHERE card_id='t23')",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?);
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM repeat_order", [], |r| r
+                .get::<_, i64>(0))?,
+            0
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn counts_respect_readiness_pause_due_time_and_committed_work() -> Result<()> {
         let mut db = Connection::open_in_memory()?;
         for schema in [
@@ -337,6 +423,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
@@ -455,6 +542,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;
@@ -545,6 +633,7 @@ mod tests {
             )?;
         }
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("lichess_packs.sql"))?;
         db.execute_batch(include_str!("coverage_order.sql"))?;
         assert!(!seed_batch(&mut db)?);
         assert!(!prepared(&db)?);
@@ -575,6 +664,7 @@ mod tests {
         db.execute_batch(include_str!("opening_policy.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("lichess_packs.sql"))?;
         db.execute_batch(include_str!("coverage_order.sql"))?;
         db.execute_batch(
             "INSERT INTO cards (id,kind,title,color,fen,position_id,answers) VALUES
@@ -638,6 +728,7 @@ mod tests {
             include_str!("opening_policy.sql"),
             include_str!("opening_order.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {
             db.execute_batch(schema)?;

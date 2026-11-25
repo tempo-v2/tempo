@@ -536,6 +536,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("lichess_packs.sql"),
         ] {
             db.execute_batch(schema)?;
         }
@@ -594,6 +595,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("lichess_packs.sql"),
             include_str!("job_turns.sql"),
             include_str!("operation_bounds.sql"),
             include_str!("job_admission.sql"),
@@ -666,6 +668,7 @@ mod tests {
         db.execute_batch(include_str!("job_turns.sql"))?;
         db.execute_batch(include_str!("opening_order.sql"))?;
         db.execute_batch(include_str!("prepared_queue.sql"))?;
+        db.execute_batch(include_str!("lichess_packs.sql"))?;
         db.execute_batch(include_str!("operation_bounds.sql"))?;
         db.execute_batch(include_str!("job_admission.sql"))?;
         db.execute_batch(include_str!("detectors.sql"))?;

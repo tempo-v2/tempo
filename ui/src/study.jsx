@@ -1,3 +1,4 @@
+import { decodePuzzle, PuzzleBoard, recoverPuzzleAction } from "./puzzle_play.jsx";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api, readView } from "./api.js";
@@ -126,6 +127,7 @@ function decodeStudyReply(body, dataset) {
   }
   return {
     ...body,
+    puzzle: body.puzzle === undefined ? null : decodePuzzle(body.puzzle, "study", { dataset: body.dataset }),
     title: typeof body.title === "string" ? body.title : "",
     result,
   };
@@ -225,6 +227,7 @@ export function Study({ openGame, sounds }) {
       while ((intent = await nextSavedAnswer(intent))) {
         await deliverAnswer(intent);
       }
+      await recoverPuzzleAction("study");
       if (!mounted.current) return;
       async function resumeCurrent() {
         const active = await loadCurrent();
@@ -248,7 +251,7 @@ export function Study({ openGame, sounds }) {
     };
   }, []);
   useEffect(() => {
-    if (!attemptKey || card.kind === "opening") return;
+    if (!attemptKey || card.kind === "opening" || card.puzzle) return;
     const request = new AbortController();
     opponentRead.current = readView(`study/${card.attempt}/opponent-move`, request.signal)
       .then((move) => {
@@ -325,6 +328,15 @@ export function Study({ openGame, sounds }) {
       if (result.rating === "Good") setAdvanceAfter(card.attempt);
     });
   }
+
+  if (card?.puzzle) return <section className="study" aria-label="Study">
+    <h1>Study</h1>
+    <PuzzleBoard key={card.puzzle.play} view={card.puzzle} scope="study" sounds={sounds}
+      onView={(puzzle) => showCard({ ...card, puzzle })}
+      onRefresh={async () => showCard(await loadCurrent())}
+      continuation={<button ref={nextButton} disabled={pending} onClick={() => next(card.attempt)}>Next</button>} />
+    {error && <div role="alert">{error.message} <button disabled={pending} onClick={() => run(retry.current)}>Retry</button></div>}
+  </section>;
 
   const frame = openingPlaying ? frames[openingPly] : frames?.at(-1);
   const game = card && new Chess(openingPlaying ? frame.fen : card.fen);
