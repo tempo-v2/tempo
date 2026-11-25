@@ -109,6 +109,21 @@ async function fullLineRecovery(browser, db) {
       assert.equal(solved.solution.moves.at(-1), "a7b8r");
       assert.deepEqual(await api("study/puzzle-move", finish), solved);
       assert.equal(grades(db), 3);
+      await page.reload();
+      await page.getByRole("status").filter({ hasText: "Solved" }).waitFor();
+      const commands = [];
+      page.on("request", request => {
+        if (request.method() === "POST") commands.push([new URL(request.url()).pathname, request.postDataJSON()]);
+      });
+      await page.route(nextPattern, route => route.abort(), { times: 1 });
+      await page.getByRole("button", { name: "Next", exact: true }).click();
+      await retry(page).waitFor();
+      assert.equal(await page.getByRole("status").filter({ hasText: "Solved" }).count(), 1);
+      await retry(page).click();
+      await retry(page).waitFor({ state: "hidden" });
+      const expectedNext = ["/api/study/next", { after: current.attempt, dataset: current.dataset }];
+      assert.deepEqual(commands, [expectedNext, expectedNext]);
+      assert.equal(grades(db), 3);
     });
   } finally {
     await page.context().close();
