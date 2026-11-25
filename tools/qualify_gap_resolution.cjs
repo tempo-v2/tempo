@@ -427,6 +427,11 @@ async function laterGapAcrossTabs(browser) {
       });
       await author.getByRole("button", { name: /^42%/ }).click();
       await reviewRequested;
+      await author.waitForFunction(() => {
+        const heading = document.activeElement;
+        return heading?.textContent === "Your white reply" && heading.getBoundingClientRect().top >= 0 &&
+          heading.getBoundingClientRect().bottom <= innerHeight;
+      });
       await observer.getByRole("link", { name: "Open line in Lichess" }).waitFor();
       await observer.waitForFunction(() => document.querySelector("a[href*='e4']"));
       await author.getByRole("button", { name: /^43%/ }).click();

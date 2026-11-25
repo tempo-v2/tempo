@@ -171,6 +171,7 @@ export function Gaps() {
   const [commandFeedback, setCommandFeedback] = useState(null);
   const [reload, setReload] = useState(0);
   const [requestedReview, setRequestedReview] = useState(null);
+  const gapHeading = useRef(null);
   function refreshJournal() {
     const current = restore();
     if (scanOwner.current && scanOwner.current.view !== viewIdentity(current)) {
@@ -474,6 +475,11 @@ export function Gaps() {
   const blocked = locked || report?.stale || Boolean(saved);
   const blockedSelection = locked || Boolean(saved);
   const reviewStart = requestedReview?.report === reportId && requestedReview?.index === gapIndex ? requestedReview : null;
+  useEffect(() => {
+    if (!reviewStart || !gapHeading.current) return;
+    gapHeading.current.focus({ preventScroll: true });
+    gapHeading.current.scrollIntoView({ block: "start" });
+  }, [reviewStart, gap]);
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
       {!book && <option value="" disabled>Select a repertoire</option>}
@@ -495,7 +501,7 @@ export function Gaps() {
       {(report.model_superseded||report.stale||error||saved||previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : previous))}>Retry scan</button>}
       <button disabled={blocked||report.model_superseded} onClick={()=>applyOrder({ report: report.id, command: crypto.randomUUID() })}>Apply to opening order</button>
       {report.gaps.length>0 && <button disabled={blockedSelection} onClick={()=>open(0)}>Work on next gap</button>}
-      {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
+      {gap && <section><h3 ref={gapHeading} tabIndex={-1}>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         {!saved && <GapReview
           key={JSON.stringify([viewIdentity(draft), gapIndex])}
           report={report.id} index={gapIndex} fen={gap.fen} color={report.scan.color}
