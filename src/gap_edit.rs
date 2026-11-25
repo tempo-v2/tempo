@@ -43,6 +43,7 @@ struct Edit {
     has_conflicts: bool,
     preview: Value,
     anchor: String,
+    recorded_moves: Option<Vec<String>>,
     conflicts: BTreeMap<String, Conflict>,
 }
 
@@ -108,7 +109,11 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
     }
     ensure!(
         !plans.is_empty(),
-        "The PGN must reach this gap and supply a reply."
+        if prefix.is_some() {
+            "Continue the recorded lead-in before adding the reply."
+        } else {
+            "The PGN must reach this gap and supply a reply."
+        }
     );
     let mut responses = BTreeMap::<String, Vec<&catalog::OpeningCard>>::new();
     for card in plans.iter().flat_map(|plan| &plan.cards) {
@@ -182,6 +187,7 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
         has_conflicts: !conflicts.is_empty(),
         preview,
         anchor: target,
+        recorded_moves: prefix.map(|route| route.moves),
         conflicts,
     })
 }
@@ -603,6 +609,7 @@ pub async fn correct(State(app): State<App>, Json(input): Json<Correct>) -> ApiR
                 gap_pgn::correct(
                     &input.draft.pgn,
                     &edit.anchor,
+                    edit.recorded_moves.as_deref(),
                     &input.position,
                     &reply.movement,
                 )?

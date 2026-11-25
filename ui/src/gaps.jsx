@@ -77,9 +77,14 @@ function lead(report, gap, reply) {
   };
 }
 
+function stagedFor(report, index, draft) {
+  return draft.stagedReply?.report === report?.id && draft.stagedReply?.gap === index
+    ? draft.stagedReply : null;
+}
+
 function stagedLead(report, gap, index, draft) {
-  const staged = draft.stagedReply;
-  if (staged?.report !== report.id || staged?.gap !== index) return null;
+  const staged = stagedFor(report, index, draft);
+  if (!staged) return null;
   try {
     const line = lead(report, gap, staged.movement);
     return draft.pgn === line.pgn ? line : null;
@@ -393,7 +398,7 @@ export function Gaps() {
   const locked = busy || !!draft.pending || !!draft.applyCommand;
   const staged = gap && report ? stagedLead(report, gap, gapIndex, draft) : null;
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??"",
-    ...(staged ? { anchor: "recorded_lead_in" } : {})};
+    ...(stagedFor(report, gapIndex, draft) ? { anchor: "recorded_lead_in" } : {})};
   const replacements = draft.replacements ?? noReplacements;
   const hasReplacements = Object.keys(replacements).length > 0;
 
@@ -404,8 +409,7 @@ export function Gaps() {
   }
   function isCurrent(candidate, choices) {
     const latest = restore();
-    const anchor = gap && report && stagedLead(report, gap, gapIndex, latest)
-      ? "recorded_lead_in" : undefined;
+    const anchor = stagedFor(report, gapIndex, latest) ? "recorded_lead_in" : undefined;
     return candidate.anchor === anchor && mounted.current && latest.report === candidate.report && latest.index === candidate.gap &&
       latest.pgn === candidate.pgn && latest.saveAcknowledgement?.report !== candidate.report &&
       latest.savedReport !== candidate.report &&
@@ -419,7 +423,7 @@ export function Gaps() {
   async function applyCorrection(correction) {
     if (!isCurrent(correction.draft, correction.choices)) return;
     const next = { ...correction.draft, pgn: correction.pgn };
-    update({ pgn: next.pgn, stagedReply: null, replacements: correction.nextChoices });
+    update({ pgn: next.pgn, replacements: correction.nextChoices });
     await previewDraft(next, correction.nextChoices);
   }
   async function correct(conflict, reply) {
@@ -500,7 +504,11 @@ export function Gaps() {
         <a href={(staged ?? lead(report,gap)).url} target="_blank" rel="noreferrer">
           {staged ? "Extend staged reply in Lichess" : "Open line in Lichess"}
         </a>
-        <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value,stagedReply:null});}}/></label>
+        <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value,...(!e.target.value.trim() ? { stagedReply:null } : {})});}}/></label>
+        {stagedFor(report, gapIndex, draft) && !staged && <button type="button" disabled={locked}
+          onClick={() => { clearPreview(); update({stagedReply:null,replacements:noReplacements}); }}>
+          Use pasted line’s own lead-in
+        </button>}
         <div className="controls">
           <button disabled={blocked || !edit.pgn}
             onClick={() => run(() => previewDraft(edit, replacements))}>Preview</button>

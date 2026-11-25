@@ -595,6 +595,12 @@ async function reviewWinningMoves(browser, stockfish) {
       await optional.click();
       await (await opened).close();
 
+      const { Chess } = require("../ui/node_modules/chess.js");
+      const extended = new Chess();
+      extended.loadPgn(draft);
+      assert.ok(extended.moves().length > 0);
+      extended.move(extended.moves()[0]);
+      await page.getByRole("textbox", { name: "Paste PGN from Lichess" }).fill(extended.pgn());
       const preview = page.waitForResponse("**/api/coverage/preview");
       await page.getByRole("button", { name: "Preview", exact: true }).click();
       const previewed = await (await preview).json();
@@ -613,6 +619,36 @@ async function reviewWinningMoves(browser, stockfish) {
       await page.close();
     }
   });
+}
+
+async function previousGapsOnRetainedData(source) {
+  const db = path.join(folder, "retained.sqlite3");
+  execFileSync("sqlite3", ["-readonly", source, ".backup " + quoted(db)]);
+  const before = sql(db, "SELECT count(*) FROM gap_save_receipt");
+  const learning = sql(db, "SELECT count(*) FROM learning");
+  const attempt = sql(db, "SELECT active FROM study");
+  const commands = await withServer(predecessor, db, async (_origin, api) => {
+    const repertoire = await addOpening(api, "Gap review predecessor qualification", ["e2e4", "e7e5", "g1f3"]);
+    const draft = { report: "qualification-lost-ack", gap: 0, pgn: "1. Nf3 Nc6 2. d4 *" };
+    seedReport(db, draft.report, repertoire, anchor, ["g1f3", "b8c6"]);
+    const accepted = { draft, command: (await api("coverage/preview", draft)).command };
+    const receipt = await api("coverage/save", accepted);
+    const next = { report: "qualification-undelivered", gap: 0, pgn: "1. Nf3 Nc6 2. d4 d5 3. Nc3 *" };
+    seedReport(db, next.report, repertoire, anchor, ["g1f3", "b8c6"]);
+    const pending = { draft: next, command: (await api("coverage/preview", next)).command };
+    return { accepted, receipt, pending };
+  });
+  await withServer(candidate, db, async (_origin, api) => {
+    assert.deepEqual(await api("coverage/save", commands.accepted), commands.receipt);
+    const accepted = await api("coverage/save", commands.pending);
+    assert.deepEqual(await api("coverage/save", commands.pending), accepted);
+    assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), String(Number(before) + 2));
+    assert.equal(sql(db, "SELECT count(*) FROM learning"), learning);
+    assert.equal(sql(db, "SELECT active FROM study"), attempt);
+    assert.equal(sql(db, "PRAGMA integrity_check"), "ok");
+    assert.equal(sql(db, "PRAGMA foreign_key_check"), "");
+  });
+  console.log("Both previous-release Gap Save delivery states passed on a retained-data copy.");
 }
 
 async function previousCommands() {
@@ -666,6 +702,9 @@ async function previousCommands() {
       await reviewWinningMoves(browser, process.env.TEMPO_QUALIFY_STOCKFISH);
     }
     await previousCommands();
+    if (process.env.TEMPO_QUALIFY_PREDECESSOR_DB) {
+      await previousGapsOnRetainedData(process.env.TEMPO_QUALIFY_PREDECESSOR_DB);
+    }
     console.log("Chromium conflict resolution, confirmed replacement retry, and installed predecessor command replay passed.");
   } finally {
     try { await browser?.close(); } finally { fs.rmSync(folder, { recursive: true, force: true }); }
