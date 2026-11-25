@@ -51,3 +51,30 @@ cargo test --locked -p tempo-stockfish-analysis
 TEMPO_TEST_STOCKFISH=/opt/homebrew/bin/stockfish \
   cargo test --locked -p tempo-stockfish-analysis --test contract native_cli -- --ignored
 ```
+
+## Generated tactic publication worker
+
+`tempo-tactic-worker` is a separate process that evaluates pending generated
+tactics over Tempo's owner-only Unix socket. The Tempo server validates and
+applies the evidence through its normal SQLite writer. The worker has no
+database access and the server has no engine dependency.
+
+```sh
+cargo build --locked --release --workspace
+target/release/tempo-tactic-worker status /path/to/tempo.sqlite3
+target/release/tempo-tactic-worker drain /path/to/tempo.sqlite3 /opt/homebrew/bin/stockfish
+target/release/tempo-tactic-worker watch /path/to/tempo.sqlite3 /opt/homebrew/bin/stockfish
+```
+
+Run the server before starting the worker. `drain` processes currently ready
+work and prints the resulting counts. Run it against a disposable served
+backup to preview catalog impact. `watch` waits for new work and for deferred
+retries, making it suitable for a separately managed LaunchAgent. One worker
+per database takes one engine request at a time. If the companion is stopped,
+Games import and Study continue and new capture candidates remain pending.
+
+Tempo compares every legal root at depth 10. The best move must be a detector
+candidate and have no equivalent alternative within 30 centipawns, inclusive.
+Moves preserving the same forced mate count as equivalent across mate distances.
+Existing capture cards remain available until checked. Rejected cards leave the
+active catalog and queue while their saved reviews remain available for replay.

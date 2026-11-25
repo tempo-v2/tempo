@@ -135,6 +135,7 @@ mod tests {
                 include_str!("opening_order.sql"),
                 include_str!("game_pipeline.sql"),
                 include_str!("prepared_queue.sql"),
+                include_str!("card_availability.sql"),
                 include_str!("lichess_packs.sql"),
                 include_str!("coverage_order.sql"),
             ] {
@@ -224,6 +225,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("card_availability.sql"),
             include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {
@@ -244,7 +246,13 @@ mod tests {
         db.flush_prepared_statement_cache();
         db.authorizer(Some(|context: AuthContext<'_>| match context.action {
             AuthAction::Read {
-                table_name: "games" | "jobs" | "mismatches" | "missed_captures" | "opening_order",
+                table_name:
+                    "games"
+                    | "jobs"
+                    | "mismatches"
+                    | "missed_captures"
+                    | "capture_qualification"
+                    | "opening_order",
                 ..
             } => Authorization::Deny,
             _ => Authorization::Allow,
@@ -279,6 +287,7 @@ mod tests {
             include_str!("opening_order.sql"),
             include_str!("game_pipeline.sql"),
             include_str!("prepared_queue.sql"),
+            include_str!("card_availability.sql"),
             include_str!("lichess_packs.sql"),
             include_str!("coverage_order.sql"),
         ] {

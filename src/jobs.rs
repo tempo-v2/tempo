@@ -349,15 +349,6 @@ fn run(
                 return Ok(());
             }
         }
-        ("archive", "publish") => {
-            if let Some(game) = db.pending_game(id)? {
-                let plans = db.publication_batch(&game)?;
-                writer.background_until(deadline, move |db| {
-                    game_pipeline::publish_batch(db, id, &game, &plans)
-                })?;
-                return Ok(());
-            }
-        }
         (name, "all" | "new") => {
             return provider_turn(
                 db,

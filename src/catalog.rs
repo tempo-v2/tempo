@@ -352,7 +352,8 @@ pub fn save_opening(
 
 pub fn tactics(db: &Connection, after: &str) -> Result<Vec<Tactic>> {
     let mut q = db.prepare(
-        "SELECT id,name,route,game_id,game_ply FROM tactics WHERE id>?1 ORDER BY id LIMIT 100",
+        "SELECT t.id,t.name,t.route,t.game_id,t.game_ply FROM tactics t
+         JOIN active_cards c ON c.id=t.id WHERE t.id>?1 ORDER BY t.id LIMIT 100",
     )?;
     let rows = q.query_map([after], |r| {
         Ok((
@@ -474,6 +475,86 @@ pub fn apply_tactic(db: &Connection, plan: &TacticPlan) -> Result<String> {
         ],
     )?;
     Ok(plan.id.clone())
+}
+
+/// Apply an already qualified answer or retire the game occurrence. The caller
+/// commits this with its qualification receipt under the same writer transaction.
+pub fn qualify_game_tactic(
+    db: &Connection,
+    game: &str,
+    ply: usize,
+    fen: &str,
+    played: &str,
+    answer: Option<&str>,
+) -> Result<&'static str> {
+    let existing = db
+        .query_row(
+            "SELECT t.id,c.fen,c.played_move,c.answers FROM tactics t JOIN cards c ON c.id=t.id
+         WHERE t.game_id=?1 AND t.game_ply=?2",
+            params![game, ply],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, saved_fen, saved_played, saved_answers)) = existing else {
+        if let Some(answer) = answer {
+            let route = Route {
+                fen: fen.to_owned(),
+                moves: vec![answer.to_owned()],
+            };
+            let plan = prepare_tactic(TacticInput {
+                name: &format!("Missed capture · move {}", ply / 2 + 1),
+                route: &route,
+                answers: &route.moves,
+                source: Some((game, ply, played)),
+            })?;
+            apply_tactic(db, &plan)?;
+            return Ok("published");
+        }
+        return Ok("absent");
+    };
+    ensure!(
+        fen == saved_fen && played == saved_played,
+        "Published tactic position changed"
+    );
+    let Some(answer) = answer else {
+        db.execute("UPDATE cards SET retired=1 WHERE id=?1", [&id])?;
+        db.execute("DELETE FROM deck WHERE card_id=?1", [&id])?;
+        db.execute("DELETE FROM repeat_obligation WHERE card_id=?1", [&id])?;
+        return Ok("removed");
+    };
+    let original: Vec<String> = serde_json::from_str(&saved_answers)?;
+    ensure!(
+        original.iter().any(|move_| move_ == answer),
+        "Published tactic candidates changed"
+    );
+    if original.len() == 1 {
+        return Ok("kept");
+    }
+    db.execute(
+        "UPDATE attempts SET issued_answers=?2
+         WHERE id=(SELECT active FROM study) AND card_id=?1 AND result IS NULL AND issued_answers IS NULL",
+        params![id,saved_answers],
+    )?;
+    let route = Route {
+        fen: saved_fen,
+        moves: vec![answer.to_owned()],
+    };
+    db.execute(
+        "UPDATE tactics SET route=?2 WHERE id=?1",
+        params![id, serde_json::to_string(&route)?],
+    )?;
+    db.execute(
+        "UPDATE cards SET answers=?2 WHERE id=?1",
+        params![id, serde_json::to_string(&route.moves)?],
+    )?;
+    Ok("narrowed")
 }
 
 pub fn visit_answers_at(
