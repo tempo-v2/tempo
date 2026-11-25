@@ -217,6 +217,17 @@ pub fn authored_reply_revision(c: &Connection, rep: &str) -> Result<i64> {
     )?)
 }
 
+#[derive(Debug)]
+pub struct MissingRepertoire;
+
+impl std::fmt::Display for MissingRepertoire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The selected repertoire is unavailable for this practice color.")
+    }
+}
+
+impl std::error::Error for MissingRepertoire {}
+
 pub fn existing_repertoire(db: &Connection, id: &str, color: &str) -> Result<()> {
     ensure!(
         db.query_row(
@@ -224,7 +235,7 @@ pub fn existing_repertoire(db: &Connection, id: &str, color: &str) -> Result<()>
             params![id, color],
             |row| row.get::<_, bool>(0),
         )?,
-        "The selected repertoire is unavailable for this practice color."
+        MissingRepertoire
     );
     Ok(())
 }

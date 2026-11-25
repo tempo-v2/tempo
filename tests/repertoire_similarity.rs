@@ -90,3 +90,24 @@ fn compares_exact_special_move_identity() {
         "a7a8n"
     );
 }
+
+#[test]
+fn distinguishes_missing_repertoire_from_storage_failure() {
+    let area = tempfile::tempdir().unwrap();
+    let path = area.path().join("snapshot.sqlite3");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let export = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_tempo"))
+            .arg("repertoire-similarity-input")
+            .arg(&path)
+            .args(["missing", "white"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(export()["error"], "unavailable");
+    db.execute_batch("CREATE TABLE repertoire_choices(repertoire_id TEXT, color TEXT)")
+        .unwrap();
+    assert_eq!(export()["error"], "invalid_request");
+}
