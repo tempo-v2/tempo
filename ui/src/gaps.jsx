@@ -45,9 +45,10 @@ function ConflictDetails({ conflict, disabled, correct }) {
   return <li className="gap-conflict">
     <h4>{turn} to move, move {conflict.number}{conflict.transposition && " · Same position by transposition"}</h4>
     <dl>
-      <dt>In your repertoire</dt>
-      <dd>{saved ? (saved.line ?? `${saved.reply} (saved route unavailable)`) :
+      <dt>{conflict.saved_route_recorded ? "Recorded repertoire route" : "In your repertoire"}</dt>
+      <dd>{saved ? (saved.line ?? `${saved.reply} (${conflict.saved_route_limited ? "saved route search limit reached" : "saved route unavailable"})`) :
         conflict.unresolved ? "Saved replies are unresolved at this position." : "No saved reply."}</dd>
+      {conflict.saved_route_recorded && <dd>{conflict.saved_route_limited ? "Current route search limit reached." : "Current saved route unavailable."}</dd>}
       <dt>In the pasted PGN</dt>
       {proposed.map(reply => <React.Fragment key={reply.movement}>
         <dd>{reply.line}</dd>

@@ -49,11 +49,13 @@ fn saved_lines(db: &Connection, repertoire: &str, color: &str) -> Result<Vec<Sav
     let mut rows = query.query((repertoire, color))?;
     let mut lines = Vec::new();
     let mut moves = 0;
+    let mut expanded_work = 0;
     while let Some(row) = rows.next()? {
         let route: chess::Route = serde_json::from_str(&row.get::<_, String>(2)?)?;
         moves += route.moves.len();
+        expanded_work += route.moves.len().pow(2);
         ensure!(
-            lines.len() < 2000 && moves <= 100_000,
+            lines.len() < 2000 && moves <= 100_000 && expanded_work <= 8_000_000,
             "This repertoire is too large to preview a replacement here."
         );
         lines.push(SavedLine {
@@ -72,89 +74,155 @@ fn saved_lines(db: &Connection, repertoire: &str, color: &str) -> Result<Vec<Sav
 #[derive(Default)]
 struct Rewritten {
     moves: Vec<String>,
-    new_replies: Vec<(String, String)>,
+    decisions: Vec<ContinuationReply>,
     stopped_at: Option<String>,
 }
 
-struct Rules<'a> {
-    db: &'a Connection,
-    repertoire: &'a str,
-    proposed: &'a Choices,
-    selected: &'a Choices,
-    competing: &'a BTreeSet<String>,
+struct ContinuationReply {
+    ply: usize,
+    position: String,
+    movement: String,
+    label: String,
 }
 
-impl Rules<'_> {
-    fn rewrite(&self, input: &catalog::OpeningInput) -> Result<Rewritten> {
-        let mut result = Rewritten::default();
-        let mut board = chess::position(&input.route.fen)?;
-        let mut original_board = board.clone();
-        let mut changed = false;
-        for (ply, original) in input.route.moves.iter().enumerate() {
-            let position = chess::position_id(&board);
-            let original_move = chess::parse_move(&board, original).ok();
-            let owned = ply >= input.start_at && chess::color_name(board.turn()) == input.color;
-            let movement = match self.selected.get(&position).filter(|_| owned) {
-                Some(selected) => chess::parse_move(&board, selected).ok(),
-                None => original_move,
-            };
-            let Some(movement) = movement else {
-                result.stopped_at = Some(format!(
-                    "{} becomes illegal.",
-                    gap_pgn::reply_text(&original_board, original)?
-                ));
-                break;
-            };
-            let canonical = chess::uci(movement);
-            changed |= Some(movement) != original_move;
-            if owned && changed {
-                let version = chess::id(&["answer-v1", &canonical]);
-                let mut lookup = self.db.prepare_cached(
-                    "SELECT answer_version,quarantined FROM cards
-                     WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2 AND opening_retired=0
-                     ORDER BY quarantined LIMIT 1",
-                )?;
-                let current: Option<(String, bool)> = lookup
-                    .query_row((self.repertoire, &position), |row| {
-                        Ok((row.get(0)?, row.get(1)?))
-                    })
-                    .optional()?;
-                let incompatible = match self
-                    .selected
-                    .get(&position)
-                    .or_else(|| self.proposed.get(&position))
-                {
-                    Some(expected) => *expected != canonical,
-                    None => {
-                        current
-                            .as_ref()
-                            .is_some_and(|(saved, quarantined)| *quarantined || *saved != version)
-                            || self.competing.contains(&position)
-                    }
-                };
-                if incompatible {
-                    result.stopped_at = Some(format!(
-                        "{} would introduce another reply conflict.",
-                        gap_pgn::reply_text(&board, &canonical)?
-                    ));
-                    break;
-                }
-                if current.is_none() && !self.proposed.contains_key(&position) {
-                    result.new_replies.push((position, canonical.clone()));
-                }
-            }
-            let stored = if original_move == Some(movement) {
-                original.clone()
-            } else {
-                canonical
-            };
-            result.moves.push(stored);
-            board.play_unchecked(movement);
-            let old = chess::parse_move(&original_board, original)?;
-            original_board.play_unchecked(old);
+enum SavedVersion {
+    Active(String),
+    Quarantined,
+}
+
+impl Rewritten {
+    fn stop_before(&mut self, incompatible: impl Fn(&ContinuationReply) -> bool) {
+        if let Some(decision) = self.decisions.iter().find(|reply| incompatible(reply)) {
+            let ply = decision.ply;
+            self.stopped_at = Some(format!(
+                "{} would introduce another reply conflict.",
+                decision.label
+            ));
+            self.moves.truncate(ply);
+            self.decisions.retain(|reply| reply.ply < ply);
         }
-        Ok(result)
     }
+}
+
+fn replay(input: &catalog::OpeningInput, selected: &Choices) -> Result<Rewritten> {
+    let mut result = Rewritten::default();
+    let mut board = chess::position(&input.route.fen)?;
+    let mut original_board = board.clone();
+    let mut changed = false;
+    for (ply, original) in input.route.moves.iter().enumerate() {
+        let position = chess::position_id(&board);
+        let original_move = chess::parse_move(&board, original).ok();
+        let owned = ply >= input.start_at && chess::color_name(board.turn()) == input.color;
+        let movement = match selected.get(&position).filter(|_| owned) {
+            Some(selected) => chess::parse_move(&board, selected).ok(),
+            None => original_move,
+        };
+        let Some(movement) = movement else {
+            result.stopped_at = Some(format!(
+                "{} becomes illegal.",
+                gap_pgn::reply_text(&original_board, original)?
+            ));
+            break;
+        };
+        let canonical = chess::uci(movement);
+        changed |= Some(movement) != original_move;
+        if owned && changed {
+            result.decisions.push(ContinuationReply {
+                ply,
+                position,
+                label: gap_pgn::reply_text(&board, &canonical)?,
+                movement: canonical.clone(),
+            });
+        }
+        let stored = if original_move == Some(movement) {
+            original.clone()
+        } else {
+            canonical
+        };
+        result.moves.push(stored);
+        board.play_unchecked(movement);
+        let old = chess::parse_move(&original_board, original)?;
+        original_board.play_unchecked(old);
+    }
+    Ok(result)
+}
+
+fn stop_at_known_conflict(
+    continuation: &mut Rewritten,
+    selected: &Choices,
+    pasted: &Choices,
+    current: &BTreeMap<String, SavedVersion>,
+) {
+    continuation.stop_before(|reply| {
+        if let Some(expected) = selected
+            .get(&reply.position)
+            .or_else(|| pasted.get(&reply.position))
+        {
+            return expected != &reply.movement;
+        }
+        match current.get(&reply.position) {
+            Some(SavedVersion::Active(version)) => {
+                version != &chess::id(&["answer-v1", &reply.movement])
+            }
+            Some(SavedVersion::Quarantined) => true,
+            None => false,
+        }
+    });
+}
+
+/// Resolve disagreements only when the competing replies can reach the
+/// position without first crossing another unresolved disagreement.
+fn stop_at_reachable_conflicts(
+    continuations: &mut [Rewritten],
+    is_new: impl Fn(&ContinuationReply) -> bool,
+) -> Result<()> {
+    let mut visits_left = 8_000_000usize;
+    loop {
+        let decisions: usize = continuations.iter().map(|line| line.decisions.len()).sum();
+        visits_left = visits_left.checked_sub(3 * decisions)
+            .context("These saved continuations exceed the conflict preview work limit. Split the replacement and preview again.")?;
+        let candidates = continuations
+            .iter()
+            .flat_map(|line| &line.decisions)
+            .filter(|reply| is_new(reply));
+        let potential = disagreements(candidates);
+        if potential.is_empty() {
+            return Ok(());
+        }
+        let first_reached = continuations.iter().flat_map(|line| {
+            line.decisions
+                .iter()
+                .filter(|reply| potential.contains(reply.position.as_str()))
+                .scan(None, |earliest, reply| {
+                    let position = reply.position.as_str();
+                    (*earliest.get_or_insert(position) == position).then_some(reply)
+                })
+        });
+        let reachable: BTreeSet<String> = disagreements(first_reached)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        ensure!(
+            !reachable.is_empty(),
+            "The saved continuations reach competing replies in different orders. Preview the replacements separately."
+        );
+        for line in continuations.iter_mut() {
+            line.stop_before(|reply| reachable.contains(reply.position.as_str()));
+        }
+    }
+}
+
+fn disagreements<'a>(replies: impl Iterator<Item = &'a ContinuationReply>) -> BTreeSet<&'a str> {
+    let mut first = BTreeMap::new();
+    let mut competing = BTreeSet::new();
+    for reply in replies {
+        let position = reply.position.as_str();
+        let movement = reply.movement.as_str();
+        if *first.entry(position).or_insert(movement) != movement {
+            competing.insert(position);
+        }
+    }
+    competing
 }
 
 fn authored(input: &catalog::OpeningInput) -> Result<Option<catalog::OpeningPlan>> {
@@ -203,43 +271,41 @@ pub fn plan(
         })
         .collect::<Result<Choices>>()?;
     let lines = saved_lines(db, repertoire, color)?;
-    let mut competing = BTreeSet::new();
-    let empty = BTreeSet::new();
-    let rules = Rules {
-        db,
-        repertoire,
-        proposed: &proposed,
-        selected,
-        competing: &empty,
-    };
-    // Never resolve two newly colliding saved continuations by picking a line
-    // in database order. Stop both before the disagreement.
-    let mut replies = Choices::new();
-    for line in &lines {
-        for (position, played) in rules.rewrite(&line.input)?.new_replies {
-            if replies
-                .insert(position.clone(), played.clone())
-                .is_some_and(|previous| previous != played)
-            {
-                competing.insert(position);
-            }
+    let mut continuations = lines
+        .iter()
+        .map(|line| replay(&line.input, selected))
+        .collect::<Result<Vec<_>>>()?;
+
+    let addressed = continuations
+        .iter()
+        .flat_map(|line| &line.decisions)
+        .map(|reply| reply.position.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut current = BTreeMap::new();
+    for position in addressed {
+        if let Some(reply) = catalog::current_opening_reply(db, repertoire, position)? {
+            let version = if reply.quarantined {
+                SavedVersion::Quarantined
+            } else {
+                SavedVersion::Active(reply.version)
+            };
+            current.insert(position.into(), version);
         }
     }
-    let rules = Rules {
-        db,
-        repertoire,
-        proposed: &proposed,
-        selected,
-        competing: &competing,
-    };
+
+    for line in &mut continuations {
+        stop_at_known_conflict(line, selected, &proposed, &current);
+    }
+    stop_at_reachable_conflicts(&mut continuations, |reply| {
+        !proposed.contains_key(&reply.position) && !current.contains_key(&reply.position)
+    })?;
     let mut impact = Vec::new();
     let mut archived = Vec::new();
     let mut rewritten = Vec::new();
     let mut removed = BTreeSet::new();
     let mut supported = BTreeSet::new();
-    for line in lines {
+    for (line, change) in lines.into_iter().zip(continuations) {
         let previous = catalog::prepare_opening(&line.input)?;
-        let change = rules.rewrite(&line.input)?;
         if change.moves == line.input.route.moves {
             supported.extend(
                 previous
@@ -285,27 +351,21 @@ pub fn plan(
     // Current card rows with no surviving authored occurrence are retired, but
     // only if an affected line previously owned that reply.
     let mut retired = BTreeSet::new();
-    let mut lookup = db.prepare_cached(
-        "SELECT id,answer_version FROM cards
-         WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2 AND opening_retired=0 AND quarantined=0",
-    )?;
-    let active = |position: &str| -> Result<Option<(String, String)>> {
-        Ok(lookup
-            .query_row((repertoire, position), |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?)
+    let active = |position: &str| -> Result<Option<catalog::CurrentOpeningReply>> {
+        Ok(catalog::current_opening_reply(db, repertoire, position)?
+            .filter(|reply| !reply.quarantined))
     };
-    let mut active = active;
     for (position, version) in removed.difference(&supported) {
-        if let Some((id, current)) = active(position)?
-            && &current == version
+        if let Some(current) = active(position)?
+            && &current.version == version
         {
-            retired.insert(id);
+            retired.insert(current.id);
         }
     }
     for (position, movement) in selected {
         let id = active(position)?
             .context("The saved reply is no longer available.")?
-            .0;
+            .id;
         ensure!(
             proposed.get(position) == Some(movement),
             "The selected replacement is no longer in the PGN."
@@ -315,7 +375,7 @@ pub fn plan(
     let mut writes =
         1 + 3 * (archived.len() + rewritten.len() + incoming.len()) + 5 * retired.len();
     for (position, version) in installed {
-        if !active(&position)?.is_some_and(|(_, current)| current == version) {
+        if !active(&position)?.is_some_and(|current| current.version == version) {
             writes += 3;
         }
     }
@@ -383,9 +443,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_discarded_suffix_cannot_trim_an_independent_continuation() -> Result<()> {
+        let line = |steps: &[(&str, &str)]| Rewritten {
+            moves: steps
+                .iter()
+                .map(|(_, movement)| (*movement).into())
+                .collect(),
+            decisions: steps
+                .iter()
+                .enumerate()
+                .map(|(ply, (position, movement))| ContinuationReply {
+                    ply,
+                    position: (*position).into(),
+                    movement: (*movement).into(),
+                    label: (*movement).into(),
+                })
+                .collect(),
+            stopped_at: None,
+        };
+        let mut branches = [
+            line(&[("first", "a2a3"), ("later", "e2e4")]),
+            line(&[("first", "a2a4")]),
+            line(&[("later", "d2d4")]),
+        ];
+        stop_at_reachable_conflicts(&mut branches, |_| true)?;
+        assert!(branches[0].moves.is_empty());
+        assert!(branches[1].moves.is_empty());
+        assert_eq!(branches[2].moves, ["d2d4"]);
+        assert!(branches[2].stopped_at.is_none());
+        let mut cyclic = [
+            line(&[("first", "a2a3"), ("later", "e2e4")]),
+            line(&[("later", "d2d4"), ("first", "a2a4")]),
+        ];
+        assert!(stop_at_reachable_conflicts(&mut cyclic, |_| true).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn preserves_a_castle_when_its_uci_spelling_differs() -> Result<()> {
-        let files = tempfile::tempdir()?;
-        let db = crate::Database::init(&files.path().join("test.sqlite3"))?;
         let mut route =
             chess::parse_gap_pgn("1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. Bb5 a6 5. O-O *")?.main;
         route.moves[8] = "e1h1".into();
@@ -395,19 +490,16 @@ mod tests {
             chess::parse_gap_pgn("1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. Bc4 a6 5. O-O *")?.main;
         let castle = chess::position_id(&chess::board_at(&redirected, 8)?);
         let proposed = Choices::from([(castle, "e1g1".into())]);
-        let rules = Rules {
-            db: &db,
-            repertoire: "fixture",
-            proposed: &proposed,
-            selected: &selected,
-            competing: &BTreeSet::new(),
-        };
-        let rewrite = rules.rewrite(&catalog::OpeningInput {
-            name: "Fixture".into(),
-            color: "white".into(),
-            route,
-            start_at: 0,
-        })?;
+        let mut rewrite = replay(
+            &catalog::OpeningInput {
+                name: "Fixture".into(),
+                color: "white".into(),
+                route,
+                start_at: 0,
+            },
+            &selected,
+        )?;
+        stop_at_known_conflict(&mut rewrite, &selected, &proposed, &BTreeMap::new());
         assert!(rewrite.stopped_at.is_none());
         assert_eq!(rewrite.moves[8], "e1h1");
         Ok(())

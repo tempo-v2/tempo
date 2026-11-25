@@ -96,7 +96,7 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
     let mut wanted_contexts = BTreeMap::new();
     let mut new_responses = 0;
     for (position, cards) in responses {
-        let prior = saved_reply(c, &scan.repertoire, &position)?;
+        let prior = catalog::current_opening_reply(c, &scan.repertoire, &position)?;
         let unanimous = cards.iter().all(|card| card.version == cards[0].version);
         let status = match &prior {
             None if unanimous => {
@@ -124,12 +124,21 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
     let conflicts = pending_conflicts
         .into_iter()
         .map(|(position, saved, cards)| {
-            let conflict = describe_conflict(
-                &position,
-                &cards,
-                saved.as_ref(),
-                contexts.remove(&position),
-            )?;
+            let current_route = contexts.routes.remove(&position);
+            let missing_current = current_route.is_none();
+            let saved_route = match (&saved, current_route) {
+                (Some(reply), None) if !reply.quarantined => {
+                    let movement = first_reply(&reply.answers)?;
+                    catalog::recorded_opening_context(c, &reply.id)?
+                        .filter(|route| gap_pgn::line_text(route, &position, &movement).is_ok())
+                }
+                (_, current) => current,
+            };
+            let recorded = missing_current && saved_route.is_some();
+            let mut conflict = describe_conflict(&position, &cards, saved.as_ref(), saved_route)?;
+            conflict.saved_route_limited =
+                missing_current && contexts.limited && conflict.saved.is_some();
+            conflict.saved_route_recorded = recorded;
             Ok((position, conflict))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -149,29 +158,6 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
         anchor: target,
         conflicts,
     })
-}
-
-struct SavedReply {
-    version: String,
-    quarantined: bool,
-    answers: String,
-}
-
-fn saved_reply(c: &Connection, repertoire: &str, position: &str) -> Result<Option<SavedReply>> {
-    Ok(c.query_row(
-        "SELECT answer_version,quarantined,answers FROM cards
-         WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2 AND opening_retired=0
-         ORDER BY quarantined LIMIT 1",
-        (repertoire, position),
-        |row| {
-            Ok(SavedReply {
-                version: row.get(0)?,
-                quarantined: row.get(1)?,
-                answers: row.get(2)?,
-            })
-        },
-    )
-    .optional()?)
 }
 
 fn first_reply(answers: &str) -> Result<String> {
@@ -199,6 +185,8 @@ struct Conflict {
     proposed: Vec<Reply>,
     transposition: bool,
     unresolved: bool,
+    saved_route_limited: bool,
+    saved_route_recorded: bool,
 }
 
 fn same_route(a: &chess::Route, b: &chess::Route) -> Result<bool> {
@@ -221,7 +209,7 @@ fn same_route(a: &chess::Route, b: &chess::Route) -> Result<bool> {
 fn describe_conflict(
     position: &str,
     cards: &[&catalog::OpeningCard],
-    saved: Option<&SavedReply>,
+    saved: Option<&catalog::CurrentOpeningReply>,
     saved_route: Option<chess::Route>,
 ) -> Result<Conflict> {
     let board = chess::position(&cards[0].fen)?;
@@ -278,6 +266,8 @@ fn describe_conflict(
         proposed: proposals.into_values().map(|(reply, _)| reply).collect(),
         transposition,
         unresolved,
+        saved_route_limited: false,
+        saved_route_recorded: false,
     })
 }
 
@@ -838,7 +828,8 @@ mod tests {
         let conflict = describe_conflict(
             &canonical,
             &[&same.cards[0], &other.cards[0]],
-            Some(&SavedReply {
+            Some(&catalog::CurrentOpeningReply {
+                id: String::new(),
                 version: saved.cards[0].version.clone(),
                 quarantined: false,
                 answers: saved.cards[0].answers.clone(),
@@ -960,6 +951,28 @@ mod tests {
                 .reply,
             "4. Bb5"
         );
+        let unrelated = serde_json::to_string(&main("1. e4 *")?)?;
+        c.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000)
+             INSERT INTO openings(id,repertoire_id,name,color,route,start_at)
+             SELECT printf('!fixture-%04d',i),?1,'Other line','white',?2,0 FROM n",
+            (&repertoire, unrelated),
+        )?;
+        let limited = build(&c, draft.clone())?;
+        let from_record = &limited.conflicts[&old_position];
+        assert!(from_record.saved_route_limited);
+        assert!(from_record.saved_route_recorded);
+        assert!(from_record.transposition);
+        assert_eq!(
+            from_record.saved.as_ref().unwrap().line,
+            candidate.conflicts[&old_position]
+                .saved
+                .as_ref()
+                .unwrap()
+                .line
+        );
+        c.execute("DELETE FROM openings WHERE id GLOB '!fixture-*'", [])?;
+
         let clean = build(
             &c,
             Draft {
@@ -1052,7 +1065,7 @@ mod tests {
             6
         );
         assert_eq!(
-            saved_reply(&c, &repertoire, &old_position)?
+            catalog::current_opening_reply(&c, &repertoire, &old_position)?
                 .unwrap()
                 .answers,
             r#"["d2d4"]"#
@@ -1071,7 +1084,8 @@ mod tests {
             2
         );
         let surviving_position = chess::position_id(&chess::position(&independent.fen)?);
-        let surviving = saved_reply(&c, &repertoire, &surviving_position)?.unwrap();
+        let surviving =
+            catalog::current_opening_reply(&c, &repertoire, &surviving_position)?.unwrap();
         assert_eq!(surviving.answers, r#"["b5c6"]"#);
         let routes = catalog::reply_contexts(
             &c,
@@ -1079,7 +1093,7 @@ mod tests {
             "white",
             BTreeMap::from([(surviving_position.clone(), surviving.version)]),
         )?;
-        let surviving_route = &routes[&surviving_position];
+        let surviving_route = &routes.routes[&surviving_position];
         assert_eq!(
             chess::position_id(&chess::board_at(
                 surviving_route,
