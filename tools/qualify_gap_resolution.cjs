@@ -219,13 +219,14 @@ async function browserFlow(browser) {
   });
 }
 
-async function saveReplyAcrossRemount(browser) {
-  const db = path.join(folder, "save-remount.sqlite3");
+async function saveReplyAcrossViews(browser, remount) {
+  const db = path.join(folder, remount ? "save-remount.sqlite3" : "save-peer.sqlite3");
   await withServer(candidate, db, async (origin, api) => {
     const repertoire = await addOpening(api, "Save remount", ["e2e4", "e7e5", "g1f3"]);
     seedReport(db, "saved-report", repertoire, anchor, ["g1f3", "b8c6"]);
-    const page = await browser.newPage();
-    await page.addInitScript(key => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await context.addInitScript(key => {
       if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({
         report: "saved-report", index: 0, pgn: "1. Nf3 Nc6 2. d4 *"
       }));
@@ -265,22 +266,38 @@ async function saveReplyAcrossRemount(browser) {
       await page.getByRole("button", {name:"Retry same save"}).click();
       assert.equal(await saved, true);
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
-      await page.getByRole("button", {name:"Games", exact:true}).click();
-      await page.getByRole("button", {name:"Openings", exact:true}).click();
       const retry = page.getByRole("button", {name:"Retry same save"});
-      await retry.waitFor();
-      deliver();
+      if (remount) {
+        await page.getByRole("button", {name:"Games", exact:true}).click();
+        await page.getByRole("button", {name:"Openings", exact:true}).click();
+        await retry.waitFor();
+        deliver();
+      } else {
+        const peer = await context.newPage();
+        await openGaps(peer, origin);
+        await peer.route("**/api/coverage", route => route.abort());
+        await peer.getByRole("button", { name: "Retry same save" }).click();
+        await peer.getByText("Continuation saved.", { exact: true }).waitFor();
+      }
       await page.getByText("Continuation saved.", {exact:true}).waitFor({timeout:3000});
       assert.equal(await retry.count(), 0);
+      assert.equal(await page.getByText("Working…", {exact:true}).count(), 0);
       assert.equal(scans, 0);
-      await page.getByRole("button", {name:"Retry scan", exact:true}).click();
+      await page.getByRole("button", {name:"Retry scan", exact:true}).click({timeout:3000});
       await page.getByRole("alert").waitFor();
+      if (!remount) {
+        const delivered = page.waitForResponse("**/api/coverage/save");
+        deliver();
+        await delivered;
+        assert.equal(await page.getByText("Continuation saved.", {exact:true}).count(), 1);
+        assert.equal(await page.getByRole("alert").count(), 1);
+      }
       assert.equal(scans, 1);
       assert.equal(saves, 2);
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
     } finally {
       deliver();
-      await page.close();
+      await context.close();
     }
   });
 }
@@ -497,7 +514,8 @@ async function previousCommands() {
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true });
-    await saveReplyAcrossRemount(browser);
+    await saveReplyAcrossViews(browser, true);
+    await saveReplyAcrossViews(browser, false);
     await applyReplyAcrossViews(browser);
     await laterGapAcrossTabs(browser);
     await browserFlow(browser);

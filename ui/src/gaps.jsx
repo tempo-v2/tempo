@@ -127,7 +127,8 @@ export function Gaps() {
   const [preview,setPreview] = useState(null);
   const [trim,setTrim] = useState(null);
   const [confirmation,setConfirmation] = useState(null);
-  const [busy,setBusy] = useState(false);
+  const [work, setWork] = useState(null);
+  const running = useRef(null);
   const [error,setError] = useState("");
   const [message,setMessage] = useState("");
   const [commandFeedback, setCommandFeedback] = useState(null);
@@ -198,16 +199,22 @@ export function Gaps() {
   }, [reportId, reload, summaryRetry]);
   const currentSummary = summary?.id === reportId ? summary : null;
   async function run(fn, command) {
-    setBusy(true);
+    const task = { command };
+    running.current = task;
+    setWork(task);
     setError("");
     setCommandFeedback(null);
     try {
       await fn();
     } catch (failure) {
+      if (running.current !== task) return;
       if (command) setCommandFeedback({ command, error: failure.message });
       else setError(failure.message);
     } finally {
-      setBusy(false);
+      if (running.current === task) {
+        running.current = null;
+        setWork(null);
+      }
     }
   }
   const book = draft.book ? books.find(b => b.id + "/" + b.color === draft.book) : books[0];
@@ -258,10 +265,18 @@ export function Gaps() {
     }
     refreshJournal();
     const progress = new AbortController();
+    const pending = () => stored(storage + ".save")?.command === command.command;
     const timer = command.replacements ? null : setInterval(async () => {
+      if (!pending()) {
+        clearInterval(timer);
+        progress.abort();
+        return;
+      }
       try {
         const state = await api("coverage/save/" + command.command, undefined, progress.signal);
-        if (state && !progress.signal.aborted) showProgress(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
+        if (state && !progress.signal.aborted && pending()) {
+          showProgress(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
+        }
       } catch { /* The save command has its own acknowledgement. */ }
     }, 750);
     let receipt;
@@ -289,14 +304,9 @@ export function Gaps() {
     const accepted = await settleCommand("save", command, {
       report: command.draft.report, replacement: Boolean(command.replacements), previous,
     });
-    setMessage("");
-    clearPreview();
-    if (accepted && stored(storage)?.report === command.draft.report) {
-      try {
-        await scan(report.scan, previous);
-      } catch (failure) {
-        if (mounted.current) setError(failure.message);
-      }
+    if (accepted && mounted.current && stored(storage)?.report === command.draft.report) {
+      clearPreview();
+      await run(() => scan(report.scan, previous));
     }
   }
   function applyOrder(pending) {
@@ -323,7 +333,9 @@ export function Gaps() {
       throw e;
     }
   }
-  const locked=busy || !!draft.pending || !!draft.applyCommand;
+  const isPending = command => command === draft.pending?.command || command === draft.applyCommand?.command;
+  const busy = !!work && (!work.command || isPending(work.command));
+  const locked = busy || !!draft.pending || !!draft.applyCommand;
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
   const replacements = draft.replacements ?? noReplacements;
   const hasReplacements = Object.keys(replacements).length > 0;
@@ -377,8 +389,7 @@ export function Gaps() {
   const previous = saveAcknowledgement ? saveAcknowledgement.previous : draft.previous;
   const savedMessage = saveAcknowledgement?.replacement ? "Repertoire changes and continuation saved." : "Continuation saved.";
   const appliedMessage = applyAcknowledgement && "Applied opening order for "+applyAcknowledgement.cards+" reached cards. New cards use this order when Maia is selected in Settings.";
-  const pendingFeedback = commandFeedback &&
-    [draft.pending?.command, draft.applyCommand?.command].includes(commandFeedback.command) ? commandFeedback : null;
+  const pendingFeedback = commandFeedback && isPending(commandFeedback.command) ? commandFeedback : null;
   const alert = error || pendingFeedback?.error;
   const status = pendingFeedback?.message || (!draft.pending && saved && savedMessage) || message;
   const blocked = locked || report?.stale || Boolean(saved);
