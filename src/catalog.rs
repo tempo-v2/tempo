@@ -167,6 +167,14 @@ struct OpeningCard {
     context: String,
 }
 
+impl OpeningPlan {
+    pub fn responses(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.cards
+            .iter()
+            .map(|c| (c.position.as_str(), c.version.as_str(), c.answers.as_str()))
+    }
+}
+
 pub fn prepare_opening(input: &OpeningInput) -> Result<OpeningPlan> {
     let name = name(&input.name)?.to_owned();
     ensure!(
@@ -266,9 +274,9 @@ pub fn apply_opening(
             }
         } else {
             pending.insert(card.position.clone(), (card_id, card));
-            // One card and one prepared entry per position, plus the line and new choice.
+            // Each new card writes its prepared entry and repertoire revision.
             ensure!(
-                !online || pending.len() * 2 + 1 + usize::from(new_choice) <= 128,
+                !online || pending.len() * 3 + 1 + usize::from(new_choice) <= 128,
                 OverBudget
             );
         }

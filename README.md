@@ -129,3 +129,20 @@ identity and practice color. Each choice keeps the first authored line as
 its display example. The picker follows the same indexed lookup through
 migration and newly saved content. Choice paging has its own read slot and
 the same SQL budget as other optional reads.
+
+### Repertoire coverage
+
+On the Tempo host, run `tools/setup-coverage.sh` once (requires uv). It provisions
+Maia-2 Rapid on CPU. Scans use the same 1500/1500 profile as the installed
+opening rank. In Openings → Gaps, choose a repertoire, starting PGN and horizon.
+The forecast follows your saved responses and branches on Maia's opponent move
+probabilities. Authored coverage counts complete paths through your chosen move.
+Personally studied coverage requires a completed review on each current response.
+Both are conditional on the starting line. Early game endings are shown separately.
+A scan expands up to 3,000 positions, most probable first. Unexplored probability
+and conflicting replies contribute to the displayed uncertainty range.
+
+Open a gap in Lichess, extend the line and paste its exported PGN in Tempo.
+Preview shows the learner replies below the selected position, including legal
+transpositions and variations. Save commits those lines together. Scanning and
+previewing leave the repertoire and learning history untouched.
