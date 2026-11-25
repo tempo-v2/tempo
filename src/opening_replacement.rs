@@ -43,7 +43,7 @@ impl PreviewUnavailable {
 impl std::fmt::Display for PreviewUnavailable {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         output.write_str(match self {
-            Self::WorkLimit => "These saved continuations exceed the preview work limit. Split the replacement and preview again.",
+            Self::WorkLimit => "These saved continuations exceed the preview work limit. Clear staged repertoire changes to continue editing.",
             Self::CyclicReplies => "The saved continuations reach competing replies in different orders. Preview the replacements separately.",
         })
     }
