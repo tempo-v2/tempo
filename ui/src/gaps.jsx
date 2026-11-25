@@ -200,11 +200,15 @@ export function Gaps() {
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
         <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{setPreview(null);update({pgn:e.target.value});}}/></label>
-        <button disabled={locked||report.stale||!edit.pgn} onClick={()=>run(async()=>setPreview({ ...await api("coverage/preview",edit), draft: edit }))}>Preview</button>
-        {currentPreview && <><ul>{currentPreview.responses.map(r=><li key={r.position}>{r.move} · {r.status}</li>)}</ul>
-          <button disabled={locked || report.stale || currentPreview.responses.some(r => r.status === "conflict")}
-            onClick={() => run(() => save({ draft: currentPreview.draft, command: currentPreview.command }, currentPreview.batched))}>Save to repertoire</button></>}
-        {pendingSave && <button disabled={busy} onClick={()=>run(()=>save(pendingSave))}>Retry same save</button>}
+        <div className="controls">
+          <button disabled={locked || report.stale || !edit.pgn}
+            onClick={() => run(async () => setPreview({ ...await api("coverage/preview", edit), draft: edit }))}>Preview</button>
+          {pendingSave
+            ? <button disabled={busy} onClick={() => run(() => save(pendingSave))}>Retry same save</button>
+            : <button disabled={locked || report.stale || !currentPreview || currentPreview.responses.some(r => r.status === "conflict")}
+                onClick={() => run(() => save({ draft: currentPreview.draft, command: currentPreview.command }, currentPreview.batched))}>Save to repertoire</button>}
+        </div>
+        {currentPreview && <ul>{currentPreview.responses.map(r => <li key={r.position}>{r.move} · {r.status}</li>)}</ul>}
       </section>}
       <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
       {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
