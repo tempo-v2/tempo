@@ -100,27 +100,85 @@ pub fn repertoires(db: &Connection, after: &str, color: &str) -> Result<Vec<Repe
     .collect::<rusqlite::Result<_>>()?)
 }
 
+pub struct CurrentOpeningReply {
+    pub id: String,
+    pub version: String,
+    pub quarantined: bool,
+    pub answers: String,
+}
+
+/// Return the current reply, including an unresolved reply when no active one exists.
+pub fn current_opening_reply(
+    db: &Connection,
+    repertoire: &str,
+    position: &str,
+) -> Result<Option<CurrentOpeningReply>> {
+    let mut query = db.prepare_cached(
+        "SELECT id,answer_version,quarantined,answers FROM cards
+         WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2 AND opening_retired=0
+         ORDER BY quarantined LIMIT 1",
+    )?;
+    Ok(query
+        .query_row((repertoire, position), |row| {
+            Ok(CurrentOpeningReply {
+                id: row.get(0)?,
+                version: row.get(1)?,
+                quarantined: row.get(2)?,
+                answers: row.get(3)?,
+            })
+        })
+        .optional()?)
+}
+
+/// The route recorded when this reply was created. Its current authorship
+/// must be established separately.
+pub fn recorded_opening_context(db: &Connection, id: &str) -> Result<Option<Route>> {
+    let text: Option<String> = db.query_row(
+        "SELECT context FROM cards WHERE id=?1 AND kind='opening'",
+        [id],
+        |row| row.get(0),
+    )?;
+    Ok(text.and_then(|source| serde_json::from_str(&source).ok()))
+}
+
+pub struct ReplyContexts {
+    pub routes: std::collections::BTreeMap<String, Route>,
+    pub limited: bool,
+}
+
 /// Current authored routes for the requested reply versions in this repertoire.
+/// A missing route is conclusive only when the bounded search was exhausted.
 pub fn reply_contexts(
     db: &Connection,
     repertoire: &str,
     color: &str,
     mut wanted: std::collections::BTreeMap<String, String>,
-) -> Result<std::collections::BTreeMap<String, Route>> {
-    let mut found = std::collections::BTreeMap::new();
+) -> Result<ReplyContexts> {
+    const LINE_LIMIT: usize = 2000;
+    let mut found = ReplyContexts {
+        routes: std::collections::BTreeMap::new(),
+        limited: false,
+    };
     if wanted.is_empty() {
         return Ok(found);
     }
     let mut query = db.prepare(
         "SELECT route,start_at FROM openings
-         WHERE repertoire_id=?1 AND color=?2 AND archived=0 ORDER BY id LIMIT 2000",
+         WHERE repertoire_id=?1 AND color=?2 AND archived=0 ORDER BY id LIMIT ?3",
     )?;
-    let mut rows = query.query((repertoire, color))?;
+    let mut rows = query.query((repertoire, color, LINE_LIMIT + 1))?;
     let mut moves_left = 100_000usize;
+    let mut checked = 0;
     while let Some(row) = rows.next()? {
+        if checked == LINE_LIMIT {
+            found.limited = true;
+            break;
+        }
+        checked += 1;
         let route: Route = serde_json::from_str(&row.get::<_, String>(0)?)?;
         let start_at: usize = row.get(1)?;
         let Some(remaining) = moves_left.checked_sub(route.moves.len()) else {
+            found.limited = true;
             break;
         };
         moves_left = remaining;
@@ -133,7 +191,7 @@ pub fn reply_contexts(
                     version == &chess::id(&["answer-v1", &chess::uci(movement)])
                 }) {
                     wanted.remove(&position);
-                    found.insert(
+                    found.routes.insert(
                         position,
                         Route {
                             fen: route.fen.clone(),
