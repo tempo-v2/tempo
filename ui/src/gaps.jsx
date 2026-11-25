@@ -8,21 +8,51 @@ function stored(key) {
   try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
 }
 function restore() {
-  return { ...stored(storage), pending: stored(storage + ".save"), applyCommand: stored(storage + ".apply") };
+  return {
+    ...stored(storage),
+    pending: stored(storage + ".save"),
+    applyCommand: stored(storage + ".apply"),
+    saveAcknowledgement: stored(storage + ".saved"),
+    applyAcknowledgement: stored(storage + ".applied"),
+  };
 }
+function reportOf(draft) {
+  return draft.pending?.draft.report ?? draft.report;
+}
+
+function viewIdentity(draft) {
+  const report = reportOf(draft);
+  const accepted = draft.saveAcknowledgement?.report === report ? draft.saveAcknowledgement?.command : null;
+  return JSON.stringify([report, accepted]);
+}
+
+const journalChanged = storage + ".changed";
+const acknowledgementKey = kind => storage + (kind === "save" ? ".saved" : ".applied");
+
 async function claimCommand(kind, command) {
   return navigator.locks.request(storage + "." + kind, () => {
     const key = storage + "." + kind;
     const current = stored(key);
     if (current) return current.command === command.command;
+    if (stored(acknowledgementKey(kind))?.command === command.command) return false;
     localStorage.setItem(key, JSON.stringify(command));
+    window.dispatchEvent(new Event(journalChanged));
     return true;
   });
 }
-async function clearCommand(kind, command) {
-  await navigator.locks.request(storage + "." + kind, () => {
+
+async function settleCommand(kind, command, acknowledgement) {
+  return navigator.locks.request(storage + "." + kind, () => {
     const key = storage + "." + kind;
-    if (stored(key)?.command === command.command) localStorage.removeItem(key);
+    if (stored(key)?.command !== command.command) return false;
+    if (acknowledgement) {
+      localStorage.setItem(acknowledgementKey(kind), JSON.stringify({
+        command: command.command, ...acknowledgement,
+      }));
+    }
+    localStorage.removeItem(key);
+    window.dispatchEvent(new Event(journalChanged));
+    return true;
   });
 }
 function notation(game) {
@@ -81,34 +111,57 @@ function ReplacementImpact({ impact }) {
 
 export function Gaps() {
   const [draft, setDraft] = useState(restore);
-  const form = useRef(stored(storage));
   const scanOwner = useRef(null);
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; scanOwner.current?.abort(); };
+    const storageChanged = event => {
+      if (event.key === null || event.key === storage || event.key.startsWith(storage + ".")) refreshJournal();
+    };
+    window.addEventListener(journalChanged, refreshJournal);
+    window.addEventListener("storage", storageChanged);
+    refreshJournal();
+    return () => {
+      mounted.current = false;
+      scanOwner.current?.controller.abort();
+      window.removeEventListener(journalChanged, refreshJournal);
+      window.removeEventListener("storage", storageChanged);
+    };
   }, []);
   const [books, setBooks] = useState([]);
-  const [report,setReport] = useState(null);
+  const [loadedReport,setReport] = useState(null);
+  const [selectedGap, setSelectedGap] = useState(null);
   const [summary, setSummary] = useState(null);
   const [summaryRetry, setSummaryRetry] = useState(0);
   const [preview,setPreview] = useState(null);
   const [trim,setTrim] = useState(null);
   const [confirmation,setConfirmation] = useState(null);
-  const [busy,setBusy] = useState(false);
+  const [work, setWork] = useState(null);
+  const running = useRef(null);
   const [error,setError] = useState("");
   const [message,setMessage] = useState("");
+  const [commandFeedback, setCommandFeedback] = useState(null);
   const [reload, setReload] = useState(0);
   function refreshJournal() {
-    setDraft({ ...form.current, pending: stored(storage + ".save"), applyCommand: stored(storage + ".apply") });
+    const current = restore();
+    if (scanOwner.current && scanOwner.current.view !== viewIdentity(current)) {
+      scanOwner.current.controller.abort();
+    }
+    setDraft(current);
   }
   function update(patch) {
-    form.current = { ...form.current, ...patch };
-    localStorage.setItem(storage, JSON.stringify(form.current));
+    localStorage.setItem(storage, JSON.stringify({ ...stored(storage), ...patch }));
     refreshJournal();
   }
+  const requestedReport = reportOf(draft);
+  const report = loadedReport?.id === requestedReport ? loadedReport : null;
+  const pendingSave = draft.pending?.draft.report === report?.id ? draft.pending : null;
+  const gapIndex = pendingSave?.draft.gap ?? draft.index;
+  const gap = report?.gaps[gapIndex] ??
+    (selectedGap?.report === requestedReport && selectedGap?.index === gapIndex ? selectedGap?.gap : null);
+
   useEffect(() => {
-    const ctrl=new AbortController();
+    const ctrl = new AbortController();
     async function loadBooks() {
       let options = [], page;
       do {
@@ -119,27 +172,32 @@ export function Gaps() {
       } while (page.length === 50);
       setBooks(options);
     }
-    async function loadReport() {
-      const saved = { ...form.current, pending: stored(storage + ".save") };
-      const reportId = saved.pending?.draft.report ?? saved.report;
-      if (!reportId) return;
-      const result = await api("coverage/" + reportId + "/gaps", undefined, ctrl.signal);
-      // Recover an editor opened on a later page without fetching intervening pages.
-      const index = saved.pending?.draft.gap ?? saved.index;
-      if (index >= result.gaps.length && index < result.total) {
-        const offset = Math.floor(index / 30) * 30;
-        const page = await api("coverage/" + reportId + "/gaps?offset=" + offset, undefined, ctrl.signal);
-        result.selectedGap = page.gaps[index - offset];
-      }
-      const latest = { ...form.current, pending: stored(storage + ".save") };
-      if ((latest.pending?.draft.report ?? latest.report) === reportId) setReport(result);
-    }
     setError("");
-    const failed = e => { if (!ctrl.signal.aborted) setError(e.message); };
-    void loadBooks().catch(failed);
-    void loadReport().catch(failed);
+    void loadBooks().catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
     return () => ctrl.abort();
   }, [reload]);
+  useEffect(() => {
+    if (!requestedReport || (requestedReport === report?.id && !reload)) return;
+    const ctrl = new AbortController();
+    api("coverage/" + requestedReport + "/gaps", undefined, ctrl.signal).then(result => {
+      if (!ctrl.signal.aborted && reportOf(restore()) === requestedReport) {
+        setReport(result);
+      }
+    }).catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
+    return () => ctrl.abort();
+  }, [reload, requestedReport]);
+  const needsGapPage = Boolean(report && gapIndex >= report.gaps.length && gapIndex < report.total);
+  useEffect(() => {
+    if (!needsGapPage) return;
+    const ctrl = new AbortController();
+    const offset = Math.floor(gapIndex / 30) * 30;
+    api("coverage/" + requestedReport + "/gaps?offset=" + offset, undefined, ctrl.signal)
+      .then(page => {
+        if (!ctrl.signal.aborted) setSelectedGap({ report: requestedReport, index: gapIndex, gap: page.gaps[gapIndex - offset] });
+      })
+      .catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
+    return () => ctrl.abort();
+  }, [reload, requestedReport, gapIndex, needsGapPage]);
   const reportId = report?.id;
   useEffect(() => {
     if (!reportId) return;
@@ -150,20 +208,42 @@ export function Gaps() {
     return () => controller.abort();
   }, [reportId, reload, summaryRetry]);
   const currentSummary = summary?.id === reportId ? summary : null;
-  async function run(fn) {
-    setBusy(true);setError("");
-    try { await fn(); } catch(e){setError(e.message);} finally {setBusy(false);}
+  async function run(fn, { command } = {}) {
+    const task = command ? { command } : { view: viewIdentity(restore()) };
+    running.current = task;
+    setWork(task);
+    setError("");
+    setCommandFeedback(null);
+    try {
+      await fn();
+    } catch (failure) {
+      if (running.current !== task || (task.view && task.view !== viewIdentity(restore()))) return;
+      if (command) setCommandFeedback({ command, error: failure.message });
+      else setError(failure.message);
+    } finally {
+      if (running.current === task) {
+        running.current = null;
+        setWork(null);
+      }
+    }
   }
   const book = draft.book ? books.find(b => b.id + "/" + b.color === draft.book) : books[0];
   async function scan(request, previous) {
     if (!mounted.current) return;
-    scanOwner.current?.abort();
+    scanOwner.current?.controller.abort();
     const controller = new AbortController();
-    scanOwner.current = controller;
+    scanOwner.current = { controller, view: viewIdentity(restore()) };
     const signal = controller.signal;
+    const scanDraft = localStorage.getItem(storage);
+    const acceptedSave = localStorage.getItem(acknowledgementKey("save"));
+    const acceptedApply = localStorage.getItem(acknowledgementKey("apply"));
     const {id}=await api("coverage",request,signal,{requireJson:true});
     const next=await api("coverage/"+id+"/gaps",undefined,signal);
     signal.throwIfAborted();
+    if (localStorage.getItem(storage) !== scanDraft ||
+        localStorage.getItem(acknowledgementKey("save")) !== acceptedSave ||
+        localStorage.getItem(acknowledgementKey("apply")) !== acceptedApply ||
+        stored(storage + ".save") || stored(storage + ".apply")) return;
     setReport(next);clearPreview();
     if (reportId === id) setSummaryRetry(n => n + 1);
     update({report:id,index:null,pgn:"",replacements:noReplacements,previous:null,savedReport:null});
@@ -176,15 +256,18 @@ export function Gaps() {
     return {repertoire:book.id,color:book.color,through:Number(draft.through??10),
       route:{fen:history[0]?.before??game.fen(),moves:history.map(m=>m.lan)}};
   }
-  const pendingSave = draft.pending?.draft.report === report?.id ? draft.pending : null;
-  const gap=report?.gaps[pendingSave?.draft.gap ?? draft.index]??report?.selectedGap;
   function open(index) {
     const link=lead(report,report.gaps[index]);
     window.open(link.url,"_blank","noopener,noreferrer");
     clearPreview();setMessage("");update({index,pgn:"",replacements:noReplacements});
   }
-  async function save(command, batched) {
-    setMessage(batched ? "Saving continuation in batches…" : "Saving continuation…");
+  function save(command, batched) {
+    return run(() => sendSave(command, batched), { command: command.command });
+  }
+  async function sendSave(command, batched) {
+    setMessage("");
+    const showProgress = message => setCommandFeedback({ command: command.command, message });
+    showProgress(batched ? "Saving continuation in batches…" : "Saving continuation…");
     if (!await claimCommand("save", command)) {
       refreshJournal();
       setReload(n => n + 1);
@@ -192,10 +275,18 @@ export function Gaps() {
     }
     refreshJournal();
     const progress = new AbortController();
+    const pending = () => stored(storage + ".save")?.command === command.command;
     const timer = command.replacements ? null : setInterval(async () => {
+      if (!pending()) {
+        clearInterval(timer);
+        progress.abort();
+        return;
+      }
       try {
         const state = await api("coverage/save/" + command.command, undefined, progress.signal);
-        if (state && !progress.signal.aborted) setMessage(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
+        if (state && !progress.signal.aborted && pending()) {
+          showProgress(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
+        }
       } catch { /* The save command has its own acknowledgement. */ }
     }, 750);
     let receipt;
@@ -204,28 +295,34 @@ export function Gaps() {
     } catch(e) {
       const stale = e.code === "stale_gap" || e.code === "gap_save_interrupted";
       if(stale || e.code==="opening_reply_conflict" || e.code==="replacement_over_budget" || e.code==="replacement_preview_unavailable") {
-        await clearCommand("save", command);
-        refreshJournal();
-        clearPreview();
-        if (stale) setReport(old=>({...old,stale:true}));
+        if (await settleCommand("save", command)) {
+          clearPreview();
+          if (stale) setReport(old => old?.id === command.draft.report ? {...old, stale:true} : old);
+          setError(e.message);
+        }
+        return;
       }
-      setMessage("");
       throw e;
     } finally {
       clearInterval(timer);
       progress.abort();
     }
-    if(receipt?.command!==command.command || !Array.isArray(receipt.lines) || !receipt.lines.length)
+    if (receipt?.command !== command.command || !Array.isArray(receipt.lines) || !receipt.lines.length ||
+        !receipt.lines.every(line => typeof line === "string" && line.length > 0))
       throw new Error("Save acknowledgement was incomplete. Retry the same save.");
-    setReport(old=>({...old,stale:true}));
-    setMessage(command.replacements ? "Repertoire changes and continuation saved." : "Continuation saved.");
-    await clearCommand("save", command);
     const previous = report.model_superseded ? null : report.authored;
-    update({previous,savedReport:command.draft.report});
-    clearPreview();
-    await scan(report.scan,previous);
+    const accepted = await settleCommand("save", command, {
+      report: command.draft.report, replacement: Boolean(command.replacements), previous,
+    });
+    if (accepted && mounted.current && stored(storage)?.report === command.draft.report) {
+      clearPreview();
+      await run(() => scan(report.scan, previous));
+    }
   }
-  async function applyOrder(pending) {
+  function applyOrder(pending) {
+    return run(() => sendApply(pending), { command: pending.command });
+  }
+  async function sendApply(pending) {
     if (!await claimCommand("apply", pending)) {
       refreshJournal();
       return;
@@ -233,19 +330,22 @@ export function Gaps() {
     refreshJournal();
     try {
       const reply = await api("coverage/" + pending.report + "/apply", { command: pending.command });
-      if(reply?.command!==pending.command || reply.id!==pending.report)throw new Error("Retry applying the opening order.");
-      await clearCommand("apply", pending);
-      refreshJournal();
-      setMessage("Applied opening order for "+reply.cards+" reached cards. New cards use this order when Maia is selected in Settings.");
+      if (reply?.command !== pending.command || reply.id !== pending.report ||
+          !Number.isSafeInteger(reply.cards) || reply.cards < 0) {
+        throw new Error("Retry applying the opening order.");
+      }
+      await settleCommand("apply", pending, { report: reply.id, cards: reply.cards });
     } catch(e) {
       if (e.code === "stale_gap" || e.code === "coverage_model_superseded") {
-        await clearCommand("apply", pending);
-        refreshJournal();
+        if (await settleCommand("apply", pending)) setError(e.message);
+        return;
       }
       throw e;
     }
   }
-  const locked=busy || !!draft.pending || !!draft.applyCommand;
+  const isPending = command => command === draft.pending?.command || command === draft.applyCommand?.command;
+  const busy = !!work && (work.command ? isPending(work.command) : work.view === viewIdentity(draft));
+  const locked = busy || !!draft.pending || !!draft.applyCommand;
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
   const replacements = draft.replacements ?? noReplacements;
   const hasReplacements = Object.keys(replacements).length > 0;
@@ -256,9 +356,11 @@ export function Gaps() {
     setConfirmation(null);
   }
   function isCurrent(candidate, choices) {
-    return mounted.current && form.current?.report === candidate.report && form.current?.index === candidate.gap &&
-      form.current?.pgn === candidate.pgn &&
-      JSON.stringify(form.current?.replacements ?? noReplacements) === JSON.stringify(choices);
+    const latest = restore();
+    return mounted.current && latest.report === candidate.report && latest.index === candidate.gap &&
+      latest.pgn === candidate.pgn && latest.saveAcknowledgement?.report !== candidate.report &&
+      latest.savedReport !== candidate.report &&
+      JSON.stringify(latest.replacements ?? noReplacements) === JSON.stringify(choices);
   }
   async function previewDraft(candidate, choices) {
     clearPreview();
@@ -289,11 +391,32 @@ export function Gaps() {
     update({ replacements: next });
     await previewDraft(edit, next);
   }
+  function showMoreGaps() {
+    const { id, gaps } = report;
+    const offset = gaps.length;
+    const view = viewIdentity(restore());
+    return run(async () => {
+      const page = await api("coverage/" + id + "/gaps?offset=" + offset);
+      if (!mounted.current || viewIdentity(restore()) !== view || page.id !== id) return;
+      setReport(current => current?.id === id && current.gaps.length === offset
+        ? { ...page, gaps: [...current.gaps, ...page.gaps] }
+        : current);
+    });
+  }
   const currentPreview = preview && isCurrent(preview.draft, preview.choices) ? preview : null;
   const conflicts = currentPreview?.conflicts ?? [];
   const replacement = currentPreview?.replacement;
   const confirming = replacement && confirmation === replacement.command;
-  const blocked = locked || report?.stale;
+  const saveAcknowledgement = draft.saveAcknowledgement?.report === reportId ? draft.saveAcknowledgement : null;
+  const applyAcknowledgement = draft.applyAcknowledgement?.report === reportId ? draft.applyAcknowledgement : null;
+  const saved = saveAcknowledgement || (draft.savedReport && draft.savedReport === reportId);
+  const previous = saveAcknowledgement ? saveAcknowledgement.previous : draft.previous;
+  const savedMessage = saveAcknowledgement?.replacement ? "Repertoire changes and continuation saved." : "Continuation saved.";
+  const appliedMessage = applyAcknowledgement && "Applied opening order for "+applyAcknowledgement.cards+" reached cards. New cards use this order when Maia is selected in Settings.";
+  const pendingFeedback = commandFeedback && isPending(commandFeedback.command) ? commandFeedback : null;
+  const alert = error || pendingFeedback?.error;
+  const status = pendingFeedback?.message || (!draft.pending && saved && savedMessage) || message;
+  const blocked = locked || report?.stale || Boolean(saved);
   return <section><h2>Repertoire gaps</h2>
     <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
       {!book && <option value="" disabled>Select a repertoire</option>}
@@ -301,18 +424,20 @@ export function Gaps() {
       <label>Starting line (PGN) <input placeholder="1. e4 e5 2. Nf3 Nc6 3. Bc4" value={draft.line??""} onChange={e=>update({line:e.target.value})}/></label>
       <label>Through my move <input type="number" min="1" max="100" value={draft.through??10} onChange={e=>update({through:e.target.value})}/></label>
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
-    {busy && <p role="status">Working…</p>}{error && <p role="alert">{error}</p>}
-    {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{(message || (draft.savedReport && draft.savedReport === report?.id)) && <p role="status">{message || "Continuation saved."}</p>}
-    {draft.applyCommand && <button disabled={busy} onClick={() => run(() => applyOrder(draft.applyCommand))}>Retry applying order</button>}
+    {busy && <p role="status">Working…</p>}{alert && <p role="alert">{alert}</p>}
+    {error && (!report || !books.length) && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Reload gaps</button>}{status && <p role="status">{status}</p>}
+    {!draft.applyCommand && appliedMessage && <p role="status">{appliedMessage}</p>}
+    {draft.applyCommand && <button disabled={busy} onClick={() => applyOrder(draft.applyCommand)}>Retry applying order</button>}
+    {pendingSave && !gap && <button disabled={busy} onClick={() => save(pendingSave)}>Retry same save</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
     {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · {report.model}</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {currentSummary?.unavailable ? <button onClick={() => setSummaryRetry(n => n + 1)}>Retry summary</button> : currentSummary ? range(currentSummary.studied,report.unresolved) : "Loading…"}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
       {report.model_superseded && <p>Rescan with the current model before using these probabilities to set your opening order.</p>}
-      {(report.model_superseded||report.stale||error||draft.previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : draft.previous))}>Retry scan</button>}
-      <button disabled={locked||report.stale||report.model_superseded} onClick={()=>run(() => applyOrder({ report: report.id, command: crypto.randomUUID() }))}>Apply to opening order</button>
-      {report.gaps.length>0 && <button disabled={locked||report.stale} onClick={()=>open(0)}>Work on next gap</button>}
+      {(report.model_superseded||report.stale||error||saved||previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : previous))}>Retry scan</button>}
+      <button disabled={blocked||report.model_superseded} onClick={()=>applyOrder({ report: report.id, command: crypto.randomUUID() })}>Apply to opening order</button>
+      {report.gaps.length>0 && <button disabled={blocked} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         <a href={lead(report,gap).url} target="_blank" rel="noreferrer">Open line in Lichess</a>
         <label>Paste PGN from Lichess <textarea disabled={locked} value={draft.pgn??""} onChange={e=>{clearPreview();update({pgn:e.target.value});}}/></label>
@@ -320,13 +445,13 @@ export function Gaps() {
           <button disabled={blocked || !edit.pgn}
             onClick={() => run(() => previewDraft(edit, replacements))}>Preview</button>
           {pendingSave
-            ? <button disabled={busy} onClick={() => run(() => save(pendingSave))}>Retry same save</button>
+            ? <button disabled={busy} onClick={() => save(pendingSave)}>Retry same save</button>
             : hasReplacements
               ? <button disabled={blocked || !!trim || !replacement || replacement.over_budget || confirming}
                   onClick={() => setConfirmation(replacement.command)}>Review repertoire changes</button>
               : <button disabled={blocked || !!trim || !currentPreview || conflicts.length > 0 ||
                     currentPreview.responses.some(reply => reply.status === "conflict")}
-                  onClick={() => run(() => save({ draft: currentPreview.draft, command: currentPreview.command }, currentPreview.batched))}>Save to repertoire</button>}
+                  onClick={() => save({ draft: currentPreview.draft, command: currentPreview.command }, currentPreview.batched)}>Save to repertoire</button>}
         </div>
         {currentPreview && <p role="status">{currentPreview.new_replies} new {currentPreview.new_replies === 1 ? "reply" : "replies"} · {conflicts.length ? `${conflicts.length} ${conflicts.length === 1 ? "conflict" : "conflicts"}` : "No remaining conflicts"}</p>}
         {!!conflicts.length && <ol className="gap-conflict-list">{conflicts.map(conflict =>
@@ -356,18 +481,15 @@ export function Gaps() {
           {replacement.over_budget && <p>This change is too large to save at once. Split the PGN and preview again.</p>}
           {confirming && <div className="controls">
             <button disabled={blocked} onClick={() => setConfirmation(null)}>Cancel</button>
-            <button disabled={blocked} onClick={() => run(() => save({
+            <button disabled={blocked} onClick={() => save({
               draft: currentPreview.draft, replacements, command: replacement.command, revision: replacement.revision,
               line_revision: replacement.line_revision,
-            }))}>Confirm repertoire changes and save</button>
+            })}>Confirm repertoire changes and save</button>
           </div>}
         </section>}
       </section>}
-      <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={locked||report.stale} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
-      {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
-        const page=await api("coverage/"+report.id+"/gaps?offset="+report.gaps.length);
-        setReport({...page,selectedGap:report.selectedGap,gaps:[...report.gaps,...page.gaps]});
-      })}>Show more gaps</button>}
+      <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={blocked} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
+      {report.gaps.length < report.total && <button disabled={busy} onClick={showMoreGaps}>Show more gaps</button>}
     </>}
   </section>;
 }
