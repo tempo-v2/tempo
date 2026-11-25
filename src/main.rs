@@ -72,6 +72,13 @@ type ApiResult = std::result::Result<Json<Value>, ApiError>;
 struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.0.is::<gap_edit::Stale>() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"code":"stale_gap","error":self.0.to_string()})),
+            )
+                .into_response();
+        }
         if self.0.is::<catalog::OverBudget>() {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
