@@ -374,7 +374,8 @@ async function invalidCurrentReply(browser, db) {
   });
 }
 
-async function incompleteNextReply(browser, db, automatic) {
+async function incompleteNextReply(browser, db, failure) {
+  const automatic = failure === "missing-result";
   await serve(candidate, db, await unusedPort(), async (origin, api) => {
     await seed(api);
     const page = await browser.newPage();
@@ -394,9 +395,14 @@ async function incompleteNextReply(browser, db, automatic) {
         assert.equal(response.status(), 200);
         issued = await response.json();
         assert.notEqual(issued.attempt, first.attempt);
-        await route.fulfill(automatic
-          ? { status: 200, json: { ...issued, result: undefined } }
-          : { status: 200, contentType: "application/json", body: '{"attempt":' });
+        if (failure === "truncated") {
+          await route.fulfill({ status: 200, contentType: "application/json", body: '{"attempt":' });
+          return;
+        }
+        const result = failure === "unplayable"
+          ? { rating: "Again", answers: ["a1a8"], repeat_after: null }
+          : undefined;
+        await route.fulfill({ status: 200, json: { ...issued, result } });
       }, { times: 1 });
       const rating = automatic ? "Good" : "Again";
       if (automatic) {
@@ -536,8 +542,9 @@ async function browserReads(browser, db) {
     await mixedTabs(browser, path.join(root, "mixed.db"));
     await browserReads(browser, path.join(root, "browse.db"));
     await invalidCurrentReply(browser, path.join(root, "invalid-current.db"));
-    await incompleteNextReply(browser, path.join(root, "manual-next.db"), false);
-    await incompleteNextReply(browser, path.join(root, "automatic-next.db"), true);
+    for (const failure of ["truncated", "missing-result", "unplayable"]) {
+      await incompleteNextReply(browser, path.join(root, failure + "-next.db"), failure);
+    }
     await incompleteStartupNext(browser, path.join(root, "startup-next.db"));
     console.log("Malformed Next replies preserved saved manual and automatic results. Retry reused the issued attempt and the startup retry accepted real null.");
     console.log("Predecessor accepted-lost and undelivered Answers, two-tab recovery, incomplete reply replay, and Next-only retry passed.");

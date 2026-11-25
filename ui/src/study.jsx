@@ -108,11 +108,22 @@ function decodeStudyReply(body, dataset) {
       !Array.isArray(body.legal) || !body.legal.every(isMove)) {
     throw new Error(incomplete);
   }
-  new Chess(body.fen);
+  const result = body.result === null ? null : decodeResult(body.result, incomplete);
+  // The board and feedback render these moves from the issued position.
+  // Validate that projection before replacing the last rendered card.
+  try {
+    const board = new Chess(body.fen);
+    for (const move of result?.answers ?? []) {
+      play(board, move);
+      board.undo();
+    }
+  } catch {
+    throw new Error(incomplete);
+  }
   return {
     ...body,
     title: typeof body.title === "string" ? body.title : "",
-    result: body.result === null ? null : decodeResult(body.result, incomplete),
+    result,
   };
 }
 
