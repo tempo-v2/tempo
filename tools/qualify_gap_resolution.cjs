@@ -416,6 +416,38 @@ async function laterGapAcrossTabs(browser) {
       assert.equal(await author.getByRole("alert").count(), 0);
       assert.equal(await author.getByText(/Saving continuation/).count(), 0);
       assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
+
+      seedReport(db, "new-report", repertoire, anchor, ["g1f3", "b8c6"]);
+      let releasePage;
+      let fetchedPage;
+      const holdPage = new Promise(resolve => { releasePage = resolve; });
+      const pageFetched = new Promise(resolve => { fetchedPage = resolve; });
+      await observer.route("**/api/coverage/later-report/gaps?offset=30", async route => {
+        const response = await route.fetch();
+        fetchedPage();
+        await holdPage;
+        await route.fulfill({ response });
+      }, { times: 1 });
+      try {
+        await observer.getByRole("button", { name: "Show more gaps" }).click();
+        await pageFetched;
+        await author.route("**/api/coverage", route => route.fulfill({ json: { id: "new-report" } }));
+        const loaded = observer.waitForResponse("**/api/coverage/new-report/gaps");
+        await author.getByRole("button", { name: "Scan repertoire" }).click();
+        await loaded;
+        const apply = observer.getByRole("button", { name: "Apply to opening order" });
+        await observer.getByRole("button", { name: "Show more gaps" }).waitFor({ state: "hidden" });
+        assert.equal(await apply.isEnabled(), true);
+        const delivered = observer.waitForResponse("**/api/coverage/later-report/gaps?offset=30");
+        releasePage();
+        await delivered;
+        // Wait for the handler's continuation, including the run finalizer.
+        await observer.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        assert.equal(await apply.isEnabled(), true);
+        assert.equal(await observer.getByRole("button", { name: "Show more gaps" }).count(), 0);
+      } finally {
+        releasePage();
+      }
     } finally {
       await context.close();
     }

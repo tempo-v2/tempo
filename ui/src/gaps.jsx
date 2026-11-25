@@ -143,6 +143,10 @@ export function Gaps() {
     refreshJournal();
   }
   const requestedReport = draft.pending?.draft.report ?? draft.report;
+  function currentReport() {
+    const latest = restore();
+    return latest.pending?.draft.report ?? latest.report;
+  }
   const report = loadedReport?.id === requestedReport ? loadedReport : null;
   const pendingSave = draft.pending?.draft.report === report?.id ? draft.pending : null;
   const gapIndex = pendingSave?.draft.gap ?? draft.index;
@@ -169,8 +173,7 @@ export function Gaps() {
     if (!requestedReport || (requestedReport === report?.id && !reload)) return;
     const ctrl = new AbortController();
     api("coverage/" + requestedReport + "/gaps", undefined, ctrl.signal).then(result => {
-      const latest = restore();
-      if (!ctrl.signal.aborted && (latest.pending?.draft.report ?? latest.report) === requestedReport) {
+      if (!ctrl.signal.aborted && currentReport() === requestedReport) {
         setReport(result);
       }
     }).catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
@@ -198,8 +201,8 @@ export function Gaps() {
     return () => controller.abort();
   }, [reportId, reload, summaryRetry]);
   const currentSummary = summary?.id === reportId ? summary : null;
-  async function run(fn, command) {
-    const task = { command };
+  async function run(fn, { command, report: workReport } = {}) {
+    const task = { command, report: workReport };
     running.current = task;
     setWork(task);
     setError("");
@@ -207,7 +210,7 @@ export function Gaps() {
     try {
       await fn();
     } catch (failure) {
-      if (running.current !== task) return;
+      if (running.current !== task || (workReport && currentReport() !== workReport)) return;
       if (command) setCommandFeedback({ command, error: failure.message });
       else setError(failure.message);
     } finally {
@@ -252,7 +255,7 @@ export function Gaps() {
     clearPreview();setMessage("");update({index,pgn:"",replacements:noReplacements});
   }
   function save(command, batched) {
-    return run(() => sendSave(command, batched), command.command);
+    return run(() => sendSave(command, batched), { command: command.command });
   }
   async function sendSave(command, batched) {
     setMessage("");
@@ -310,7 +313,7 @@ export function Gaps() {
     }
   }
   function applyOrder(pending) {
-    return run(() => sendApply(pending), pending.command);
+    return run(() => sendApply(pending), { command: pending.command });
   }
   async function sendApply(pending) {
     if (!await claimCommand("apply", pending)) {
@@ -334,7 +337,8 @@ export function Gaps() {
     }
   }
   const isPending = command => command === draft.pending?.command || command === draft.applyCommand?.command;
-  const busy = !!work && (!work.command || isPending(work.command));
+  const busy = !!work && (!work.command || isPending(work.command)) &&
+    (!work.report || work.report === requestedReport);
   const locked = busy || !!draft.pending || !!draft.applyCommand;
   const edit={report:report?.id,gap:draft.index,pgn:draft.pgn??""};
   const replacements = draft.replacements ?? noReplacements;
@@ -378,6 +382,17 @@ export function Gaps() {
     delete next[position];
     update({ replacements: next });
     await previewDraft(edit, next);
+  }
+  function showMoreGaps() {
+    const { id, gaps } = report;
+    const offset = gaps.length;
+    return run(async () => {
+      const page = await api("coverage/" + id + "/gaps?offset=" + offset);
+      if (!mounted.current || currentReport() !== id || page.id !== id) return;
+      setReport(current => current?.id === id && current.gaps.length === offset
+        ? { ...page, gaps: [...current.gaps, ...page.gaps] }
+        : current);
+    }, { report: id });
   }
   const currentPreview = preview && isCurrent(preview.draft, preview.choices) ? preview : null;
   const conflicts = currentPreview?.conflicts ?? [];
@@ -465,10 +480,7 @@ export function Gaps() {
         </section>}
       </section>}
       <ol>{report.gaps.map((g,i)=><li key={g.fen}><button disabled={blocked} onClick={()=>open(i)}>{percent(g.probability)} · {lead(report,g).text}</button></li>)}</ol>
-      {report.gaps.length<report.total && <button disabled={busy} onClick={()=>run(async()=>{
-        const page=await api("coverage/"+report.id+"/gaps?offset="+report.gaps.length);
-        setReport({...page,gaps:[...report.gaps,...page.gaps]});
-      })}>Show more gaps</button>}
+      {report.gaps.length < report.total && <button disabled={busy} onClick={showMoreGaps}>Show more gaps</button>}
     </>}
   </section>;
 }
