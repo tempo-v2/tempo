@@ -108,8 +108,9 @@ Use the qualified pack artifact containing puzzle `03N75` and its pack,
 identified in the Lean assembly manifest. Each Tempo binary must have the
 matching built `ui/dist` in the checkout path used to compile it. Set
 `TEMPO_QUALIFY_CHROME` only to exercise an explicitly chosen Chrome binary.
-Set `TEMPO_QUALIFY_STOCKFISH` to a Stockfish 19 binary to include native gap
-review in the Gaps suite.
+To include native gap review, build the sibling worker with
+`cargo build --locked --release -p tempo-stockfish-analysis --bin tempo-tactic-worker`.
+Then set `TEMPO_QUALIFY_STOCKFISH` to a Stockfish 19 binary for the Gaps suite.
 
 Run installed-predecessor replay separately. Use the actual previous
 installation's binary and assets and take a read-only SQLite backup of its

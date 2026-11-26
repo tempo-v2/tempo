@@ -16,6 +16,15 @@ if (!["--candidate-only", "--predecessor-only"].includes(mode)
 const [candidate, predecessor, retainedDatabase] = args.map(value => path.resolve(value));
 const chrome = process.env.TEMPO_QUALIFY_CHROME;
 const stockfish = process.env.TEMPO_QUALIFY_STOCKFISH;
+if (mode === "--candidate-only" && stockfish) {
+  const worker = path.join(path.dirname(candidate), "tempo-tactic-worker");
+  try {
+    fs.accessSync(stockfish, fs.constants.X_OK);
+    fs.accessSync(worker, fs.constants.X_OK);
+  } catch (error) {
+    throw new Error("Native gap review requires executable Stockfish and a tempo-tactic-worker beside Tempo. See README.md.", { cause: error });
+  }
+}
 const folder = fs.mkdtempSync(path.join(os.tmpdir(), "tgr-"));
 const journal = "tempo-lean-gap-draft-v1";
 const start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
