@@ -2,12 +2,14 @@ use std::time::Instant;
 // Application orchestration. Games archives, the scanner compares, and Tactics publishes.
 use crate::{
     catalog, chess,
+    game_feedback::{self, Admission, Pair},
     games::{self, Acceptance, Candidate},
     job_store,
-    scanner::{self, Detector, Observation, Program},
+    scanner::{self, CaptureProgram, Detector, Observation},
 };
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
+use serde::{Deserialize, Serialize};
 
 fn stage(db: &Connection, parent: i64, operation: &str) -> Result<i64> {
     if let Some((detector, _)) = Detector::from_job(operation) {
@@ -121,20 +123,18 @@ pub fn start_scan(db: &mut Connection, job: i64, cursor: &str) -> Result<()> {
     Ok(())
 }
 
-/// The only lookup the comparison operation can make is for authored replies
-/// at a learner position. The sealed batch outlives this read snapshot.
-pub fn prepare_detector(
+pub fn prepare_capture(
     db: &Connection,
     game: &str,
-    program: Program,
+    capture: CaptureProgram,
     deadline: Instant,
 ) -> Result<Vec<u8>> {
     let snapshot = db.unchecked_transaction()?;
     let archived = games::read(&snapshot, game)?;
     let mut bytes = Vec::new();
-    let mut append = |finding: Option<Observation>| -> Result<()> {
+    for decision in scanner::decisions(&archived.mainline, archived.learner)? {
         ensure!(Instant::now() < deadline, "Games turn timed out.");
-        if let Some(finding) = finding {
+        if let Some(finding) = capture(&decision) {
             let encoded = serde_json::to_vec(&finding)?;
             ensure!(
                 bytes.len() + encoded.len() < 32 * 1024 * 1024,
@@ -142,21 +142,6 @@ pub fn prepare_detector(
             );
             bytes.extend_from_slice(&encoded);
             bytes.push(b'\n');
-        }
-        Ok(())
-    };
-    for decision in scanner::decisions(&archived.mainline, archived.learner)? {
-        match program {
-            Program::Repertoire(compare) => {
-                ensure!(Instant::now() < deadline, "Games turn timed out.");
-                catalog::visit_answers_at(
-                    &snapshot,
-                    &decision.position,
-                    chess::color_name(archived.learner),
-                    |reference| append(compare(&decision, reference)),
-                )?;
-            }
-            Program::Capture(capture) => append(capture(&decision))?,
         }
     }
     snapshot.commit()?;
@@ -181,7 +166,33 @@ pub fn seal_detector(db: &mut Connection, job: i64, game: &str, file: &str) -> R
 // A new capture can write a finding, a qualification row and a counter update.
 // Keep the remaining eight writes available for the scan checkpoint.
 pub const MAX_FINDINGS_PER_APPLY: usize = 40;
-const MAX_APPLY_ROWS: u64 = 128;
+pub const MAX_APPLY_ROWS: u64 = 128;
+
+pub struct Mismatch<'a> {
+    pub game: &'a str,
+    pub ply: usize,
+    pub position: &'a str,
+    pub repertoire: &'a str,
+    pub answer_version: &'a str,
+    pub played: &'a str,
+    pub detector_version: i64,
+}
+
+pub fn write_mismatch(db: &Connection, miss: Mismatch<'_>) -> Result<()> {
+    db.execute(
+        "INSERT OR IGNORE INTO mismatches VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            miss.game,
+            miss.ply,
+            miss.position,
+            miss.repertoire,
+            miss.answer_version,
+            miss.played,
+            miss.detector_version
+        ],
+    )?;
+    Ok(())
+}
 
 pub struct DetectorBatch {
     pub job: i64,
@@ -242,17 +253,17 @@ pub fn apply_detector(db: &mut Connection, batch: &DetectorBatch) -> Result<()> 
                 answer_version,
                 played,
             } => {
-                tx.execute(
-                    "INSERT OR IGNORE INTO mismatches VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                    params![
-                        batch.game,
-                        ply,
+                write_mismatch(
+                    &tx,
+                    Mismatch {
+                        game: &batch.game,
+                        ply: *ply,
                         position,
                         repertoire,
                         answer_version,
                         played,
-                        batch.version
-                    ],
+                        detector_version: batch.version,
+                    },
                 )?;
             }
             Observation::Capture {
@@ -283,19 +294,13 @@ pub fn apply_detector(db: &mut Connection, batch: &DetectorBatch) -> Result<()> 
         }
     }
     if batch.finished {
-        complete(&tx, batch.job, &batch.game)?;
-        if batch.cursor.is_some() {
-            let sibling = match batch.detector {
-                Detector::Repertoire => Detector::Capture,
-                Detector::Capture => Detector::Repertoire,
-            };
-            tx.execute(
-                "UPDATE jobs SET added=added+1 WHERE id=(SELECT parent_id FROM jobs WHERE id=?1)
-                 AND EXISTS(SELECT 1 FROM jobs sibling JOIN job_games done ON done.job_id=sibling.id
-                   WHERE sibling.parent_id=jobs.id AND sibling.operation=?2 AND done.game_id=?3 AND done.scanned=1)",
-                params![batch.job,sibling.job(true),batch.game],
-            )?;
-        }
+        complete_scan_game(
+            &tx,
+            batch.job,
+            &batch.game,
+            batch.detector,
+            batch.cursor.is_some(),
+        )?;
     }
     let cursor = batch.cursor.as_deref().filter(|_| batch.finished);
     job_store::yield_turn(&tx, batch.job, cursor, 0)?;
@@ -313,6 +318,122 @@ fn complete(db: &Connection, job: i64, game: &str) -> Result<()> {
          ON CONFLICT(job_id,game_id) DO UPDATE SET scanned=1",
         params![job, game],
     )?;
+    Ok(())
+}
+
+fn complete_scan_game(
+    db: &Connection,
+    job: i64,
+    game: &str,
+    detector: Detector,
+    archive: bool,
+) -> Result<()> {
+    complete(db, job, game)?;
+    if archive {
+        let sibling = match detector {
+            Detector::Repertoire => Detector::Capture,
+            Detector::Capture => Detector::Repertoire,
+        };
+        db.execute(
+            "UPDATE jobs SET added=added+1 WHERE id=(SELECT parent_id FROM jobs WHERE id=?1)
+             AND EXISTS(SELECT 1 FROM jobs sibling JOIN job_games done ON done.job_id=sibling.id
+               WHERE sibling.parent_id=jobs.id AND sibling.operation=?2 AND done.game_id=?3 AND done.scanned=1)",
+            params![job, sibling.job(true), game],
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FeedbackCursor {
+    pub game: String,
+    after: String,
+    waiting: Option<FeedbackWait>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FeedbackWait {
+    repertoire: String,
+    generation: i64,
+}
+
+pub fn feedback_cursor(db: &Connection, job: i64) -> Result<Option<FeedbackCursor>> {
+    let cursor: Option<String> = db.query_row(
+        "SELECT feedback_cursor FROM jobs WHERE id=?1",
+        [job],
+        |row| row.get(0),
+    )?;
+    Ok(cursor.as_deref().map(serde_json::from_str).transpose()?)
+}
+
+fn save_feedback_cursor(db: &Connection, job: i64, cursor: Option<&FeedbackCursor>) -> Result<()> {
+    db.execute(
+        "UPDATE jobs SET feedback_cursor=?2 WHERE id=?1",
+        params![job, cursor.map(serde_json::to_string).transpose()?],
+    )?;
+    Ok(())
+}
+
+pub fn retry_feedback_feeder(db: &Connection, job: i64) -> Result<()> {
+    if let Some(mut cursor) = feedback_cursor(db, job)? {
+        cursor.waiting = None;
+        save_feedback_cursor(db, job, Some(&cursor))?;
+    }
+    Ok(())
+}
+
+/// One addressed feeder step. It shares the explicit comparison's durable
+/// work without advancing past an accepted but unfinished comparison.
+pub fn feed_feedback(
+    db: &mut Connection,
+    job: i64,
+    game: &str,
+    archive_next: Option<&str>,
+) -> Result<()> {
+    let tx = db.transaction_with_behavior(Immediate)?;
+    let mut cursor = feedback_cursor(&tx, job)?.unwrap_or_else(|| FeedbackCursor {
+        game: game.to_owned(),
+        after: String::new(),
+        waiting: None,
+    });
+    ensure!(cursor.game == game, "comparison feeder game changed");
+    if let Some(waiting) = &cursor.waiting {
+        let pair = Pair {
+            game: game.to_owned(),
+            repertoire: waiting.repertoire.clone(),
+        };
+        if game_feedback::feed_settled(&tx, &pair, waiting.generation)? {
+            cursor.after = pair.repertoire;
+            cursor.waiting = None;
+            save_feedback_cursor(&tx, job, Some(&cursor))?;
+        }
+    } else if let Some(repertoire) =
+        catalog::next_repertoire(&tx, &games::learner_color(&tx, game)?, &cursor.after)?
+    {
+        let pair = Pair {
+            game: game.to_owned(),
+            repertoire,
+        };
+        match game_feedback::feed(&tx, &pair)? {
+            Admission::Current => cursor.after = pair.repertoire,
+            Admission::Wait(generation) => {
+                cursor.waiting = Some(FeedbackWait {
+                    repertoire: pair.repertoire,
+                    generation,
+                })
+            }
+            Admission::Full => (),
+        }
+        save_feedback_cursor(&tx, job, Some(&cursor))?;
+    } else {
+        complete_scan_game(&tx, job, game, Detector::Repertoire, archive_next.is_some())?;
+        save_feedback_cursor(&tx, job, None)?;
+        job_store::yield_turn(&tx, job, archive_next, 0)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    job_store::yield_turn(&tx, job, None, 0)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -441,10 +562,10 @@ mod tests {
             pending_game(&db, scan)?.as_deref(),
             Some(game.game.id.as_str())
         );
-        let bytes = prepare_detector(
+        let bytes = prepare_capture(
             &db,
             &game.game.id,
-            Detector::Capture.program(1)?,
+            scanner::capture_program(1)?,
             Instant::now() + std::time::Duration::from_secs(5),
         )?;
         let findings = serde_json::Deserializer::from_slice(&bytes)
@@ -483,14 +604,14 @@ mod tests {
 
         // Substitute a detector using the same addressed game and persisted
         // apply path. This version keeps a single candidate from the result.
-        let program = Program::Capture(|decision| {
+        let program: CaptureProgram = |decision| {
             let mut finding = scanner::capture(decision)?;
             if let Observation::Capture { captures, .. } = &mut finding {
                 captures.truncate(1);
             }
             Some(finding)
-        });
-        let replacement = prepare_detector(
+        };
+        let replacement = prepare_capture(
             &db,
             &game.game.id,
             program,

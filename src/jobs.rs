@@ -1,8 +1,8 @@
 use crate::{
-    game_pipeline,
+    game_feedback, game_pipeline,
     job_store::{self, ARCHIVE_RESUME_PAGE, ArchiveGame, FailedTurn, JobReads},
     providers::{self, Provider},
-    scanner::{Detector, Observation},
+    scanner::{self, Detector, Observation, REPERTOIRE_VERSION},
     uploads::Staging,
     writer::Writer,
 };
@@ -227,10 +227,30 @@ fn detector_turn(
             ArchiveStep::Complete => (None, None),
         },
         Some(_) => bail!("archive checkpoint was not converted"),
-        None => (db.pending_game(id)?, None),
+        None => {
+            let game = if detector == Detector::Repertoire {
+                match db.feedback_cursor(id)? {
+                    Some(progress) => Some(progress.game),
+                    None => db.pending_game(id)?,
+                }
+            } else {
+                db.pending_game(id)?
+            };
+            (game, None)
+        }
     };
     let Some(game) = game else { return Ok(false) };
-    let bytes = db.detector_plan(&game, detector.program(version)?, deadline)?;
+    let next_cursor = next_cursor
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    if detector == Detector::Repertoire {
+        writer.background_until(deadline, move |db| {
+            game_pipeline::feed_feedback(db, id, &game, next_cursor.as_deref())
+        })?;
+        return Ok(true);
+    }
+    let bytes = db.capture_plan(&game, scanner::capture_program(version)?, deadline)?;
     if bytes.is_empty() {
         let batch = game_pipeline::DetectorBatch {
             job: id,
@@ -242,9 +262,7 @@ fn detector_turn(
             after: 0,
             findings: Vec::new(),
             finished: true,
-            cursor: next_cursor
-                .map(|cursor| serde_json::to_string(&cursor))
-                .transpose()?,
+            cursor: next_cursor,
         };
         writer.background_until(deadline, move |db| {
             game_pipeline::apply_detector(db, &batch)
@@ -256,6 +274,66 @@ fn detector_turn(
         game_pipeline::seal_detector(db, id, &game, staged.id())
     })?;
     Ok(true)
+}
+
+fn feedback_turn(
+    db: &JobReads,
+    writer: &Writer,
+    staging: &Staging,
+    job: &Job,
+    deadline: Instant,
+) -> Result<()> {
+    let id = job.id;
+    let claim = db.feedback_claim(id)?;
+    let (version, sealed) = db.detector_checkpoint(id)?;
+    ensure!(
+        version == REPERTOIRE_VERSION,
+        "unsupported repertoire comparator version"
+    );
+    let Some((game, file)) = sealed else {
+        let game = claim.pair.game.clone();
+        let bytes = db.feedback_plan(claim.pair, deadline)?;
+        let staged = staging.worker(&bytes)?;
+        return writer.background_until(deadline, move |db| {
+            game_pipeline::seal_detector(db, id, &game, staged.id())
+        });
+    };
+    let batch = (|| {
+        let mut bytes = Vec::new();
+        staging
+            .open(&file, deadline)?
+            .take((game_feedback::MAX_REPORT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        ensure!(game == claim.pair.game, "sealed comparison game changed");
+        game_feedback::Batch::decode(
+            id,
+            claim,
+            file.clone(),
+            job.window_offset.try_into()?,
+            bytes,
+        )
+    })();
+    let batch = match batch {
+        Ok(batch) => batch,
+        Err(error) => {
+            let release = staging.reserve_release(&file)?;
+            writer.background_until(deadline, move |db| {
+                let _release = &release;
+                game_feedback::clear_damaged_checkpoint(db, id, &file)
+            })?;
+            return Err(
+                error.context("Could not read the saved comparison. Retry to recompute it.")
+            );
+        }
+    };
+    let release = batch
+        .finished()
+        .then(|| staging.reserve_release(&file))
+        .transpose()?;
+    writer.background_until(deadline, move |db| {
+        let _release = &release;
+        game_feedback::apply(db, &batch)
+    })
 }
 
 fn read_detector_batch(
@@ -344,6 +422,7 @@ fn run(
                 game_pipeline::start_scan(db, id, &saved)
             });
         }
+        ("archive", "compare_game") => return feedback_turn(db, writer, staging, job, deadline),
         ("archive", operation) if Detector::from_job(operation).is_some() => {
             let (detector, whole_archive) = Detector::from_job(operation).unwrap();
             if detector_turn(db, writer, staging, job, detector, whole_archive, deadline)? {

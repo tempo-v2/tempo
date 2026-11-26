@@ -9,7 +9,8 @@ reviews published opening and tactic cards using Good, Again, and FSRS.
 | Operation | Owner, inputs and effect |
 | --- | --- |
 | Import games | Games accepts public provider account or PGN plus learner identity. The same canonical game and learner side reuse an archive record. The worker saves each canonical game and queues its scan in the same transaction. Import completes after archive acceptance. |
-| Scan | The scanner compares legal played moves against each matching repertoire independently and saves answer-versioned observations. Missed-capture findings wait for the [standalone tactic worker](stockfish-analysis/README.md#generated-tactic-publication-worker). Tactics publishes a finding only when a proposed capture is the unique best move at depth 10, with every alternative outside the 30-centipawn window. |
+| Repertoire feedback | Games compares each learner occurrence against one eligible repertoire snapshot and saves a complete report. A game import or explicit archive scan can feed the same work as an individual comparison. A reply edit makes an earlier report outdated and preserves its original expected moves. |
+| Capture analysis | Missed-capture findings wait for the [standalone tactic worker](stockfish-analysis/README.md#generated-tactic-publication-worker). Tactics publishes a finding only when a proposed capture is the unique best move at depth 10, with every alternative outside the 30-centipawn window. |
 | Save opening | Openings validates legal routes and publishes one response card at each learner decision. The destination selects a repertoire. A matching reply reuses the card, and a different reply at the same position returns a conflict. Existing conflicts are quarantined. |
 | Publish tactic | Tactics validates every move of the supplied PGN and publishes the solver position and accepted moves. Stable content identity makes imports and worker replay idempotent. |
 | Review | Study issues one durable attempt with a fixed answer set for the published card. The first legal answer or reveal accepts one Good/Again, writes FSRS and the repeat placement atomically, and saves a replayable receipt. Next is a separate operation. Source details are read separately after acceptance. |
@@ -17,10 +18,10 @@ reviews published opening and tactic cards using Good, Again, and FSRS.
 
 Position IDs hash a canonical orthodox position with side to move,
 castling rights and legal en passant. Games and the scanner share that
-representation with Openings. The two game observations are addressed by
-game, ply and, for mismatch, repertoire and answer version. Evaluation,
-move probability and explorer statistics are future read-only interfaces
-over the same position input.
+representation with Openings. A saved feedback report is addressed by game
+and repertoire, with one decision per learner ply and the exact revision
+that supplied its answers. Capture findings retain their own game and ply
+identity.
 
 The previous runtime is available in repository history. The current
 runtime and browser application are GPL-3.0-or-later. The original license
@@ -51,6 +52,14 @@ stored games against the repertoire as it exists today. The service owns
 one background worker with bounded network calls and short SQLite writes.
 `serve DATABASE PORT --no-worker` runs the same browser and Study paths
 with no provider or scanner activity.
+
+Open an archived game and choose a repertoire for your side to see
+**Repertoire feedback**. Use **Compare game** to fill a missing report or
+**Refresh comparison** after editing the repertoire. The percentage divides
+matches by assessed learner moves. Unassessed moves are listed separately.
+Use **First repertoire mismatch** or a decision's **View position** to
+inspect the board immediately before the move. Feedback leaves Study
+scheduling independent.
 
 Each submitted Again places the card into the persisted queue at the
 drawn offset, or at the end of a shorter queue. Subsequent Again results
@@ -102,6 +111,7 @@ npm --prefix ui run build
 cargo build --locked --release --bin tempo
 node tools/qualify_gap_resolution.cjs --candidate-only target/release/tempo
 node tools/qualify_answer_ir.cjs --candidate-only target/release/tempo /path/to/lichess-packs.sqlite3
+node tools/qualify_game_feedback.cjs target/release/tempo
 ```
 
 Use the qualified pack artifact containing puzzle `03N75` and its pack,
@@ -123,6 +133,14 @@ fixture, independent of the learner’s active review.
 ```sh
 tools/qualify-predecessor.sh /path/to/candidate/tempo /path/to/predecessor/tempo \
   /path/to/predecessor-snapshot.sqlite3 /path/to/lichess-packs.sqlite3
+```
+
+Pass the predecessor and snapshot to exercise migration, sealed comparison
+recovery, and a retained imported game in the Games screen.
+
+```sh
+node tools/qualify_game_feedback.cjs /path/to/candidate/tempo /path/to/predecessor/tempo \
+  /path/to/predecessor-snapshot.sqlite3
 ```
 
 For historical qualification, `tools/qualify_answer_ir.cjs --legacy-puzzle
