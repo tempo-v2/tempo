@@ -257,6 +257,14 @@ pub fn read(db: &Connection, id: &str) -> Result<Game> {
     read_fields(db, id, FIELDS)
 }
 
+pub fn learner_color(db: &Connection, id: &str) -> Result<String> {
+    db.query_row("SELECT learner_color FROM games WHERE id=?1", [id], |row| {
+        row.get(0)
+    })
+    .optional()?
+    .context("This game is no longer available.")
+}
+
 fn read_fields(db: &Connection, id: &str, fields: &str) -> Result<Game> {
     let row = db
         .query_row(

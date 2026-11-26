@@ -1,6 +1,6 @@
 use crate::{chess, game_ir::Mainline};
 use anyhow::Result;
-use pgn_reader::shakmaty::{Chess, Color, Move, Position};
+use pgn_reader::shakmaty::{Chess, Color, Move, Position, san::SanPlus};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -21,11 +21,54 @@ pub enum Observation {
     },
 }
 
-// Repertoire data is supplied by Openings. No detector can fetch its own inputs.
-pub struct ReferenceAnswer {
-    pub repertoire_id: String,
-    pub answer_version: String,
-    pub moves: Vec<String>,
+/// The authored reply supplied by Openings for one learner position.
+pub enum AuthoredReply {
+    Missing,
+    Conflict,
+    Unusable,
+    Expected { uci: String, version: String },
+}
+
+pub const REPERTOIRE_VERSION: i64 = 2;
+
+#[derive(Serialize, Deserialize)]
+pub struct RepertoireDecision {
+    pub ply: usize,
+    pub position: String,
+    pub move_number: u32,
+    pub played: MoveLabel,
+    #[serde(flatten)]
+    pub outcome: RepertoireOutcome,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MoveLabel {
+    pub uci: String,
+    pub san: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RepertoireOutcome {
+    Followed {
+        expected: MoveLabel,
+        answer_version: String,
+    },
+    Differed {
+        expected: MoveLabel,
+        answer_version: String,
+    },
+    Unassessed {
+        reason: Unassessed,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unassessed {
+    NoReply,
+    Conflict,
+    Unusable,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,25 +77,20 @@ pub enum Detector {
     Capture,
 }
 
-/// The selected detector owns its algorithm and its supported versions.
-pub enum Program {
-    Repertoire(fn(&Decision, ReferenceAnswer) -> Option<Observation>),
-    Capture(fn(&Decision) -> Option<Observation>),
+pub type CaptureProgram = fn(&Decision) -> Option<Observation>;
+
+pub fn capture_program(version: i64) -> Result<CaptureProgram> {
+    match version {
+        1 => Ok(capture),
+        _ => anyhow::bail!("unsupported capture detector version"),
+    }
 }
 
 impl Detector {
     pub fn current_version(self) -> i64 {
         match self {
-            Self::Repertoire => 1,
+            Self::Repertoire => REPERTOIRE_VERSION,
             Self::Capture => 1,
-        }
-    }
-
-    pub fn program(self, version: i64) -> Result<Program> {
-        match (self, version) {
-            (Self::Repertoire, 1) => Ok(Program::Repertoire(compare)),
-            (Self::Capture, 1) => Ok(Program::Capture(capture)),
-            _ => anyhow::bail!("unsupported detector version"),
         }
     }
 
@@ -111,14 +149,50 @@ pub fn decisions(game: &Mainline, learner: Color) -> Result<Vec<Decision>> {
     Ok(decisions)
 }
 
-pub fn compare(decision: &Decision, reference: ReferenceAnswer) -> Option<Observation> {
-    (!reference.moves.contains(&decision.uci)).then(|| Observation::Repertoire {
+pub fn compare(decision: &Decision, reply: AuthoredReply) -> RepertoireDecision {
+    let label = |uci, movement| MoveLabel {
+        uci,
+        san: SanPlus::from_move(decision.board.clone(), movement).to_string(),
+    };
+    let outcome = match reply {
+        AuthoredReply::Missing => RepertoireOutcome::Unassessed {
+            reason: Unassessed::NoReply,
+        },
+        AuthoredReply::Conflict => RepertoireOutcome::Unassessed {
+            reason: Unassessed::Conflict,
+        },
+        AuthoredReply::Unusable => RepertoireOutcome::Unassessed {
+            reason: Unassessed::Unusable,
+        },
+        AuthoredReply::Expected { uci, version } => {
+            match chess::parse_move(&decision.board, &uci) {
+                Ok(movement) if chess::uci(movement) == uci => {
+                    let expected = label(uci, movement);
+                    if expected.uci == decision.uci {
+                        RepertoireOutcome::Followed {
+                            expected,
+                            answer_version: version,
+                        }
+                    } else {
+                        RepertoireOutcome::Differed {
+                            expected,
+                            answer_version: version,
+                        }
+                    }
+                }
+                _ => RepertoireOutcome::Unassessed {
+                    reason: Unassessed::Unusable,
+                },
+            }
+        }
+    };
+    RepertoireDecision {
         ply: decision.ply,
         position: decision.position.clone(),
-        repertoire: reference.repertoire_id,
-        answer_version: reference.answer_version,
-        played: decision.uci.clone(),
-    })
+        move_number: decision.board.fullmoves().get(),
+        played: label(decision.uci.clone(), decision.played),
+        outcome,
+    }
 }
 
 pub fn capture(decision: &Decision) -> Option<Observation> {

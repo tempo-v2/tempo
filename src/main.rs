@@ -5,6 +5,7 @@ mod coverage;
 mod db;
 mod full_line;
 mod full_line_store;
+mod game_feedback;
 mod game_ir;
 mod game_pipeline;
 mod games;
@@ -189,6 +190,13 @@ impl IntoResponse for ApiError {
                 Json(json!({
                     "code":"writer_busy", "error":self.0.to_string()
                 })),
+            )
+                .into_response();
+        }
+        if self.0.is::<game_feedback::QueueFull>() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"code":"comparison_queue_full","error":self.0.to_string()})),
             )
                 .into_response();
         }
@@ -471,6 +479,36 @@ async fn archives(State(db): State<App>, Query(q): Query<Page>) -> ViewResult {
 async fn read_game(State(db): State<App>, UrlPath(id): UrlPath<String>) -> ViewResult {
     optional_view(db, optional_read::Reader::GameReplay, move |c| {
         games::replay(c, &id)
+    })
+    .await
+}
+async fn feedback_repertoires(
+    State(db): State<App>,
+    UrlPath(game): UrlPath<String>,
+    Query(query): Query<game_feedback::ChoicesQuery>,
+) -> ViewResult {
+    optional_view(db, optional_read::Reader::FeedbackRepertoires, move |c| {
+        game_feedback::choices(c, game, query)
+    })
+    .await
+}
+async fn feedback_view(
+    State(db): State<App>,
+    UrlPath((game, repertoire)): UrlPath<(String, String)>,
+    Query(query): Query<game_feedback::ReadQuery>,
+) -> ViewResult {
+    optional_view(db, optional_read::Reader::GameFeedback, move |c| {
+        game_feedback::read(c, game_feedback::Pair { game, repertoire }, query)
+    })
+    .await
+}
+async fn request_feedback(
+    State(db): State<App>,
+    UrlPath((game, repertoire)): UrlPath<(String, String)>,
+    Json(input): Json<game_feedback::Request>,
+) -> ApiResult {
+    write_db(db, move |c| {
+        game_feedback::request(c, game_feedback::Pair { game, repertoire }, input)
     })
     .await
 }
@@ -869,6 +907,14 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         )
         .route("/api/games", get(archives))
         .route("/api/games/archive/{id}", get(read_game))
+        .route(
+            "/api/games/archive/{id}/repertoires",
+            get(feedback_repertoires),
+        )
+        .route(
+            "/api/games/archive/{id}/feedback/{repertoire}",
+            get(feedback_view).post(request_feedback),
+        )
         .route("/api/games/jobs", get(job_views).post(start_job))
         .route(
             "/api/games/uploads",

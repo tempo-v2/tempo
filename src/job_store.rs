@@ -1,9 +1,10 @@
 use crate::{
     db::Database,
-    game_pipeline,
+    game_feedback::{self, Claim, Pair},
+    game_pipeline::{self, FeedbackCursor},
     jobs::{Job, JobView, NewJob, valid_user},
     providers::Provider,
-    scanner::Program,
+    scanner::CaptureProgram,
 };
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -39,14 +40,14 @@ pub fn views(db: &Connection) -> Result<Vec<JobView>> {
         "WITH visible(id) AS (
             SELECT id FROM (
                 SELECT id FROM jobs INDEXED BY jobs_visible_latest
-                WHERE operation NOT IN ('compare_all','capture_all') ORDER BY id DESC LIMIT 12
+                WHERE operation NOT IN ('compare_all','capture_all','compare_game') ORDER BY id DESC LIMIT 12
             ) UNION SELECT id FROM (
                 SELECT id FROM jobs INDEXED BY jobs_visible_failed
-                WHERE status='failed' AND operation NOT IN ('compare_all','capture_all')
+                WHERE status='failed' AND operation NOT IN ('compare_all','capture_all','compare_game')
                 ORDER BY id DESC LIMIT 12
             ) UNION SELECT id FROM (
                 SELECT id FROM jobs INDEXED BY jobs_active_user
-                WHERE parent_id IS NULL AND operation!='publish' AND status IN ('queued','running')
+                WHERE parent_id IS NULL AND operation NOT IN ('publish','compare_game') AND status IN ('queued','running')
                 LIMIT 4
             )
          )
@@ -72,7 +73,7 @@ pub fn views(db: &Connection) -> Result<Vec<JobView>> {
 fn check_user_job_capacity(db: &Connection) -> Result<()> {
     let full: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM jobs INDEXED BY jobs_active_user
-         WHERE parent_id IS NULL AND operation!='publish' AND status IN ('queued','running')
+         WHERE parent_id IS NULL AND operation NOT IN ('publish','compare_game') AND status IN ('queued','running')
          LIMIT 1 OFFSET 3)",
         [],
         |r| r.get(0),
@@ -90,7 +91,7 @@ fn active_user_job(
     Ok(db
         .query_row(
             "SELECT id FROM jobs INDEXED BY jobs_active_user
-             WHERE parent_id IS NULL AND operation!='publish' AND status IN ('queued','running')
+             WHERE parent_id IS NULL AND operation NOT IN ('publish','compare_game') AND status IN ('queued','running')
                AND provider=?1 AND operation=?2 AND username=?3
              ORDER BY status,id LIMIT 1",
             params![provider, operation, username],
@@ -136,7 +137,7 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let user_batch = tx
         .query_row(
-            "SELECT parent_id IS NULL AND operation!='publish' FROM jobs WHERE id=?1",
+            "SELECT parent_id IS NULL AND operation NOT IN ('publish','compare_game') FROM jobs WHERE id=?1",
             [id],
             |r| r.get::<_, bool>(0),
         )
@@ -144,6 +145,18 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
         .unwrap_or(false);
     if user_batch {
         check_user_job_capacity(&tx)?;
+    }
+    let comparison_lane: Option<i64> = tx
+        .query_row(
+            "SELECT lane.id FROM jobs lane
+         WHERE lane.parent_id=?1 AND lane.operation='compare_all' AND lane.status='failed'
+           AND EXISTS(SELECT 1 FROM jobs parent WHERE parent.id=?1 AND parent.status='failed')",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(lane) = comparison_lane {
+        game_pipeline::retry_feedback_feeder(&tx, lane)?;
     }
     let lanes = tx.execute(
         "UPDATE jobs SET status='queued',error=NULL
@@ -160,11 +173,12 @@ pub fn retry(db: &mut Connection, id: i64) -> Result<()> {
         ensure!(
             tx.execute(
                 "UPDATE jobs SET status='queued',error=NULL WHERE id=?1 AND status='failed'
-                 AND operation NOT IN ('compare_all','capture_all')",
+                 AND operation NOT IN ('compare_all','capture_all','compare_game')",
                 [id],
             )? == 1,
             "the job is not waiting for retry"
         );
+        game_pipeline::retry_feedback_feeder(&tx, id)?;
     }
     tx.commit()?;
     Ok(())
@@ -422,13 +436,25 @@ impl JobReads {
             })?)
     }
 
-    pub fn detector_plan(
+    pub fn capture_plan(
         &self,
         game: &str,
-        detector: Program,
+        capture: CaptureProgram,
         deadline: Instant,
     ) -> Result<Vec<u8>> {
-        game_pipeline::prepare_detector(&self.0, game, detector, deadline)
+        game_pipeline::prepare_capture(&self.0, game, capture, deadline)
+    }
+
+    pub fn feedback_cursor(&self, job: i64) -> Result<Option<FeedbackCursor>> {
+        game_pipeline::feedback_cursor(&self.0, job)
+    }
+
+    pub fn feedback_claim(&self, job: i64) -> Result<Claim> {
+        game_feedback::claim(&self.0, job)
+    }
+
+    pub fn feedback_plan(&self, pair: Pair, deadline: Instant) -> Result<Vec<u8>> {
+        game_feedback::prepare(&self.0, pair, deadline)
     }
 
     pub fn detector_checkpoint(&self, job: i64) -> Result<(i64, Option<(String, String)>)> {
@@ -544,6 +570,7 @@ mod tests {
         db.execute_batch(include_str!("operation_bounds.sql"))?;
         db.execute_batch(include_str!("job_admission.sql"))?;
         db.execute_batch(include_str!("detectors.sql"))?;
+        db.execute_batch(include_str!("game_feedback.sql"))?;
         assert_eq!(recover_running(&mut db)?, 1);
 
         assert_eq!(next(&mut db, None)?.unwrap().id, 1);
@@ -583,20 +610,8 @@ mod tests {
             atomic::{AtomicUsize, Ordering::Relaxed},
         };
 
-        let mut db = Connection::open_in_memory()?;
-        for schema in [
-            include_str!("schema.sql"),
-            include_str!("opening_policy.sql"),
-            include_str!("opening_order.sql"),
-            include_str!("game_pipeline.sql"),
-            include_str!("prepared_queue.sql"),
-            include_str!("lichess_packs.sql"),
-            include_str!("job_turns.sql"),
-            include_str!("operation_bounds.sql"),
-            include_str!("job_admission.sql"),
-        ] {
-            db.execute_batch(schema)?;
-        }
+        let directory = tempfile::tempdir()?;
+        let mut db = Database::init(&directory.path().join("admission.sqlite3"))?;
         let scan = || {
             NewJob::Command(StartJob {
                 provider: "archive".into(),
@@ -656,17 +671,8 @@ mod tests {
 
     #[test]
     fn recent_job_remains_visible_alongside_prior_failures() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        db.execute_batch(include_str!("schema.sql"))?;
-        db.execute_batch(include_str!("opening_policy.sql"))?;
-        db.execute_batch(include_str!("game_pipeline.sql"))?;
-        db.execute_batch(include_str!("job_turns.sql"))?;
-        db.execute_batch(include_str!("opening_order.sql"))?;
-        db.execute_batch(include_str!("prepared_queue.sql"))?;
-        db.execute_batch(include_str!("lichess_packs.sql"))?;
-        db.execute_batch(include_str!("operation_bounds.sql"))?;
-        db.execute_batch(include_str!("job_admission.sql"))?;
-        db.execute_batch(include_str!("detectors.sql"))?;
+        let directory = tempfile::tempdir()?;
+        let db = Database::init(&directory.path().join("views.sqlite3"))?;
         for _ in 0..12 {
             db.execute("INSERT INTO jobs(provider,username,operation,status) VALUES ('pgn','Learner','upload','failed')", [])?;
         }

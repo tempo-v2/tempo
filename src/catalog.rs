@@ -1,6 +1,6 @@
 use crate::{
     chess::{self, Route},
-    scanner::ReferenceAnswer,
+    scanner::AuthoredReply,
 };
 use anyhow::{Context, Result, ensure};
 use pgn_reader::shakmaty::{Chess, Position};
@@ -112,6 +112,35 @@ pub fn repertoire(db: &Connection, id: &str, color: &str) -> Result<Option<Reper
                     example_line: row.get(0)?,
                 })
             },
+        )
+        .optional()?)
+}
+
+pub const REPERTOIRE_PAGE: usize = 50;
+
+/// One bounded, color-filtered page, with a lookahead for availability.
+pub fn repertoires_for_color(db: &Connection, color: &str, after: &str) -> Result<Vec<Repertoire>> {
+    let mut q = db.prepare_cached(
+        "SELECT repertoire_id,example_line FROM repertoire_choices
+         WHERE color=?1 AND repertoire_id>?2 ORDER BY repertoire_id LIMIT ?3",
+    )?;
+    Ok(q.query_map((color, after, REPERTOIRE_PAGE + 1), |r| {
+        Ok(Repertoire {
+            id: r.get(0)?,
+            example_line: r.get(1)?,
+            color: color.to_owned(),
+        })
+    })?
+    .collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn next_repertoire(db: &Connection, color: &str, after: &str) -> Result<Option<String>> {
+    Ok(db
+        .query_row(
+            "SELECT repertoire_id FROM repertoire_choices
+         WHERE color=?1 AND repertoire_id>?2 ORDER BY repertoire_id LIMIT 1",
+            (color, after),
+            |r| r.get(0),
         )
         .optional()?)
 }
@@ -808,22 +837,39 @@ pub fn qualify_game_tactic(
     Ok("narrowed")
 }
 
-pub fn visit_answers_at(
+/// Interpret the existing single-active-reply policy for Games. Missing or
+/// damaged authored data cannot turn into a successful comparison.
+pub fn comparison_reply_at(
     db: &Connection,
     position: &str,
+    repertoire: &str,
     color: &str,
-    mut visit: impl FnMut(ReferenceAnswer) -> Result<()>,
-) -> Result<()> {
-    let mut q = db.prepare_cached("SELECT repertoire_id,answer_version,answers FROM active_cards WHERE position_id=?1 AND kind='opening' AND color=?2")?;
-    let mut rows = q.query(params![position, color])?;
-    while let Some(row) = rows.next()? {
-        visit(ReferenceAnswer {
-            repertoire_id: row.get(0)?,
-            answer_version: row.get(1)?,
-            moves: serde_json::from_str(row.get_ref(2)?.as_str()?)?,
-        })?;
-    }
-    Ok(())
+) -> Result<AuthoredReply> {
+    let mut q = db.prepare_cached(
+        "SELECT answer_version,quarantined,answers FROM cards
+         WHERE kind='opening' AND opening_retired=0 AND repertoire_id=?1 AND position_id=?2
+           AND color=?3 ORDER BY quarantined LIMIT 1",
+    )?;
+    let row = q
+        .query_row((repertoire, position, color), |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?;
+    Ok(match row {
+        None => AuthoredReply::Missing,
+        Some((_, true, _)) => AuthoredReply::Conflict,
+        Some((Some(version), false, answers)) if !version.is_empty() => {
+            match serde_json::from_str::<[String; 1]>(&answers) {
+                Ok([uci]) => AuthoredReply::Expected { uci, version },
+                Err(_) => AuthoredReply::Unusable,
+            }
+        }
+        Some(_) => AuthoredReply::Unusable,
+    })
 }
 
 #[cfg(test)]

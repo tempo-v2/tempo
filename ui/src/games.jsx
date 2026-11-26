@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { api, fileText, readView, visibleRead } from "./api.js";
 import { Replay } from "./board.jsx";
+import { GameFeedback } from "./game_feedback.jsx";
 import { More, useList } from "./library.jsx";
 
 const labels = { chesscom: "Chess.com", lichess: "Lichess", pgn: "PGN", archive: "Archive scan" };
@@ -9,6 +10,7 @@ export function Games({ jump, addOpening, settings, sounds }) {
   const list = useList("games");
   const [game, setGame] = useState(null);
   const [ply, setPly] = useState(0);
+  const [repertoire, setRepertoire] = useState(null);
   const [username, setUsername] = useState("");
   const [pgn, setPgn] = useState("");
   const [jobs, setJobs] = useState([]);
@@ -107,6 +109,8 @@ export function Games({ jump, addOpening, settings, sounds }) {
         </div>
       </>}</div>
       <div>
+        {game && <GameFeedback key={game.id} game={game} ply={ply} onPly={setPly}
+          retained={repertoire} onSelect={setRepertoire} />}
         <details open={!game}><summary>Import games</summary>
           {["chesscom", "lichess"].map((provider) => <div key={provider} className="provider">
             <strong>{labels[provider]}</strong>
@@ -126,8 +130,9 @@ export function Games({ jump, addOpening, settings, sounds }) {
         </div>
         {error && <p className="error" role="alert">{error}</p>}
         {jobs.length > 0 && <details open><summary>Recent jobs</summary><ul className="items">{jobs.map((j) =>
-          <li key={j.id}><strong>{j.operation === "publish" ? "Publish tactics" : j.provider === "archive" ? "Scan games" : labels[j.provider]}</strong> · {j.status}
-            <div>{j.operation === "publish" ? `${j.found} puzzles published` : j.operation === "scan" ? `${j.added} games scanned · ${j.found} new findings` : j.provider === "archive" ? `${j.found} new findings` : `${j.added} added · ${j.existing} already present · ${j.rejected} rejected`}</div>
+          <li key={j.id}><strong>{j.operation === "compare_new" ? "Compare repertoires" :
+            j.operation === "publish" ? "Publish tactics" : j.provider === "archive" ? "Scan games" : labels[j.provider]}</strong> · {j.status}
+            {j.operation !== "compare_new" && <div>{j.operation === "publish" ? `${j.found} puzzles published` : j.operation === "scan" ? `${j.added} games scanned · ${j.found} new findings` : j.provider === "archive" ? `${j.found} new findings` : `${j.added} added · ${j.existing} already present · ${j.rejected} rejected`}</div>}
             {j.error && <p className="error">{j.error}</p>}
             {j.status === "failed" && <button disabled={busy} onClick={() => job(`games/jobs/${j.id}/retry`, {})}>Retry</button>}
           </li>)}</ul></details>}
