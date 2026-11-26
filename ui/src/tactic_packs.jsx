@@ -1,5 +1,7 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 import { api } from "./api.js";
+import { ChessBoard, position } from "./board.jsx";
+import { ExerciseLayout } from "./exercise_layout.jsx";
 import { decodePuzzle, PuzzleBoard, recoverPuzzleActions, startPuzzle } from "./puzzle_play.jsx";
 
 const themeNames = {
@@ -16,6 +18,7 @@ function name(key) {
 const band = (pack) => pack.ceiling === null ? `${pack.band}+` : `${pack.band}–${pack.ceiling}`;
 const packsUrl = "tactics/packs";
 const playsUrl = "tactics/plays";
+const startingPosition = position({ moves: [] });
 
 export function TacticPacks({ sounds }) {
   const [index, setIndex] = useState(null);
@@ -27,6 +30,8 @@ export function TacticPacks({ sounds }) {
   const [pendingPlays, setPendingPlays] = useState([]);
   const [view, setView] = useState(null);
   const [issue, setIssue] = useState("");
+  const [packsIssue, setPacksIssue] = useState("");
+  const [membersIssue, setMembersIssue] = useState("");
   const [busy, setBusy] = useState(false);
   const running = useRef(false);
   const mounted = useRef(false);
@@ -34,9 +39,16 @@ export function TacticPacks({ sounds }) {
   currentView.current = view;
   const retry = useRef(null);
   const [refresh, setRefresh] = useState(0);
+  const [retryPacks, setRetryPacks] = useState(0);
+  const [retryMembers, setRetryMembers] = useState(0);
+  const panelPrefix = useId();
+  const expandedHeader = useRef(null);
+  const themePicker = useRef(null);
+  const returnFocus = useRef(false);
+  const playing = Boolean(view);
 
-  async function readIndex() {
-    const next = await api(packsUrl);
+  async function readIndex(signal) {
+    const next = await api(packsUrl, undefined, signal);
     if (index && index.revision !== next.revision) {
       setSelected(null); setPacks(null); setMorePacks(false); setMembers(null);
     }
@@ -46,8 +58,8 @@ export function TacticPacks({ sounds }) {
     const reply = await api(`${playsUrl}/${id}`);
     return decodePuzzle(reply, "tactics", dataset === undefined ? undefined : { dataset, play: id });
   }
-  async function readPending(after = 0) {
-    const page = await api(`${playsUrl}?after=${after}`);
+  async function readPending(after = 0, signal) {
+    const page = await api(`${playsUrl}?after=${after}`, undefined, signal);
     setPendingPlays((old) => after ? [...old, ...page] : page);
   }
   async function run(work) {
@@ -84,36 +96,45 @@ export function TacticPacks({ sounds }) {
     return () => { mounted.current = false; };
   }, []);
   useEffect(() => {
-    if (!index?.revision || view) return;
+    if (!index?.revision || playing) return;
     const request = new AbortController();
+    setPacksIssue("");
     async function load() {
       const next = await api(`${packsUrl}/${encodeURIComponent(theme)}`, undefined, request.signal);
-      if (next.revision !== index.revision) { await readIndex(); return; }
+      if (next.revision !== index.revision) { await readIndex(request.signal); return; }
       setPacks((old) => [...next.packs, ...(old ?? []).filter((pack) => pack.band > next.packs.at(-1)?.band)]);
       if (!packs || packs.length <= 50) setMorePacks(next.packs.length === 50);
-      await readPending();
+      await readPending(0, request.signal);
     }
     load().catch((error) => {
-      if (!request.signal.aborted) { setIssue(error.message); retry.current = load; }
+      if (!request.signal.aborted) setPacksIssue(error.message);
     });
     return () => request.abort();
-  }, [index, theme, refresh, Boolean(view)]);
+  }, [index, theme, refresh, retryPacks, playing]);
   useEffect(() => {
-    if (selected === null || view || !index?.revision) return;
+    if (selected === null || playing || !index?.revision) return;
     const request = new AbortController();
+    setMembersIssue("");
     async function load() {
       const reply = await api(`${packsUrl}/${encodeURIComponent(theme)}/${selected}`, undefined, request.signal);
-      if (reply.revision !== index.revision) { await readIndex(); return; }
+      if (reply.revision !== index.revision) { await readIndex(request.signal); return; }
       setMembers(reply.puzzles);
     }
     load().catch((error) => {
-      if (!request.signal.aborted) { setIssue(error.message); retry.current = load; }
+      if (!request.signal.aborted) setMembersIssue(error.message);
     });
     return () => request.abort();
-  }, [selected, theme, index, refresh, Boolean(view)]);
-  function choose(pack) {
-    setSelected(pack.band);
+  }, [selected, theme, index, refresh, retryMembers, playing]);
+  useEffect(() => {
+    if (!playing && returnFocus.current) {
+      returnFocus.current = false;
+      (expandedHeader.current ?? themePicker.current)?.focus();
+    }
+  }, [playing, selected]);
+  function choose(band) {
+    setSelected(band);
     setMembers(null);
+    setMembersIssue("");
     setIssue("");
   }
   function showView(next) {
@@ -155,10 +176,14 @@ export function TacticPacks({ sounds }) {
   const recommended = packs?.find((pack) => pack.done < 20);
   const selectedPack = packs?.find((pack) => pack.band === selected);
   const nextPack = selectedPack && packs.find((pack) => pack.band > selected && pack.done < 20);
-  function openNextPack() {
+  function returnToPacks() {
+    returnFocus.current = true;
     setView(null);
-    choose(nextPack);
     setRefresh((value) => value + 1);
+  }
+  function openNextPack() {
+    choose(nextPack.band);
+    returnToPacks();
   }
   const nextPackButton = nextPack && <button disabled={busy} onClick={openNextPack}>Open next pack {band(nextPack)}</button>;
   if (view) return <PuzzleBoard key={view.play} view={view} scope="tactics" sounds={sounds} onView={showView}
@@ -167,7 +192,7 @@ export function TacticPacks({ sounds }) {
       if (mounted.current && currentView.current === view) showView(next);
     }}
     heading={<>
-      <button disabled={busy} onClick={() => { setView(null); setRefresh((value) => value + 1); }}>{selectedPack ? "Back to pack" : "Back to packs"}</button>
+      <button disabled={busy} onClick={returnToPacks}>{selectedPack ? "Back to pack" : "Back to packs"}</button>
       <h2>Lichess puzzle</h2>
     </>}
     continuation={view.result && view.mode === "first" && members && (following
@@ -175,43 +200,61 @@ export function TacticPacks({ sounds }) {
       : nextPackButton)}>
     {issue && <p role="alert">{issue} <button disabled={busy} onClick={() => run(retry.current)}>Retry</button></p>}
   </PuzzleBoard>;
-  return <section aria-label="Puzzle packs">
+  return <ExerciseLayout label="Puzzle packs"
+    board={<ChessBoard game={startingPosition} orientation="white" identity="tactics-pack-browser" />}>
     {issue && <p role="alert">{issue} <button disabled={busy} onClick={() => run(retry.current)}>Retry</button></p>}
+    {!index && !issue && <p role="status">Loading puzzle packs…</p>}
     {index?.revision === null && <p>Puzzle packs have not been imported.</p>}
     {index?.revision && <>
-      <label>Theme <select value={theme} onChange={(event) => {
-        setTheme(event.target.value); setSelected(null); setMembers(null); setPacks(null); setIssue("");
-      }}>
-        {index.themes.map(({ key }) => <option key={key} value={key}>{name(key)}</option>)}
-      </select></label>
-      {selectedPack ? <div>
-        <button onClick={() => { setSelected(null); setMembers(null); }}>All packs</button>
-        <h2>{band(selectedPack)}</h2>
-        {members && <>
-          {nextMember
-            ? <button disabled={busy} onClick={() => tryPuzzle(nextMember)}>{nextMember.resume ? "Resume puzzle" : "Play next puzzle"}</button>
-            : nextPackButton}
-          <ul className="items">{members.map((member, position) => <li key={member.puzzle}>
-            <button disabled={busy || (!member.done && member.puzzle !== nextMember?.puzzle)}
-              onClick={() => tryPuzzle(member)}>
-              Puzzle {position + 1} <small>{member.rating}{member.done ? " · Practice" : ""}</small>
-            </button>
-          </li>)}</ul>
-        </>}
-      </div> : <>
-        {recommended && <button onClick={() => choose(recommended)}>Open recommended pack {band(recommended)}</button>}
-        <ul className="items">{packs?.map((pack) => <li key={pack.band}>
-          <button onClick={() => choose(pack)}>{band(pack)} <small>{pack.done}/20</small></button>
-        </li>)}</ul>
-        {morePacks && <button disabled={busy} onClick={() => run(loadMorePacks)}>More packs</button>}
-      </>}
-      {pendingPlays.length > 0 && <>
-        <h2>In progress</h2>
+      <div className="pack-theme">
+        <label htmlFor={`${panelPrefix}-theme`}>Theme</label>
+        <select id={`${panelPrefix}-theme`} ref={themePicker} value={theme} disabled={busy} onChange={(event) => {
+          setTheme(event.target.value);
+          choose(null);
+          setPacks(null);
+          setMorePacks(false);
+          setPacksIssue("");
+        }}>
+          {index.themes.map(({ key }) => <option key={key} value={key}>{name(key)}</option>)}
+        </select>
+      </div>
+      {pendingPlays.length > 0 && <details className="pack-progress">
+        <summary>In progress</summary>
         <ul className="items">{pendingPlays.map((item) => <li key={item.play}>
           <button disabled={busy} onClick={() => run(async () => showView(await resume(item.play)))}>Resume {item.puzzle}</button>
         </li>)}</ul>
         {pendingPlays.length % 50 === 0 && <button disabled={busy} onClick={() => run(() => readPending(pendingPlays.at(-1).play))}>More in-progress puzzles</button>}
-      </>}
+      </details>}
+      {packsIssue && <p role="alert">{packsIssue} <button disabled={busy} onClick={() => setRetryPacks((value) => value + 1)}>Retry</button></p>}
+      {!packs && !packsIssue && <p role="status">Loading rating bands…</p>}
+      <div className="pack-accordion">{packs?.map((pack) => {
+        const expanded = pack.band === selected;
+        const panelId = `${panelPrefix}-${pack.band}`;
+        return <div key={pack.band} className="pack-band">
+          <h2><button className="pack-header" aria-expanded={expanded} aria-controls={panelId}
+            ref={expanded ? expandedHeader : null} disabled={busy}
+            onClick={() => choose(expanded ? null : pack.band)}>
+            <span>{band(pack)}{pack === recommended && <small>Recommended</small>}</span>
+            <small>{pack.done}/20</small>
+          </button></h2>
+          <div id={panelId} className="pack-body" hidden={!expanded}>{expanded && <>
+            {membersIssue && <p role="alert">{membersIssue} <button disabled={busy} onClick={() => setRetryMembers((value) => value + 1)}>Retry</button></p>}
+            {!members && !membersIssue && <p role="status">Loading puzzles…</p>}
+            {members && <>
+              {nextMember
+                ? <button className="primary" disabled={busy} onClick={() => tryPuzzle(nextMember)}>{nextMember.resume ? "Resume puzzle" : "Play next puzzle"}</button>
+                : nextPackButton}
+              <ul className="items">{members.map((member, offset) => <li key={member.puzzle}>
+                <button disabled={busy || (!member.done && member.puzzle !== nextMember?.puzzle)}
+                  onClick={() => tryPuzzle(member)}>
+                  Puzzle {offset + 1} <small>{member.rating}{member.done ? " · Practice" : ""}</small>
+                </button>
+              </li>)}</ul>
+            </>}
+          </>}</div>
+        </div>;
+      })}</div>
+      {morePacks && <button disabled={busy} onClick={() => run(loadMorePacks)}>More packs</button>}
     </>}
-  </section>;
+  </ExerciseLayout>;
 }
