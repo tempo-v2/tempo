@@ -39,10 +39,21 @@ export function decodePuzzle(value, scope, intent, issuedFen) {
     }
   }
   const board = new Chess(value.fen);
-  if (intent?.step !== undefined && !matchesMoveReply(value, intent, board.fen(), issuedFen)) throw new Error(failed);
-  const playable = new Set(board.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? "")));
-  if (value.legal.some((move) => !playable.has(move))) throw new Error(failed);
-  if (value.result !== null) position(value.solution);
+  const boardFen = board.fen();
+  if (value.result === null) {
+    const playable = new Set(board.moves({ verbose: true }).map(move => move.lan));
+    const supplied = new Set(value.legal);
+    if (board.turn() !== value.color[0] || supplied.size !== playable.size ||
+        supplied.size !== value.legal.length || value.legal.some(move => !playable.has(move))) throw new Error(failed);
+  } else {
+    const { solution, step } = value;
+    const end = position(solution);
+    const displayed = step === solution.moves.length ? end : position(solution, step);
+    const lastMove = step === 0 ? null : solution.moves[step - 1];
+    if (value.legal.length || displayed.fen() !== boardFen || value.last_move !== lastMove ||
+        new Chess(solution.fen).turn() !== value.color[0]) throw new Error(failed);
+  }
+  if (intent?.step !== undefined && !matchesMoveReply(value, intent, boardFen, issuedFen)) throw new Error(failed);
   return value;
 }
 
@@ -57,7 +68,7 @@ function matchesMoveReply(value, { step, played }, afterFen, issuedFen) {
     if (played !== null) play(before, played);
     return value.result?.rating === "Again" && value.step === step &&
       (played === null || value.solution.moves[step] !== played) &&
-      beforeFen === afterFen && position(value.solution, step).fen() === beforeFen;
+      beforeFen === afterFen;
   }
   if (value.result === null) {
     if (value.step !== step + 2) return false;
@@ -67,8 +78,7 @@ function matchesMoveReply(value, { step, played }, afterFen, issuedFen) {
   }
   const { solution } = value;
   return (value.step === step + 1 || value.step === step + 2) && solution.moves[step] === played &&
-    value.last_move === solution.moves.at(-1) && position(solution, step).fen() === beforeFen &&
-    position(solution).fen() === afterFen;
+    position(solution, step).fen() === beforeFen;
 }
 
 function validRepeat(repeat) {

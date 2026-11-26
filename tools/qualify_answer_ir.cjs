@@ -361,6 +361,16 @@ async function competingPuzzleTabs(browser, db) {
       await retry(older).click();
       await retry(older).waitFor();
       await older.route(url, async route => {
+        assert.deepEqual(route.request().postDataJSON(), original);
+        const reply = await route.fetch();
+        const continued = await reply.json();
+        const legal = continued.legal.filter(move => !move.startsWith("a7b8"));
+        assert.ok(legal.length > 0 && legal.length < continued.legal.length);
+        await route.fulfill({ response: reply, json: { ...continued, legal } });
+      }, { times: 1 });
+      await retry(older).click();
+      await retry(older).waitFor();
+      await older.route(url, async route => {
         const reply = await route.fetch();
         assert.equal(reply.status(), 200);
         held.resolve(route.request().postDataJSON());
