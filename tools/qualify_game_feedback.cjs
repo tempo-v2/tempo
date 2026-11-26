@@ -222,9 +222,39 @@ async function fixtureFlow(browser) {
     await button("First repertoire mismatch").click();
     assert.match(await panel(page).locator(".feedback-position").innerText(), /Repertoire Bc4/);
     sql(db, "DROP TRIGGER fixture_report_failure");
+
+    const checkpoint = () => sql(db, `SELECT j.upload_file FROM repertoire_feedback f JOIN jobs j ON j.id=f.job_id
+      WHERE f.game_id=${quote(whiteGame)} AND f.repertoire_id=${quote(italian)}`);
+    const sealed = checkpoint();
+    assert.match(sealed, /^[0-9a-f]{32}$/);
+    const stagedPath = path.join(db.replace(/\.sqlite3$/, ".uploads"), sealed);
+    const heldPath = stagedPath + ".held-for-test";
+    fs.renameSync(stagedPath, heldPath);
+    fs.mkdirSync(stagedPath);
+    try {
+      // Opening the path succeeds but reading returns a real filesystem error.
+      await button("Retry comparison").click();
+      await count(page, "Could not read the sealed comparison. Retry to resume it.");
+      assert.equal(checkpoint(), sealed, "temporary I/O failure lost the sealed checkpoint");
+    } finally {
+      fs.rmdirSync(stagedPath);
+      fs.renameSync(heldPath, stagedPath);
+    }
+    await api("openings", {
+      name: "Added after sealing", color: "white", start_at: 2,
+      route: { fen: start, moves: ["g1f3", "g8f6", "g2g3"] },
+      destination: { kind: "existing", repertoire_id: italian },
+    });
+    await chooseBook(page, ruy);
+    await button("Compare game").waitFor();
+    await chooseBook(page, italian);
     await button("Retry comparison").click();
     await count(page, "2 of 2 repertoire decisions followed — 100.0%");
-    assert.equal((await api(feedbackPath(whiteGame, italian))).generation, previous.generation + 2);
+    await count(page, "Compared with an earlier version of your repertoire.");
+    await button("Refresh comparison").click();
+    await count(page, "2 of 2 repertoire decisions followed — 100.0%");
+    await count(page, "Compared with your current repertoire.");
+    assert.equal((await api(feedbackPath(whiteGame, italian))).generation, previous.generation + 4);
 
     const before = studyState(db);
     await importGame(api, db, "AutoFeedback", whitePgn.replace("WhiteFeedback", "AutoFeedback"));

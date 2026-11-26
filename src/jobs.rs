@@ -11,7 +11,7 @@ use chrono::Utc;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
     path::Path,
     time::{Duration, Instant},
 };
@@ -298,21 +298,33 @@ fn feedback_turn(
             game_pipeline::seal_detector(db, id, &game, staged.id())
         });
     };
-    let batch = (|| {
-        let mut bytes = Vec::new();
-        staging
-            .open(&file, deadline)?
-            .take((game_feedback::MAX_REPORT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        ensure!(game == claim.pair.game, "sealed comparison game changed");
-        game_feedback::Batch::decode(
-            id,
-            claim,
-            file.clone(),
-            job.window_offset.try_into()?,
-            bytes,
-        )
-    })();
+    ensure!(game == claim.pair.game, "sealed comparison game changed");
+    let batch = match staging.open(&file, deadline) {
+        Ok(input) => {
+            let mut bytes = Vec::new();
+            input
+                .take((game_feedback::MAX_REPORT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .context("Could not read the sealed comparison. Retry to resume it.")?;
+            game_feedback::Batch::decode(
+                id,
+                claim,
+                file.clone(),
+                job.window_offset.try_into()?,
+                bytes,
+            )
+        }
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == ErrorKind::NotFound) =>
+        {
+            Err(error)
+        }
+        Err(error) => {
+            return Err(error.context("Could not open the sealed comparison. Retry to resume it."));
+        }
+    };
     let batch = match batch {
         Ok(batch) => batch,
         Err(error) => {
