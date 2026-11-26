@@ -274,9 +274,9 @@ async function predecessorFlow(browser) {
       legacyJob = Number(sql(db, `INSERT INTO jobs(provider,username,operation,status)
         VALUES ('pgn','fixture','upload','done');
         INSERT INTO jobs(provider,username,operation,status,parent_id,detector_game,detector_version,upload_file,window_offset)
-        VALUES ('archive','','compare_new','running',last_insert_rowid(),${quote(game.id)},1,${quote(asset)},${Buffer.byteLength(bytes)});
-        INSERT INTO job_games(job_id,game_id,scanned) VALUES (last_insert_rowid(),${quote(game.id)},0);
-        SELECT last_insert_rowid();`));
+        VALUES ('archive','','compare_new','running',last_insert_rowid(),${quote(game.id)},1,${quote(asset)},${Buffer.byteLength(bytes)})
+        RETURNING id;`));
+      sql(db, `INSERT INTO job_games(job_id,game_id,scanned) VALUES (${legacyJob},${quote(game.id)},0);`);
       break;
     }
     assert(selected, "Retained first archive page needs a real game with earlier mismatch observations");
