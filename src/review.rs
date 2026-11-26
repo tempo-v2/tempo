@@ -246,6 +246,13 @@ mod tests {
                 moves: vec!["a2a5".into()],
             };
             assert!(published(invalid).is_err());
+            let castle = |played: &str| chess::Route {
+                fen: "4k3/8/8/8/8/8/8/4K2R w K - 0 1".into(),
+                moves: vec![played.into()],
+            };
+            assert!(published(castle("e1h1")).is_err());
+            assert!(published(castle("e1g1")).is_ok());
+
             let exercise = published(chess::Route {
                 fen: String::new(),
                 moves: route.moves.clone(),
