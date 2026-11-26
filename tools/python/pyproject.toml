@@ -1,0 +1,22 @@
+[project]
+name = "tempo-python-tools"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = ["chess==1.11.2"]
+
+[project.optional-dependencies]
+maia = [
+  "maia3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "torch==2.8.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv]
+package = false
+environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+build-constraint-dependencies = ["setuptools==84.2.1", "wheel==0.45.1"]
+
+[tool.uv.sources]
+maia3 = { git = "https://github.com/CSSLab/maia3.git", rev = "1e13597c42d4858b7cfd7cfdae01e297263364b2" }

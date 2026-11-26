@@ -1,4 +1,4 @@
-use crate::{chess, db};
+use crate::{chess, db, full_line::PublishedExercise, full_line_store, study::Conflict};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
@@ -66,14 +66,16 @@ pub fn import(db: &mut Connection, file: &Path) -> Result<ImportReport> {
             solver_fen == chess::fen(&chess::position(&solver)?),
             "Setup disagrees for {id}"
         );
-        chess::board_at(&route, route.moves.len())
+        let route = chess::Route {
+            fen: solver_fen,
+            moves: route.moves.into_iter().skip(1).collect(),
+        };
+        let solution = serde_json::to_string(&route.moves)?;
+        let version = chess::id(&["lichess-solution-v1", &route.fen, &solution]);
+        let exercise = PublishedExercise::new(id.clone(), version, route)
             .with_context(|| format!("Invalid line for {id}"))?;
-        let solution = serde_json::to_string(&route.moves[1..])?;
-        let version = chess::id(&["lichess-solution-v1", &solver_fen, &solution]);
         ensure!(
-            puzzles
-                .insert(id, (rating, solver_fen, solution, version, tags))
-                .is_none(),
+            puzzles.insert(id, (rating, exercise, tags)).is_none(),
             "Duplicate puzzle"
         );
     }
@@ -111,7 +113,7 @@ pub fn import(db: &mut Connection, file: &Path) -> Result<ImportReport> {
         ensure!(members.len() == 20, "Incomplete {theme} pack at {band}");
         let mut last_rating = band;
         for (index, (position, id)) in members.iter().enumerate() {
-            let (rating, _, _, _, tags) = puzzles.get(id).context("Missing pack member")?;
+            let (rating, _, tags) = puzzles.get(id).context("Missing pack member")?;
             ensure!(
                 *position == index as i64 + 1
                     && *rating >= last_rating
@@ -135,11 +137,8 @@ pub fn import(db: &mut Connection, file: &Path) -> Result<ImportReport> {
         return Ok(report);
     }
     tx.execute("DELETE FROM lichess_packs", [])?;
-    for (id, (_, fen, moves, version, _)) in &puzzles {
-        tx.execute(
-            "INSERT OR IGNORE INTO lichess_versions VALUES (?1,?2,?3,?4)",
-            params![id, version, fen, moves],
-        )?;
+    for (_, exercise, _) in puzzles.values() {
+        full_line_store::publish(&tx, exercise)?;
     }
     for (theme, band, ceiling, members) in packs {
         tx.execute(
@@ -147,10 +146,10 @@ pub fn import(db: &mut Connection, file: &Path) -> Result<ImportReport> {
             params![theme, band, ceiling],
         )?;
         for (position, id) in members {
-            let (rating, _, _, version, _) = &puzzles[&id];
+            let (rating, exercise, _) = &puzzles[&id];
             tx.execute(
                 "INSERT INTO lichess_members VALUES (?1,?2,?3,?4,?5,?6)",
-                params![theme, band, position, id, version, rating],
+                params![theme, band, position, id, exercise.version(), rating],
             )?;
         }
     }
@@ -174,6 +173,18 @@ fn revision(db: &Connection) -> Result<Option<String>> {
             |r| r.get(0),
         )
         .optional()?)
+}
+
+pub fn member_version(db: &Connection, puzzle: &str, revision: &str) -> Result<String> {
+    Ok(db
+        .query_row(
+            "SELECT m.version FROM lichess_members m CROSS JOIN lichess_catalog c
+         WHERE m.puzzle=?1 AND c.artifact=?2 LIMIT 1",
+            params![puzzle, revision],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(Conflict::PackChanged)?)
 }
 
 #[derive(Serialize)]
@@ -266,8 +277,9 @@ pub fn members(db: &Connection, key: &str, band: i64) -> Result<Members> {
 mod tests {
     use super::*;
     use crate::{
-        lichess_play::{self, Surface},
-        study::Conflict,
+        full_line::Move,
+        lichess_play,
+        review::{self, FullLineSurface},
     };
 
     fn artifact(path: &Path, first_move: &str, start_id: i64, size: i64) -> Result<()> {
@@ -336,8 +348,21 @@ mod tests {
             )?,
         )?;
         assert!(import(&mut db, &invalid).is_err());
-        assert_eq!(revision(&db)?, Some(first.artifact));
+        assert_eq!(revision(&db)?.as_deref(), Some(first.artifact.as_str()));
         import(&mut db, &next)?;
+        let replayed = lichess_play::start(
+            &mut db,
+            start(
+                "00000",
+                "00000000-0000-0000-0000-000000000000",
+                &first.artifact,
+            )?,
+        )?;
+        assert_eq!(
+            serde_json::to_value(&replayed)?,
+            serde_json::to_value(&removed)?
+        );
+
         assert_eq!(
             db.query_row("SELECT count(*) FROM cards", [], |r| r.get::<_, i64>(0))?,
             0
@@ -346,28 +371,40 @@ mod tests {
             db.query_row("SELECT count(*) FROM learning", [], |r| r.get::<_, i64>(0))?,
             0
         );
-        assert_eq!(lichess_play::pending(&db, 0)?.len(), 2);
+        assert_eq!(full_line_store::pending(&db, 0)?.len(), 2);
         assert_eq!(
-            lichess_play::resume_tactics(&db, removed.play)?.fen,
+            full_line_store::resume_tactics(&db, removed.play)?.fen,
             removed.fen
         );
-        let answer = |played: &str| lichess_play::Move {
+        let answer = |played: &str| Move {
             dataset: dataset.clone(),
             play: changed.play,
             step: 0,
             played: Some(played.into()),
         };
-        let solved = lichess_play::play(&mut db, answer("e7e5"), Surface::Tactics)?;
+        let solved = review::move_full_line(
+            &mut db,
+            answer("e7e5"),
+            FullLineSurface::Tactics {
+                first_card: lichess_play::first_card,
+            },
+        )?;
         assert_eq!(serde_json::to_value(solved.view.result)?["rating"], "Good");
         assert_eq!(
             db.query_row("SELECT count(*) FROM learning", [], |r| r.get::<_, i64>(0))?,
             1
         );
         assert!(matches!(
-            lichess_play::play(&mut db, answer("c7c5"), Surface::Tactics)
-                .err()
-                .unwrap()
-                .downcast_ref::<Conflict>(),
+            review::move_full_line(
+                &mut db,
+                answer("c7c5"),
+                FullLineSurface::Tactics {
+                    first_card: lichess_play::first_card
+                }
+            )
+            .err()
+            .unwrap()
+            .downcast_ref::<Conflict>(),
             Some(Conflict::Submission)
         ));
         Ok(())

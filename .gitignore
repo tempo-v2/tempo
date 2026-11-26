@@ -2,3 +2,6 @@
 /ui/node_modules/
 /ui/dist/
 /.local/
+/tools/node_modules/
+/tools/python/.venv/
+__pycache__/

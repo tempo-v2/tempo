@@ -1,4 +1,4 @@
-// Usage: NODE_PATH=<playwright-core parent> node tools/qualify_gap_resolution.cjs <candidate> <installed predecessor>
+// Usage is documented in README.md. All server writes use disposable databases.
 const { chromium } = require("playwright-core");
 const assert = require("node:assert/strict");
 const { spawn, execFileSync } = require("node:child_process");
@@ -8,8 +8,14 @@ const os = require("node:os");
 const path = require("node:path");
 const net = require("node:net");
 
-const [candidate, predecessor] = process.argv.slice(2).map(value => path.resolve(value));
-const chrome = process.env.TEMPO_QUALIFY_CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const [mode, ...args] = process.argv.slice(2);
+if (!["--candidate-only", "--predecessor-only"].includes(mode)
+    || args.length !== (mode === "--candidate-only" ? 1 : 3)) {
+  throw new Error("Use --candidate-only CANDIDATE or --predecessor-only CANDIDATE PREDECESSOR SNAPSHOT");
+}
+const [candidate, predecessor, retainedDatabase] = args.map(value => path.resolve(value));
+const chrome = process.env.TEMPO_QUALIFY_CHROME;
+const stockfish = process.env.TEMPO_QUALIFY_STOCKFISH;
 const folder = fs.mkdtempSync(path.join(os.tmpdir(), "tgr-"));
 const journal = "tempo-lean-gap-draft-v1";
 const start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -324,6 +330,92 @@ async function saveReplyAcrossViews(browser, remount) {
       deliver();
       releasePreview?.();
       await context.close();
+    }
+  });
+}
+
+async function saveProgressAcrossVisibility(browser) {
+  const db = path.join(folder, "save-observation.sqlite3");
+  await withServer(candidate, db, async (origin, api) => {
+    const repertoire = await addOpening(api, "Save observation", ["e2e4", "e7e5", "g1f3"]);
+    seedReport(db, "observed-report", repertoire, anchor, ["g1f3", "b8c6"]);
+    const page = await browser.newPage();
+    const saveReply = Promise.withResolvers();
+    const saveCommitted = Promise.withResolvers();
+    const lateProgress = Promise.withResolvers();
+    const progressPath = "/api/coverage/save/";
+    const isProgress = request => new URL(request.url()).pathname.startsWith(progressPath);
+    const active = new Set();
+    let polls = 0;
+    let peak = 0;
+    let saves = 0;
+    page.on("request", request => {
+      if (!isProgress(request)) return;
+      polls++;
+      active.add(request);
+      peak = Math.max(peak, active.size);
+    });
+    page.on("requestfailed", request => active.delete(request));
+    page.on("requestfinished", request => active.delete(request));
+    await page.addInitScript(key => {
+      if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({
+        report: "observed-report", index: 0, pgn: "1. Nf3 Nc6 2. d4 *"
+      }));
+    }, journal);
+    await page.route("**/api/coverage/save/*", async route => {
+      await lateProgress.promise;
+      // The client has already aborted these held requests.
+      await route.fulfill({ json: { finished: 99, total: 99 } }).catch(() => {});
+    });
+    await page.route("**/api/coverage/save", async route => {
+      saves++;
+      const reply = await route.fetch();
+      saveCommitted.resolve({ body: route.request().postDataJSON(), ok: reply.ok() });
+      await saveReply.promise;
+      await route.fulfill({ response: reply });
+    });
+    const hidden = value => page.evaluate(value => {
+      Object.defineProperty(document, "hidden", { configurable: true, value });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }, value);
+    try {
+      await openGaps(page, origin);
+      await page.getByRole("button", { name: "Preview", exact: true }).click();
+      await page.getByRole("button", { name: "Save to repertoire", exact: true }).click();
+      const command = await saveCommitted.promise;
+      assert.ok(command.ok);
+      await waitFor(() => polls >= 2);
+      assert.equal(peak, 1, "A stalled read must end before the next read starts");
+      assert.equal(active.size, 1);
+
+      const cancelledWhenHidden = page.waitForEvent("requestfailed", { predicate: isProgress });
+      await hidden(true);
+      await cancelledWhenHidden;
+      await new Promise(resolve => setTimeout(resolve, 850));
+      assert.equal(polls, 2);
+      await hidden(false);
+      await waitFor(() => polls === 3 && active.size === 1);
+
+      const cancelledOnNavigation = page.waitForEvent("requestfailed", { predicate: isProgress });
+      await page.getByRole("button", { name: "Games", exact: true }).click();
+      await cancelledOnNavigation;
+      await page.getByRole("button", { name: "Openings", exact: true }).click();
+      await page.getByRole("button", { name: "Retry same save" }).waitFor();
+      lateProgress.resolve();
+      await new Promise(resolve => setTimeout(resolve, 850));
+      assert.equal(polls, 3);
+      assert.equal(saves, 1);
+      assert.deepEqual(await page.evaluate(key => JSON.parse(localStorage.getItem(key)), journal + ".save"), command.body);
+      assert.equal(await page.getByText(/99 of 99/).count(), 0);
+
+      saveReply.resolve();
+      await page.getByText("Continuation saved.", { exact: true }).waitFor();
+      assert.equal(saves, 1);
+      assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
+    } finally {
+      lateProgress.resolve();
+      saveReply.resolve();
+      await page.context().close();
     }
   });
 }
@@ -831,6 +923,12 @@ async function previousCommands() {
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true });
+    if (mode === "--predecessor-only") {
+      await previousCommands();
+      await previousGapsOnRetainedData(browser, retainedDatabase);
+      return;
+    }
+    await saveProgressAcrossVisibility(browser);
     await saveReplyAcrossViews(browser, true);
     await saveReplyAcrossViews(browser, false);
     await applyReplyAcrossViews(browser);
@@ -838,14 +936,8 @@ async function previousCommands() {
     await browserFlow(browser);
     await cancelledScans(browser);
     await boundedPickerAndOptionalReview(browser);
-    if (process.env.TEMPO_QUALIFY_STOCKFISH) {
-      await reviewWinningMoves(browser, process.env.TEMPO_QUALIFY_STOCKFISH);
-    }
-    await previousCommands();
-    if (process.env.TEMPO_QUALIFY_PREDECESSOR_DB) {
-      await previousGapsOnRetainedData(browser, process.env.TEMPO_QUALIFY_PREDECESSOR_DB);
-    }
-    console.log("Chromium conflict resolution, confirmed replacement retry, and installed predecessor command replay passed.");
+    if (stockfish) await reviewWinningMoves(browser, stockfish);
+    console.log("Gaps progress, conflict resolution, and recovery passed in Chromium.");
   } finally {
     try { await browser?.close(); } finally { fs.rmSync(folder, { recursive: true, force: true }); }
   }

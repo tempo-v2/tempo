@@ -81,6 +81,54 @@ before writing. Cards omitted from the snapshot use the ordinary unranked
 queue rules. Snapshots contain repertoire answers and are intended for use
 by local tooling.
 
+## Verification
+
+Run `tools/check.sh` from a checkout. CI uses the same command with Rust
+1.98.1, Node 26.12.0, uv 0.13.4 and `zstd`. The script runs locked Rust
+workspace tests, builds the UI from `npm ci` and the vendored Core package, and
+runs the Coverage and pack-builder Python tests on locked Python 3.12.12.
+The native Stockfish test is opt-in as described in
+[Stockfish analysis](stockfish-analysis/README.md).
+
+For mounted Chromium qualification, install the locked harness and its browser.
+On a new Linux host, add `-- --with-deps` to the browser install command if its
+system libraries are missing. The harness also uses the `sqlite3` CLI.
+
+```sh
+npm --prefix tools ci
+npm --prefix tools run browser:install
+npm --prefix ui ci
+npm --prefix ui run build
+cargo build --locked --release --bin tempo
+node tools/qualify_gap_resolution.cjs --candidate-only target/release/tempo
+node tools/qualify_answer_ir.cjs --candidate-only target/release/tempo /path/to/lichess-packs.sqlite3
+```
+
+Use the qualified pack artifact containing puzzle `03N75` and its pack,
+identified in the Lean assembly manifest. Each Tempo binary must have the
+matching built `ui/dist` in the checkout path used to compile it. Set
+`TEMPO_QUALIFY_CHROME` only to exercise an explicitly chosen Chrome binary.
+Set `TEMPO_QUALIFY_STOCKFISH` to a Stockfish 19 binary to include native gap
+review in the Gaps suite.
+
+Run installed-predecessor replay separately. Use the actual previous
+installation's binary and assets and take a read-only SQLite backup of its
+database. The harness copies the schema-18 snapshot before starting either
+server, and uses temporary databases and loopback ports.
+
+```sh
+tools/qualify-predecessor.sh /path/to/candidate/tempo /path/to/predecessor/tempo \
+  /path/to/predecessor-snapshot.sqlite3 /path/to/lichess-packs.sqlite3
+```
+
+For historical qualification, `tools/qualify_answer_ir.cjs --legacy-puzzle
+CANDIDATE PREDECESSOR SNAPSHOT PACK` targets the old per-tab puzzle journal.
+`--legacy-packs CANDIDATE PREDECESSOR SNAPSHOT PACK LEGACY_STUDY_CLIENT`
+targets the older pack and receipt contracts. Keep the schema-18
+`tools/qualify_opening_batch_upgrade.py` migration check with its schema-17
+predecessor and the `tools/qualify_game_ir.py` checks with their schema-8
+candidate.
+
 ## Offline large content saves
 
 If the browser reports that an opening save exceeds its row budget, stop the
@@ -143,8 +191,10 @@ the same SQL budget as other optional reads.
 
 ### Repertoire coverage
 
-On the Tempo host, run `tools/setup-coverage.sh` once (requires uv). It provisions
-Maia-3 5M on CPU. Scans use 1500/1500 Elo and include the available recent
+On the Apple silicon Tempo host, run `tools/setup-coverage.sh` with uv 0.13.4.
+It synchronizes the locked Python 3.12.12 Maia-3 5M CPU environment and verifies
+the weights checksum. Pass a disposable runtime directory as the first argument
+to rehearse provisioning and synchronization away from the serving runtime. Scans use 1500/1500 Elo and include the available recent
 move history. In Openings → Gaps, choose a repertoire, starting PGN and horizon.
 The forecast follows your saved responses and branches on Maia's opponent move
 probabilities. Authored coverage counts complete paths through your chosen move.

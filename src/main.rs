@@ -3,6 +3,8 @@ mod catalog;
 mod chess;
 mod coverage;
 mod db;
+mod full_line;
+mod full_line_store;
 mod game_ir;
 mod game_pipeline;
 mod games;
@@ -606,31 +608,34 @@ async fn pack_members(
 }
 async fn pack_pending(State(db): State<App>, Query(page): Query<PackCursor>) -> ViewResult {
     optional_view(db, optional_read::Reader::LichessPlays, move |c| {
-        lichess_play::pending(c, page.after)
+        full_line_store::pending(c, page.after)
     })
     .await
 }
 async fn pack_resume(State(db): State<App>, UrlPath(play): UrlPath<i64>) -> ViewResult {
     optional_view(db, optional_read::Reader::LichessPlays, move |c| {
-        lichess_play::resume_tactics(c, play)
+        full_line_store::resume_tactics(c, play)
     })
     .await
 }
 async fn pack_start(State(db): State<App>, Json(input): Json<lichess_play::Start>) -> ApiResult {
     write_db(db, move |c| lichess_play::start(c, input)).await
 }
-async fn pack_move(State(db): State<App>, Json(input): Json<lichess_play::Move>) -> ApiResult {
+async fn pack_move(State(db): State<App>, Json(input): Json<full_line::Move>) -> ApiResult {
     write_db(db, move |c| {
-        lichess_play::play(c, input, lichess_play::Surface::Tactics)
+        review::move_full_line(
+            c,
+            input,
+            review::FullLineSurface::Tactics {
+                first_card: lichess_play::first_card,
+            },
+        )
     })
     .await
 }
-async fn study_puzzle_move(
-    State(db): State<App>,
-    Json(input): Json<lichess_play::Move>,
-) -> ApiResult {
+async fn study_puzzle_move(State(db): State<App>, Json(input): Json<full_line::Move>) -> ApiResult {
     write_db(db, move |c| {
-        lichess_play::play(c, input, lichess_play::Surface::Study)
+        review::move_full_line(c, input, review::FullLineSurface::Study)
     })
     .await
 }
