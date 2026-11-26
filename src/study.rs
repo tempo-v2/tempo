@@ -179,9 +179,21 @@ pub struct Review {
     pub legal: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_in: Option<chess::Route>,
-    pub result: Option<AcceptedView>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub puzzle: Option<crate::lichess_play::View>,
+    #[serde(flatten)]
+    pub activity: Activity,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "activity_mode", rename_all = "snake_case")]
+pub enum Activity {
+    SingleAnswer {
+        result: Option<AcceptedView>,
+    },
+    FullLine {
+        // Preserve the top-level null expected by browsers from the prior release.
+        result: (),
+        puzzle: crate::lichess_play::View,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]

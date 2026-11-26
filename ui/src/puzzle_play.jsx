@@ -2,17 +2,17 @@ import React, { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { ExerciseLayout } from "./exercise_layout.jsx";
 import { api } from "./api.js";
-import { ChessBoard, Replay, position } from "./board.jsx";
+import { ChessBoard, Replay, play, position } from "./board.jsx";
 import { isMove } from "./answer-journal.js";
+import { importPuzzleCommand, nextPuzzleCommand, resolvePuzzleCommand, savePuzzleCommand } from "./puzzle-journal.js";
 
 const endpoint = {
   tactics: "tactics/plays/move",
   study: "study/puzzle-move",
 };
-const key = (scope) => `tempo.lichess.v1.${scope}`;
 const terminalErrors = ["stale_attempt", "stale_dataset", "answer_conflict", "illegal_move", "pack_changed"];
 
-export function decodePuzzle(value, scope, intent) {
+export function decodePuzzle(value, scope, intent, issuedFen) {
   const failed = "The puzzle reply was incomplete. Retry.";
   if (!value || !Number.isSafeInteger(value.play) || value.play < 1 ||
       !Number.isSafeInteger(value.step) || value.step < 0 ||
@@ -20,48 +20,102 @@ export function decodePuzzle(value, scope, intent) {
       !(scope === "study" ? value.mode === "study" : ["first", "practice"].includes(value.mode)) ||
       !["white", "black"].includes(value.color) || typeof value.fen !== "string" ||
       !Array.isArray(value.legal) || !value.legal.every(isMove) ||
-      !(value.last_move === null || isMove(value.last_move)) ||
+      !(value.step === 0 ? value.last_move === null : isMove(value.last_move)) ||
       (intent && (intent.dataset !== value.dataset ||
         (intent.play !== undefined && intent.play !== value.play) ||
         (intent.puzzle !== undefined && intent.puzzle !== value.puzzle) ||
-        (intent.step !== undefined && (value.step < intent.step || value.result === null && value.step === intent.step))))) throw new Error(failed);
+        (intent.practice !== undefined && value.mode !== (intent.practice ? "practice" : "first"))))) throw new Error(failed);
   if (value.result !== null && (!["Good", "Again"].includes(value.result?.rating) ||
+      !validRepeat(value.result.repeat) ||
+      !(value.result.due_day === null || /^\d{4}-\d{2}-\d{2}$/.test(value.result.due_day)) ||
       !Array.isArray(value.solution?.moves) || !value.solution.moves.length ||
       !value.solution.moves.every(isMove) || typeof value.solution.fen !== "string")) throw new Error(failed);
-  if (value.result === null && (value.solution !== null || !value.legal.length)) throw new Error(failed);
+  if (value.result === null) {
+    if (value.solution !== null || !value.legal.length || value.step % 2 !== 0) throw new Error(failed);
+  } else {
+    const end = value.solution.moves.length;
+    if (value.result.rating === "Good" ? value.step !== end : value.step >= end || value.step % 2 !== 0) {
+      throw new Error(failed);
+    }
+  }
   const board = new Chess(value.fen);
-  const playable = new Set(board.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? "")));
-  if (value.legal.some((move) => !playable.has(move))) throw new Error(failed);
-  if (value.result !== null) position(value.solution);
+  const boardFen = board.fen();
+  if (value.result === null) {
+    const playable = new Set(board.moves({ verbose: true }).map(move => move.lan));
+    const supplied = new Set(value.legal);
+    if (board.turn() !== value.color[0] || supplied.size !== playable.size ||
+        supplied.size !== value.legal.length || value.legal.some(move => !playable.has(move))) throw new Error(failed);
+  } else {
+    const { solution, step } = value;
+    const end = position(solution);
+    const displayed = step === solution.moves.length ? end : position(solution, step);
+    const lastMove = step === 0 ? null : solution.moves[step - 1];
+    if (value.legal.length || displayed.fen() !== boardFen || value.last_move !== lastMove ||
+        new Chess(solution.fen).turn() !== value.color[0]) throw new Error(failed);
+  }
+  if (intent?.step !== undefined && !matchesMoveReply(value, intent, boardFen, issuedFen)) throw new Error(failed);
   return value;
 }
 
-async function deliver(scope, record) {
-  const storageKey = key(scope);
-  const snapshot = JSON.stringify(record);
-  sessionStorage.setItem(storageKey, snapshot);
-  try {
-    const url = record.kind === "start" ? "tactics/plays" : endpoint[scope];
-    return decodePuzzle(await api(url, record.intent, undefined, { requireJson: true }), scope, record.intent);
-  } catch (error) {
-    if (!terminalErrors.includes(error.code)) throw error;
-    return null;
+// Move receipts project the single submitted action. Start can instead resume an existing play.
+function matchesMoveReply(value, { step, played }, afterFen, issuedFen) {
+  if (typeof value.before_fen !== "string" || !value.before_fen) return false;
+  const before = new Chess(value.before_fen);
+  const beforeFen = before.fen();
+  if (before.turn() !== value.color[0] || (issuedFen && new Chess(issuedFen).fen() !== beforeFen)) return false;
+
+  if (played === null || value.result?.rating === "Again") {
+    if (played !== null) play(before, played);
+    return value.result?.rating === "Again" && value.step === step &&
+      (played === null || value.solution.moves[step] !== played) &&
+      beforeFen === afterFen;
   }
+  if (value.result === null) {
+    if (value.step !== step + 2) return false;
+    play(before, played);
+    play(before, value.last_move);
+    return before.fen() === afterFen;
+  }
+  const { solution } = value;
+  return (value.step === step + 1 || value.step === step + 2) && solution.moves[step] === played &&
+    position(solution, step).fen() === beforeFen;
 }
 
-async function finish(scope, record) {
-  const reply = await deliver(scope, record);
-  if (sessionStorage.getItem(key(scope)) === JSON.stringify(record)) sessionStorage.removeItem(key(scope));
+function validRepeat(repeat) {
+  return repeat === "None" || repeat === "Deferred" ||
+    (Number.isInteger(repeat?.Placed) && repeat.Placed >= 0 && repeat.Placed <= 20);
+}
+
+async function deliver(scope, command) {
+  let reply = null;
+  try {
+    const url = command.kind === "start" ? "tactics/plays" : endpoint[scope];
+    const body = await api(url, command.intent, undefined, { requireJson: true });
+    reply = decodePuzzle(body, scope, command.intent, command.issuedFen);
+  } catch (error) {
+    if (!terminalErrors.includes(error.code)) throw error;
+  }
+  // A cleanup failure can cause another exact replay. It cannot undo settlement.
+  await resolvePuzzleCommand(scope, command).catch(() => {});
   return reply;
 }
 
-export function recoverPuzzleAction(scope) {
-  const pending = sessionStorage.getItem(key(scope));
-  return pending ? finish(scope, JSON.parse(pending)) : Promise.resolve(null);
+async function sendPuzzleAction(scope, command) {
+  await savePuzzleCommand(scope, command);
+  return deliver(scope, command);
 }
 
-export async function startPuzzle(intent) {
-  return finish("tactics", { kind: "start", intent });
+export async function recoverPuzzleActions(scope, onAccepted) {
+  await importPuzzleCommand(scope);
+  let entry;
+  while ((entry = await nextPuzzleCommand(scope, entry?.key))) {
+    const reply = await deliver(scope, entry.command);
+    if (reply) onAccepted?.(reply);
+  }
+}
+
+export function startPuzzle(intent) {
+  return sendPuzzleAction("tactics", { kind: "start", intent });
 }
 
 export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuation, heading, children }) {
@@ -73,6 +127,8 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
   const busy = useRef(false);
   const retry = useRef(null);
   const mounted = useRef(false);
+  const currentView = useRef(view);
+  currentView.current = view;
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   async function run(work) {
     if (busy.current) return;
@@ -93,8 +149,10 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
   function move(played) {
     const intent = { dataset: view.dataset, play: view.play, step: view.step, played };
     void run(async () => {
-      const next = await finish(scope, { kind: "move", intent });
-      if (!mounted.current) return;
+      const next = await sendPuzzleAction(scope, { kind: "move", intent, issuedFen: view.fen });
+      const current = currentView.current;
+      if (!mounted.current || current.dataset !== intent.dataset || current.play !== intent.play ||
+          current.step !== intent.step || current.result !== null) return;
       if (next) {
         if (next.result?.rating === "Again") sounds.play("illegal");
         onView(next);

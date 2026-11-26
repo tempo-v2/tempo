@@ -62,7 +62,7 @@ pub async fn browse(State(app): State<App>, Json(request): Json<BrowseRequest>) 
     PositionIr::parse(&request.fen).map_err(|error| ApiError(error.into()))?;
     Ok(Json(
         evaluate(
-            &app,
+            app.opening_engine.as_ref(),
             wire::EngineRequest {
                 fen: request.fen,
                 mode: wire::EngineMode::TopFive,
@@ -73,8 +73,11 @@ pub async fn browse(State(app): State<App>, Json(request): Json<BrowseRequest>) 
     .into_response())
 }
 
-pub async fn evaluate(app: &App, request: wire::EngineRequest) -> wire::EngineReply {
-    let Some(endpoint) = &app.opening_engine else {
+pub async fn evaluate(
+    endpoint: Option<&Endpoint>,
+    request: wire::EngineRequest,
+) -> wire::EngineReply {
+    let Some(endpoint) = endpoint else {
         return wire::EngineReply::Unavailable;
     };
     let Ok(_permit) = SLOT.try_acquire() else {

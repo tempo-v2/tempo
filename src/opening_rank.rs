@@ -40,9 +40,8 @@ pub struct RankSnapshot {
 }
 
 pub fn read(db: &Connection) -> Result<RankInput> {
-    let mut q = db.prepare(
-        "SELECT repertoire_id,color,route,start_at FROM openings WHERE archived=0 ORDER BY id",
-    )?;
+    let mut q =
+        db.prepare("SELECT repertoire_id,color,route,start_at FROM authored_openings ORDER BY id")?;
     let mut rows = q.query([])?;
     let mut routes = Vec::new();
     while let Some(row) = rows.next()? {

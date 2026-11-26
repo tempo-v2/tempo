@@ -5,6 +5,7 @@ import { Chess } from "chess.js";
 import { api, fileText, readView } from "./api.js";
 import { ChessBoard, Replay, play, position } from "./board.jsx";
 import { moveCue } from "./sounds.js";
+import { repertoireKey, useRepertoirePages } from "./repertoire_pages.js";
 
 export function useList(endpoint) {
   const [rows, setRows] = useState([]);
@@ -106,55 +107,13 @@ function decodeOpeningPreview(body) {
 export function Openings({ fromGame, onSaved, sounds }) {
   const list = useList("openings");
   const [draft, setDraft] = useState(fromGame ?? initial);
-  const [repertoires, setRepertoires] = useState([]);
-  const [moreRepertoires, setMoreRepertoires] = useState(false);
-  const [loadingRepertoires, setLoadingRepertoires] = useState(false);
-  const [repertoireFailure, setRepertoireFailure] = useState(null);
-  const repertoireRequest = useRef(null);
+  const { rows: repertoires, more: moreRepertoires, busy: loadingRepertoires,
+    error: repertoireFailure, load: loadRepertoires } = useRepertoirePages();
   const [destination, setDestination] = useState(fromGame ? null : "new");
-  const choiceKey = ({ id, color }) => id + "/" + color;
+  const choiceKey = repertoireKey;
   const saveDestination = destination === "new" ? null : destination;
   const choices = saveDestination && !repertoires.some((entry) => choiceKey(entry) === choiceKey(saveDestination))
     ? [saveDestination, ...repertoires] : repertoires;
-  async function loadRepertoires(append = false) {
-    if (document.hidden) return;
-    if (repertoireRequest.current) {
-      if (append) return;
-      repertoireRequest.current.abort();
-    }
-    const request = new AbortController();
-    repertoireRequest.current = request;
-    setLoadingRepertoires(true);
-    const tail = append ? repertoires.at(-1) : null;
-    const cursor = tail ? "?" + new URLSearchParams({ after: tail.id, color: tail.color }) : "";
-    try {
-      const page = await readView("openings/repertoires" + cursor, request.signal);
-      if (request.signal.aborted) return;
-      setRepertoires((rows) => append ? [...rows, ...page] : page);
-      setMoreRepertoires(page.length === 50);
-      setRepertoireFailure(null);
-    } catch (error) {
-      if (!request.signal.aborted) setRepertoireFailure({ message: error.message, append });
-    } finally {
-      if (repertoireRequest.current === request) {
-        repertoireRequest.current = null;
-        setLoadingRepertoires(false);
-      }
-    }
-  }
-  useEffect(() => {
-    function visibilityChanged() {
-      if (document.hidden) repertoireRequest.current?.abort();
-      else loadRepertoires();
-    }
-    document.addEventListener("visibilitychange", visibilityChanged);
-    loadRepertoires();
-    return () => {
-      document.removeEventListener("visibilitychange", visibilityChanged);
-      repertoireRequest.current?.abort();
-      repertoireRequest.current = null;
-    };
-  }, []);
   const [name, setName] = useState("");
   const [color, setColor] = useState(fromGame?.color ?? "white");
   const [startingText, setStartingText] = useState("");

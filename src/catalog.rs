@@ -3,7 +3,7 @@ use crate::{
     scanner::ReferenceAnswer,
 };
 use anyhow::{Context, Result, ensure};
-use pgn_reader::shakmaty::Position;
+use pgn_reader::shakmaty::{Chess, Position};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -48,9 +48,9 @@ pub fn name(value: &str) -> Result<&str> {
 pub fn openings(db: &Connection, after: &str) -> Result<Vec<Opening>> {
     let mut q = db.prepare(
         "SELECT o.id,o.repertoire_id,r.example_line,o.name,o.color,o.route,o.start_at
-         FROM openings o CROSS JOIN repertoire_choices r
+         FROM authored_openings o CROSS JOIN repertoire_choices r
          ON r.repertoire_id=o.repertoire_id AND r.color=o.color
-         WHERE o.id>?1 AND o.archived=0 ORDER BY o.id LIMIT 100",
+         WHERE o.id>?1 ORDER BY o.id LIMIT 100",
     )?;
     let rows = q.query_map([after], |r| {
         Ok((
@@ -98,6 +98,22 @@ pub fn repertoires(db: &Connection, after: &str, color: &str) -> Result<Vec<Repe
         })
     })?
     .collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn repertoire(db: &Connection, id: &str, color: &str) -> Result<Option<Repertoire>> {
+    Ok(db
+        .query_row(
+            "SELECT example_line FROM repertoire_choices WHERE repertoire_id=?1 AND color=?2",
+            (id, color),
+            |row| {
+                Ok(Repertoire {
+                    id: id.into(),
+                    color: color.into(),
+                    example_line: row.get(0)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 pub struct CurrentOpeningReply {
@@ -163,8 +179,8 @@ pub fn reply_contexts(
         return Ok(found);
     }
     let mut query = db.prepare(
-        "SELECT route,start_at FROM openings
-         WHERE repertoire_id=?1 AND color=?2 AND archived=0 ORDER BY id LIMIT ?3",
+        "SELECT route,start_at FROM authored_openings
+         WHERE repertoire_id=?1 AND color=?2 ORDER BY id LIMIT ?3",
     )?;
     let mut rows = query.query((repertoire, color, LINE_LIMIT + 1))?;
     let mut moves_left = 100_000usize;
@@ -254,7 +270,10 @@ impl std::error::Error for OpeningConflict {}
 pub fn branch_repertoire(db: &Connection, source: &str, color: &str) -> Result<String> {
     let (repertoire, saved_color): (String, String) = db
         .query_row(
-            "SELECT repertoire_id,color FROM openings WHERE id=?1 AND archived=0",
+            "SELECT a.repertoire_id,a.color FROM openings o
+             CROSS JOIN authored_openings a ON a.id=coalesce(o.alias_of,o.id)
+               AND a.repertoire_id=o.repertoire_id AND a.color=o.color
+             WHERE o.id=?1 AND o.archived=0",
             [source],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -282,6 +301,7 @@ pub struct OpeningPlan {
     fen: String,
     moves: String,
     route: String,
+    line_key: String,
     start_at: usize,
     pub(crate) cards: Vec<OpeningCard>,
 }
@@ -295,69 +315,129 @@ pub(crate) struct OpeningCard {
     pub(crate) context: String,
 }
 
+fn canonical_opening_route(
+    input: &Route,
+    start_at: usize,
+    mut visit: impl FnMut(&Chess, usize, &Route, &str) -> Result<()>,
+) -> Result<Route> {
+    ensure!(
+        start_at < input.moves.len() && input.moves.len() <= chess::MAX_PLIES,
+        "enter a continuation"
+    );
+    let mut board = chess::position(&input.fen)?;
+    let mut route = Route {
+        fen: chess::fen(&board),
+        moves: Vec::with_capacity(input.moves.len()),
+    };
+    for (ply, played) in input.moves.iter().enumerate() {
+        let movement = chess::parse_move(&board, played)?;
+        let normalized = chess::uci(movement);
+        visit(&board, ply, &route, &normalized)?;
+        route.moves.push(normalized);
+        board.play_unchecked(movement);
+    }
+    Ok(route)
+}
+
+fn opening_line_key(color: &str, route: &str, start_at: usize) -> String {
+    chess::id(&["authored-opening-v2", color, route, &start_at.to_string()])
+}
+
 pub fn prepare_opening(input: &OpeningInput) -> Result<OpeningPlan> {
     let name = name(&input.name)?.to_owned();
     ensure!(
         matches!(input.color.as_str(), "white" | "black"),
         "select a practice color"
     );
-    let mut board = chess::position(&input.route.fen)?;
-    let route = Route {
-        fen: chess::fen(&board),
-        moves: input.route.moves.clone(),
-    };
-    ensure!(
-        input.start_at < route.moves.len() && route.moves.len() <= chess::MAX_PLIES,
-        "enter a continuation"
-    );
     let mut cards = Vec::new();
-    for (ply, played) in route.moves.iter().enumerate() {
-        let movement = chess::parse_move(&board, played)?;
-        if ply >= input.start_at && chess::color_name(board.turn()) == input.color {
-            let normalized = chess::uci(movement);
-            cards.push(OpeningCard {
-                ply: board.fullmoves(),
-                position: chess::position_id(&board),
-                version: chess::id(&["answer-v1", &normalized]),
-                fen: chess::fen(&board),
-                answers: serde_json::to_string(&[normalized])?,
-                context: serde_json::to_string(&Route {
-                    fen: route.fen.clone(),
-                    moves: route.moves[..ply].to_vec(),
-                })?,
-            });
-        }
-        board.play_unchecked(movement);
-    }
+    let route = canonical_opening_route(
+        &input.route,
+        input.start_at,
+        |board, ply, prefix, normalized| {
+            if ply >= input.start_at && chess::color_name(board.turn()) == input.color {
+                cards.push(OpeningCard {
+                    ply: board.fullmoves(),
+                    position: chess::position_id(board),
+                    version: chess::id(&["answer-v1", normalized]),
+                    fen: chess::fen(board),
+                    answers: serde_json::to_string(&[normalized])?,
+                    context: serde_json::to_string(prefix)?,
+                });
+            }
+            Ok(())
+        },
+    )?;
     ensure!(
         !cards.is_empty(),
         "the continuation needs a move for the selected color"
     );
+    let moves = serde_json::to_string(&route.moves)?;
+    let fen = route.fen.clone();
+    let route = serde_json::to_string(&route)?;
     Ok(OpeningPlan {
         name,
         color: input.color.clone(),
-        fen: route.fen.clone(),
-        moves: serde_json::to_string(&route.moves)?,
-        route: serde_json::to_string(&route)?,
+        fen,
+        moves,
+        line_key: opening_line_key(&input.color, &route, input.start_at),
+        route,
         start_at: input.start_at,
         cards,
     })
 }
 
+/// Populate derived identity and an alias for each non-authoritative retained row.
+/// The caller holds the stopped database's exclusive lock and a migration transaction.
+pub fn migrate_opening_identities(db: &Connection) -> Result<()> {
+    db.execute_batch(include_str!("opening_identity_columns.sql"))?;
+    let mut scan = db.prepare("SELECT id,color,route,start_at FROM openings ORDER BY rowid")?;
+    let mut rows = scan.query([])?;
+    let mut update =
+        db.prepare("UPDATE openings SET line_key=?1,canonical_route=?2 WHERE id=?3")?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let color: String = row.get(1)?;
+        let start_at: usize = row.get(3)?;
+        let input: Route = serde_json::from_str(row.get_ref(2)?.as_str()?)
+            .with_context(|| format!("Read retained opening {id}"))?;
+        let canonical = canonical_opening_route(&input, start_at, |_, _, _, _| Ok(()))
+            .with_context(|| format!("Canonicalize retained opening {id}"))?;
+        let route = serde_json::to_string(&canonical)?;
+        update.execute((opening_line_key(&color, &route, start_at), route, id))?;
+    }
+    let duplicate_roots: i64 = db.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM openings WHERE id=repertoire_id
+          GROUP BY name,color,line_key HAVING count(*)>1)",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        duplicate_roots == 0,
+        "Opening migration found {duplicate_roots} equivalent root groups across separate repertoires"
+    );
+    db.execute_batch(include_str!("opening_identity.sql"))?;
+    Ok(())
+}
+
 // A batch can publish at most 40 learner responses of one prepared route.
+pub enum OpeningBatch {
+    More(usize),
+    Finished(String),
+}
+
 pub fn apply_opening_batch(
     db: &Connection,
     plan: &OpeningPlan,
     repertoire: &str,
     offset: usize,
-) -> Result<Option<usize>> {
+) -> Result<OpeningBatch> {
     ensure!(
         offset < plan.cards.len(),
         "Invalid opening batch checkpoint"
     );
     let end = (offset + 40).min(plan.cards.len());
     let next = (end < plan.cards.len()).then_some(end);
-    apply_opening_cards(
+    let id = apply_opening_cards(
         db,
         plan,
         Some(repertoire),
@@ -365,7 +445,10 @@ pub fn apply_opening_batch(
         &plan.cards[offset..end],
         next.is_none(),
     )?;
-    Ok(next)
+    Ok(match next {
+        Some(next) => OpeningBatch::More(next),
+        None => OpeningBatch::Finished(id),
+    })
 }
 
 pub fn apply_opening(
@@ -377,7 +460,9 @@ pub fn apply_opening(
     apply_opening_cards(db, plan, inherited_book, online, &plan.cards, true)
 }
 
-pub fn opening_id(plan: &OpeningPlan, inherited_book: Option<&str>) -> String {
+/// Schema 17's hash is retained for completed Gaps batch prefixes. PGN
+/// parsing already emitted canonical UCI for every one of those input routes.
+pub fn legacy_opening_id(plan: &OpeningPlan, inherited_book: Option<&str>) -> String {
     chess::id(&[
         "opening-v1",
         inherited_book.unwrap_or(""),
@@ -388,6 +473,44 @@ pub fn opening_id(plan: &OpeningPlan, inherited_book: Option<&str>) -> String {
         &plan.start_at.to_string(),
     ])
 }
+
+fn opening_destination(
+    db: &Connection,
+    plan: &OpeningPlan,
+    inherited_book: Option<&str>,
+) -> Result<(String, String)> {
+    let repertoire = if let Some(repertoire) = inherited_book {
+        repertoire.to_owned()
+    } else {
+        // Explicit New accepts the proposed repertoire label. Equivalent
+        // delivery reuses the same root across move spellings.
+        let root: Option<String> = db
+            .query_row(
+                "SELECT id FROM openings
+             WHERE id=repertoire_id AND name=?1 AND color=?2 AND line_key=?3",
+                (&plan.name, &plan.color, &plan.line_key),
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(root) = root else {
+            let id = legacy_opening_id(plan, None);
+            return Ok((id.clone(), id));
+        };
+        root
+    };
+    let id: Option<String> = db
+        .query_row(
+            "SELECT id FROM openings
+         WHERE repertoire_id=?1 AND color=?2 AND line_key=?3 AND alias_of IS NULL",
+            (&repertoire, &plan.color, &plan.line_key),
+            |row| row.get(0),
+        )
+        .optional()?;
+    let id =
+        id.unwrap_or_else(|| chess::id(&["opening-in-repertoire-v2", &repertoire, &plan.line_key]));
+    Ok((id, repertoire))
+}
+
 fn apply_opening_cards(
     db: &Connection,
     plan: &OpeningPlan,
@@ -396,17 +519,21 @@ fn apply_opening_cards(
     cards: &[OpeningCard],
     finish_line: bool,
 ) -> Result<String> {
-    let id = opening_id(plan, inherited_book);
-    let repertoire = inherited_book.unwrap_or(&id);
+    let (id, repertoire) = opening_destination(db, plan, inherited_book)?;
     let new_choice = inherited_book.is_none()
         && !db.query_row(
             "SELECT EXISTS(SELECT 1 FROM repertoire_choices WHERE repertoire_id=?1 AND color=?2)",
-            (repertoire, &plan.color),
+            (&repertoire, &plan.color),
             |row| row.get::<_, bool>(0),
         )?;
     let mut pending = std::collections::HashMap::new();
     for card in cards {
-        let card_id = chess::id(&["opening-card-v1", repertoire, &card.position, &card.version]);
+        let card_id = chess::id(&[
+            "opening-card-v1",
+            &repertoire,
+            &card.position,
+            &card.version,
+        ]);
         let prior = db.query_row(
             "SELECT id,quarantined FROM cards WHERE kind='opening' AND repertoire_id=?1 AND position_id=?2 AND opening_retired=0
              ORDER BY quarantined LIMIT 1",
@@ -449,7 +576,8 @@ fn apply_opening_cards(
     }
     if finish_line {
         db.execute(
-            "INSERT INTO openings(id,repertoire_id,name,color,route,start_at) VALUES (?1,?2,?3,?4,?5,?6)
+            "INSERT INTO openings(id,repertoire_id,name,color,route,start_at,line_key,canonical_route)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?5)
              ON CONFLICT(id) DO UPDATE SET archived=0 WHERE openings.archived=1",
             params![
                 id,
@@ -457,7 +585,8 @@ fn apply_opening_cards(
                 plan.name,
                 plan.color,
                 plan.route,
-                plan.start_at
+                plan.start_at,
+                plan.line_key,
             ],
         )?;
     }
@@ -700,6 +829,41 @@ pub fn visit_answers_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_replay_uses_canonical_moves_and_preserves_the_saved_title() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let db = crate::db::Database::init(&directory.path().join("openings"))?;
+        let opening = |name: &str, castle: &str, start_at| OpeningInput {
+            name: name.into(),
+            color: "white".into(),
+            route: Route {
+                fen: "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1".into(),
+                moves: vec![castle.into(), "e8c8".into(), "f1c1".into()],
+            },
+            start_at,
+        };
+        let id = save_opening(&db, &opening("First", "e1g1", 0), None)?;
+        let writes = db.total_changes();
+        assert_eq!(save_opening(&db, &opening("First", "e1h1", 0), None)?, id);
+        assert_eq!(
+            save_opening(&db, &opening("Later title", "e1h1", 0), Some(&id))?,
+            id
+        );
+        assert_eq!(db.total_changes(), writes);
+        let saved = openings(&db, "")?;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "First");
+        assert_eq!(saved[0].route.moves[0], "e1g1");
+
+        let other_line = save_opening(&db, &opening("From ply 2", "e1h1", 2), Some(&id))?;
+        assert_ne!(other_line, id);
+        let independent = save_opening(&db, &opening("A separate repertoire", "e1h1", 0), None)?;
+        assert_ne!(independent, id);
+        assert_eq!(branch_repertoire(&db, &other_line, "white")?, id);
+        assert_eq!(branch_repertoire(&db, &independent, "white")?, independent);
+        Ok(())
+    }
 
     #[test]
     fn tactics_pages_skip_retired_ids_using_the_filtered_index() -> Result<()> {

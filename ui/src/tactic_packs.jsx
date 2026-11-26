@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
-import { decodePuzzle, PuzzleBoard, recoverPuzzleAction, startPuzzle } from "./puzzle_play.jsx";
+import { decodePuzzle, PuzzleBoard, recoverPuzzleActions, startPuzzle } from "./puzzle_play.jsx";
 
 const themeNames = {
   mix: "Healthy mix", mateIn5: "Mate in 5 or more", attackingF2F7: "Attacking f2 or f7",
@@ -30,6 +30,8 @@ export function TacticPacks({ sounds }) {
   const [busy, setBusy] = useState(false);
   const running = useRef(false);
   const mounted = useRef(false);
+  const currentView = useRef(view);
+  currentView.current = view;
   const retry = useRef(null);
   const [refresh, setRefresh] = useState(0);
 
@@ -40,7 +42,10 @@ export function TacticPacks({ sounds }) {
     }
     setIndex(next);
   }
-  async function resume(id) { return decodePuzzle(await api(`${playsUrl}/${id}`), "tactics"); }
+  async function resume(id, dataset) {
+    const reply = await api(`${playsUrl}/${id}`);
+    return decodePuzzle(reply, "tactics", dataset === undefined ? undefined : { dataset, play: id });
+  }
   async function readPending(after = 0) {
     const page = await api(`${playsUrl}?after=${after}`);
     setPendingPlays((old) => after ? [...old, ...page] : page);
@@ -57,11 +62,24 @@ export function TacticPacks({ sounds }) {
   }
   useEffect(() => {
     mounted.current = true;
-    void run(async () => {
-      const restored = await recoverPuzzleAction("tactics");
-      if (!mounted.current) return;
-      if (restored) setView(await resume(restored.play));
+    let recovered = null;
+    let multiple = false;
+    async function readAfterRecovery() {
+      if (recovered && !multiple) {
+        const view = await resume(recovered.play, recovered.dataset);
+        if (!mounted.current) return;
+        setView(view);
+      }
       await readIndex();
+    }
+    void run(async () => {
+      await recoverPuzzleActions("tactics", (reply) => {
+        multiple ||= Boolean(recovered && (recovered.play !== reply.play || recovered.dataset !== reply.dataset));
+        recovered = reply;
+      });
+      if (!mounted.current) return;
+      retry.current = readAfterRecovery;
+      await readAfterRecovery();
     });
     return () => { mounted.current = false; };
   }, []);
@@ -120,7 +138,15 @@ export function TacticPacks({ sounds }) {
       const reply = await startPuzzle(intent);
       if (!mounted.current) return;
       if (reply) showView(reply);
-      else { setView(null); await readIndex(); setRefresh((value) => value + 1); }
+      else {
+        setView(null);
+        async function refreshPacks() {
+          await readIndex();
+          if (mounted.current) setRefresh((value) => value + 1);
+        }
+        retry.current = refreshPacks;
+        await refreshPacks();
+      }
     });
   }
   const nextMember = members?.find((item) => item.resume && !item.done) ?? members?.find((item) => !item.done);
@@ -136,7 +162,10 @@ export function TacticPacks({ sounds }) {
   }
   const nextPackButton = nextPack && <button disabled={busy} onClick={openNextPack}>Open next pack {band(nextPack)}</button>;
   if (view) return <PuzzleBoard key={view.play} view={view} scope="tactics" sounds={sounds} onView={showView}
-    onRefresh={async () => showView(await resume(view.play))}
+    onRefresh={async () => {
+      const next = await resume(view.play, view.dataset);
+      if (mounted.current && currentView.current === view) showView(next);
+    }}
     heading={<>
       <button disabled={busy} onClick={() => { setView(null); setRefresh((value) => value + 1); }}>{selectedPack ? "Back to pack" : "Back to packs"}</button>
       <h2>Lichess puzzle</h2>

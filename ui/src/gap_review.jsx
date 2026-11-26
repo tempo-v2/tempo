@@ -9,6 +9,35 @@ function evaluation(score) {
   return score.white > 0 ? "+" + value : value;
 }
 
+function decodeReview(reply, report, index, fen) {
+  const incomplete = new Error("The move review reply was incomplete.");
+  if (reply?.report !== report || reply.gap !== index) throw incomplete;
+  if (["conflict", "stale", "terminal", "busy", "unavailable"].includes(reply.status)) return reply;
+  const legal = new Map(new Chess(fen).moves({ verbose: true }).map(({ lan, san }) => [lan, san]));
+  if (reply.status === "covered" && [...legal.values()].includes(reply.san)) return reply;
+  if (reply.status !== "ranked" || typeof reply.winning_mate !== "boolean" ||
+      typeof reply.similarity_available !== "boolean" || !Array.isArray(reply.choices)) throw incomplete;
+  function validMove(move) {
+    const score = move?.score;
+    return legal.has(move?.first_move) && legal.get(move.first_move) === move.san &&
+      (score?.kind === "centipawns" ? Number.isSafeInteger(score.white) :
+        score?.kind === "mate" && ["white", "black"].includes(score.winner) &&
+        Number.isSafeInteger(score.moves) && score.moves > 0);
+  }
+  if (!validMove(reply.best) || reply.choices.length > legal.size) throw incomplete;
+  const seen = new Set();
+  for (const choice of reply.choices) {
+    if (!validMove(choice) || seen.has(choice.first_move)) throw incomplete;
+    seen.add(choice.first_move);
+    if (choice.example === null && choice.distance === null) continue;
+    if (!Number.isSafeInteger(choice.distance) || choice.distance < 0 ||
+        typeof choice.example?.fen !== "string" || choice.example.fen.length > 256) throw incomplete;
+    const example = new Chess(choice.example.fen);
+    if (!example.moves({ verbose: true }).some(move => move.lan === choice.first_move)) throw incomplete;
+  }
+  return reply;
+}
+
 export function GapReview({ report, index, fen, color, start, staged, canReview, canStage, canRescan, onStage, onRescan }) {
   const [retry, setRetry] = useState(0);
   const [review, setReview] = useState(null);
@@ -32,10 +61,7 @@ export function GapReview({ report, index, fen, color, start, staged, canReview,
     setExample(false);
     setLoading(true);
     api("coverage/gaps/review", { report, gap: index }, signal, { requireJson: true })
-      .then(reply => {
-        if (reply.report !== report || reply.gap !== index) throw new Error("Gap review address changed");
-        setReview(reply);
-      })
+      .then(reply => setReview(decodeReview(reply, report, index, fen)))
       .catch(() => {
         if (!request.signal.aborted) setReview({ status: "unavailable" });
       })
@@ -46,7 +72,7 @@ export function GapReview({ report, index, fen, color, start, staged, canReview,
       request.abort();
       document.removeEventListener("visibilitychange", hide);
     };
-  }, [report, index, start, retry]);
+  }, [report, index, fen, start, retry]);
 
   const choices = review?.status === "ranked" ? review.choices : [];
   const selected = choices.find(row => row.first_move === (selection ?? staged)) ?? choices[0];

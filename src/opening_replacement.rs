@@ -68,8 +68,8 @@ struct SavedLine {
 
 fn saved_lines(db: &Connection, repertoire: &str, color: &str) -> Result<Vec<SavedLine>> {
     let mut query = db.prepare(
-        "SELECT id,name,route,start_at FROM openings
-         WHERE repertoire_id=?1 AND color=?2 AND archived=0 ORDER BY id LIMIT 2001",
+        "SELECT id,name,route,start_at FROM authored_openings
+         WHERE repertoire_id=?1 AND color=?2 ORDER BY id LIMIT 2001",
     )?;
     let mut rows = query.query((repertoire, color))?;
     let mut lines = Vec::new();

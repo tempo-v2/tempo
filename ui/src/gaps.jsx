@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
-import { api } from "./api.js";
+import { api, readView, visibleRead } from "./api.js";
 import { play, position } from "./board.jsx";
 import { GapReview } from "./gap_review.jsx";
+import { repertoireKey, useRepertoirePages } from "./repertoire_pages.js";
 
 const storage = "tempo-lean-gap-draft-v1";
 function stored(key) {
@@ -156,7 +157,6 @@ export function Gaps() {
       window.removeEventListener("storage", storageChanged);
     };
   }, []);
-  const [books, setBooks] = useState([]);
   const [loadedReport,setReport] = useState(null);
   const [selectedGap, setSelectedGap] = useState(null);
   const [summary, setSummary] = useState(null);
@@ -170,6 +170,10 @@ export function Gaps() {
   const [message,setMessage] = useState("");
   const [commandFeedback, setCommandFeedback] = useState(null);
   const [reload, setReload] = useState(0);
+  const picker = useRepertoirePages(reload);
+  const [addressed, setAddressed] = useState({});
+  const [pickerLookupFailed, setPickerLookupFailed] = useState(false);
+  const [pickerLookupRetry, setPickerLookupRetry] = useState(0);
   const [requestedReview, setRequestedReview] = useState(null);
   const gapHeading = useRef(null);
   function refreshJournal() {
@@ -191,23 +195,39 @@ export function Gaps() {
   const gapIndex = pendingSave?.draft.gap ?? draft.index;
   const gap = report?.gaps[gapIndex] ??
     (selectedGap?.report === requestedReport && selectedGap?.index === gapIndex ? selectedGap?.gap : null);
-
+  const headingKey = report && repertoireKey({ id: report.scan.repertoire, color: report.scan.color });
+  const pagedSelection = picker.rows.find(book => repertoireKey(book) === draft.book);
+  const pagedHeading = picker.rows.find(book => repertoireKey(book) === headingKey);
+  const missingSelection = picker.loaded && !pagedSelection ? draft.book : null;
+  const missingHeading = picker.loaded && !pagedHeading ? headingKey : null;
   useEffect(() => {
-    const ctrl = new AbortController();
-    async function loadBooks() {
-      let options = [], page;
-      do {
-        const tail = options.at(-1);
-        const query = tail ? "?" + new URLSearchParams({ after: tail.id, color: tail.color }) : "";
-        page = await api("openings/repertoires" + query, undefined, ctrl.signal);
-        options = options.concat(page);
-      } while (page.length === 50);
-      setBooks(options);
-    }
-    setError("");
-    void loadBooks().catch(error => { if (!ctrl.signal.aborted) setError(error.message); });
-    return () => ctrl.abort();
-  }, [reload]);
+    setPickerLookupFailed(false);
+    const keys = [...new Set([missingSelection, missingHeading].filter(Boolean))];
+    setAddressed(prior => Object.fromEntries(keys.filter(key => prior[key]).map(key => [key, prior[key]])));
+    if (!keys.length) return;
+    return visibleRead(async signal => {
+      let failed = false;
+      for (const key of keys) {
+        const separator = key.lastIndexOf("/");
+        const id = key.slice(0, separator);
+        const color = key.slice(separator + 1);
+        try {
+          if (!id || !["white", "black"].includes(color)) throw new Error("Invalid repertoire address");
+          const row = await readView("openings/repertoires/" + encodeURIComponent(id) + "/" + color, signal);
+          if (!row || repertoireKey(row) !== key) throw new Error("Repertoire unavailable");
+          signal.throwIfAborted();
+          setAddressed(prior => ({ ...prior, [key]: row }));
+        } catch {
+          if (signal.aborted) return;
+          failed = true;
+        }
+      }
+      if (!signal.aborted) setPickerLookupFailed(failed);
+    });
+  }, [missingSelection, missingHeading, reload, pickerLookupRetry]);
+  const book = draft.book ? pagedSelection ?? addressed[draft.book] : picker.rows[0];
+  const books = book && !pagedSelection && draft.book ? [book, ...picker.rows] : picker.rows;
+  const reportBook = pagedHeading ?? addressed[headingKey];
   useEffect(() => {
     if (!requestedReport || (requestedReport === report?.id && !reload)) return;
     const ctrl = new AbortController();
@@ -259,7 +279,6 @@ export function Gaps() {
       }
     }
   }
-  const book = draft.book ? books.find(b => b.id + "/" + b.color === draft.book) : books[0];
   async function scan(request, previous) {
     if (!mounted.current) return;
     scanOwner.current?.controller.abort();
@@ -482,9 +501,17 @@ export function Gaps() {
     gapHeading.current.scrollIntoView({ block: "start" });
   }, [reviewStart, hasGap]);
   return <section><h2>Repertoire gaps</h2>
-    <fieldset disabled={locked}><label>Repertoire <select value={book ? book.id+"/"+book.color : ""} onChange={e=>update({book:e.target.value})}>
+    <fieldset disabled={locked}><label>Repertoire <select value={book ? repertoireKey(book) : ""} onChange={e=>update({book:e.target.value})}>
       {!book && <option value="" disabled>Select a repertoire</option>}
-      {books.map(b=><option key={b.id+b.color} value={b.id+"/"+b.color}>{b.example_line} ({b.color})</option>)}</select></label>
+      {books.map(b=><option key={repertoireKey(b)} value={repertoireKey(b)}>{b.example_line} ({b.color})</option>)}</select></label>
+      {picker.error && <p role="alert">{picker.error.message}</p>}
+      {(picker.error || picker.more) && <button type="button" disabled={picker.busy}
+        onClick={() => picker.load(picker.error?.append ?? true)}>
+        {picker.error ? "Retry loading repertoires" : "Load more repertoires"}
+      </button>}
+      {pickerLookupFailed && <button type="button" onClick={() => setPickerLookupRetry(count => count + 1)}>
+        Retry saved repertoire lookup
+      </button>}
       <label>Starting line (PGN) <input placeholder="1. e4 e5 2. Nf3 Nc6 3. Bc4" value={draft.line??""} onChange={e=>update({line:e.target.value})}/></label>
       <label>Through my move <input type="number" min="1" max="100" value={draft.through??10} onChange={e=>update({through:e.target.value})}/></label>
       <button disabled={!book} onClick={()=>run(()=>scan(inputScan()))}>Scan repertoire</button></fieldset>
@@ -494,7 +521,7 @@ export function Gaps() {
     {draft.applyCommand && <button disabled={busy} onClick={() => applyOrder(draft.applyCommand)}>Retry applying order</button>}
     {pendingSave && !gap && <button disabled={busy} onClick={() => save(pendingSave)}>Retry same save</button>}
     {draft.pending && !pendingSave && <button disabled={busy} onClick={() => setReload(n => n + 1)}>Load pending save</button>}
-    {report && <><h3>{books.find(b=>b.id===report.scan.repertoire&&b.color===report.scan.color)?.example_line} · {report.scan.color}</h3>
+    {report && <><h3>{reportBook?.example_line ?? "Repertoire"} · {report.scan.color}</h3>
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · {report.model}</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {currentSummary?.unavailable ? <button onClick={() => setSummaryRetry(n => n + 1)}>Retry summary</button> : currentSummary ? range(currentSummary.studied,report.unresolved) : "Loading…"}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>

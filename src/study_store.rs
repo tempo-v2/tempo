@@ -25,21 +25,25 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
         .optional()?;
     row.map(
         |(attempt, kind, title, color, fen, result, submission, context, played_in_game)| {
-            let puzzle = crate::lichess_play::for_review(db, attempt)?
-                .map(|id| crate::lichess_play::resume(db, id))
-                .transpose()?;
             let legal = chess::legal(&chess::position(&fen)?);
-            let result = result
-                .filter(|_| puzzle.is_none())
-                .as_deref()
-                .map(|saved| {
-                    serde_json::from_str::<AnswerReceipt>(saved)?.view(
-                        &fen,
-                        submission.as_deref(),
-                        played_in_game,
-                    )
-                })
-                .transpose()?;
+            let activity = if let Some(play) = crate::lichess_play::for_review(db, attempt)? {
+                Activity::FullLine {
+                    result: (),
+                    puzzle: crate::lichess_play::resume(db, play)?,
+                }
+            } else {
+                let result = result
+                    .as_deref()
+                    .map(|saved| {
+                        serde_json::from_str::<AnswerReceipt>(saved)?.view(
+                            &fen,
+                            submission.as_deref(),
+                            played_in_game,
+                        )
+                    })
+                    .transpose()?;
+                Activity::SingleAnswer { result }
+            };
             // Opening context contains only authored moves before this issued decision.
             let lead_in = if kind == "opening" {
                 context.and_then(|route| serde_json::from_str(&route).ok())
@@ -55,8 +59,7 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
                 fen,
                 legal,
                 lead_in,
-                result,
-                puzzle,
+                activity,
             })
         },
     )
