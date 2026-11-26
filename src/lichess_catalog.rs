@@ -316,7 +316,6 @@ mod tests {
     #[test]
     fn another_source_with_the_same_local_key_keeps_pack_and_study_independent() -> Result<()> {
         use crate::{
-            full_line::InitialCard,
             queue_store,
             study::{Activity, Next},
         };
@@ -336,14 +335,7 @@ mod tests {
         )?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         full_line_store::publish(&tx, &exercise)?;
-        full_line_store::register_card(
-            &tx,
-            &exercise,
-            &InitialCard {
-                id: "independent-card".into(),
-                title: "Independent exercise".into(),
-            },
-        )?;
+        full_line_store::register_card(&tx, &exercise, "Independent exercise")?;
         tx.commit()?;
         while !queue_store::seed_batch(&mut db)? {}
 

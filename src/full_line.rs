@@ -9,9 +9,20 @@ use serde::{Deserialize, Serialize};
 
 /// A source's opaque identity and immutable, Chess-validated solver route.
 pub struct PublishedExercise {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by new publisher registration")
+    )]
+    origin: ExerciseOrigin,
     key: String,
     version: String,
     route: Route,
+}
+
+#[derive(Clone, Copy)]
+enum ExerciseOrigin {
+    Source,
+    LegacyPack,
 }
 
 impl PublishedExercise {
@@ -38,7 +49,12 @@ impl PublishedExercise {
             "Invalid full-line source namespace"
         );
         ensure!(!local_key.is_empty(), "Missing full-line source-local key");
-        Self::new(format!("{namespace}:{local_key}"), version, route)
+        Self::new(
+            ExerciseOrigin::Source,
+            format!("{namespace}:{local_key}"),
+            version,
+            route,
+        )
     }
 
     /// Reserved for the historical pack adapter and its already published keys.
@@ -47,17 +63,35 @@ impl PublishedExercise {
             key.len() == 5 && key.bytes().all(|b| b.is_ascii_alphanumeric()),
             "Invalid legacy pack key"
         );
-        Self::new(key, version, route)
+        Self::new(ExerciseOrigin::LegacyPack, key, version, route)
     }
 
-    fn new(key: String, version: String, route: Route) -> Result<Self> {
+    fn new(origin: ExerciseOrigin, key: String, version: String, route: Route) -> Result<Self> {
         ensure!(!version.is_empty(), "Full-line version is missing");
         let route = chess::validate_solver_route(route)?;
         Ok(Self {
+            origin,
             key,
             version,
             route,
         })
+    }
+
+    /// New publishers share a stable card namespace disjoint from legacy hash IDs.
+    /// Historical pack enrollment keeps the card identity assigned by its adapter.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "new publisher registration is exercised by the Study consumer fixture"
+        )
+    )]
+    pub fn study_card_id(&self) -> Result<String> {
+        ensure!(
+            matches!(self.origin, ExerciseOrigin::Source),
+            "Historical pack cards enroll through first play"
+        );
+        Ok(format!("full-line:{}", chess::id(&[&self.key])))
     }
 
     pub fn key(&self) -> &str {

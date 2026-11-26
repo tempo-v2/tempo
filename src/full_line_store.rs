@@ -259,8 +259,12 @@ pub fn publish(db: &Transaction<'_>, exercise: &PublishedExercise) -> Result<()>
 pub fn register_card(
     db: &Transaction<'_>,
     exercise: &PublishedExercise,
-    initial: &InitialCard,
-) -> Result<()> {
+    title: &str,
+) -> Result<String> {
+    let initial = InitialCard {
+        id: exercise.study_card_id()?,
+        title: title.to_owned(),
+    };
     let (fen, moves): (String, String) = db.query_row(
         "SELECT fen,moves FROM lichess_versions WHERE puzzle=?1 AND version=?2",
         params![exercise.key(), exercise.version()],
@@ -275,8 +279,9 @@ pub fn register_card(
         exercise.key(),
         exercise.version(),
         exercise.route(),
-        initial,
-    )
+        &initial,
+    )?;
+    Ok(initial.id)
 }
 
 /// Re-delivery of the same exercise/version/card triple leaves the original card and title intact.

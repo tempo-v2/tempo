@@ -213,110 +213,140 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_line_registration_cannot_repurpose_a_learned_card() -> Result<()> {
+    fn full_line_and_ordinary_publication_keep_distinct_cards_in_both_orders() -> Result<()> {
         use crate::catalog::{self, TacticInput};
-        let files = tempfile::tempdir()?;
-        let mut db = db::Database::init(&files.path().join("cards.sqlite3"))?;
-        let route = chess::Route {
-            fen: chess::fen(&chess::position("")?),
-            moves: vec!["e2e4".into(), "e7e5".into(), "g1f3".into()],
-        };
-        let ordinary = catalog::apply_tactic(
-            &db,
-            &catalog::prepare_tactic(TacticInput {
-                name: "Single-answer card",
-                route: &route,
-                answers: &route.moves[..1],
-                source: None,
-            })?,
-        )?;
-        while !queue_store::seed_batch(&mut db)? {}
-        let issued = next(
-            &mut db,
-            Next {
-                after: None,
-                dataset: None,
-            },
-        )?
-        .unwrap();
-        assert!(matches!(
-            issued.activity,
-            crate::study::Activity::SingleAnswer { .. }
-        ));
-        let intent = || AnswerIntentV1 {
-            attempt: issued.attempt,
-            dataset: issued.dataset.clone(),
-            action: AnswerAction::Play("e2e4".into()),
-        };
-        let accepted = serde_json::to_value(answer(&mut db, intent())?)?;
+        use rusqlite::params;
 
-        let tx = db.transaction_with_behavior(Immediate)?;
-        let first = full_line::PublishedExercise::from_source(
-            "publisher",
-            "shared",
-            "1".into(),
-            route.clone(),
-        )?;
-        let updated = full_line::PublishedExercise::from_source(
-            "publisher",
-            "shared",
-            "2".into(),
-            route.clone(),
-        )?;
-        full_line_store::publish(&tx, &first)?;
-        full_line_store::publish(&tx, &updated)?;
-        let initial = |id: &str, title: &str| full_line::InitialCard {
-            id: id.into(),
-            title: title.into(),
-        };
-        assert!(
-            full_line_store::register_card(&tx, &first, &initial(&ordinary, "Replacement"))
-                .is_err()
-        );
-        full_line_store::register_card(&tx, &first, &initial("fresh", "First title"))?;
-        let changes = tx.total_changes();
-        full_line_store::register_card(&tx, &first, &initial("fresh", "Replay title"))?;
-        assert!(
-            full_line_store::register_card(&tx, &updated, &initial("fresh", "New revision"))
-                .is_err()
-        );
-        assert!(
-            full_line_store::register_card(&tx, &first, &initial("conflict", "Another card"))
-                .is_err()
-        );
-        let conflicting_route = full_line::PublishedExercise::from_source(
-            "publisher",
-            "shared",
-            "1".into(),
-            chess::Route {
-                fen: route.fen.clone(),
-                moves: vec!["a2a3".into()],
-            },
-        )?;
-        assert!(
-            full_line_store::register_card(
-                &tx,
-                &conflicting_route,
-                &initial("fresh", "Different content")
-            )
-            .is_err()
-        );
-        assert_eq!(tx.total_changes(), changes);
-        let title: String =
-            tx.query_row("SELECT title FROM cards WHERE id='fresh'", [], |r| r.get(0))?;
-        assert_eq!(title, "First title");
-        tx.commit()?;
-        assert!(matches!(
-            study_store::current(&db)?.unwrap().activity,
-            crate::study::Activity::SingleAnswer { result: Some(_) }
-        ));
-        let changes = db.total_changes();
-        assert_eq!(serde_json::to_value(answer(&mut db, intent())?)?, accepted);
-        assert_eq!(db.total_changes(), changes);
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM learning", [], |r| r.get::<_, i64>(0))?,
-            1
-        );
+        for full_line_first in [false, true] {
+            let files = tempfile::tempdir()?;
+            let mut db = db::Database::init(&files.path().join("cards.sqlite3"))?;
+            let route = chess::Route {
+                fen: chess::fen(&chess::position("")?),
+                moves: vec!["e2e4".into(), "e7e5".into(), "g1f3".into()],
+            };
+            let exercise = |version: &str, route: chess::Route| {
+                full_line::PublishedExercise::from_source(
+                    "publisher",
+                    "shared",
+                    version.into(),
+                    route,
+                )
+            };
+            let first = exercise("1", route.clone())?;
+            let register_full_line = |db: &mut Connection| -> Result<String> {
+                let tx = db.transaction_with_behavior(Immediate)?;
+                full_line_store::publish(&tx, &first)?;
+                let id = full_line_store::register_card(&tx, &first, "First title")?;
+                tx.commit()?;
+                Ok(id)
+            };
+            let early_card = if full_line_first {
+                Some(register_full_line(&mut db)?)
+            } else {
+                None
+            };
+            let ordinary = catalog::apply_tactic(
+                &db,
+                &catalog::prepare_tactic(TacticInput {
+                    name: "Single-answer card",
+                    route: &route,
+                    answers: &route.moves[..1],
+                    source: None,
+                })?,
+            )?;
+            while !queue_store::seed_batch(&mut db)? {}
+            db.execute("INSERT INTO deck(slot,card_id) VALUES (1,?1)", [&ordinary])?;
+            let issued = next(
+                &mut db,
+                Next {
+                    after: None,
+                    dataset: None,
+                },
+            )?
+            .unwrap();
+            assert!(matches!(
+                issued.activity,
+                crate::study::Activity::SingleAnswer { .. }
+            ));
+            let intent = || AnswerIntentV1 {
+                attempt: issued.attempt,
+                dataset: issued.dataset.clone(),
+                action: AnswerAction::Play("e2e4".into()),
+            };
+            let accepted = serde_json::to_value(answer(&mut db, intent())?)?;
+            let card = match early_card {
+                Some(id) => id,
+                None => register_full_line(&mut db)?,
+            };
+            assert_ne!(card, ordinary);
+
+            let tx = db.transaction_with_behavior(Immediate)?;
+            let updated = exercise("2", route.clone())?;
+            full_line_store::publish(&tx, &updated)?;
+            let changes = tx.total_changes();
+            assert_eq!(
+                full_line_store::register_card(&tx, &first, "Replay title")?,
+                card
+            );
+            assert!(full_line_store::register_card(&tx, &updated, "New revision").is_err());
+            let conflicting_route = exercise(
+                "1",
+                chess::Route {
+                    fen: route.fen.clone(),
+                    moves: vec!["a2a3".into()],
+                },
+            )?;
+            assert!(
+                full_line_store::register_card(&tx, &conflicting_route, "Different content")
+                    .is_err()
+            );
+            let legacy =
+                full_line::PublishedExercise::from_legacy_pack("00000".into(), "1".into(), route)?;
+            assert!(full_line_store::register_card(&tx, &legacy, "Bypass first play").is_err());
+            assert_eq!(tx.total_changes(), changes);
+            let title: String =
+                tx.query_row("SELECT title FROM cards WHERE id=?1", [&card], |r| r.get(0))?;
+            assert_eq!(title, "First title");
+            tx.commit()?;
+
+            assert!(matches!(
+                study_store::current(&db)?.unwrap().activity,
+                crate::study::Activity::SingleAnswer { result: Some(_) }
+            ));
+            let changes = db.total_changes();
+            assert_eq!(serde_json::to_value(answer(&mut db, intent())?)?, accepted);
+            assert_eq!(db.total_changes(), changes);
+
+            db.execute(
+                "INSERT INTO deck(slot,card_id) VALUES (1,?1)",
+                params![card],
+            )?;
+            let full = next(
+                &mut db,
+                Next {
+                    after: Some(issued.attempt),
+                    dataset: Some(issued.dataset.clone()),
+                },
+            )?
+            .unwrap();
+            let crate::study::Activity::FullLine { puzzle, .. } = full.activity else {
+                panic!("Independent card must issue as a full line");
+            };
+            move_full_line(
+                &mut db,
+                full_line::Move {
+                    dataset: full.dataset,
+                    play: puzzle.play,
+                    step: 0,
+                    played: None,
+                },
+                FullLineSurface::Study,
+            )?;
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM learning", [], |r| r.get::<_, i64>(0))?,
+                2
+            );
+        }
         Ok(())
     }
 
@@ -363,14 +393,7 @@ mod tests {
                 moves: vec!["a2a3".into()],
             };
             assert!(full_line_store::publish(&tx, &published(other_route)?).is_err());
-            full_line_store::register_card(
-                &tx,
-                &exercise,
-                &full_line::InitialCard {
-                    id: "fixture-card".into(),
-                    title: "Imported exercise".into(),
-                },
-            )?;
+            full_line_store::register_card(&tx, &exercise, "Imported exercise")?;
             tx.commit()?;
             while !queue_store::seed_batch(&mut db)? {}
             db.flush_prepared_statement_cache();
