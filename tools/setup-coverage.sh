@@ -1,5 +1,10 @@
 #!/bin/sh
 set -eu
+if [ "$(uname -s):$(uname -m)" != Darwin:arm64 ]; then
+    echo "Maia provisioning targets macOS on Apple silicon." >&2
+    exit 1
+fi
+project="$(cd "$(dirname "$0")/python" && pwd)"
 runtime="${1:-$HOME/Library/Application Support/Tempo Lean/Maia3}"
 mkdir -p "$runtime/weights"
 weights="$runtime/weights/maia3-5m.pt"
@@ -15,7 +20,6 @@ if [ ! -f "$weights" ] || ! verify_weights "$weights"; then
     verify_weights "$candidate"
     mv "$candidate" "$weights"
 fi
-uv venv --allow-existing --python 3.12 "$runtime/venv"
-uv pip install --python "$runtime/venv/bin/python" \
-    'maia3 @ git+https://github.com/CSSLab/maia3.git@1e13597c42d4858b7cfd7cfdae01e297263364b2' \
-    'torch==2.8.0' 'chess==1.11.2'
+runtime="$(cd "$runtime" && pwd)"
+UV_PROJECT_ENVIRONMENT="$runtime/venv" \
+    uv sync --project "$project" --python 3.12.12 --locked --extra maia

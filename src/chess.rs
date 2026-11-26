@@ -89,6 +89,25 @@ pub fn board_at(route: &Route, ply: usize) -> Result<Chess> {
     Ok(board)
 }
 
+/// Check an issued solver route and make its starting position explicit on the wire.
+pub fn validate_solver_route(mut route: Route) -> Result<Route> {
+    ensure!(
+        (1..=MAX_PLIES).contains(&route.moves.len()),
+        "invalid solver route length"
+    );
+    let mut board = position(&route.fen)?;
+    route.fen = fen(&board);
+    for input in &route.moves {
+        let movement = parse_move(&board, input)?;
+        ensure!(
+            *input == uci(movement),
+            "solver move must use canonical UCI"
+        );
+        board.play_unchecked(movement);
+    }
+    Ok(route)
+}
+
 /// The result of interpreting one learner action in an issued solution.
 pub enum PuzzleMove {
     Illegal,

@@ -1,0 +1,10 @@
+{
+  "name": "tempo-qualification",
+  "private": true,
+  "scripts": {
+    "browser:install": "playwright-core install chromium"
+  },
+  "devDependencies": {
+    "playwright-core": "1.65.1"
+  }
+}

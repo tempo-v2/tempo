@@ -192,7 +192,7 @@ pub enum Activity {
     FullLine {
         // Preserve the top-level null expected by browsers from the prior release.
         result: (),
-        puzzle: crate::lichess_play::View,
+        puzzle: crate::full_line::View,
     },
 }
 

@@ -26,10 +26,10 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
     row.map(
         |(attempt, kind, title, color, fen, result, submission, context, played_in_game)| {
             let legal = chess::legal(&chess::position(&fen)?);
-            let activity = if let Some(play) = crate::lichess_play::for_review(db, attempt)? {
+            let activity = if let Some(play) = crate::full_line_store::for_review(db, attempt)? {
                 Activity::FullLine {
                     result: (),
-                    puzzle: crate::lichess_play::resume(db, play)?,
+                    puzzle: crate::full_line_store::resume(db, play)?,
                 }
             } else {
                 let result = result
@@ -66,7 +66,7 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
     .transpose()
 }
 
-fn state(db: &Connection) -> Result<(Option<i64>, Option<String>)> {
+pub(crate) fn state(db: &Connection) -> Result<(Option<i64>, Option<String>)> {
     Ok(db.query_row("SELECT active,last_kind FROM study", [], |r| {
         Ok((r.get(0)?, r.get(1)?))
     })?)
@@ -107,7 +107,7 @@ pub fn issue(db: &Connection, card: Option<(&str, &str)>) -> Result<()> {
     if let Some((id, kind)) = card {
         db.execute("INSERT INTO attempts(card_id) VALUES (?1)", [id])?;
         let attempt = db.last_insert_rowid();
-        crate::lichess_play::issue_review(db, id, attempt)?;
+        crate::full_line_store::issue_review(db, id, attempt)?;
         db.execute(
             "UPDATE study SET active=?1,last_kind=?2",
             params![attempt, kind],
@@ -121,7 +121,7 @@ pub fn issue(db: &Connection, card: Option<(&str, &str)>) -> Result<()> {
 pub fn begin_answer(db: &Connection, input: &AnswerIntentV1) -> Result<AnswerState> {
     check_dataset(Some(&input.dataset), &crate::db::dataset(db)?)?;
     ensure!(
-        crate::lichess_play::for_review(db, input.attempt)?.is_none(),
+        crate::full_line_store::for_review(db, input.attempt)?.is_none(),
         Conflict::FullSolution
     );
     type IssuedRow = (

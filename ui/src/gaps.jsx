@@ -141,6 +141,7 @@ function ReplacementImpact({ impact }) {
 export function Gaps() {
   const [draft, setDraft] = useState(restore);
   const scanOwner = useRef(null);
+  const saveProgress = useRef(null);
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
@@ -153,6 +154,7 @@ export function Gaps() {
     return () => {
       mounted.current = false;
       scanOwner.current?.controller.abort();
+      saveProgress.current?.stop();
       window.removeEventListener(journalChanged, refreshJournal);
       window.removeEventListener("storage", storageChanged);
     };
@@ -181,6 +183,7 @@ export function Gaps() {
     if (scanOwner.current && scanOwner.current.view !== viewIdentity(current)) {
       scanOwner.current.controller.abort();
     }
+    if (saveProgress.current && !saveProgress.current.owns(current)) saveProgress.current.stop();
     setRequestedReview(request => request?.report === reportOf(current) &&
       request?.index === (current.pending?.draft.gap ?? current.index) ? request : null);
     setDraft(current);
@@ -346,21 +349,7 @@ export function Gaps() {
       return;
     }
     refreshJournal();
-    const progress = new AbortController();
-    const pending = () => stored(storage + ".save")?.command === command.command;
-    const timer = command.replacements ? null : setInterval(async () => {
-      if (!pending()) {
-        clearInterval(timer);
-        progress.abort();
-        return;
-      }
-      try {
-        const state = await api("coverage/save/" + command.command, undefined, progress.signal);
-        if (state && !progress.signal.aborted && pending()) {
-          showProgress(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
-        }
-      } catch { /* The save command has its own acknowledgement. */ }
-    }, 750);
+    const stopProgress = command.replacements ? undefined : observeSaveProgress(command, showProgress);
     let receipt;
     try {
       receipt=await api(command.replacements ? "coverage/replace" : "coverage/save",command,undefined,{requireJson:true});
@@ -376,8 +365,7 @@ export function Gaps() {
       }
       throw e;
     } finally {
-      clearInterval(timer);
-      progress.abort();
+      stopProgress?.();
     }
     if (receipt?.command !== command.command || !Array.isArray(receipt.lines) || !receipt.lines.length ||
         !receipt.lines.every(line => typeof line === "string" && line.length > 0))
@@ -390,6 +378,61 @@ export function Gaps() {
       clearPreview();
       await run(() => scan(report.scan, previous));
     }
+  }
+  function observeSaveProgress(command, showProgress) {
+    const delivery = running.current;
+    const view = viewIdentity(restore());
+    let timer;
+    let request;
+    const observer = { owns, stop };
+
+    function owns(current) {
+      return mounted.current && running.current === delivery &&
+        current.pending?.command === command.command && viewIdentity(current) === view;
+    }
+    function eligible() {
+      return saveProgress.current === observer && owns(restore()) && !document.hidden;
+    }
+    function schedule() {
+      clearTimeout(timer);
+      if (eligible() && !request) timer = setTimeout(poll, 750);
+    }
+    async function poll() {
+      if (!eligible() || request) return;
+      const reading = new AbortController();
+      request = reading;
+      try {
+        const state = await readView("coverage/save/" + command.command, reading.signal);
+        if (state && eligible() && !reading.signal.aborted) {
+          showProgress(`Saving continuation. ${state.finished} of ${state.total} lines complete…`);
+        }
+      } catch { /* The save command has its own acknowledgement. */ }
+      finally {
+        request = undefined;
+        schedule();
+      }
+    }
+    function visibilityChanged() {
+      if (document.hidden) {
+        clearTimeout(timer);
+        request?.abort();
+      } else {
+        schedule();
+      }
+    }
+    function stop() {
+      if (saveProgress.current === observer) saveProgress.current = null;
+      clearTimeout(timer);
+      request?.abort();
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    }
+
+    if (!owns(restore())) return;
+    saveProgress.current?.stop();
+    saveProgress.current = observer;
+    document.addEventListener("visibilitychange", visibilityChanged);
+    schedule();
+    return stop;
   }
   function applyOrder(pending) {
     return run(() => sendApply(pending), { command: pending.command });
