@@ -15,7 +15,7 @@ pub struct PublishedExercise {
 }
 
 impl PublishedExercise {
-    pub fn new(key: String, version: String, route: Route) -> Result<Self> {
+    pub fn new(key: String, version: String, mut route: Route) -> Result<Self> {
         ensure!(
             !key.is_empty() && !version.is_empty(),
             "Full-line identity is missing"
@@ -24,6 +24,7 @@ impl PublishedExercise {
             !route.moves.is_empty(),
             "Full-line exercise has no solver moves"
         );
+        route.fen = chess::fen(&chess::position(&route.fen)?);
         chess::board_at(&route, route.moves.len())?;
         Ok(Self {
             key,

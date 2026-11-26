@@ -246,7 +246,11 @@ mod tests {
                 moves: vec!["a2a5".into()],
             };
             assert!(published(invalid).is_err());
-            let exercise = published(route.clone())?;
+            let exercise = published(chess::Route {
+                fen: String::new(),
+                moves: route.moves.clone(),
+            })?;
+            assert_eq!(exercise.route().fen, route.fen);
             full_line_store::publish(&tx, &exercise)?;
             full_line_store::publish(&tx, &exercise)?;
             let other_route = chess::Route {
