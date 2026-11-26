@@ -17,6 +17,7 @@ fn directory(db: &Path) -> PathBuf {
 const FILES: usize = 4;
 const BYTES: usize = 256 * 1024 * 1024;
 const WORKER_BYTES: usize = 32 * 1024 * 1024;
+const STARTUP_BATCH: usize = 32;
 
 #[derive(Debug)]
 pub struct Unavailable;
@@ -43,9 +44,28 @@ impl Staged {
 
 #[derive(Default)]
 struct Inventory {
-    generation: u64,
-    reconciled: Option<u64>,
+    initialized: bool,
     reservations: HashMap<String, (usize, Weak<()>)>,
+}
+
+impl Inventory {
+    fn insert(&mut self, id: &str, bytes: usize, lease: Weak<()>) -> Result<()> {
+        let reserved: usize = self.reservations.values().map(|(size, _)| size).sum();
+        ensure!(
+            self.reservations.len() < FILES
+                && bytes <= BYTES - reserved
+                && !self.reservations.contains_key(id),
+            Unavailable
+        );
+        self.reservations.insert(id.to_owned(), (bytes, lease));
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Startup {
+    entries: Option<fs::ReadDir>,
+    pending: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -64,8 +84,9 @@ impl Staging {
         std::thread::Builder::new()
             .name("tempo-staged-file-cleanup".into())
             .spawn(move || {
+                let mut startup = Startup::default();
                 loop {
-                    if let Err(error) = cleaner.reconcile() {
+                    if let Err(error) = cleaner.reconcile(&mut startup) {
                         eprintln!("Games file cleanup will retry: {error:#}");
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -92,22 +113,8 @@ impl Staging {
         let lease = Arc::new(());
         {
             let mut inventory = self.inventory.lock().unwrap();
-            ensure!(
-                inventory.reconciled == Some(inventory.generation)
-                    && inventory.reservations.len() < FILES
-                    && inventory
-                        .reservations
-                        .values()
-                        .map(|(size, _)| size)
-                        .sum::<usize>()
-                        + bytes.len()
-                        <= BYTES
-                    && !inventory.reservations.contains_key(&id),
-                Unavailable
-            );
-            inventory
-                .reservations
-                .insert(id.clone(), (bytes.len(), Arc::downgrade(&lease)));
+            ensure!(inventory.initialized, Unavailable);
+            inventory.insert(&id, bytes.len(), Arc::downgrade(&lease))?;
         }
         let dir = directory(&self.database);
         fs::DirBuilder::new()
@@ -133,91 +140,152 @@ impl Staging {
         ))
     }
 
-    /// A checkpoint released a durable reference. Reconcile it off the worker.
-    pub fn released(&self) {
-        self.inventory.lock().unwrap().generation += 1;
+    /// Hold this file in quota through the transaction that clears its job reference.
+    pub fn reserve_release(&self, id: &str) -> Result<Staged> {
+        ensure!(valid_id(id), "invalid upload identity");
+        let mut inventory = self.inventory.lock().unwrap();
+        ensure!(inventory.initialized, Unavailable);
+        let lease = match inventory.reservations.get(id) {
+            // An expired lease belongs to the cleaner until its check finishes.
+            Some((_, lease)) => lease.upgrade().ok_or(Unavailable)?,
+            None => {
+                let lease = Arc::new(());
+                inventory.insert(id, crate::jobs::MAX_PGN, Arc::downgrade(&lease))?;
+                lease
+            }
+        };
+        Ok(Staged {
+            id: id.to_owned(),
+            _lease: lease,
+        })
     }
 
-    fn reconcile(&self) -> Result<()> {
-        let (scan, released) = {
+    fn reconcile(&self, startup: &mut Startup) -> Result<()> {
+        let (initializing, released) = {
             let inventory = self.inventory.lock().unwrap();
-            let scan = (inventory.reconciled != Some(inventory.generation))
-                .then_some(inventory.generation);
             let released: Vec<_> = inventory
                 .reservations
                 .iter()
                 .filter(|(_, (_, lease))| lease.strong_count() == 0)
                 .map(|(id, _)| id.clone())
                 .collect();
-            (scan, released)
+            (!inventory.initialized, released)
         };
-        if scan.is_none() && released.is_empty() {
+        if !initializing && released.is_empty() {
             return Ok(());
         }
         let read = Database::read_with_busy_timeout(&self.database, Duration::ZERO)?;
         let mut used =
             read.prepare_cached("SELECT EXISTS(SELECT 1 FROM jobs WHERE upload_file=?1)")?;
-        let mut reconcile_file = |id: &str| -> Result<()> {
-            if self
-                .inventory
-                .lock()
-                .unwrap()
-                .reservations
-                .get(id)
-                .is_some_and(|(_, lease)| lease.strong_count() != 0)
-            {
-                return Ok(());
-            }
-            if !used.query_row([id], |row| row.get::<_, bool>(0))? {
-                match fs::remove_file(path(&self.database, id)?) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            self.inventory.lock().unwrap().reservations.remove(id);
-            Ok(())
-        };
         // Try independent released leases even if one file cannot be removed.
         let mut error = None;
         for id in released {
-            if let Err(failure) = reconcile_file(&id) {
-                error = Some(failure);
+            match referenced(&mut used, &id).and_then(|referenced| {
+                if !referenced {
+                    unlink(&directory(&self.database).join(&id))?;
+                }
+                Ok(())
+            }) {
+                Ok(()) => {
+                    self.inventory.lock().unwrap().reservations.remove(&id);
+                }
+                Err(failure) => error = Some(failure),
             }
         }
-        if let Some(generation) = scan {
-            match fs::read_dir(directory(&self.database)) {
-                Ok(entries) => {
-                    for (index, entry) in entries.enumerate() {
-                        let entry = entry?;
-                        if let Some(id) = entry.file_name().to_str()
-                            && path(&self.database, id).is_ok()
-                            && entry.file_type()?.is_file()
-                            && let Err(failure) = reconcile_file(id)
-                        {
-                            error = Some(failure);
-                        }
-                        if index % 32 == 31 {
-                            std::thread::yield_now();
-                        }
-                    }
-                }
-                Err(failure) if failure.kind() == io::ErrorKind::NotFound => {}
-                Err(failure) => return Err(failure.into()),
-            }
-            if error.is_none() {
-                self.inventory.lock().unwrap().reconciled = Some(generation);
-            }
+        if initializing {
+            self.reconcile_startup(startup, &mut used)?;
         }
         error.map_or(Ok(()), Err)
     }
+
+    fn reconcile_startup(
+        &self,
+        startup: &mut Startup,
+        used: &mut rusqlite::Statement<'_>,
+    ) -> Result<()> {
+        if startup.entries.is_none() {
+            match fs::read_dir(directory(&self.database)) {
+                Ok(entries) => startup.entries = Some(entries),
+                Err(failure) if failure.kind() == io::ErrorKind::NotFound => {
+                    self.inventory.lock().unwrap().initialized = true;
+                    return Ok(());
+                }
+                Err(failure) => return Err(failure.into()),
+            }
+        }
+        for _ in 0..STARTUP_BATCH {
+            if startup.pending.is_none() {
+                match startup.entries.as_mut().unwrap().next() {
+                    Some(Ok(entry)) => startup.pending = Some(entry.path()),
+                    Some(Err(failure)) => {
+                        startup.entries = None;
+                        return Err(failure.into());
+                    }
+                    None => {
+                        startup.entries = None;
+                        self.inventory.lock().unwrap().initialized = true;
+                        return Ok(());
+                    }
+                }
+            }
+            self.reconcile_startup_file(startup.pending.as_ref().unwrap(), used)?;
+            startup.pending = None;
+        }
+        Ok(())
+    }
+
+    fn reconcile_startup_file(
+        &self,
+        file: &Path,
+        used: &mut rusqlite::Statement<'_>,
+    ) -> Result<()> {
+        let Some(id) = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|id| valid_id(id))
+        else {
+            return Ok(());
+        };
+        let metadata = match file.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(failure) if failure.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(failure) => return Err(failure.into()),
+        };
+        let tracked = self.inventory.lock().unwrap().reservations.contains_key(id);
+        if metadata.is_file()
+            && !tracked
+            && !referenced(used, id)?
+            && let Err(failure) = unlink(file)
+        {
+            // A known orphan can remain in service if it fits the existing quota.
+            self.inventory.lock().unwrap().insert(
+                id,
+                usize::try_from(metadata.len())?,
+                Weak::new(),
+            )?;
+            eprintln!("Games file cleanup will retry: {failure:#}");
+        }
+        Ok(())
+    }
+}
+
+fn referenced(used: &mut rusqlite::Statement<'_>, id: &str) -> Result<bool> {
+    Ok(used.query_row([id], |row| row.get(0))?)
+}
+
+fn unlink(file: &Path) -> io::Result<()> {
+    match fs::remove_file(file) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+fn valid_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn path(db: &Path, id: &str) -> Result<PathBuf> {
-    ensure!(
-        id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
-        "invalid upload identity"
-    );
+    ensure!(valid_id(id), "invalid upload identity");
     Ok(directory(db).join(id))
 }
 
@@ -260,6 +328,93 @@ mod tests {
     use super::*;
     use crate::writer::Writer;
 
+    fn fixture(database: &Path) -> Staging {
+        Staging {
+            database: Arc::new(database.to_owned()),
+            inventory: Arc::new(Mutex::new(Inventory::default())),
+        }
+    }
+
+    #[test]
+    fn startup_checks_a_bounded_page_and_keeps_referenced_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("db");
+        let db = Database::init(&database)?;
+        let staging = fixture(&database);
+        let mut startup = Startup::default();
+        let files = super::directory(&database);
+        fs::create_dir(&files)?;
+        let retained = format!("{:032x}", STARTUP_BATCH);
+        for index in 0..=STARTUP_BATCH {
+            fs::write(files.join(format!("{index:032x}")), b"fixture")?;
+        }
+        db.execute(
+            "INSERT INTO jobs(provider,username,operation,status,upload_file)
+             VALUES ('pgn','Learner','upload','failed',?1)",
+            [&retained],
+        )?;
+        staging.reconcile(&mut startup)?;
+        assert!(
+            staging
+                .worker(b"fixture")
+                .err()
+                .unwrap()
+                .is::<Unavailable>()
+        );
+        assert!(files.join(&retained).is_file());
+        staging.reconcile(&mut startup)?;
+        assert_eq!(fs::read_dir(&files)?.count(), 1);
+        assert!(files.join(&retained).is_file());
+        assert!(staging.worker(b"fixture").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn job_release_holds_quota_until_commit_and_checks_only_its_file() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("db");
+        let mut db = Database::init(&database)?;
+        let staging = fixture(&database);
+        let mut startup = Startup::default();
+        staging.reconcile(&mut startup)?;
+
+        let staged = staging.worker(b"fixture")?;
+        let id = staged.id().to_owned();
+        let file = path(&database, &id)?;
+        db.execute(
+            "INSERT INTO jobs(provider,username,operation,status,upload_file)
+             VALUES ('pgn','Learner','upload','running',?1)",
+            [&id],
+        )?;
+        let job = db.last_insert_rowid();
+        drop(staged);
+        staging.reconcile(&mut startup)?;
+
+        {
+            let _release = staging.reserve_release(&id)?;
+            let tentative = db.transaction()?;
+            tentative.execute("UPDATE jobs SET upload_file=NULL WHERE id=?1", [job])?;
+            tentative.rollback()?;
+        }
+        staging.reconcile(&mut startup)?;
+        assert!(file.is_file());
+
+        let unrelated = path(&database, "00000000000000000000000000000000")?;
+        fs::write(
+            &unrelated,
+            b"a post-startup directory sweep would read this file",
+        )?;
+        let release = staging.reserve_release(&id)?;
+        crate::job_store::complete(&mut db, job, "pgn", "learner", None)?;
+        staging.reconcile(&mut startup)?;
+        assert!(file.is_file());
+        drop(release);
+        staging.reconcile(&mut startup)?;
+        assert!(!file.exists());
+        assert!(unrelated.is_file());
+        Ok(())
+    }
+
     #[test]
     fn failed_reclamation_neither_owns_writer_nor_exceeds_staging_quota() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("tempo-stage-{:032x}", rand::random::<u128>()));
@@ -267,11 +422,9 @@ mod tests {
         let database = dir.join("fixture.sqlite3");
         let result = (|| -> Result<()> {
             let mut db = Database::init(&database)?;
-            let staging = Staging {
-                database: Arc::new(database.clone()),
-                inventory: Arc::new(Mutex::new(Inventory::default())),
-            };
-            staging.reconcile()?;
+            let staging = fixture(&database);
+            let mut startup = Startup::default();
+            staging.reconcile(&mut startup)?;
             let mut obstacles = Vec::new();
             for _ in 0..FILES {
                 let file = staging.worker(b"fixture")?;
@@ -283,8 +436,8 @@ mod tests {
                 drop(file);
                 tx.commit()?;
                 obstacles.push(name);
+                assert!(staging.reconcile(&mut startup).is_err());
             }
-            assert!(staging.reconcile().is_err());
             assert!(
                 staging
                     .worker(b"one too many")
@@ -335,7 +488,7 @@ mod tests {
             for obstacle in obstacles {
                 fs::remove_dir(obstacle)?;
             }
-            staging.reconcile()?;
+            staging.reconcile(&mut startup)?;
             let live = staging.worker(b"retained")?;
             let durable = live.id().to_owned();
             runtime.block_on(async {
@@ -353,7 +506,7 @@ mod tests {
                     .await
             })?;
             drop(live);
-            staging.reconcile()?;
+            staging.reconcile(&mut startup)?;
             assert!(path(&database, &durable)?.is_file());
             Ok(())
         })();

@@ -8,10 +8,15 @@ use anyhow::{Result, ensure};
 use axum::{Json, extract::State};
 use pgn_reader::shakmaty::{Chess, Color, Position, san::SanPlus};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::Duration,
+};
 use tokio::sync::Semaphore;
 
 static SLOT: Semaphore = Semaphore::const_new(1);
+const REVIEW_LIMIT: Duration = Duration::from_millis(5750);
 const DISPLAY_COUNT: usize = 5;
 const MAX_LOSS_CP: i64 = 30;
 
@@ -81,7 +86,13 @@ pub async fn review(
     Json(address): Json<Address>,
 ) -> Result<Json<Reply>, ApiError> {
     let result = match SLOT.try_acquire() {
-        Ok(_permit) => inspect(&app, &address).await.map_err(ApiError)?,
+        Ok(_permit) => {
+            let work = inspect(&app.database, app.opening_engine.as_ref(), &address);
+            match tokio::time::timeout(REVIEW_LIMIT, work).await {
+                Ok(result) => result.map_err(ApiError)?,
+                Err(_) => Review::Unavailable,
+            }
+        }
         Err(_) => Review::Busy,
     };
     Ok(Json(Reply {
@@ -90,12 +101,16 @@ pub async fn review(
     }))
 }
 
-async fn inspect(app: &App, address: &Address) -> Result<Review> {
+async fn inspect(
+    database: &Path,
+    engine_endpoint: Option<&opening_engine::Endpoint>,
+    address: &Address,
+) -> Result<Review> {
     let report = address.report.clone();
     let index = address.gap;
     let target = optional_read::read_value(
         optional_read::Reader::RepertoireSimilarity,
-        app.database.clone(),
+        database.to_owned(),
         move |db, _| {
             let tx = db.transaction()?;
             let (scan, revision, gap) = super::selected(&tx, &report, index)?;
@@ -139,7 +154,7 @@ async fn inspect(app: &App, address: &Address) -> Result<Review> {
     let repertoire = gap.repertoire.clone();
     let candidates = optional_read::read_value(
         optional_read::Reader::RepertoireSimilarity,
-        app.database.clone(),
+        database.to_owned(),
         move |db, stopped| {
             let tx = db.transaction()?;
             let input = similarity::snapshot(&tx, &repertoire, &gap.color)?;
@@ -148,7 +163,7 @@ async fn inspect(app: &App, address: &Address) -> Result<Review> {
         },
     );
     let engine = opening_engine::evaluate(
-        app,
+        engine_endpoint,
         EngineRequest {
             fen: gap.fen,
             mode: EngineMode::ScoredRoots,
@@ -169,7 +184,7 @@ async fn inspect(app: &App, address: &Address) -> Result<Review> {
     };
     let fresh = optional_read::read_value(
         optional_read::Reader::RepertoireSimilarity,
-        app.database.clone(),
+        database.to_owned(),
         move |db, _| Ok(super::revision(db, &gap.repertoire)? == gap.revision),
     )
     .await?;

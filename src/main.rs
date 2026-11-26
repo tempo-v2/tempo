@@ -66,6 +66,8 @@ struct Runtime {
     staging: uploads::Staging,
     content_preparation: Arc<Semaphore>,
     games_upload_staging: Arc<Semaphore>,
+    games_pgn_receive: Arc<Semaphore>,
+    tactics_pgn_receive: Arc<Semaphore>,
 }
 
 impl Runtime {
@@ -78,6 +80,8 @@ impl Runtime {
             staging,
             content_preparation: Arc::new(Semaphore::new(2)),
             games_upload_staging: Arc::new(Semaphore::new(2)),
+            games_pgn_receive: Arc::new(Semaphore::new(1)),
+            tactics_pgn_receive: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -288,6 +292,16 @@ struct RepertoirePage {
 async fn repertoires(State(db): State<App>, Query(page): Query<RepertoirePage>) -> ViewResult {
     optional_view(db, optional_read::Reader::Repertoires, move |c| {
         catalog::repertoires(c, &page.after, &page.color)
+    })
+    .await
+}
+
+async fn repertoire(
+    State(db): State<App>,
+    UrlPath((id, color)): UrlPath<(String, String)>,
+) -> ViewResult {
+    optional_view(db, optional_read::Reader::RepertoireChoice, move |c| {
+        catalog::repertoire(c, &id, &color)
     })
     .await
 }
@@ -664,10 +678,16 @@ async fn opponent_move(State(db): State<App>, UrlPath(id): UrlPath<i64>) -> View
     .await
 }
 
-async fn receive_pgn(request: Request, next: Next) -> Response {
-    static UPLOADS: Semaphore = Semaphore::const_new(2);
-    let Ok(_permit) = UPLOADS.try_acquire() else {
-        return ApiError(writer::Unavailable.into()).into_response();
+async fn receive_pgn(State(slot): State<Arc<Semaphore>>, request: Request, next: Next) -> Response {
+    let Ok(_permit) = slot.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "code": "pgn_receive_busy",
+                "error": "This PGN intake is busy. Retry the same request."
+            })),
+        )
+            .into_response();
     };
     match buffer_pgn(request, Instant::now() + PGN_DEADLINE).await {
         Ok(request) => next.run(request).await,
@@ -826,6 +846,7 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .route("/api/coverage/save/{command}", get(gap_edit::progress))
         .route("/api/openings", get(openings).post(save_opening))
         .route("/api/openings/repertoires", get(repertoires))
+        .route("/api/openings/repertoires/{id}/{color}", get(repertoire))
         .route(
             "/api/openings/similar-moves",
             post(repertoire_similarity::browse),
@@ -837,11 +858,9 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         )
         .route(
             "/api/tactics",
-            get(tactics).merge(
-                post(save_tactic)
-                    .layer(pgn_body_limit)
-                    .layer(middleware::from_fn(receive_pgn)),
-            ),
+            get(tactics).merge(post(save_tactic).layer(pgn_body_limit).layer(
+                middleware::from_fn_with_state(app.tactics_pgn_receive.clone(), receive_pgn),
+            )),
         )
         .route("/api/games", get(archives))
         .route("/api/games/archive/{id}", get(read_game))
@@ -850,7 +869,10 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             "/api/games/uploads",
             post(upload_games)
                 .layer(pgn_body_limit)
-                .layer(middleware::from_fn(receive_pgn)),
+                .layer(middleware::from_fn_with_state(
+                    app.games_pgn_receive.clone(),
+                    receive_pgn,
+                )),
         )
         .route("/api/games/jobs/{id}/retry", post(retry_job))
         .route("/api/settings", get(settings).post(save_settings))
@@ -983,7 +1005,88 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn incomplete_pgn_receive_uses_only_its_route_slot() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("fixture.sqlite3");
+        let db = Database::init(&database)?;
+        let app = Arc::new(Runtime::new(
+            database.clone(),
+            writer::Writer::start(db, None)?,
+            uploads::Staging::start(&database)?,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(
+            axum::serve(listener, router(Path::new("."), port, app.clone())).into_future(),
+        );
+        let origin = format!("http://127.0.0.1:{port}/api");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+        let tactic = json!({"name":"Puzzle","pgn":"1. d4 d5 1-0"});
+        let upload = json!({"username":"Learner",
+            "pgn":"[White \"Learner\"]\n[Black \"Other\"]\n\n1. e4 e5 1-0"});
+        let post = |path, body: &Value| client.post(format!("{origin}/{path}")).json(body).send();
+        for (path, blocked, other, allowed, slot) in [
+            (
+                "games/uploads",
+                &upload,
+                "tactics",
+                &tactic,
+                &app.games_pgn_receive,
+            ),
+            (
+                "tactics",
+                &tactic,
+                "games/uploads",
+                &upload,
+                &app.tactics_pgn_receive,
+            ),
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+            let prefix = format!(
+                "POST /api/{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: 1024\r\n\r\n{{"
+            );
+            stream.write_all(prefix.as_bytes()).await?;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while slot.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            let refused = post(path, blocked).await?;
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(refused.json::<Value>().await?["code"], "pgn_receive_busy");
+            client
+                .get(format!("{origin}/health"))
+                .send()
+                .await?
+                .error_for_status()?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let response = post(other, allowed).await?;
+                    if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+                        response.error_for_status()?;
+                        return Ok::<_, reqwest::Error>(());
+                    }
+                    assert_eq!(
+                        response.json::<Value>().await?["code"],
+                        "staging_unavailable"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await??;
+            drop(stream);
+            drop(tokio::time::timeout(Duration::from_secs(1), slot.acquire()).await??);
+        }
+        server.abort();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn preparation_slots_keep_preview_staging_and_commands_independent() -> Result<()> {

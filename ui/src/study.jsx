@@ -1,5 +1,5 @@
 import { ExerciseLayout } from "./exercise_layout.jsx";
-import { decodePuzzle, PuzzleBoard, recoverPuzzleAction } from "./puzzle_play.jsx";
+import { decodePuzzle, PuzzleBoard, recoverPuzzleActions } from "./puzzle_play.jsx";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api, readView } from "./api.js";
@@ -115,6 +115,7 @@ function decodeStudyReply(body, dataset) {
   if (!Number.isSafeInteger(body?.attempt) || body.attempt <= 0 ||
       typeof body.dataset !== "string" || !body.dataset || (dataset && body.dataset !== dataset) ||
       !["opening", "tactic"].includes(body.kind) || !["white", "black"].includes(body.color) ||
+      !["single_answer", "full_line"].includes(body.activity_mode) ||
       typeof body.fen !== "string" || !body.fen ||
       !Array.isArray(body.legal) || !body.legal.every(isMove)) {
     throw new Error(incomplete);
@@ -122,13 +123,16 @@ function decodeStudyReply(body, dataset) {
   // The server supplies the allowed moves. Verify that the board can render
   // those moves and the feedback from this position before replacing the card.
   const playable = playableMoves(body.fen, incomplete);
+  const fullLine = body.activity_mode === "full_line";
+  if (fullLine ? body.result !== null : body.puzzle !== undefined) throw new Error(incomplete);
+  const puzzle = fullLine ? decodePuzzle(body.puzzle, "study", { dataset: body.dataset }) : null;
   const result = body.result === null ? null : decodeResult(body.result, incomplete, playable);
   if (body.legal.some((move) => !playable.has(move)) || (result === null && body.legal.length === 0)) {
     throw new Error(incomplete);
   }
   return {
     ...body,
-    puzzle: body.puzzle === undefined ? null : decodePuzzle(body.puzzle, "study", { dataset: body.dataset }),
+    puzzle,
     title: typeof body.title === "string" ? body.title : "",
     result,
   };
@@ -233,7 +237,7 @@ export function Study({ openGame, sounds }) {
       while ((intent = await nextSavedAnswer(intent))) {
         await deliverAnswer(intent);
       }
-      await recoverPuzzleAction("study");
+      await recoverPuzzleActions("study");
       if (!mounted.current) return;
       async function resumeCurrent() {
         const active = await loadCurrent();
@@ -257,7 +261,7 @@ export function Study({ openGame, sounds }) {
     };
   }, []);
   useEffect(() => {
-    if (!attemptKey || card.kind === "opening" || card.puzzle) return;
+    if (!attemptKey || card.kind === "opening" || card.activity_mode === "full_line") return;
     const request = new AbortController();
     opponentRead.current = readView(`study/${card.attempt}/opponent-move`, request.signal)
       .then((move) => {
@@ -269,7 +273,7 @@ export function Study({ openGame, sounds }) {
       request.abort();
       opponentRead.current = null;
     };
-  }, [attemptKey, card?.kind]);
+  }, [attemptKey, card?.kind, card?.activity_mode]);
 
   useEffect(() => {
     setSource(null);
@@ -339,9 +343,12 @@ export function Study({ openGame, sounds }) {
     <h1>Study</h1>
     {counts && <p>{formatStudyCount(counts.new)} new · {formatStudyCount(counts.reviews)} {counts.reviews === 1 ? "review" : "reviews"}</p>}
   </>;
-  if (card?.puzzle) return <PuzzleBoard key={card.puzzle.play} view={card.puzzle} scope="study" sounds={sounds}
+  if (card?.activity_mode === "full_line") return <PuzzleBoard key={card.puzzle.play} view={card.puzzle} scope="study" sounds={sounds}
     onView={(puzzle) => showCard({ ...card, puzzle })}
-    onRefresh={async () => showCard(await loadCurrent())}
+    onRefresh={async () => {
+      const current = await loadCurrent();
+      if (mounted.current) showCard(current);
+    }}
     heading={heading}
     continuation={<button ref={nextButton} disabled={pending} onClick={() => next(card.attempt)}>Next</button>}>
     {error && <div role="alert">{error.message} <button disabled={pending} onClick={() => run(retry.current)}>Retry</button></div>}

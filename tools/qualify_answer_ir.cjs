@@ -69,6 +69,235 @@ async function openPuzzle(api, puzzle, options = {}) {
   return { start, play: await api("tactics/plays", start) };
 }
 
+const fullLineReveal = page => page.getByRole("button", { name: "Reveal solution", exact: true });
+
+function puzzleCommandCount(db, intent) {
+  const statement = intent.request
+    ? `SELECT count(*) FROM lichess_starts WHERE request='${intent.request}'`
+    : `SELECT count(*) FROM lichess_moves WHERE play=${intent.play} AND step=${intent.step}`;
+  return Number(execFileSync("sqlite3", ["-readonly", db, statement], { encoding: "utf8" }));
+}
+
+async function issuePackStudy(api, db) {
+  const { play } = await openPuzzle(api, "03N75");
+  await api("tactics/plays/move", { dataset: play.dataset, play: play.play, step: play.step, played: null });
+  // Isolate which committed card Next issues in this disposable predecessor copy.
+  execFileSync("sqlite3", [db, "PRAGMA busy_timeout=2000; UPDATE study SET active=NULL; DELETE FROM deck; " +
+    "INSERT INTO deck SELECT 1,card FROM lichess_cards WHERE puzzle='03N75';"]);
+  const issued = await api("study/next", { after: null });
+  assert.equal(issued.puzzle.puzzle, "03N75");
+  return issued;
+}
+
+async function oldPuzzleCommand(browser, db, activity, accepted) {
+  const port = await unusedPort();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const scope = activity === "study_move" ? "study" : "tactics";
+  const start = activity === "tactics_start" || activity === "practice_start";
+  const endpoint = start ? "tactics/plays" : scope === "study" ? "study/puzzle-move" : "tactics/plays/move";
+  const url = "**/api/" + endpoint;
+  const legacyKey = `tempo.lichess.v1.${scope}`;
+  let intent;
+  let gradesBefore;
+  try {
+    await serve(predecessor, db, port, async (origin, api) => {
+      if (scope === "study" || activity === "practice_start") await issuePackStudy(api, db);
+      if (activity === "tactics_move") await openPuzzle(api, "03N75");
+      await page.goto(origin);
+      if (scope === "tactics") await page.getByRole("button", { name: "Tactics", exact: true }).click();
+      let command = fullLineReveal(page);
+      if (start) {
+        if (activity === "practice_start") {
+          const membership = execFileSync("sqlite3", ["-readonly", db,
+            "SELECT theme,band,position FROM lichess_members WHERE puzzle='03N75' ORDER BY band,theme LIMIT 1"],
+          { encoding: "utf8" }).trim();
+          const [theme, band, position] = membership.split("|");
+          assert.ok(position);
+          await page.getByLabel("Theme").selectOption(theme);
+          await page.getByRole("button", { name: new RegExp(`^${band}[–+]`) }).click();
+          command = page.getByRole("button", { name: new RegExp(`^Puzzle ${position} .*Practice$`) });
+        } else {
+          await page.getByLabel("Theme").selectOption("fork");
+          await page.getByRole("button", { name: /Open recommended pack/ }).click();
+          command = page.getByRole("button", { name: /^(Play next|Resume) puzzle$/ });
+        }
+      } else if (scope === "tactics") {
+        await page.getByRole("button", { name: "Resume 03N75", exact: true }).click();
+      }
+      gradesBefore = grades(db);
+      await page.route(url, async route => {
+        intent = route.request().postDataJSON();
+        if (accepted) assert.equal((await route.fetch()).status(), 200);
+        await route.abort();
+      }, { times: 1 });
+      await command.click();
+      await retry(page).waitFor();
+      assert.deepEqual(await page.evaluate(key => JSON.parse(sessionStorage.getItem(key)), legacyKey), {
+        kind: start ? "start" : "move", intent,
+      });
+      assert.equal(puzzleCommandCount(db, intent), Number(accepted));
+    });
+
+    execFileSync(candidate, ["migrate-games", db]);
+    await serve(candidate, db, port, async () => {
+      const delivered = page.waitForRequest(url);
+      await page.reload();
+      if (scope === "tactics") await page.getByRole("button", { name: "Tactics", exact: true }).click();
+      assert.deepEqual((await delivered).postDataJSON(), intent);
+      if (start) await fullLineReveal(page).waitFor();
+      else await page.getByRole("status").filter({ hasText: "Again" }).waitFor();
+      assert.equal(await page.evaluate(key => sessionStorage.getItem(key), legacyKey), null);
+      assert.equal(puzzleCommandCount(db, intent), 1);
+      assert.equal(grades(db), gradesBefore + Number(!start));
+      if (activity === "practice_start") {
+        // Practice acceptance records its command, while Learning remains unchanged.
+        await fullLineReveal(page).click();
+        await page.getByRole("status").filter({ hasText: "Again" }).waitFor();
+        assert.equal(grades(db), gradesBefore);
+      }
+    });
+  } finally {
+    await context.close();
+  }
+}
+
+async function explicitActivityAndReopenedPuzzle(browser, db) {
+  execFileSync(candidate, ["import-lichess-packs", db, packArtifact]);
+  await serve(candidate, db, await unusedPort(), async (origin, api) => {
+    const review = await issuePackStudy(api, db);
+    assert.equal(review.activity_mode, "full_line");
+    assert.equal(review.result, null);
+    const context = await browser.newContext();
+    let page = await context.newPage();
+    try {
+      const writes = [];
+      page.on("request", request => { if (request.method() === "POST") writes.push(request.url()); });
+      for (const change of [
+        value => ({ ...value, puzzle: undefined }),
+        value => ({ ...value, activity_mode: undefined }),
+        value => ({ ...value, activity_mode: "single_answer" }),
+      ]) {
+        await page.route("**/api/study", async route => {
+          const response = await route.fetch();
+          await route.fulfill({ response, json: change(await response.json()) });
+        }, { times: 1 });
+        await page.goto(origin);
+        await retry(page).waitFor();
+        assert.equal(await fullLineReveal(page).count(), 0);
+        assert.equal(await reveal(page).count(), 0);
+        assert.deepEqual(writes, []);
+      }
+      await retry(page).click();
+      await fullLineReveal(page).waitFor();
+
+      let intent;
+      const url = "**/api/study/puzzle-move";
+      await page.route(url, route => {
+        intent = route.request().postDataJSON();
+        return route.abort();
+      }, { times: 1 });
+      await fullLineReveal(page).click();
+      await retry(page).waitFor();
+      assert.equal(puzzleCommandCount(db, intent), 0);
+      await page.close();
+      page = await context.newPage();
+      const replay = page.waitForRequest(url);
+      await page.goto(origin);
+      assert.deepEqual((await replay).postDataJSON(), intent);
+      await page.getByRole("status").filter({ hasText: "Again" }).waitFor();
+      assert.equal(puzzleCommandCount(db, intent), 1);
+      const calls = [];
+      page.on("request", request => { if (request.method() === "POST") calls.push(request.url()); });
+      await page.route(nextPattern, route => route.abort(), { times: 1 });
+      await page.getByRole("button", { name: "Next", exact: true }).click();
+      await retry(page).waitFor();
+      await page.getByRole("status").filter({ hasText: "Again" }).waitFor();
+      await retry(page).click();
+      await retry(page).waitFor({ state: "hidden" });
+      assert.deepEqual(calls, [origin + "/api/study/next", origin + "/api/study/next"]);
+      assert.equal(puzzleCommandCount(db, intent), 1);
+    } finally {
+      await context.close();
+    }
+  });
+}
+
+async function competingPuzzleTabs(browser, db) {
+  execFileSync(candidate, ["import-lichess-packs", db, packArtifact]);
+  await serve(candidate, db, await unusedPort(), async (origin, api) => {
+    const review = await issuePackStudy(api, db);
+    const context = await browser.newContext();
+    const older = await context.newPage();
+    const newer = await context.newPage();
+    const held = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    const url = "**/api/study/puzzle-move";
+    const terminal = page => page.getByRole("status").filter({ hasText: "Again" });
+    try {
+      await older.goto(origin);
+      await newer.goto(origin);
+      await fullLineReveal(older).waitFor();
+      await fullLineReveal(newer).waitFor();
+      await older.route(url, async route => {
+        const reply = await route.fetch();
+        assert.equal(reply.status(), 200);
+        held.resolve(route.request().postDataJSON());
+        await release.promise;
+        await route.fulfill({ response: reply });
+      }, { times: 1 });
+      const board = await older.locator("cg-board").boundingBox();
+      const white = review.puzzle.color === "white";
+      async function clickSquare(square) {
+        const file = square.charCodeAt(0) - 97;
+        const rank = Number(square[1]) - 1;
+        await older.mouse.click(
+          board.x + (0.5 + (white ? file : 7 - file)) * board.width / 8,
+          board.y + (0.5 + (white ? 7 - rank : rank)) * board.height / 8,
+        );
+      }
+      await clickSquare("d6");
+      await clickSquare("b8");
+      const first = await held.promise;
+      assert.equal(first.played, "d6b8");
+      assert.equal(puzzleCommandCount(db, first), 1);
+
+      const writes = [];
+      newer.on("request", request => {
+        if (request.url().endsWith("/api/study/puzzle-move")) writes.push(request.postDataJSON());
+      });
+      await newer.route("**/api/study", route => route.abort(), { times: 1 });
+      await fullLineReveal(newer).click();
+      await retry(newer).waitFor();
+      assert.equal(writes.length, 1);
+      assert.equal(writes[0].step, first.step);
+      assert.equal(writes[0].played, null);
+      await retry(newer).click();
+      await retry(newer).waitFor({ state: "hidden" });
+      assert.equal(writes.length, 1, "The known conflict retries Current alone");
+
+      await newer.route(url, route => route.abort(), { times: 1 });
+      await fullLineReveal(newer).click();
+      await retry(newer).waitFor();
+      const last = writes.at(-1);
+      assert.ok(last.step > first.step);
+      release.resolve();
+      await older.waitForFunction(() => [...document.querySelectorAll("button")]
+        .some(button => button.textContent === "Reveal solution" && !button.disabled));
+      assert.equal(puzzleCommandCount(db, last), 0);
+      await newer.reload();
+      await terminal(newer).waitFor();
+      assert.deepEqual(writes.at(-1), last);
+      assert.equal(puzzleCommandCount(db, first), 1);
+      assert.equal(puzzleCommandCount(db, last), 1);
+      assert.equal(grades(db), 2);
+    } finally {
+      release.resolve();
+      await context.close();
+    }
+  });
+}
+
 async function fullLineRecovery(browser, db) {
   const port = await unusedPort();
   const page = await browser.newPage();
@@ -935,6 +1164,20 @@ async function openingPreview(browser, db) {
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true, timeout: 15000 });
+    if (process.env.TEMPO_QUALIFY_PUZZLE_JOURNAL === "1") {
+      assert.ok(retainedDatabase && packArtifact, "Provide the installed predecessor database and pack artifact");
+      await explicitActivityAndReopenedPuzzle(browser, path.join(root, "puzzle-reopen.db"));
+      await competingPuzzleTabs(browser, path.join(root, "puzzle-tabs.db"));
+      for (const activity of ["study_move", "tactics_move", "tactics_start", "practice_start"]) {
+        for (const accepted of [true, false]) {
+          const copy = path.join(root, `${activity}-${accepted}.db`);
+          execFileSync("sqlite3", ["-readonly", retainedDatabase, ".backup " + copy]);
+          await oldPuzzleCommand(browser, copy, activity, accepted);
+        }
+      }
+      console.log("Full-line mode, tab reopen, Next-only retry and both predecessor Move and Start delivery states passed.");
+      return;
+    }
     if (process.env.TEMPO_QUALIFY_PACKS_ONLY === "1") {
       assert.ok(retainedDatabase && packArtifact && legacyStudyClient, "Provide all predecessor inputs");
       for (const accepted of [true, false]) {

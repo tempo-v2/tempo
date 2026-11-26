@@ -47,11 +47,12 @@ pub enum Reader {
     CoverageStudied,
     CurrentStudy,
     RepertoireSimilarity,
+    RepertoireChoice,
 }
 
 impl Reader {
     fn slot(self) -> &'static Semaphore {
-        const LANES: usize = Reader::RepertoireSimilarity as usize + 1;
+        const LANES: usize = Reader::RepertoireChoice as usize + 1;
         static SLOTS: [Semaphore; LANES] = [const { Semaphore::const_new(1) }; LANES];
         &SLOTS[self as usize]
     }

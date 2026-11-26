@@ -177,6 +177,9 @@ fn detector_turn(
     if let Some((game, file)) = sealed {
         let (findings, after, finished) =
             read_detector_batch(staging, &file, job.window_offset, deadline)?;
+        let release = finished
+            .then(|| staging.reserve_release(&file))
+            .transpose()?;
         let cursor = cursor
             .map(|cursor| {
                 if !finished {
@@ -204,11 +207,9 @@ fn detector_turn(
                 .transpose()?,
         };
         writer.background_until(deadline, move |db| {
+            let _release = &release;
             game_pipeline::apply_detector(db, &batch)
         })?;
-        if finished {
-            staging.released();
-        }
         return Ok(true);
     }
     let (game, next_cursor) = match cursor {
@@ -364,13 +365,14 @@ fn run(
     }
     let provider = job.provider.clone();
     let username = job.username.to_ascii_lowercase();
+    let release = upload_file
+        .as_deref()
+        .map(|file| staging.reserve_release(file))
+        .transpose()?;
     writer.background_until(deadline, move |db| {
+        let _release = &release;
         job_store::complete(db, id, &provider, &username, None)
-    })?;
-    if upload_file.is_some() {
-        staging.released();
-    }
-    Ok(())
+    })
 }
 
 fn yield_turn(
@@ -569,6 +571,10 @@ fn provider_turn(
             None => {}
         }
     }
+    let release = upload
+        .as_deref()
+        .map(|file| staging.reserve_release(file))
+        .transpose()?;
     let mut cursor = match db.cursor(id)?.as_deref() {
         Some(json) => serde_json::from_str::<ProviderCursor>(json)?,
         None => {
@@ -596,6 +602,7 @@ fn provider_turn(
         cursor.freeze(provider, windows);
         let saved = serde_json::to_string(&cursor)?;
         writer.background_until(deadline, move |db| {
+            let _release = &release;
             job_store::checkpoint_provider_window(db, id, &saved, None, 0)
         })?;
         return Ok(());
@@ -615,6 +622,7 @@ fn provider_turn(
             cursor.recounted_rejected.unwrap_or_default(),
         );
         return writer.background_until(deadline, move |db| {
+            let _release = &release;
             job_store::complete(db, id, &provider, &user, Some(checkpoint))
         });
     };
@@ -634,12 +642,9 @@ fn provider_turn(
     let rejected = cursor.advance(job.window_rejected);
     let saved = serde_json::to_string(&cursor)?;
     writer.background_until(deadline, move |db| {
+        let _release = &release;
         job_store::checkpoint_provider_window(db, id, &saved, None, rejected)
-    })?;
-    if upload.is_some() {
-        staging.released();
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]

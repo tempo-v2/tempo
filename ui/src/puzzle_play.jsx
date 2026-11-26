@@ -4,12 +4,12 @@ import { ExerciseLayout } from "./exercise_layout.jsx";
 import { api } from "./api.js";
 import { ChessBoard, Replay, position } from "./board.jsx";
 import { isMove } from "./answer-journal.js";
+import { importPuzzleCommand, nextPuzzleCommand, resolvePuzzleCommand, savePuzzleCommand } from "./puzzle-journal.js";
 
 const endpoint = {
   tactics: "tactics/plays/move",
   study: "study/puzzle-move",
 };
-const key = (scope) => `tempo.lichess.v1.${scope}`;
 const terminalErrors = ["stale_attempt", "stale_dataset", "answer_conflict", "illegal_move", "pack_changed"];
 
 export function decodePuzzle(value, scope, intent) {
@@ -24,8 +24,11 @@ export function decodePuzzle(value, scope, intent) {
       (intent && (intent.dataset !== value.dataset ||
         (intent.play !== undefined && intent.play !== value.play) ||
         (intent.puzzle !== undefined && intent.puzzle !== value.puzzle) ||
+        (intent.practice !== undefined && value.mode !== (intent.practice ? "practice" : "first")) ||
         (intent.step !== undefined && (value.step < intent.step || value.result === null && value.step === intent.step))))) throw new Error(failed);
   if (value.result !== null && (!["Good", "Again"].includes(value.result?.rating) ||
+      !validRepeat(value.result.repeat) ||
+      !(value.result.due_day === null || /^\d{4}-\d{2}-\d{2}$/.test(value.result.due_day)) ||
       !Array.isArray(value.solution?.moves) || !value.solution.moves.length ||
       !value.solution.moves.every(isMove) || typeof value.solution.fen !== "string")) throw new Error(failed);
   if (value.result === null && (value.solution !== null || !value.legal.length)) throw new Error(failed);
@@ -36,32 +39,41 @@ export function decodePuzzle(value, scope, intent) {
   return value;
 }
 
-async function deliver(scope, record) {
-  const storageKey = key(scope);
-  const snapshot = JSON.stringify(record);
-  sessionStorage.setItem(storageKey, snapshot);
-  try {
-    const url = record.kind === "start" ? "tactics/plays" : endpoint[scope];
-    return decodePuzzle(await api(url, record.intent, undefined, { requireJson: true }), scope, record.intent);
-  } catch (error) {
-    if (!terminalErrors.includes(error.code)) throw error;
-    return null;
-  }
+function validRepeat(repeat) {
+  return repeat === "None" || repeat === "Deferred" ||
+    (Number.isInteger(repeat?.Placed) && repeat.Placed >= 0 && repeat.Placed <= 20);
 }
 
-async function finish(scope, record) {
-  const reply = await deliver(scope, record);
-  if (sessionStorage.getItem(key(scope)) === JSON.stringify(record)) sessionStorage.removeItem(key(scope));
+async function deliver(scope, command) {
+  let reply = null;
+  try {
+    const url = command.kind === "start" ? "tactics/plays" : endpoint[scope];
+    const body = await api(url, command.intent, undefined, { requireJson: true });
+    reply = decodePuzzle(body, scope, command.intent);
+  } catch (error) {
+    if (!terminalErrors.includes(error.code)) throw error;
+  }
+  // A cleanup failure can cause another exact replay. It cannot undo settlement.
+  await resolvePuzzleCommand(scope, command).catch(() => {});
   return reply;
 }
 
-export function recoverPuzzleAction(scope) {
-  const pending = sessionStorage.getItem(key(scope));
-  return pending ? finish(scope, JSON.parse(pending)) : Promise.resolve(null);
+async function sendPuzzleAction(scope, command) {
+  await savePuzzleCommand(scope, command);
+  return deliver(scope, command);
 }
 
-export async function startPuzzle(intent) {
-  return finish("tactics", { kind: "start", intent });
+export async function recoverPuzzleActions(scope, onAccepted) {
+  await importPuzzleCommand(scope);
+  let entry;
+  while ((entry = await nextPuzzleCommand(scope, entry?.key))) {
+    const reply = await deliver(scope, entry.command);
+    if (reply) onAccepted?.(reply);
+  }
+}
+
+export function startPuzzle(intent) {
+  return sendPuzzleAction("tactics", { kind: "start", intent });
 }
 
 export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuation, heading, children }) {
@@ -73,6 +85,8 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
   const busy = useRef(false);
   const retry = useRef(null);
   const mounted = useRef(false);
+  const currentView = useRef(view);
+  currentView.current = view;
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   async function run(work) {
     if (busy.current) return;
@@ -93,8 +107,10 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
   function move(played) {
     const intent = { dataset: view.dataset, play: view.play, step: view.step, played };
     void run(async () => {
-      const next = await finish(scope, { kind: "move", intent });
-      if (!mounted.current) return;
+      const next = await sendPuzzleAction(scope, { kind: "move", intent });
+      const current = currentView.current;
+      if (!mounted.current || current.dataset !== intent.dataset || current.play !== intent.play ||
+          current.step !== intent.step || current.result !== null) return;
       if (next) {
         if (next.result?.rating === "Again") sounds.play("illegal");
         onView(next);

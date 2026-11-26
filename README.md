@@ -107,12 +107,15 @@ and legacy opening import commands also require exclusive database ownership.
 With the service stopped, run `tempo migrate-games DATABASE` on the existing
 Lean database before starting this release. The command acquires the service
 lock and converts archived routes to the versioned packed format in one
-transaction. It preserves game IDs, staged uploads, saved Study receipts and
-Learning. Keep the stopped database and adjacent `.uploads` directory together
-for recovery. The schema-6 executable belongs with its matching schema-6 backup.
+transaction. The schema-18 migration also assigns a canonical identity to each
+authored opening. Equivalent saved lines in the same repertoire become aliases
+of one active line. Their original IDs, titles and routes remain stored.
+Game IDs, staged uploads, Study receipts and Learning are preserved. Keep the
+stopped database and adjacent `.uploads` directory together for recovery, with
+the executable and UI that served that schema.
 
-Reload active Study tabs during cutover. The current browser imports surviving
-predecessor pending Answers into its per-intent journal. An accepted Answer
+Reload active Study and Tactics tabs during cutover. Tempo imports surviving
+predecessor pending commands into its browser journals. An accepted Study result
 can be recovered independently of loading the next card.
 
 ## Provider turns and repertoire choices

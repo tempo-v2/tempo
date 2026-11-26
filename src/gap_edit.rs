@@ -655,7 +655,7 @@ pub async fn save(State(app): State<App>, Json(input): Json<Save>) -> ApiResult 
         .map_err(|_| ApiError(writer::Unavailable.into()))?;
     let reply = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        apply_batches(&app.writer, edit)
+        apply_batches(&app.writer, &app.database, edit)
     })
     .await
     .map_err(|error| ApiError(error.into()))?
@@ -743,51 +743,108 @@ struct Batch {
     revision: i64,
     line: usize,
     card: usize,
+    resolved_lines: Vec<String>,
 }
 
-fn checkpoint(c: &Connection, edit: &Edit) -> Result<Option<Batch>> {
-    Ok(c.query_row(
-        "SELECT revision,line,card FROM gap_batch WHERE command=?1",
-        [&edit.command],
-        |row| {
-            Ok(Batch {
-                revision: row.get(0)?,
-                line: row.get(1)?,
-                card: row.get(2)?,
-            })
-        },
-    )
-    .optional()?)
+// Read the predecessor's completed line IDs once, before writer admission.
+// These addressed records survive archive and aliasing.
+fn predecessor_prefix(db: &Connection, edit: &Edit) -> Result<Vec<String>> {
+    let line: Option<usize> = db
+        .query_row(
+            "SELECT line FROM gap_batch WHERE command=?1 AND resolved_lines IS NULL",
+            [&edit.command],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(line) = line else {
+        return Ok(Vec::new());
+    };
+    ensure!(
+        line < edit.plans.len(),
+        "Invalid predecessor Gaps line checkpoint"
+    );
+    let mut ids = Vec::with_capacity(line);
+    let mut present = db.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM openings WHERE id=?1 AND repertoire_id=?2 AND color=?3)",
+    )?;
+    for plan in &edit.plans[..line] {
+        let id = catalog::legacy_opening_id(plan, Some(&edit.repertoire));
+        ensure!(
+            present.query_row((&id, &edit.repertoire, &plan.color), |row| row
+                .get::<_, bool>(0))?,
+            "A completed Gaps line is missing from the predecessor checkpoint"
+        );
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
-fn apply_batches(writer: &writer::Writer, edit: Edit) -> Result<Value> {
-    let lines: Vec<_> = edit
-        .plans
-        .iter()
-        .map(|plan| catalog::opening_id(plan, Some(&edit.repertoire)))
-        .collect();
-    let reply = json!({"command":edit.command,"lines":lines});
-    let completed = std::sync::Arc::new(reply.to_string());
+fn checkpoint(c: &Connection, edit: &Edit, predecessor_prefix: &[String]) -> Result<Option<Batch>> {
+    let saved = c
+        .query_row(
+            "SELECT revision,line,card,total,resolved_lines FROM gap_batch WHERE command=?1",
+            [&edit.command],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, usize>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, usize>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((revision, line, card, total, resolved)) = saved else {
+        return Ok(None);
+    };
+    ensure!(
+        total == edit.plans.len() && line < total,
+        "Invalid Gaps line checkpoint"
+    );
+    let resolved_lines = match resolved {
+        Some(encoded) => serde_json::from_str(&encoded)?,
+        None => predecessor_prefix.to_vec(),
+    };
+    ensure!(
+        resolved_lines.len() == line,
+        "Invalid Gaps resolved line checkpoint"
+    );
+    Ok(Some(Batch {
+        revision,
+        line,
+        card,
+        resolved_lines,
+    }))
+}
+
+fn apply_batches(writer: &writer::Writer, path: &std::path::Path, edit: Edit) -> Result<Value> {
+    let prefix = std::sync::Arc::new(predecessor_prefix(&Database::read(path)?, &edit)?);
     let edit = std::sync::Arc::new(edit);
     loop {
         let edit = edit.clone();
-        let completed = completed.clone();
-        if writer.background(move |c| batch_turn(c, &edit, &completed))? {
+        let prefix = prefix.clone();
+        if let Some(reply) = writer.background(move |c| batch_turn(c, &edit, &prefix))? {
             return Ok(reply);
         }
     }
 }
 
-fn batch_turn(c: &mut Connection, edit: &Edit, completed: &str) -> Result<bool> {
+fn batch_turn(
+    c: &mut Connection,
+    edit: &Edit,
+    predecessor_prefix: &[String],
+) -> Result<Option<Value>> {
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    if receipt(&tx, &edit.command)?.is_some() {
-        return Ok(true);
+    if let Some(prior) = receipt(&tx, &edit.command)? {
+        return Ok(Some(prior));
     }
-    let saved = checkpoint(&tx, edit)?;
+    let saved = checkpoint(&tx, edit, predecessor_prefix)?;
     let mut batch = saved.unwrap_or(Batch {
         revision: edit.revision,
         line: 0,
         card: 0,
+        resolved_lines: Vec::new(),
     });
     if coverage::revision(&tx, &edit.repertoire)? != batch.revision {
         if batch.line != 0 || batch.card != 0 {
@@ -797,30 +854,34 @@ fn batch_turn(c: &mut Connection, edit: &Edit, completed: &str) -> Result<bool> 
     }
     ensure!(!edit.has_conflicts, Conflicts);
     let plan = &edit.plans[batch.line];
-    let next = catalog::apply_opening_batch(&tx, plan, &edit.repertoire, batch.card)?;
-    if let Some(next) = next {
-        batch.card = next;
-    } else {
-        batch.line += 1;
-        batch.card = 0;
+    match catalog::apply_opening_batch(&tx, plan, &edit.repertoire, batch.card)? {
+        catalog::OpeningBatch::More(next) => batch.card = next,
+        catalog::OpeningBatch::Finished(id) => {
+            batch.resolved_lines.push(id);
+            batch.line += 1;
+            batch.card = 0;
+        }
     }
-    let finished = batch.line == edit.plans.len();
-    if finished {
+    let result = if batch.line == edit.plans.len() {
+        let reply = json!({"command": edit.command, "lines": batch.resolved_lines});
         tx.execute(
             "INSERT INTO gap_save_receipt VALUES(?1,?2)",
-            (&edit.command, completed),
+            (&edit.command, reply.to_string()),
         )?;
         tx.execute("DELETE FROM gap_batch WHERE command=?1", [&edit.command])?;
+        Some(reply)
     } else {
         let revision = coverage::revision(&tx, &edit.repertoire)?;
         tx.execute(
-            "INSERT INTO gap_batch VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(command) DO UPDATE SET revision=excluded.revision,line=excluded.line,card=excluded.card",
-            (&edit.command,revision,batch.line,batch.card,edit.plans.len()),
+            "INSERT INTO gap_batch(command,revision,line,card,total,resolved_lines) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(command) DO UPDATE SET revision=excluded.revision,line=excluded.line,
+                card=excluded.card,resolved_lines=excluded.resolved_lines",
+            (&edit.command,revision,batch.line,batch.card,edit.plans.len(),serde_json::to_string(&batch.resolved_lines)?),
         )?;
-    }
+        None
+    };
     tx.commit()?;
-    Ok(finished)
+    Ok(result)
 }
 
 pub async fn progress(
@@ -1049,16 +1110,33 @@ mod tests {
         edition.command = replacement_id(&draft, &choices, before, replacement.line_revision)?;
         let confirmation = json!({"draft":draft,"replacements":choices,"command":edition.command,"revision":before,"line_revision":replacement.line_revision});
 
-        let other = catalog::save_opening(
+        let line_revision = opening_replacement::revision(&c, &repertoire)?;
+        let equivalent = catalog::save_opening(
             &c,
             &catalog::OpeningInput {
-                name: "Another already-authored route".into(),
+                name: "Same route under a different title".into(),
                 color: "white".into(),
                 route: original.clone(),
                 start_at: 0,
             },
             Some(&repertoire),
         )?;
+        assert_eq!(equivalent, repertoire);
+        assert_eq!(
+            opening_replacement::revision(&c, &repertoire)?,
+            line_revision
+        );
+        let other = catalog::save_opening(
+            &c,
+            &catalog::OpeningInput {
+                name: "Continue from a different authoring ply".into(),
+                color: "white".into(),
+                route: original.clone(),
+                start_at: 2,
+            },
+            Some(&repertoire),
+        )?;
+        assert_ne!(other, repertoire);
         assert!(
             commit_replacement(&mut c, edition, replacement)
                 .unwrap_err()
@@ -1196,30 +1274,44 @@ mod tests {
             recorded_moves: None,
             conflicts: BTreeMap::new(),
         };
-        let ids: Vec<_> = edit
-            .plans
-            .iter()
-            .map(|plan| catalog::opening_id(plan, Some(&edit.repertoire)))
-            .collect();
-        let accepted = json!({"lines":ids,"command":edit.command});
-        let serialized = accepted.to_string();
-        assert!(!batch_turn(&mut c, &edit, &serialized)?);
+        assert!(batch_turn(&mut c, &edit, &[])?.is_none());
         assert!(receipt(&c, &edit.command)?.is_none());
-        assert_eq!(checkpoint(&c, &edit)?.unwrap().line, 1);
+        let completed = checkpoint(&c, &edit, &[])?.unwrap();
+        assert_eq!(completed.line, 1);
+        let predecessor_id = catalog::legacy_opening_id(&edit.plans[0], Some(&edit.repertoire));
+        assert_ne!(completed.resolved_lines[0], predecessor_id);
+        // Represent the predecessor's retained physical line and cursor, which
+        // lacked a list of accepted line IDs.
+        c.execute(
+            "UPDATE openings SET id=?1 WHERE id=?2",
+            (&predecessor_id, &completed.resolved_lines[0]),
+        )?;
+        c.execute(
+            "UPDATE gap_batch SET resolved_lines=NULL WHERE command=?1",
+            [&edit.command],
+        )?;
+        let prefix = predecessor_prefix(&c, &edit)?;
+        assert_eq!(prefix, [predecessor_id.clone()]);
         c.execute_batch(
             "CREATE TRIGGER reject_gap_receipt BEFORE INSERT ON gap_save_receipt
             BEGIN SELECT RAISE(ABORT, 'interrupted'); END;",
         )?;
-        assert!(batch_turn(&mut c, &edit, &serialized).is_err());
-        assert_eq!(checkpoint(&c, &edit)?.unwrap().line, 1);
+        assert!(batch_turn(&mut c, &edit, &prefix).is_err());
+        assert_eq!(checkpoint(&c, &edit, &prefix)?.unwrap().line, 1);
         assert_eq!(coverage::revision(&c, &edit.repertoire)?, edit.revision + 1);
         c.execute_batch("DROP TRIGGER reject_gap_receipt;")?;
         drop(c);
         let mut c = Database::open(path)?;
-        assert!(batch_turn(&mut c, &edit, &serialized)?);
-        assert_eq!(receipt(&c, &edit.command)?, Some(accepted));
-        assert!(checkpoint(&c, &edit)?.is_none());
-        assert!(batch_turn(&mut c, &edit, &serialized)?);
+        let accepted = batch_turn(&mut c, &edit, &prefix)?.unwrap();
+        assert_eq!(accepted["lines"][0], predecessor_id);
+        let persisted_suffix: String =
+            c.query_row("SELECT id FROM openings WHERE name='Second'", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(accepted["lines"][1], persisted_suffix);
+        assert_eq!(receipt(&c, &edit.command)?, Some(accepted.clone()));
+        assert!(checkpoint(&c, &edit, &[])?.is_none());
+        assert_eq!(batch_turn(&mut c, &edit, &[])?, Some(accepted));
         assert_eq!(coverage::revision(&c, &edit.repertoire)?, edit.revision + 2);
         Ok(())
     }

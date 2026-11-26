@@ -550,6 +550,69 @@ async function waitFor(predicate) {
   throw new Error("Timed out waiting for the disposable model process");
 }
 
+async function boundedPickerAndOptionalReview(browser) {
+  const db = path.join(folder, "bounded-review.sqlite3");
+  await withServer(candidate, db, async (origin, api) => {
+    const repertoire = await addOpening(api, "Review target", ["e2e4", "e7e5", "g1f3"]);
+    seedReport(db, "bounded-review", repertoire, anchor, ["g1f3", "b8c6"]);
+    const held = "1. Nf3 Nc6 2. d4 *";
+    for (const noise of [0, 120]) {
+      if (noise) sql(db, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<${noise})
+        INSERT INTO repertoire_choices SELECT printf('!qualify-%04d',i),'white',printf('Other %d',i) FROM n;`);
+      const page = await browser.newPage();
+      try {
+        await page.addInitScript(({ key, repertoire, held }) => localStorage.setItem(key, JSON.stringify({
+          book: repertoire + "/white", report: "bounded-review", index: 0, pgn: held,
+        })), { key: journal, repertoire, held });
+        await page.goto(origin);
+        const libraryPicker = page.waitForResponse(response =>
+          new URL(response.url()).pathname === "/api/openings/repertoires");
+        await page.getByRole("button", { name: "Openings", exact: true }).click();
+        await libraryPicker;
+        const pickerRequests = [];
+        page.on("request", request => {
+          const url = new URL(request.url());
+          if (url.pathname.startsWith("/api/openings/repertoires")) pickerRequests.push(url);
+        });
+        await page.getByRole("button", { name: "Gaps", exact: true }).click();
+        const picker = page.getByRole("combobox", { name: "Repertoire" });
+        await picker.locator(`option[value="${repertoire}/white"]`).waitFor({ state: "attached" });
+        assert.equal(await picker.inputValue(), repertoire + "/white");
+        assert.equal(pickerRequests.filter(url => url.pathname === "/api/openings/repertoires").length, 1);
+        assert.equal(pickerRequests.filter(url =>
+          url.pathname === `/api/openings/repertoires/${repertoire}/white`).length, noise ? 1 : 0);
+        assert.equal(await picker.locator("option").count(), noise ? 51 : 1);
+        if (noise) {
+          const later = page.waitForResponse(response => new URL(response.url()).searchParams.has("after"));
+          await page.getByRole("button", { name: "Load more repertoires" }).click();
+          assert.equal(new URL((await later).url()).searchParams.get("after"), "!qualify-0050");
+          assert.equal(await picker.inputValue(), repertoire + "/white");
+        }
+
+        const editor = page.getByRole("textbox", { name: "Paste PGN from Lichess" });
+        await editor.waitFor();
+        assert.equal(await editor.inputValue(), held);
+        const errors = [];
+        page.on("pageerror", error => errors.push(error.message));
+        await page.route("**/api/coverage/gaps/review", route => {
+          const address = route.request().postDataJSON();
+          return route.fulfill({ json: { ...address, status: "ranked" } });
+        });
+        await page.getByRole("button", { name: "Work on next gap" }).click();
+        await page.getByRole("button", { name: "Retry review" }).waitFor();
+        assert.equal(await editor.inputValue(), held);
+        assert.equal(errors.length, 0);
+        const preview = page.waitForResponse("**/api/coverage/preview");
+        await page.getByRole("button", { name: "Preview", exact: true }).click();
+        assert.equal((await preview).status(), 200);
+      } finally {
+        await page.close();
+      }
+    }
+    assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "0");
+  });
+}
+
 async function reviewWinningMoves(browser, stockfish) {
   const db = path.join(folder, "review.sqlite3");
   const mate = "7k/8/5KQ1/8/8/8/8/8 w - - 0 1";
@@ -628,10 +691,11 @@ async function reviewWinningMoves(browser, stockfish) {
   });
 }
 
-async function previousGapsOnRetainedData(source) {
+async function previousGapsOnRetainedData(browser, source) {
   const db = path.join(folder, "retained.sqlite3");
   execFileSync("sqlite3", ["-readonly", source, ".backup " + quoted(db)]);
   const before = sql(db, "SELECT count(*) FROM gap_save_receipt");
+  const beforeApply = sql(db, "SELECT count(*) FROM applied_forecast");
   const learning = sql(db, "SELECT count(*) FROM learning");
   const attempt = sql(db, "SELECT active FROM study");
   const commands = await withServer(predecessor, db, async (_origin, api) => {
@@ -643,19 +707,74 @@ async function previousGapsOnRetainedData(source) {
     const next = { report: "qualification-undelivered", gap: 0, pgn: "1. Nf3 Nc6 2. d4 d5 3. Nc3 *" };
     seedReport(db, next.report, repertoire, anchor, ["g1f3", "b8c6"]);
     const pending = { draft: next, command: (await api("coverage/preview", next)).command };
-    return { accepted, receipt, pending };
+    const replacements = [];
+    const applications = [];
+    for (const delivery of ["accepted", "undelivered"]) {
+      const replaceRoute = ["g1f3", "b8c6", "e2e4"];
+      const replaceBook = await addOpening(api, "Predecessor replace " + delivery, replaceRoute);
+      await addOpening(api, "Equivalent saved line", replaceRoute, replaceBook);
+      const draft = { report: "qualification-replace-" + delivery, gap: 0, pgn: "1. Nf3 Nc6 2. d4 *" };
+      seedReport(db, draft.report, replaceBook, anchor, ["g1f3", "b8c6"]);
+      const conflict = (await api("coverage/preview", draft)).conflicts[0];
+      const choices = { [conflict.position]: conflict.proposed[0].movement };
+      const { replacement } = await api("coverage/preview", { ...draft, replacements: choices });
+      const { command, revision, line_revision } = replacement;
+      const request = { draft, replacements: choices, command, revision, line_revision };
+      replacements.push({ request, receipt: delivery === "accepted" ? await api("coverage/replace", request) : null });
+
+      const applyReport = "qualification-apply-" + delivery;
+      const applyBook = await addOpening(api, "Predecessor apply " + delivery, ["e2e4"]);
+      seedReport(db, applyReport, applyBook, anchor, ["g1f3", "b8c6"]);
+      const apply = { report: applyReport, command: require("node:crypto").randomUUID() };
+      const path = "coverage/" + applyReport + "/apply";
+      applications.push({ request: apply, receipt: delivery === "accepted" ? await api(path, apply) : null });
+    }
+    return { accepted, receipt, pending, replacements, applications };
   });
-  await withServer(candidate, db, async (_origin, api) => {
-    assert.deepEqual(await api("coverage/save", commands.accepted), commands.receipt);
-    const accepted = await api("coverage/save", commands.pending);
-    assert.deepEqual(await api("coverage/save", commands.pending), accepted);
-    assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), String(Number(before) + 2));
+  execFileSync(candidate, ["migrate-games", db]);
+  await withServer(candidate, db, async (origin, api) => {
+    async function recover(request, path, expected, kind = "save") {
+      const page = await browser.newPage();
+      try {
+        const draft = request.draft ?? { report: request.report, gap: 0, pgn: "" };
+        await page.addInitScript(({ key, kind, request, draft }) => {
+          localStorage.setItem(key, JSON.stringify({ report: draft.report, index: draft.gap, pgn: draft.pgn }));
+          localStorage.setItem(key + "." + kind, JSON.stringify(request));
+        }, { key: journal, kind, request, draft });
+        await page.route(origin + "/api/coverage", route => route.abort());
+        await openGaps(page, origin);
+        const retry = page.getByRole("button", { name: kind === "apply" ? "Retry applying order" : "Retry same save" });
+        const delivery = page.waitForResponse(origin + "/api/" + path);
+        await retry.click();
+        const reply = await delivery;
+        const body = await reply.json();
+        assert.equal(reply.status(), 200, JSON.stringify(body));
+        const wire = { ...request };
+        if (kind === "apply") delete wire.report;
+        assert.deepEqual(reply.request().postDataJSON(), wire);
+        if (expected) assert.deepEqual(body, expected);
+        await retry.waitFor({ state: "detached" });
+        assert.deepEqual(await api(path, wire), body);
+      } finally {
+        await page.close();
+      }
+    }
+    await recover(commands.accepted, "coverage/save", commands.receipt);
+    await recover(commands.pending, "coverage/save", null);
+    for (const replacement of commands.replacements) {
+      await recover(replacement.request, "coverage/replace", replacement.receipt);
+    }
+    for (const apply of commands.applications) {
+      await recover(apply.request, "coverage/" + apply.request.report + "/apply", apply.receipt, "apply");
+    }
+    assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), String(Number(before) + 4));
+    assert.equal(sql(db, "SELECT count(*) FROM applied_forecast"), String(Number(beforeApply) + 2));
     assert.equal(sql(db, "SELECT count(*) FROM learning"), learning);
     assert.equal(sql(db, "SELECT active FROM study"), attempt);
     assert.equal(sql(db, "PRAGMA integrity_check"), "ok");
     assert.equal(sql(db, "PRAGMA foreign_key_check"), "");
   });
-  console.log("Both previous-release Gap Save delivery states passed on a retained-data copy.");
+  console.log("Both previous-release Gaps Save, Replace, and Apply delivery states passed in Chromium on a retained-data copy.");
 }
 
 async function previousCommands() {
@@ -705,12 +824,13 @@ async function previousCommands() {
     await laterGapAcrossTabs(browser);
     await browserFlow(browser);
     await cancelledScans(browser);
+    await boundedPickerAndOptionalReview(browser);
     if (process.env.TEMPO_QUALIFY_STOCKFISH) {
       await reviewWinningMoves(browser, process.env.TEMPO_QUALIFY_STOCKFISH);
     }
     await previousCommands();
     if (process.env.TEMPO_QUALIFY_PREDECESSOR_DB) {
-      await previousGapsOnRetainedData(process.env.TEMPO_QUALIFY_PREDECESSOR_DB);
+      await previousGapsOnRetainedData(browser, process.env.TEMPO_QUALIFY_PREDECESSOR_DB);
     }
     console.log("Chromium conflict resolution, confirmed replacement retry, and installed predecessor command replay passed.");
   } finally {
