@@ -593,13 +593,26 @@ async function boundedPickerAndOptionalReview(browser) {
         await editor.waitFor();
         assert.equal(await editor.inputValue(), held);
         const errors = [];
+        let incomplete = true;
         page.on("pageerror", error => errors.push(error.message));
         await page.route("**/api/coverage/gaps/review", route => {
           const address = route.request().postDataJSON();
-          return route.fulfill({ json: { ...address, status: "ranked" } });
+          if (incomplete) return route.fulfill({ json: { ...address, status: "ranked" } });
+          const move = { first_move: "e2e4", san: "d4", score: { kind: "centipawns", white: 20 } };
+          return route.fulfill({ json: { ...address, status: "ranked",
+            best: move, winning_mate: false, similarity_available: true,
+            choices: [{ ...move, example: null, distance: null }],
+          } });
         });
         await page.getByRole("button", { name: "Work on next gap" }).click();
-        await page.getByRole("button", { name: "Retry review" }).waitFor();
+        const retryReview = page.getByRole("button", { name: "Retry review" });
+        await retryReview.waitFor();
+        incomplete = false;
+        const contradictory = page.waitForResponse("**/api/coverage/gaps/review");
+        await retryReview.click();
+        await contradictory;
+        await retryReview.waitFor();
+        assert.equal(await page.getByRole("button", { name: "Use reply" }).count(), 0);
         assert.equal(await editor.inputValue(), held);
         assert.equal(errors.length, 0);
         const preview = page.waitForResponse("**/api/coverage/preview");

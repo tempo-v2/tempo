@@ -20,23 +20,40 @@ export function decodePuzzle(value, scope, intent) {
       !(scope === "study" ? value.mode === "study" : ["first", "practice"].includes(value.mode)) ||
       !["white", "black"].includes(value.color) || typeof value.fen !== "string" ||
       !Array.isArray(value.legal) || !value.legal.every(isMove) ||
-      !(value.last_move === null || isMove(value.last_move)) ||
+      !(value.step === 0 ? value.last_move === null : isMove(value.last_move)) ||
       (intent && (intent.dataset !== value.dataset ||
         (intent.play !== undefined && intent.play !== value.play) ||
         (intent.puzzle !== undefined && intent.puzzle !== value.puzzle) ||
-        (intent.practice !== undefined && value.mode !== (intent.practice ? "practice" : "first")) ||
-        (intent.step !== undefined && (value.step < intent.step || value.result === null && value.step === intent.step))))) throw new Error(failed);
+        (intent.practice !== undefined && value.mode !== (intent.practice ? "practice" : "first"))))) throw new Error(failed);
   if (value.result !== null && (!["Good", "Again"].includes(value.result?.rating) ||
       !validRepeat(value.result.repeat) ||
       !(value.result.due_day === null || /^\d{4}-\d{2}-\d{2}$/.test(value.result.due_day)) ||
       !Array.isArray(value.solution?.moves) || !value.solution.moves.length ||
       !value.solution.moves.every(isMove) || typeof value.solution.fen !== "string")) throw new Error(failed);
-  if (value.result === null && (value.solution !== null || !value.legal.length)) throw new Error(failed);
+  if (value.result === null) {
+    if (value.solution !== null || !value.legal.length || value.step % 2 !== 0) throw new Error(failed);
+  } else {
+    const end = value.solution.moves.length;
+    if (value.result.rating === "Good" ? value.step !== end : value.step >= end || value.step % 2 !== 0) {
+      throw new Error(failed);
+    }
+  }
+  if (intent?.step !== undefined && !matchesMoveReply(value, intent)) throw new Error(failed);
   const board = new Chess(value.fen);
   const playable = new Set(board.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? "")));
   if (value.legal.some((move) => !playable.has(move))) throw new Error(failed);
   if (value.result !== null) position(value.solution);
   return value;
+}
+
+// Move receipts project the single submitted action. Start can instead resume an existing play.
+function matchesMoveReply(value, { step, played }) {
+  if (played === null || value.result?.rating === "Again") {
+    return value.result?.rating === "Again" && value.step === step &&
+      (played === null || value.solution.moves[step] !== played);
+  }
+  if (value.result === null) return value.step === step + 2;
+  return (value.step === step + 1 || value.step === step + 2) && value.solution.moves[step] === played;
 }
 
 function validRepeat(repeat) {

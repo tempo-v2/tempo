@@ -1291,7 +1291,7 @@ mod tests {
             [&edit.command],
         )?;
         let prefix = predecessor_prefix(&c, &edit)?;
-        assert_eq!(prefix, [predecessor_id.clone()]);
+        assert_eq!(prefix.as_slice(), std::slice::from_ref(&predecessor_id));
         c.execute_batch(
             "CREATE TRIGGER reject_gap_receipt BEFORE INSERT ON gap_save_receipt
             BEGIN SELECT RAISE(ABORT, 'interrupted'); END;",

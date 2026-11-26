@@ -100,6 +100,7 @@ async function oldPuzzleCommand(browser, db, activity, accepted) {
   const legacyKey = `tempo.lichess.v1.${scope}`;
   let intent;
   let gradesBefore;
+  let advancedPractice;
   try {
     await serve(predecessor, db, port, async (origin, api) => {
       if (scope === "study" || activity === "practice_start") await issuePackStudy(api, db);
@@ -137,14 +138,23 @@ async function oldPuzzleCommand(browser, db, activity, accepted) {
         kind: start ? "start" : "move", intent,
       });
       assert.equal(puzzleCommandCount(db, intent), Number(accepted));
+      if (activity === "practice_start" && accepted) {
+        const play = await api(endpoint, intent);
+        advancedPractice = await api("tactics/plays/move", {
+          dataset: play.dataset, play: play.play, step: play.step, played: "d6b8",
+        });
+        assert.ok(advancedPractice.step > play.step);
+      }
     });
 
     execFileSync(candidate, ["migrate-games", db]);
     await serve(candidate, db, port, async () => {
       const delivered = page.waitForRequest(url);
+      const acknowledgement = advancedPractice && page.waitForResponse(url);
       await page.reload();
       if (scope === "tactics") await page.getByRole("button", { name: "Tactics", exact: true }).click();
       assert.deepEqual((await delivered).postDataJSON(), intent);
+      if (acknowledgement) assert.deepEqual(await (await acknowledgement).json(), advancedPractice);
       if (start) await fullLineReveal(page).waitFor();
       else await page.getByRole("status").filter({ hasText: "Again" }).waitFor();
       assert.equal(await page.evaluate(key => sessionStorage.getItem(key), legacyKey), null);
@@ -223,6 +233,52 @@ async function explicitActivityAndReopenedPuzzle(browser, db) {
   });
 }
 
+async function impossiblePuzzleAcknowledgements(browser, db) {
+  execFileSync(candidate, ["import-lichess-packs", db, packArtifact]);
+  await serve(candidate, db, await unusedPort(), async (origin, api) => {
+    const { puzzle } = await issuePackStudy(api, db);
+    const context = await browser.newContext();
+    let page = await context.newPage();
+    const url = "**/api/study/puzzle-move";
+    const commands = [];
+    try {
+      await page.goto(origin);
+      let submit = fullLineReveal(page);
+      for (const change of [
+        result => ({ ...puzzle, step: puzzle.step + 2, last_move: result.solution.moves[1] }),
+        result => ({ ...result, result: { ...result.result, rating: "Good" },
+          step: result.solution.moves.length, last_move: result.solution.moves.at(-1) }),
+        result => ({ ...result, step: result.step + 2, last_move: result.solution.moves[1] }),
+      ]) {
+        await page.route(url, async route => {
+          commands.push(route.request().postDataJSON());
+          const response = await route.fetch();
+          const accepted = await response.json();
+          assert.equal(accepted.result.rating, "Again");
+          await route.fulfill({ response, json: change(accepted) });
+        }, { times: 1 });
+        await submit.click();
+        await retry(page).waitFor();
+        assert.equal(await page.getByRole("status").filter({ hasText: "Again" }).count(), 0);
+        assert.equal(await page.getByRole("status").filter({ hasText: "Solved" }).count(), 0);
+        assert.deepEqual(commands.at(-1), commands[0]);
+        assert.equal(puzzleCommandCount(db, commands[0]), 1);
+        submit = retry(page);
+      }
+      await page.close();
+      page = await context.newPage();
+      const replay = page.waitForRequest(url);
+      await page.goto(origin);
+      assert.deepEqual((await replay).postDataJSON(), commands[0]);
+      await page.getByRole("status").filter({ hasText: "Again" }).waitFor();
+      assert.equal(puzzleCommandCount(db, commands[0]), 1);
+      assert.equal(grades(db), 2);
+    } finally {
+      await context.close();
+    }
+  });
+}
+
 async function competingPuzzleTabs(browser, db) {
   execFileSync(candidate, ["import-lichess-packs", db, packArtifact]);
   await serve(candidate, db, await unusedPort(), async (origin, api) => {
@@ -239,12 +295,14 @@ async function competingPuzzleTabs(browser, db) {
       await newer.goto(origin);
       await fullLineReveal(older).waitFor();
       await fullLineReveal(newer).waitFor();
+      let original;
       await older.route(url, async route => {
+        original = route.request().postDataJSON();
         const reply = await route.fetch();
         assert.equal(reply.status(), 200);
-        held.resolve(route.request().postDataJSON());
-        await release.promise;
-        await route.fulfill({ response: reply });
+        const accepted = await reply.json();
+        assert.equal(accepted.step, original.step + 2);
+        await route.fulfill({ response: reply, json: { ...accepted, step: accepted.step + 2 } });
       }, { times: 1 });
       const board = await older.locator("cg-board").boundingBox();
       const white = review.puzzle.color === "white";
@@ -258,7 +316,17 @@ async function competingPuzzleTabs(browser, db) {
       }
       await clickSquare("d6");
       await clickSquare("b8");
+      await retry(older).waitFor();
+      await older.route(url, async route => {
+        const reply = await route.fetch();
+        assert.equal(reply.status(), 200);
+        held.resolve(route.request().postDataJSON());
+        await release.promise;
+        await route.fulfill({ response: reply });
+      }, { times: 1 });
+      await retry(older).click();
       const first = await held.promise;
+      assert.deepEqual(first, original);
       assert.equal(first.played, "d6b8");
       assert.equal(puzzleCommandCount(db, first), 1);
 
@@ -1167,6 +1235,7 @@ async function openingPreview(browser, db) {
     if (process.env.TEMPO_QUALIFY_PUZZLE_JOURNAL === "1") {
       assert.ok(retainedDatabase && packArtifact, "Provide the installed predecessor database and pack artifact");
       await explicitActivityAndReopenedPuzzle(browser, path.join(root, "puzzle-reopen.db"));
+      await impossiblePuzzleAcknowledgements(browser, path.join(root, "puzzle-invalid-acks.db"));
       await competingPuzzleTabs(browser, path.join(root, "puzzle-tabs.db"));
       for (const activity of ["study_move", "tactics_move", "tactics_start", "practice_start"]) {
         for (const accepted of [true, false]) {

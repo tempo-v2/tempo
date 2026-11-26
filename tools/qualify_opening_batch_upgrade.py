@@ -135,7 +135,100 @@ def qualify(candidate, predecessor, database):
     print("Predecessor Gaps batch resumed after one completed line and 40 responses. The old alias ID and new resolved ID replayed exactly.")
 
 
+def qualify_archived_aliases(candidate, predecessor, database):
+    def opening(name, moves, repertoire=None, fen=chess.STARTING_FEN):
+        destination = {"kind": "new"} if repertoire is None else {
+            "kind": "existing", "repertoire_id": repertoire,
+        }
+        return {
+            "name": name, "color": "white", "route": {"fen": fen, "moves": moves},
+            "destination": destination,
+        }
+
+    def save(api, draft):
+        status, reply = api("openings", draft)
+        assert status == 200, reply
+        return reply["id"]
+
+    def authored(api):
+        status, lines = api("openings")
+        assert status == 200, lines
+        return {line["id"]: line["name"] for line in lines}
+
+    def retained(store, migrated=False):
+        archive = "coalesce(pre_schema18_archived,archived)" if migrated else "archived"
+        return store.execute(
+            f"SELECT id,repertoire_id,name,color,route,start_at,{archive} FROM openings ORDER BY id"
+        ).fetchall()
+
+    def facts(store):
+        return {
+            table: store.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+            for table in ("cards", "prepared_queue", "learning", "attempts", "deck", "repeat_obligation",
+                          "coverage_revision", "opening_line_revision", "repertoire_choices")
+        }
+
+    castles = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
+    main_moves = ["e2e4", "e7e5", "g1f3"]
+    archived_moves = ["e2e4", "c7c5", "g1f3"]
+    with serving(predecessor, database) as api:
+        root = save(api, opening("Original root", ["e1g1"], fen=castles))
+        root_child = save(api, opening("Active root alias", ["e1h1"], root, castles))
+        earliest = save(api, opening("Earliest continuation", main_moves, root))
+        later = save(api, opening("Active continuation alias", main_moves, root))
+        old = save(api, opening("Archived continuation", archived_moves, root))
+        old_alias = save(api, opening("Archived continuation alias", archived_moves, root))
+        with sqlite3.connect(database) as store:
+            store.executemany("UPDATE openings SET archived=1 WHERE id=?", [(key,) for key in (root, earliest, old, old_alias)])
+            position = chess.Board()
+            position.push_uci("e2e4")
+            position.push_uci("c7c5")
+            retired = store.execute(
+                "UPDATE cards SET opening_retired=1 WHERE repertoire_id=? AND fen=?",
+                (root, position.fen()),
+            )
+            assert retired.rowcount == 1
+            originals = retained(store)
+            original_facts = facts(store)
+        assert authored(api) == {root_child: "Active root alias", later: "Active continuation alias"}
+
+    subprocess.run([candidate, "migrate-games", database], check=True)
+    with sqlite3.connect(database) as store:
+        assert retained(store, migrated=True) == originals
+        assert facts(store) == original_facts
+        identities = {
+            key: (alias, archived, previous)
+            for key, alias, archived, previous in store.execute(
+                "SELECT id,alias_of,archived,pre_schema18_archived FROM openings"
+            )
+        }
+        assert identities == {
+            root: (None, 0, 1), root_child: (root, 0, None),
+            earliest: (None, 0, 1), later: (earliest, 0, None),
+            old: (None, 1, None), old_alias: (old, 1, None),
+        }, identities
+    with serving(candidate, database) as api:
+        assert authored(api) == {root: "Original root", earliest: "Earliest continuation"}
+        assert save(api, opening("Original root", ["e1h1"], fen=castles)) == root
+        for source, moves, fen, representative in [
+            (root_child, ["e1h1"], castles, root),
+            (later, main_moves, chess.STARTING_FEN, earliest),
+        ]:
+            draft = opening("A new display title", moves, fen=fen)
+            del draft["destination"]
+            assert save(api, {**draft, "source_opening": source}) == representative
+        draft = opening("Archived branch", archived_moves)
+        del draft["destination"]
+        status, reply = api("openings", {**draft, "source_opening": old_alias})
+        assert status >= 400, reply
+        with sqlite3.connect(database) as store:
+            assert retained(store, migrated=True) == originals
+            assert facts(store) == original_facts
+    print("Archived roots and earliest lines inherit effective activity without changing predecessor rows or revisions. Archive-only aliases remain inactive.")
+
+
 if __name__ == "__main__":
     candidate, predecessor = [Path(path).resolve() for path in sys.argv[1:]]
     with TemporaryDirectory(prefix="to-batch-", dir="/tmp") as temporary:
         qualify(candidate, predecessor, Path(temporary) / "fixture.sqlite3")
+        qualify_archived_aliases(candidate, predecessor, Path(temporary) / "archives.sqlite3")

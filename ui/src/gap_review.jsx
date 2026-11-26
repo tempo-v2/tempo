@@ -13,14 +13,13 @@ function decodeReview(reply, report, index, fen) {
   const incomplete = new Error("The move review reply was incomplete.");
   if (reply?.report !== report || reply.gap !== index) throw incomplete;
   if (["conflict", "stale", "terminal", "busy", "unavailable"].includes(reply.status)) return reply;
-  const notation = value => typeof value === "string" && value.length > 0 && value.length <= 32;
-  if (reply.status === "covered" && notation(reply.san)) return reply;
+  const legal = new Map(new Chess(fen).moves({ verbose: true }).map(({ lan, san }) => [lan, san]));
+  if (reply.status === "covered" && [...legal.values()].includes(reply.san)) return reply;
   if (reply.status !== "ranked" || typeof reply.winning_mate !== "boolean" ||
       typeof reply.similarity_available !== "boolean" || !Array.isArray(reply.choices)) throw incomplete;
-  const legal = new Set(new Chess(fen).moves({ verbose: true }).map(move => move.lan));
   function validMove(move) {
     const score = move?.score;
-    return legal.has(move?.first_move) && notation(move.san) &&
+    return legal.has(move?.first_move) && legal.get(move.first_move) === move.san &&
       (score?.kind === "centipawns" ? Number.isSafeInteger(score.white) :
         score?.kind === "mate" && ["white", "black"].includes(score.winner) &&
         Number.isSafeInteger(score.moves) && score.moves > 0);
@@ -33,7 +32,8 @@ function decodeReview(reply, report, index, fen) {
     if (choice.example === null && choice.distance === null) continue;
     if (!Number.isSafeInteger(choice.distance) || choice.distance < 0 ||
         typeof choice.example?.fen !== "string" || choice.example.fen.length > 256) throw incomplete;
-    new Chess(choice.example.fen);
+    const example = new Chess(choice.example.fen);
+    if (!example.moves({ verbose: true }).some(move => move.lan === choice.first_move)) throw incomplete;
   }
   return reply;
 }
