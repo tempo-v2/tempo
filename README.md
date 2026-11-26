@@ -115,7 +115,10 @@ Then set `TEMPO_QUALIFY_STOCKFISH` to a Stockfish 19 binary for the Gaps suite.
 Run installed-predecessor replay separately. Use the actual previous
 installation's binary and assets and take a read-only SQLite backup of its
 database. The harness copies the schema-18 snapshot before starting either
-server, and uses temporary databases and loopback ports.
+server, and uses temporary databases and loopback ports. It derives a small
+pack under unused test identities from the supplied artifact and imports it
+with the predecessor into a copy. It also selects a dedicated single-answer
+fixture, independent of the learner’s active review.
 
 ```sh
 tools/qualify-predecessor.sh /path/to/candidate/tempo /path/to/predecessor/tempo \

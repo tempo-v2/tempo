@@ -15,11 +15,43 @@ pub struct PublishedExercise {
 }
 
 impl PublishedExercise {
-    pub fn new(key: String, version: String, route: Route) -> Result<Self> {
+    /// The publishing adapter supplies its stable namespace and its source-local key.
+    /// Neither is a display label. Study consumes the qualified key as an opaque value.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "source-neutral intake exercised through Study by a second publisher fixture"
+        )
+    )]
+    pub fn from_source(
+        namespace: &str,
+        local_key: &str,
+        version: String,
+        route: Route,
+    ) -> Result<Self> {
         ensure!(
-            !key.is_empty() && !version.is_empty(),
-            "Full-line identity is missing"
+            !namespace.is_empty()
+                && namespace
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "Invalid full-line source namespace"
         );
+        ensure!(!local_key.is_empty(), "Missing full-line source-local key");
+        Self::new(format!("{namespace}:{local_key}"), version, route)
+    }
+
+    /// Reserved for the historical pack adapter and its already published keys.
+    pub fn from_legacy_pack(key: String, version: String, route: Route) -> Result<Self> {
+        ensure!(
+            key.len() == 5 && key.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "Invalid legacy pack key"
+        );
+        Self::new(key, version, route)
+    }
+
+    fn new(key: String, version: String, route: Route) -> Result<Self> {
+        ensure!(!version.is_empty(), "Full-line version is missing");
         let route = chess::validate_solver_route(route)?;
         Ok(Self {
             key,

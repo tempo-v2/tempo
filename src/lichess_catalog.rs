@@ -72,7 +72,7 @@ pub fn import(db: &mut Connection, file: &Path) -> Result<ImportReport> {
         };
         let solution = serde_json::to_string(&route.moves)?;
         let version = chess::id(&["lichess-solution-v1", &route.fen, &solution]);
-        let exercise = PublishedExercise::new(id.clone(), version, route)
+        let exercise = PublishedExercise::from_legacy_pack(id.clone(), version, route)
             .with_context(|| format!("Invalid line for {id}"))?;
         ensure!(
             puzzles.insert(id, (rating, exercise, tags)).is_none(),
@@ -310,6 +310,73 @@ mod tests {
                 params![offset + 1, id],
             )?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn another_source_with_the_same_local_key_keeps_pack_and_study_independent() -> Result<()> {
+        use crate::{
+            full_line::InitialCard,
+            queue_store,
+            study::{Activity, Next},
+        };
+        let files = tempfile::tempdir()?;
+        let base = files.path().join("pack.sqlite3");
+        artifact(&base, "e7e5", 0, 20)?;
+        let mut db = db::Database::init(&files.path().join("tempo.sqlite3"))?;
+        let pack = import(&mut db, &base)?;
+        let exercise = PublishedExercise::from_source(
+            "fixture",
+            "00000",
+            "2".into(),
+            chess::Route {
+                fen: chess::fen(&chess::position("")?),
+                moves: vec!["d2d4".into()],
+            },
+        )?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        full_line_store::publish(&tx, &exercise)?;
+        full_line_store::register_card(
+            &tx,
+            &exercise,
+            &InitialCard {
+                id: "independent-card".into(),
+                title: "Independent exercise".into(),
+            },
+        )?;
+        tx.commit()?;
+        while !queue_store::seed_batch(&mut db)? {}
+
+        let member = members(&db, "fork", 1000)?
+            .puzzles
+            .into_iter()
+            .find(|p| p.puzzle == "00000")
+            .unwrap();
+        assert!(!member.done);
+        let dataset = db::dataset(&db)?;
+        let pack_play = lichess_play::start(
+            &mut db,
+            serde_json::from_value(serde_json::json!({
+                "puzzle":"00000","request":"00000000-0000-0000-0000-000000000000",
+                "revision":pack.artifact,"dataset":dataset,"practice":false,
+            }))?,
+        )?;
+        assert_eq!(pack_play.puzzle, "00000");
+        assert_eq!(pack_play.color, "black");
+
+        let issued = review::next(
+            &mut db,
+            Next {
+                after: None,
+                dataset: None,
+            },
+        )?
+        .unwrap();
+        let Activity::FullLine { puzzle, .. } = issued.activity else {
+            panic!("The independent exercise must issue a full line");
+        };
+        assert_eq!(puzzle.puzzle, "fixture:00000");
+        assert_eq!(puzzle.color, "white");
         Ok(())
     }
 

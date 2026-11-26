@@ -12,7 +12,7 @@ use serde::Serialize;
 
 pub struct Play {
     pub puzzle: String,
-    pub version: String,
+    version: String,
     pub mode: String,
     pub review: Option<i64>,
     pub ply: usize,
@@ -248,36 +248,93 @@ pub fn publish(db: &Transaction<'_>, exercise: &PublishedExercise) -> Result<()>
     Ok(())
 }
 
-pub fn bind_card(db: &Connection, puzzle: &str, version: &str, card: &str) -> Result<()> {
+/// Register a new tactic for a previously published exercise in the caller's transaction.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "source-neutral registration exercised through Study by a second publisher fixture"
+    )
+)]
+pub fn register_card(
+    db: &Transaction<'_>,
+    exercise: &PublishedExercise,
+    initial: &InitialCard,
+) -> Result<()> {
+    let (fen, moves): (String, String) = db.query_row(
+        "SELECT fen,moves FROM lichess_versions WHERE puzzle=?1 AND version=?2",
+        params![exercise.key(), exercise.version()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        fen == exercise.route().fen && moves == serde_json::to_string(&exercise.route().moves)?,
+        "Conflicting published full-line version"
+    );
+    register_version(
+        db,
+        exercise.key(),
+        exercise.version(),
+        exercise.route(),
+        initial,
+    )
+}
+
+/// Re-delivery of the same exercise/version/card triple leaves the original card and title intact.
+fn register_version(
+    db: &Transaction<'_>,
+    puzzle: &str,
+    version: &str,
+    route: &Route,
+    initial: &InitialCard,
+) -> Result<()> {
+    let prior: Option<(String, String)> = db
+        .query_row(
+            "SELECT version,card FROM lichess_cards WHERE puzzle=?1",
+            [puzzle],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((saved_version, saved_card)) = prior {
+        ensure!(
+            saved_version == version && saved_card == initial.id,
+            "Conflicting full-line card registration"
+        );
+        return Ok(());
+    }
+
+    let board = chess::position(&route.fen)?;
+    let first = route
+        .moves
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Missing full-line solver move"))?;
+    // The card primary key rejects an occupied identity before changing any existing card.
+    db.execute(
+        "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+        VALUES (?1,'tactic',?2,?3,?4,?5,?6)",
+        params![
+            initial.id,
+            initial.title,
+            chess::color_name(board.turn()),
+            route.fen,
+            chess::position_id(&board),
+            serde_json::to_string(&[first])?
+        ],
+    )?;
     db.execute(
         "INSERT INTO lichess_cards VALUES (?1,?2,?3)",
-        params![puzzle, version, card],
+        params![puzzle, version, initial.id],
     )?;
     Ok(())
 }
 
 pub fn admit(
-    db: &Connection,
+    db: &Transaction<'_>,
     play: i64,
     issued: &Play,
     initial: InitialCard,
 ) -> Result<(String, i64)> {
-    let route = &issued.route;
-    let board = chess::position(&route.fen)?;
-    let InitialCard { id: card, title } = initial;
-    db.execute(
-        "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
-        VALUES (?1,'tactic',?2,?3,?4,?5,?6)",
-        params![
-            card,
-            title,
-            chess::color_name(board.turn()),
-            route.fen,
-            chess::position_id(&board),
-            serde_json::to_string(&route.moves[..1])?
-        ],
-    )?;
-    bind_card(db, &issued.puzzle, &issued.version, &card)?;
+    register_version(db, &issued.puzzle, &issued.version, &issued.route, &initial)?;
+    let card = initial.id;
     db.execute("INSERT INTO attempts(card_id) VALUES (?1)", [&card])?;
     let review = db.last_insert_rowid();
     db.execute(
