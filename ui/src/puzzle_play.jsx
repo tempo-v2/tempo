@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { ExerciseLayout } from "./exercise_layout.jsx";
 import { api } from "./api.js";
-import { ChessBoard, Replay, position } from "./board.jsx";
+import { ChessBoard, Replay, play, position } from "./board.jsx";
 import { isMove } from "./answer-journal.js";
 import { importPuzzleCommand, nextPuzzleCommand, resolvePuzzleCommand, savePuzzleCommand } from "./puzzle-journal.js";
 
@@ -12,7 +12,7 @@ const endpoint = {
 };
 const terminalErrors = ["stale_attempt", "stale_dataset", "answer_conflict", "illegal_move", "pack_changed"];
 
-export function decodePuzzle(value, scope, intent) {
+export function decodePuzzle(value, scope, intent, issuedFen) {
   const failed = "The puzzle reply was incomplete. Retry.";
   if (!value || !Number.isSafeInteger(value.play) || value.play < 1 ||
       !Number.isSafeInteger(value.step) || value.step < 0 ||
@@ -38,8 +38,8 @@ export function decodePuzzle(value, scope, intent) {
       throw new Error(failed);
     }
   }
-  if (intent?.step !== undefined && !matchesMoveReply(value, intent)) throw new Error(failed);
   const board = new Chess(value.fen);
+  if (intent?.step !== undefined && !matchesMoveReply(value, intent, board.fen(), issuedFen)) throw new Error(failed);
   const playable = new Set(board.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? "")));
   if (value.legal.some((move) => !playable.has(move))) throw new Error(failed);
   if (value.result !== null) position(value.solution);
@@ -47,13 +47,28 @@ export function decodePuzzle(value, scope, intent) {
 }
 
 // Move receipts project the single submitted action. Start can instead resume an existing play.
-function matchesMoveReply(value, { step, played }) {
+function matchesMoveReply(value, { step, played }, afterFen, issuedFen) {
+  if (typeof value.before_fen !== "string" || !value.before_fen) return false;
+  const before = new Chess(value.before_fen);
+  const beforeFen = before.fen();
+  if (before.turn() !== value.color[0] || (issuedFen && new Chess(issuedFen).fen() !== beforeFen)) return false;
+
   if (played === null || value.result?.rating === "Again") {
+    if (played !== null) play(before, played);
     return value.result?.rating === "Again" && value.step === step &&
-      (played === null || value.solution.moves[step] !== played);
+      (played === null || value.solution.moves[step] !== played) &&
+      beforeFen === afterFen && position(value.solution, step).fen() === beforeFen;
   }
-  if (value.result === null) return value.step === step + 2;
-  return (value.step === step + 1 || value.step === step + 2) && value.solution.moves[step] === played;
+  if (value.result === null) {
+    if (value.step !== step + 2) return false;
+    play(before, played);
+    play(before, value.last_move);
+    return before.fen() === afterFen;
+  }
+  const { solution } = value;
+  return (value.step === step + 1 || value.step === step + 2) && solution.moves[step] === played &&
+    value.last_move === solution.moves.at(-1) && position(solution, step).fen() === beforeFen &&
+    position(solution).fen() === afterFen;
 }
 
 function validRepeat(repeat) {
@@ -66,7 +81,7 @@ async function deliver(scope, command) {
   try {
     const url = command.kind === "start" ? "tactics/plays" : endpoint[scope];
     const body = await api(url, command.intent, undefined, { requireJson: true });
-    reply = decodePuzzle(body, scope, command.intent);
+    reply = decodePuzzle(body, scope, command.intent, command.issuedFen);
   } catch (error) {
     if (!terminalErrors.includes(error.code)) throw error;
   }
@@ -124,7 +139,7 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
   function move(played) {
     const intent = { dataset: view.dataset, play: view.play, step: view.step, played };
     void run(async () => {
-      const next = await sendPuzzleAction(scope, { kind: "move", intent });
+      const next = await sendPuzzleAction(scope, { kind: "move", intent, issuedFen: view.fen });
       const current = currentView.current;
       if (!mounted.current || current.dataset !== intent.dataset || current.play !== intent.play ||
           current.step !== intent.step || current.result !== null) return;

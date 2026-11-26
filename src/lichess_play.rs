@@ -47,6 +47,14 @@ pub struct View {
     pub result: Option<Outcome>,
     pub solution: Option<Route>,
 }
+
+#[derive(Serialize)]
+pub struct MoveReply {
+    #[serde(flatten)]
+    pub view: View,
+    before_fen: String,
+}
+
 struct Play {
     puzzle: String,
     version: String,
@@ -299,7 +307,7 @@ fn admit(
     Ok((card, review))
 }
 
-pub fn play(db: &mut Connection, input: Move, surface: Surface) -> Result<View> {
+pub fn play(db: &mut Connection, input: Move, surface: Surface) -> Result<MoveReply> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     check_dataset(&tx, &input.dataset)?;
     check_surface(&tx, input.play, surface)?;
@@ -316,7 +324,12 @@ pub fn play(db: &mut Connection, input: Move, surface: Surface) -> Result<View> 
         .optional()?;
     if let Some((action, reply)) = saved {
         ensure!(action == encoded, Conflict::Submission);
-        return Ok(serde_json::from_str(&reply)?);
+        let route = load(&tx, input.play)?.route;
+        let before = chess::board_at(&route, input.step.try_into()?)?;
+        return Ok(MoveReply {
+            view: serde_json::from_str(&reply)?,
+            before_fen: chess::fen(&before),
+        });
     }
     let current = load(&tx, input.play)?;
     ensure!(
@@ -327,6 +340,8 @@ pub fn play(db: &mut Connection, input: Move, surface: Surface) -> Result<View> 
         let active: Option<i64> = tx.query_row("SELECT active FROM study", [], |r| r.get(0))?;
         ensure!(current.review == active, Conflict::Attempt);
     }
+    let before = chess::board_at(&current.route, current.ply)?;
+    let before_fen = chess::fen(&before);
     let (ply, rating, final_move) =
         match chess::score_puzzle_move(&current.route, current.ply, action.played())? {
             chess::PuzzleMove::Illegal => return Err(Conflict::IllegalMove.into()),
@@ -404,5 +419,8 @@ pub fn play(db: &mut Connection, input: Move, surface: Surface) -> Result<View> 
         params![input.play, input.step, encoded, saved],
     )?;
     tx.commit()?;
-    Ok(reply)
+    Ok(MoveReply {
+        view: reply,
+        before_fen,
+    })
 }

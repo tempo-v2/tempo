@@ -358,7 +358,7 @@ mod tests {
             played: Some(played.into()),
         };
         let solved = lichess_play::play(&mut db, answer("e7e5"), Surface::Tactics)?;
-        assert_eq!(serde_json::to_value(solved.result)?["rating"], "Good");
+        assert_eq!(serde_json::to_value(solved.view.result)?["rating"], "Good");
         assert_eq!(
             db.query_row("SELECT count(*) FROM learning", [], |r| r.get::<_, i64>(0))?,
             1

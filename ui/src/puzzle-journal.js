@@ -35,6 +35,7 @@ function commandKey(scope, command) {
     if (["study", "tactics"].includes(scope) && command.kind === "move" &&
         Number.isSafeInteger(intent.play) && intent.play > 0 &&
         Number.isSafeInteger(intent.step) && intent.step >= 0 &&
+        (command.issuedFen === undefined || typeof command.issuedFen === "string" && command.issuedFen) &&
         (intent.played === null || isMove(intent.played))) {
       return [scope, intent.dataset, "move", intent.play, intent.step, intent.played ?? "reveal"];
     }
