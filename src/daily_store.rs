@@ -1,7 +1,7 @@
 //! Persisted daily membership. The serving reader only sees prepared work.
 use crate::{
     daily_forecast::{self, Request, Response, Score},
-    daily_openings::{self, Reply, SavedLine},
+    daily_openings::{self, ForecastReply, Reply, SavedLine},
     daily_plan::{self, Candidate, Prerequisites, Selection},
     db::{self, Database},
     writer::Writer,
@@ -491,6 +491,7 @@ fn tactic_draft(db: &Connection, day: &Day, version: i64) -> Result<Draft> {
 struct Authored {
     basis: String,
     projection: daily_openings::OpeningProjection,
+    replies: Vec<ForecastReply>,
     keys: Vec<String>,
 }
 
@@ -500,6 +501,7 @@ impl Authored {
             profile: daily_forecast::PROFILE.to_owned(),
             basis: self.basis,
             routes: self.projection.routes,
+            replies: self.replies,
             cards: self.keys,
         }
     }
@@ -527,9 +529,10 @@ fn authored(db: &Connection, day: &Day, clock: &Clock) -> Result<Authored> {
         });
     }
     let mut replies = Vec::new();
+    let mut forecast_replies = Vec::new();
     let mut keys = Vec::new();
     let mut stmt = db.prepare(
-        "SELECT id,repertoire_id,position_id,answers
+        "SELECT id,repertoire_id,position_id,answers,color,fen
         FROM active_cards WHERE kind='opening' ORDER BY id",
     )?;
     let mut rows = stmt.query([])?;
@@ -538,7 +541,12 @@ fn authored(db: &Connection, day: &Day, clock: &Clock) -> Result<Authored> {
         let repertoire: String = r.get(1)?;
         let position_id: String = r.get(2)?;
         let answers: String = r.get(3)?;
-        bytes += card.len()
+        let color: String = r.get(4)?;
+        let fen: String = r.get(5)?;
+        bytes += color.len()
+            + fen.len()
+            + std::mem::size_of::<ForecastReply>()
+            + card.len()
             + repertoire.len()
             + position_id.len()
             + answers.len()
@@ -548,6 +556,13 @@ fn authored(db: &Connection, day: &Day, clock: &Clock) -> Result<Authored> {
             "Daily opening snapshot exceeds its byte budget"
         );
         if let Ok([answer]) = serde_json::from_str::<[String; 1]>(&answers) {
+            forecast_replies.push(ForecastReply {
+                repertoire: repertoire.clone(),
+                color,
+                fen,
+                movement: answer.clone(),
+                card: card.clone(),
+            });
             replies.push(Reply {
                 card: card.clone(),
                 repertoire,
@@ -561,6 +576,7 @@ fn authored(db: &Connection, day: &Day, clock: &Clock) -> Result<Authored> {
     Ok(Authored {
         basis,
         projection,
+        replies: forecast_replies,
         keys,
     })
 }
@@ -1247,6 +1263,23 @@ mod tests {
             db.execute("INSERT INTO deck VALUES(?1,?2)", (slot, &id))?;
         }
         tactic(&db, "ready", None)?;
+        catalog::save_opening(
+            &db,
+            &catalog::OpeningInput {
+                name: "Later opening".into(),
+                color: "white".into(),
+                start_at: 0,
+                route: chess::Route {
+                    fen: chess::fen(&chess::position("")?),
+                    moves: vec!["e2e4".into()],
+                },
+            },
+            None,
+        )?;
+        db.execute(
+            "INSERT INTO deck SELECT 11,id FROM cards WHERE kind='opening'",
+            [],
+        )?;
         db.execute(
             "INSERT INTO attempts(id,card_id,result) VALUES(1,'repeat','saved')",
             [],

@@ -19,6 +19,20 @@ def route(repertoire, color, moves, decisions, fen=chess.STARTING_FEN):
                 decisions=[dict(ply=ply, card=card) for ply, card in decisions])
 
 
+def snapshot(routes, cards):
+    replies = {}
+    for entry in routes:
+        board = chess.Board(entry["fen"])
+        decisions = {item["ply"]: item["card"] for item in entry["decisions"]}
+        for ply, move in enumerate(entry["moves"]):
+            if ply in decisions:
+                reply = dict(repertoire=entry["repertoire"], color=entry["color"],
+                             fen=board.fen(), movement=move, card=decisions[ply])
+                replies[entry["repertoire"], board.fen()] = reply
+            board.push_uci(move)
+    return dict(routes=routes, replies=list(replies.values()), cards=cards)
+
+
 def distribution(board, **probabilities):
     return {move.uci(): probabilities.get(move.uci(), 0.) for move in board.legal_moves}
 
@@ -29,7 +43,7 @@ class DailyForecastTest(unittest.TestCase):
                       [(1, "nf3"), (3, "shared"), (7, "shared")])
         second = route("a", "black", "g2g3 d7d5 g1f3 g8f6", [(3, "shared")])
         other = route("b", "black", "e2e4 e7e5", [(1, "zero")])
-        data = dict(routes=[first, first, second, other], cards=["nf3", "shared", "zero"])
+        data = snapshot([first, first, second, other], ["nf3", "shared", "zero"])
 
         def predict(board):
             match board.ply():
@@ -58,19 +72,30 @@ class DailyForecastTest(unittest.TestCase):
                             "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
         cards = ["followup", "other", "root", "custom", "missing"]
         predict = lambda board: distribution(board, e7e5=.6, c7c5=.4)
-        ambiguous = forecast(dict(routes=[compatible, conflicting], cards=cards), predict)
+        ambiguous = forecast(snapshot([compatible, conflicting], cards), predict)
         self.assertEqual({"kind": "unscored"}, ambiguous["followup"])
-        scores = forecast(dict(routes=[compatible, conflicting, authority, unsupported], cards=cards), predict)
+        scores = forecast(snapshot([compatible, conflicting, authority, unsupported], cards), predict)
         self.assertEqual({"kind": "estimated", "probability": .5}, scores["root"])
         self.assertEqual({"kind": "estimated", "probability": .3}, scores["followup"])
         self.assertEqual({"kind": "unscored"}, scores["other"])
         self.assertEqual({"kind": "unscored"}, scores["custom"])
         self.assertEqual({"kind": "unscored"}, scores["missing"])
 
+    def test_custom_root_reply_controls_play_when_reached_from_start(self):
+        standard = route("a", "white", "e2e4 e7e5 g1f3 b8c6 f1b5", [(4, "ruy-lopez")])
+        board = chess.Board()
+        board.push_uci("e2e4")
+        board.push_uci("e7e5")
+        custom = route("a", "white", "f1c4", [(0, "italian")], board.fen())
+        scores = forecast(snapshot([standard, custom], ["ruy-lopez", "italian"]),
+                          lambda position: distribution(position, e7e5=1.))
+        self.assertEqual({"kind": "estimated", "probability": .5}, scores["italian"])
+        self.assertEqual({"kind": "unscored"}, scores["ruy-lopez"])
+
     def test_horizon_and_shared_physical_admission(self):
         line = route("a", "white", "e2e4 e7e5 g1f3", [(0, "root"), (2, "later")])
         with mock.patch("daily_forecast.HORIZON", 2):
-            scores = forecast(dict(routes=[line], cards=["root", "later"]),
+            scores = forecast(snapshot([line], ["root", "later"]),
                               lambda board: distribution(board, e7e5=1.))
         self.assertEqual({"kind": "estimated", "probability": .5}, scores["root"])
         self.assertEqual({"kind": "unscored"}, scores["later"])
@@ -81,7 +106,7 @@ class DailyForecastTest(unittest.TestCase):
             with model_slot(pathlib.Path(temporary)):
                 for call in ([sys.executable, "-c", coverage, temporary],
                              [sys.executable, "-c", daily, temporary, coverage]):
-                    request = dict(profile=PROFILE, basis="test day", routes=[], cards=[])
+                    request = dict(profile=PROFILE, basis="test day", routes=[], replies=[], cards=[])
                     result = subprocess.run(call, input=json.dumps(request).encode(),
                                             capture_output=True, timeout=3, check=False)
                     self.assertEqual(result.returncode, 75, result.stderr.decode())

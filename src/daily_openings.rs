@@ -27,6 +27,17 @@ pub struct OpeningProjection {
     pub routes: Vec<ForecastRoute>,
 }
 
+/// The active reply applies wherever its position is reached in this repertoire,
+/// including paths that began in a different authored line.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForecastReply {
+    pub repertoire: String,
+    pub color: String,
+    pub fen: String,
+    pub movement: String,
+    pub card: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForecastRoute {
     pub repertoire: String,

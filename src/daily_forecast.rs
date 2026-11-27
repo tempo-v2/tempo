@@ -1,6 +1,6 @@
 //! The private immutable daily forecast exchange. The worker holds no Store capability.
 
-use crate::daily_openings::ForecastRoute;
+use crate::daily_openings::{ForecastReply, ForecastRoute};
 use anyhow::{Context, Result, ensure};
 use chrono::NaiveDate;
 use fs2::FileExt;
@@ -25,7 +25,7 @@ use tokio::{
 const BYTES: usize = 32 * 1024 * 1024;
 const BUDGET: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_secs(2);
-pub const PROFILE: &str = "maia3-5m-1500-authored-history-v1";
+pub const PROFILE: &str = "maia3-5m-1500-authored-history-v2";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +33,7 @@ pub struct Request {
     pub profile: String,
     pub basis: String,
     pub routes: Vec<ForecastRoute>,
+    pub replies: Vec<ForecastReply>,
     pub cards: Vec<String>,
 }
 
@@ -445,6 +446,7 @@ mod tests {
             profile: PROFILE.to_owned(),
             basis: "original basis".into(),
             routes: Vec::new(),
+            replies: Vec::new(),
             cards: vec!["a".into()],
         };
         assert!(!request_exists(&directory, day)?);

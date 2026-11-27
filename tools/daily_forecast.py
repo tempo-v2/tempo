@@ -13,7 +13,7 @@ import chess
 
 
 HORIZON = 200
-PROFILE = "maia3-5m-1500-authored-history-v1"
+PROFILE = "maia3-5m-1500-authored-history-v2"
 
 
 @dataclass
@@ -48,7 +48,7 @@ def add_route(scenario, route):
             if board.turn != (route["color"] == "white"):
                 raise ValueError("Daily opening decision at an opponent turn")
             reply = (move, card)
-            if scenario.replies.setdefault(position_key(board), reply) != reply:
+            if scenario.replies.get(position_key(board)) != reply:
                 raise ValueError("Inconsistent daily opening card identity")
             node.card = card
         board.push_uci(move)
@@ -64,7 +64,7 @@ def mark_uncertain(node, seen, uncertain):
         mark_uncertain(child, seen, uncertain)
 
 
-def traverse(node, board, learner, mass, predict, replies, seen, reach, uncertain):
+def traverse(node, board, learner, mass, predict, replies, seen, reach, supported, uncertain):
     if board.is_game_over():
         return
     reply = replies.get(position_key(board)) if board.turn == learner else None
@@ -80,6 +80,7 @@ def traverse(node, board, learner, mass, predict, replies, seen, reach, uncertai
         if reply is not None:
             move, card = reply
             if card in reach and card not in seen:
+                supported.add(card)
                 reach[card] += mass
                 seen = seen | {card}
             for other in node.children.keys() - {move}:
@@ -99,7 +100,7 @@ def traverse(node, board, learner, mass, predict, replies, seen, reach, uncertai
     for move, child in sorted(node.children.items()):
         if move in choices:
             board.push_uci(move)
-            traverse(child, board, learner, mass * choices[move], predict, replies, seen, reach, uncertain)
+            traverse(child, board, learner, mass * choices[move], predict, replies, seen, reach, supported, uncertain)
             board.pop()
 
 
@@ -110,18 +111,26 @@ def forecast(data, predict):
     reach = dict.fromkeys(cards, 0.)
     supported, uncertain = set(), set()
     by_color = {"white": {}, "black": {}}
+    for reply in data["replies"]:
+        board = chess.Board(reply["fen"])
+        color = reply["color"]
+        if board.turn != (color == "white") or not board.is_legal(chess.Move.from_uci(reply["movement"])):
+            raise ValueError("Invalid active authored reply")
+        scenario = by_color[color].setdefault(reply["repertoire"], Scenario())
+        position = position_key(board)
+        move_and_card = (reply["movement"], reply["card"])
+        if scenario.replies.setdefault(position, move_and_card) != move_and_card:
+            raise ValueError("Conflicting active authored replies")
     for route in data["routes"]:
         scenario = by_color[route["color"]].setdefault(route["repertoire"], Scenario())
         present = {entry["card"] for entry in route["decisions"] if entry["card"] in cards}
         if route["fen"] == chess.STARTING_FEN:
             supported.update(present)
             add_route(scenario, route)
-        else:
-            uncertain.update(present)
     for color, repertoires in by_color.items():
         for _, scenario in sorted(repertoires.items()):
             traverse(scenario.root, chess.Board(), color == "white", .5 / len(repertoires),
-                     predict, scenario.replies, set(), reach, uncertain)
+                     predict, scenario.replies, set(), reach, supported, uncertain)
     return {
         card: {"kind": "estimated", "probability": min(1., reach[card])}
         if card in supported and card not in uncertain else {"kind": "unscored"}

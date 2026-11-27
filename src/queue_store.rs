@@ -102,24 +102,36 @@ fn fill_repeat(
     now: i64,
     draw: u8,
 ) -> Result<u8> {
-    anyhow::ensure!(
-        !daily_store::has_unseen_opening_commitment(db)?
-            || daily_store::opening_commitments_ready(db, now)?,
-        Preparing,
-    );
     let mut q = db.prepare(
-        "SELECT d.slot,c.kind FROM deck d CROSS JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 22",
+        "SELECT d.slot,p.kind,p.kind='opening' AND p.due_at IS NULL
+         FROM deck d CROSS JOIN prepared_queue p ON p.card_id=d.card_id
+         WHERE p.active=1 ORDER BY d.slot LIMIT 22",
     )?;
     let mut queued = q
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     anyhow::ensure!(
         queued.len() <= 20,
         "repeat deck exceeds its supported bound"
     );
+    // Only the prefix needed for the actual draw must be certified. A later
+    // held opening cannot affect insertion ahead of it.
+    if queued
+        .iter()
+        .take(usize::from(draw))
+        .any(|(_, _, unseen_opening)| *unseen_opening)
+    {
+        anyhow::ensure!(daily_store::opening_commitments_ready(db, now)?, Preparing);
+    }
     let mut previous = queued
         .last()
-        .map(|(_, kind)| kind.clone())
+        .map(|(_, kind, _)| kind.clone())
         .or_else(|| previous_kind.map(str::to_owned));
     // Tactics can place a repeat while Study is still waiting on a different card.
     let unanswered = crate::study_store::unanswered_card(db)?;
@@ -135,11 +147,11 @@ fn fill_repeat(
         let Some((id, kind)) = daily_store::select(db, previous.as_deref(), now)? else {
             break;
         };
-        let slot = queued.last().map_or(1, |(slot, _)| slot + 1);
+        let slot = queued.last().map_or(1, |(slot, _, _)| slot + 1);
         daily_store::commit_slot(db, &id, now)?;
         db.execute("INSERT INTO deck VALUES (?1,?2)", params![slot, id])?;
         previous = Some(kind.clone());
-        queued.push((slot, kind));
+        queued.push((slot, kind, false));
     }
     if protected {
         db.execute(
@@ -148,8 +160,8 @@ fn fill_repeat(
         )?;
     }
     let offset = queue::repeat_offset(draw, queued.len());
-    let slot = if let Some((slot, _)) = queued.get(usize::from(offset)) {
-        for (position, _) in queued[usize::from(offset)..].iter().rev() {
+    let slot = if let Some((slot, _, _)) = queued.get(usize::from(offset)) {
+        for (position, _, _) in queued[usize::from(offset)..].iter().rev() {
             db.execute(
                 "UPDATE deck SET slot=?2 WHERE slot=?1",
                 params![position, position + 1],
@@ -157,7 +169,7 @@ fn fill_repeat(
         }
         *slot
     } else {
-        queued.last().map_or(1, |(slot, _)| slot + 1)
+        queued.last().map_or(1, |(slot, _, _)| slot + 1)
     };
     db.execute("INSERT INTO deck VALUES (?1,?2)", params![slot, card])?;
     Ok(offset)
