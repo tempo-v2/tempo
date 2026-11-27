@@ -182,10 +182,10 @@ pub fn select(
             return Ok(Some((id, kind.to_owned())));
         }
     }
+    let openings_pending =
+        !opening_ready && (openings_enabled || has_unseen_opening_commitment(db)?);
     ensure!(
-        day.due_head.is_some()
-            && (!openings_enabled || opening_ready)
-            && (day.tactic_limit == 0 || tactic_ready),
+        day.due_head.is_some() && !openings_pending && (day.tactic_limit == 0 || tactic_ready),
         Preparing
     );
     Ok(None)
@@ -261,13 +261,11 @@ pub fn has_unseen_opening_commitment(db: &Connection) -> Result<bool> {
     )?)
 }
 
-pub fn ready_for_repeat(db: &Connection, now: i64) -> Result<bool> {
-    let Some(day) = day(db, &day_at(now)?)? else {
-        return Ok(false);
-    };
-    let clock = clock(db)?;
+fn all_lanes_ready(db: &Connection, day: &Day, clock: &Clock) -> Result<bool> {
+    let openings_needed =
+        day.opening_limit != 0 && taking_new(db)? || has_unseen_opening_commitment(db)?;
     Ok(day.due_head.is_some()
-        && (day.opening_limit == 0 || day.openings == Some(clock.openings) || !taking_new(db)?)
+        && (!openings_needed || day.openings == Some(clock.openings))
         && (day.tactic_limit == 0 || day.tactics == Some(clock.tactics)))
 }
 
@@ -314,7 +312,7 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
         json!(reviews)
     };
     Ok(Some(json!({"day":day.key,"new":new,"reviews":reviews,
-        "opening_order":day.source,"preparing":!ready_for_repeat(db,now)?})))
+        "opening_order":day.source,"preparing":!all_lanes_ready(db,&day,&clock)?})))
 }
 
 #[derive(Clone)]
@@ -1458,6 +1456,71 @@ mod tests {
         let staged: i64 =
             db.query_row("SELECT count(*) FROM daily_opening_order", [], |r| r.get(0))?;
         assert_eq!(staged, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unready_opening_reservation_keeps_next_pending_while_intake_is_paused() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Database::init(&dir.path().join("pause.sqlite3"))?;
+        let now = Utc::now().timestamp();
+        tactic(&db, "prior", Some(now))?;
+        let line = catalog::OpeningInput {
+            name: "Opening".into(),
+            color: "white".into(),
+            start_at: 0,
+            route: chess::Route {
+                fen: chess::fen(&chess::position("")?),
+                moves: vec!["e2e4".into()],
+            },
+        };
+        catalog::save_opening(&db, &line, None)?;
+        while !queue_store::seed_batch(&mut db)? {}
+        prepare_test_day(&mut db, now)?;
+        let previous = review::next(
+            &mut db,
+            Next {
+                after: None,
+                dataset: None,
+            },
+        )?
+        .unwrap();
+        review::answer(
+            &mut db,
+            AnswerIntentV1 {
+                attempt: previous.attempt,
+                dataset: previous.dataset.clone(),
+                action: AnswerAction::Play("e2e4".into()),
+            },
+        )?;
+        let card: String = db.query_row("SELECT id FROM cards WHERE kind='opening'", [], |r| {
+            r.get(0)
+        })?;
+        commit_slot(&db, &card, now)?;
+        db.execute("INSERT INTO deck VALUES(1,?1)", [&card])?;
+        db.execute("UPDATE new_opening_settings SET paused=1", [])?;
+        // An added authored line invalidates the certificate without retiring the reservation.
+        let mut another = line;
+        another.name = "Independent authored route".into();
+        another.route.moves = vec!["d2d4".into()];
+        catalog::save_opening(&db, &another, None)?;
+        let continuation = || Next {
+            after: Some(previous.attempt),
+            dataset: Some(previous.dataset.clone()),
+        };
+        assert!(
+            matches!(review::next(&mut db, continuation()), Err(error) if error.is::<Preparing>())
+        );
+        assert_eq!(
+            crate::study_store::current(&db)?.unwrap().attempt,
+            previous.attempt
+        );
+        assert_eq!(counts(&db, now, None)?.unwrap()["preparing"], true);
+        prepare_test_day(&mut db, now)?;
+        assert_eq!(
+            review::next(&mut db, continuation())?.unwrap().kind,
+            "opening"
+        );
         Ok(())
     }
 }
