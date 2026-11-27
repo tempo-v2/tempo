@@ -3,147 +3,40 @@ use serde::{Deserialize, Serialize};
 
 pub const COUNT_CAP: usize = 10_000;
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Counts {
-    pub new: usize,
-    pub reviews: usize,
-}
+pub const MAX_DAILY_NEW: u8 = 20;
 
-#[derive(Serialize)]
-#[serde(untagged)]
-enum DisplayCount {
-    Exact(usize),
-    Capped { at_least: usize },
-}
-
-impl From<usize> for DisplayCount {
-    fn from(count: usize) -> Self {
-        if count <= COUNT_CAP {
-            Self::Exact(count)
-        } else {
-            Self::Capped {
-                at_least: COUNT_CAP,
-            }
-        }
-    }
-}
-
-#[derive(Serialize)]
-pub struct DisplayCounts {
-    new: DisplayCount,
-    reviews: DisplayCount,
-}
-
-impl From<Counts> for DisplayCounts {
-    fn from(counts: Counts) -> Self {
-        Self {
-            new: counts.new.into(),
-            reviews: counts.reviews.into(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Serialize)]
 pub struct NewOpeningSettings {
     pub paused: bool,
     pub ordering: NewOpeningOrder,
+    pub opening_limit: u8,
+    pub tactic_limit: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateNewOpeningSettings {
+    pub paused: bool,
+    pub ordering: NewOpeningOrder,
+    // Legacy Settings forms never supplied these fields.
+    pub opening_limit: Option<u8>,
+    pub tactic_limit: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NewOpeningOrder {
-    #[serde(rename = "maia")]
-    SavedRank,
+    Maia,
     Standard,
 }
 
 impl NewOpeningOrder {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::SavedRank => "maia",
+            Self::Maia => "maia",
             Self::Standard => "standard",
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum CardKind {
-    Opening,
-    Tactic,
-}
-
-impl CardKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Opening => "opening",
-            Self::Tactic => "tactic",
-        }
-    }
-}
-
-/// Pausing new openings affects uncommitted candidates. Committed work is kept.
-pub fn admits_uncommitted_new(kind: CardKind, openings_paused: bool) -> bool {
-    kind != CardKind::Opening || !openings_paused
-}
-
-impl Counts {
-    /// Add committed work absent from the indexed, unreserved candidate totals.
-    pub fn include_committed(
-        &mut self,
-        kind: CardKind,
-        due_at: Option<i64>,
-        reserved: bool,
-        openings_paused: bool,
-        now: i64,
-    ) {
-        match due_at {
-            None if reserved || !admits_uncommitted_new(kind, openings_paused) => self.new += 1,
-            Some(due_at) if reserved || due_at > now => self.reviews += 1,
-            _ => {}
-        }
-    }
-}
-
-pub enum Candidates {
-    Due,
-    NewByRank,
-    New,
-}
-
-/// Call the store only for the next applicable candidate class.
-pub fn select<T, E>(
-    previous: Option<CardKind>,
-    preferences: impl FnOnce() -> Result<NewOpeningSettings, E>,
-    mut first: impl FnMut(CardKind, Candidates) -> Result<Option<T>, E>,
-) -> Result<Option<(T, CardKind)>, E> {
-    use CardKind::{Opening, Tactic};
-    let kinds = if previous == Some(Opening) {
-        [Tactic, Opening]
-    } else {
-        [Opening, Tactic]
-    };
-    for kind in kinds {
-        if let Some(id) = first(kind, Candidates::Due)? {
-            return Ok(Some((id, kind)));
-        }
-    }
-    let preferences = preferences()?;
-    for kind in kinds {
-        if !admits_uncommitted_new(kind, preferences.paused) {
-            continue;
-        }
-        if kind == Opening
-            && matches!(preferences.ordering, NewOpeningOrder::SavedRank)
-            && let Some(id) = first(kind, Candidates::NewByRank)?
-        {
-            return Ok(Some((id, kind)));
-        }
-        if let Some(id) = first(kind, Candidates::New)? {
-            return Ok(Some((id, kind)));
-        }
-    }
-    Ok(None)
 }
 
 pub fn draw_repeat_offset() -> u8 {

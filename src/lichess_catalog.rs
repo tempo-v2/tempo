@@ -338,6 +338,7 @@ mod tests {
         full_line_store::register_card(&tx, &exercise, "Independent exercise")?;
         tx.commit()?;
         while !queue_store::seed_batch(&mut db)? {}
+        crate::daily_store::prepare_test_day(&mut db, chrono::Utc::now().timestamp())?;
 
         let member = members(&db, "fork", 1000)?
             .puzzles

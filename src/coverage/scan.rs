@@ -165,8 +165,10 @@ async fn evaluate(mut command: Command, input: Vec<u8>, life: &Lifetime) -> Resu
             Ok::<_, anyhow::Error>(bytes)
         };
         let (_, bytes) = tokio::try_join!(write, read)?;
+        let status = child.wait().await?;
+        ensure!(status.code() != Some(75), ScanFailure::Busy);
         ensure!(
-            child.wait().await?.success(),
+            status.success(),
             "Maia could not finish this scan. Check the host model setup and retry."
         );
         Ok(bytes)

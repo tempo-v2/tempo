@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 19;
+const SCHEMA: i32 = 20;
 
 pub struct Database;
 
@@ -67,6 +67,7 @@ impl Database {
         db.execute_batch(include_str!("rank_apply.sql"))?;
         crate::catalog::migrate_opening_identities(&db)?;
         db.execute_batch(include_str!("game_feedback.sql"))?;
+        db.execute_batch(include_str!("daily_queue.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],
@@ -136,7 +137,10 @@ impl Database {
             if version < 18 {
                 crate::catalog::migrate_opening_identities(&tx)?;
             }
-            tx.execute_batch(include_str!("game_feedback.sql"))?;
+            if version < 19 {
+                tx.execute_batch(include_str!("game_feedback.sql"))?;
+            }
+            upgrade_daily_queue(&tx)?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -179,6 +183,7 @@ impl Database {
         tx.execute_batch(include_str!("rank_apply.sql"))?;
         crate::catalog::migrate_opening_identities(&tx)?;
         tx.execute_batch(include_str!("game_feedback.sql"))?;
+        upgrade_daily_queue(&tx)?;
         let valid: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
             [],
@@ -203,6 +208,15 @@ impl Database {
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")?;
         Ok(())
     }
+}
+
+fn upgrade_daily_queue(db: &Connection) -> Result<()> {
+    db.execute_batch(include_str!("daily_queue.sql"))?;
+    db.execute(
+        "UPDATE daily_clock SET cutover_day=?1",
+        [chrono::Local::now().date_naive().to_string()],
+    )?;
+    Ok(())
 }
 
 pub fn dataset(db: &Connection) -> Result<String> {

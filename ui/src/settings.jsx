@@ -26,7 +26,7 @@ export function Settings({ sounds }) {
       <input type="checkbox" defaultChecked={sounds.enabled} onChange={(event) => sounds.setEnabled(event.target.checked)} />
       Board sounds
     </label>
-    <NewOpeningSettings />
+    <DailyQueueSettings />
     <section aria-labelledby="game-account-settings">
       <h2 id="game-account-settings">Game accounts</h2>
       <form onSubmit={async (e) => {
@@ -48,7 +48,7 @@ export function Settings({ sounds }) {
   </section>;
 }
 
-function NewOpeningSettings() {
+function DailyQueueSettings() {
   const [settings, setSettings] = useState(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -74,7 +74,7 @@ function NewOpeningSettings() {
     setError("");
     try {
       setSettings(await api("settings/new-openings", settings));
-      setMessage("New opening card settings saved.");
+      setMessage("Daily queue settings saved.");
     } catch (error) {
       setError(error.message);
     } finally {
@@ -82,27 +82,35 @@ function NewOpeningSettings() {
     }
   }
 
-  return <section aria-labelledby="new-opening-settings">
-    <h2 id="new-opening-settings">New opening cards</h2>
+  return <section aria-labelledby="daily-queue-settings">
+    <h2 id="daily-queue-settings">Daily queue</h2>
     {settings && <form onSubmit={save}>
+      <label>New openings per day
+        <input type="number" min="0" max="20" step="1" required value={settings.opening_limit} disabled={saving}
+          onChange={(event) => setSettings({ ...settings, opening_limit: event.target.value === "" ? "" : event.target.valueAsNumber })} />
+      </label>
+      <label>New tactics per day
+        <input type="number" min="0" max="20" step="1" required value={settings.tactic_limit} disabled={saving}
+          onChange={(event) => setSettings({ ...settings, tactic_limit: event.target.value === "" ? "" : event.target.valueAsNumber })} />
+      </label>
       <label className="settings-toggle">
         <input type="checkbox" checked={settings.paused} disabled={saving}
           onChange={(event) => setSettings({ ...settings, paused: event.target.checked })} />
         Pause adding new openings to the queue
       </label>
-      <label>New card order
+      <label>New opening order
         <select value={settings.ordering} disabled={saving}
           onChange={(event) => setSettings({ ...settings, ordering: event.target.value })}>
-          <option value="maia">Maia · saved opening order</option>
+          <option value="maia">Maia · likelihood of seeing the opening in a game</option>
           <option value="standard">Standard</option>
         </select>
       </label>
-      <small>These settings apply when Study adds cards to the queue. Scheduled reviews and already queued cards keep their place.</small>
-      <button className="primary" disabled={saving}>Save opening settings</button>
+      <small>Limits and order apply to the next study day. Pausing takes effect immediately for uncommitted new openings.</small>
+      <button className="primary" disabled={saving}>Save daily queue settings</button>
     </form>}
     {message && <p role="status">{message}</p>}
     {readError && <p className="error" role="alert">{readError}{" "}
-      <button onClick={() => retryRead((n) => n + 1)}>Retry opening preferences</button></p>}
+      <button onClick={() => retryRead((n) => n + 1)}>Retry daily queue settings</button></p>}
     {error && <p className="error" role="alert">{error}</p>}
   </section>;
 }

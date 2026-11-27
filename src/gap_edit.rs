@@ -173,7 +173,11 @@ fn build(c: &Connection, draft: Draft) -> Result<Edit> {
             Ok((position, conflict))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let batched = 1 + 2 * plans.len() + 3 * new_responses > 128 || has_checkpoint(c, &command)?;
+    let batched = 1
+        + catalog::OPENING_LINE_WRITES * plans.len()
+        + catalog::OPENING_REPLY_WRITES * new_responses
+        > catalog::ONLINE_WRITE_LIMIT
+        || has_checkpoint(c, &command)?;
     let preview = json!({
         "command":command, "responses":rows, "batched":batched,
         "new_replies":new_responses, "conflicts":conflicts.values().collect::<Vec<_>>(),
@@ -535,6 +539,7 @@ fn commit_replacement(
         coverage::revision(&tx, &edit.repertoire)? == edit.revision,
         Stale
     );
+    let before = tx.total_changes();
     opening_replacement::apply(&tx, &edit.repertoire, &replacement)?;
     let lines = edit
         .plans
@@ -546,6 +551,10 @@ fn commit_replacement(
         "INSERT INTO gap_save_receipt VALUES(?1,?2)",
         (&edit.command, reply.to_string()),
     )?;
+    ensure!(
+        tx.total_changes() - before <= catalog::ONLINE_WRITE_LIMIT as u64,
+        opening_replacement::OverBudget
+    );
     tx.commit()?;
     Ok(reply)
 }
@@ -691,6 +700,7 @@ fn commit(c: &mut Connection, edit: Edit, online: bool) -> Result<Value> {
     );
 
     ensure!(!edit.has_conflicts, Conflicts);
+    let before = tx.total_changes();
     let mut lines = vec![];
     for plan in &edit.plans {
         lines.push(catalog::apply_opening(
@@ -705,6 +715,9 @@ fn commit(c: &mut Connection, edit: Edit, online: bool) -> Result<Value> {
         "INSERT INTO gap_save_receipt VALUES(?1,?2)",
         (&edit.command, reply.to_string()),
     )?;
+    if online {
+        catalog::check_opening_write_budget(&tx, before)?;
+    }
     tx.commit()?;
     Ok(reply)
 }
@@ -853,6 +866,7 @@ fn batch_turn(
         anyhow::bail!(Stale);
     }
     ensure!(!edit.has_conflicts, Conflicts);
+    let before = tx.total_changes();
     let plan = &edit.plans[batch.line];
     match catalog::apply_opening_batch(&tx, plan, &edit.repertoire, batch.card)? {
         catalog::OpeningBatch::More(next) => batch.card = next,
@@ -880,6 +894,7 @@ fn batch_turn(
         )?;
         None
     };
+    catalog::check_opening_write_budget(&tx, before)?;
     tx.commit()?;
     Ok(result)
 }
@@ -1246,6 +1261,67 @@ mod tests {
         let result = test_checkpoints(&path);
         std::fs::remove_dir_all(directory)?;
         result
+    }
+
+    #[test]
+    fn large_gap_batch_keeps_projection_writes_inside_each_turn() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut db = Database::init(&temp.path().join("batch.sqlite3"))?;
+        let opening = |fen: &str, moves: &str| catalog::OpeningInput {
+            name: "Fixture".into(),
+            color: "white".into(),
+            route: chess::Route {
+                fen: fen.into(),
+                moves: moves.split_whitespace().map(str::to_owned).collect(),
+            },
+            start_at: 0,
+        };
+        let repertoire = catalog::save_opening(
+            &db,
+            &opening(
+                "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+                "g1f3",
+            ),
+            None,
+        )?;
+        let plan = catalog::prepare_opening(&opening(
+            "",
+            "g1f3 d7d5 f3g5 b8d7 a2a3 f7f5 a1a2 g8f6 h2h4 e7e6 h1h3 e6e5 a3a4 h7h5 g5e4
+             e8e7 g2g3 f6g4 e4d6 f5f4 d2d4 a7a5 a2a1 e5e4 b2b4 h8h7 d6e8 b7b6 c1a3 g7g5
+             c2c3 a8a7 e2e3 c8b7 f1a6 h7h6 e1d2 g4f6 a3c1 d7e5 d2e1 e5c6 b1a3 e7e6 c1b2
+             f6d7 d1d3 f8g7 a1c1 c6b8 c1d1 d7e5 e1d2 e5f3 d2c2 b6b5 h3h1 e6f5 h1h2 g7f6
+             a3b1 f6h8 b2a1 d8f6 b1d2 f6g6 e8f6 c7c5 d1c1 a7a8 h2g2 f3g1 f6h7 b8d7 d3e2
+             g6b6 c1b1 c5c4 e2d3 g5g4 c2d1 f4f3 b1c1 d7f6 d2b3 b6d6 g2h2 h8g7 h7f8 g7h8
+             f8e6 h6h7",
+        ))?;
+        let baseline = db.total_changes();
+        assert!(
+            catalog::apply_opening(&db, &plan, Some(&repertoire), true)
+                .unwrap_err()
+                .is::<catalog::OverBudget>()
+        );
+        assert_eq!(db.total_changes(), baseline);
+        let edit = Edit {
+            revision: coverage::revision(&db, &repertoire)?,
+            repertoire,
+            command: "large-batch".into(),
+            plans: vec![plan],
+            batched: true,
+            has_conflicts: false,
+            preview: Value::Null,
+            anchor: String::new(),
+            recorded_moves: None,
+            conflicts: BTreeMap::new(),
+        };
+        assert!(batch_turn(&mut db, &edit, &[])?.is_none());
+        assert_eq!(checkpoint(&db, &edit, &[])?.unwrap().card, 24);
+        let first = db.total_changes() - baseline;
+        let before = db.total_changes();
+        let receipt = batch_turn(&mut db, &edit, &[])?.unwrap();
+        let final_turn = db.total_changes() - before;
+        assert_eq!((first, final_turn), (121, 115));
+        assert_eq!(batch_turn(&mut db, &edit, &[])?, Some(receipt));
+        Ok(())
     }
 
     fn test_checkpoints(path: &std::path::Path) -> Result<()> {

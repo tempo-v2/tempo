@@ -1,123 +1,51 @@
-use crate::queue::{self, Candidates, CardKind, Counts, NewOpeningOrder, NewOpeningSettings};
+use crate::{
+    daily_store::{self, Preparing},
+    queue::{self, NewOpeningOrder, NewOpeningSettings, UpdateNewOpeningSettings},
+};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
-const PREPARED_UNSEEN: &str = "FROM prepared_queue
-    WHERE active=1 AND reserved=0 AND due_at IS NULL AND kind=?1";
-const PREPARED_DUE: &str = "FROM prepared_queue
-    WHERE active=1 AND reserved=0 AND due_at IS NOT NULL AND kind=?1 AND due_at<=?2";
-
-fn card_kind(kind: &str) -> Result<CardKind> {
-    match kind {
-        "opening" => Ok(CardKind::Opening),
-        "tactic" => Ok(CardKind::Tactic),
-        _ => anyhow::bail!("Unknown prepared card kind"),
-    }
-}
-
 pub fn new_opening_settings(db: &Connection) -> Result<NewOpeningSettings> {
-    let (paused, ordering): (bool, String) = db.query_row(
-        "SELECT paused, ordering FROM new_opening_settings WHERE singleton=1",
+    let (paused, ordering, opening_limit, tactic_limit): (bool, String, u8, u8) = db.query_row(
+        "SELECT paused,ordering,opening_limit,tactic_limit FROM new_opening_settings WHERE singleton=1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     let ordering = match ordering.as_str() {
-        "maia" => NewOpeningOrder::SavedRank,
+        "maia" => NewOpeningOrder::Maia,
         "standard" => NewOpeningOrder::Standard,
         _ => anyhow::bail!("Unknown new opening order"),
     };
-    Ok(NewOpeningSettings { paused, ordering })
+    Ok(NewOpeningSettings {
+        paused,
+        ordering,
+        opening_limit,
+        tactic_limit,
+    })
 }
 
 pub fn save_new_opening_settings(
     db: &Connection,
-    preferences: NewOpeningSettings,
+    update: UpdateNewOpeningSettings,
 ) -> Result<NewOpeningSettings> {
+    let saved = new_opening_settings(db)?;
+    let preferences = NewOpeningSettings {
+        paused: update.paused,
+        ordering: update.ordering,
+        opening_limit: update.opening_limit.unwrap_or(saved.opening_limit),
+        tactic_limit: update.tactic_limit.unwrap_or(saved.tactic_limit),
+    };
+    anyhow::ensure!(
+        preferences.opening_limit <= queue::MAX_DAILY_NEW
+            && preferences.tactic_limit <= queue::MAX_DAILY_NEW,
+        "Daily new card limits must be between 0 and {}.",
+        queue::MAX_DAILY_NEW
+    );
     db.execute(
-        "UPDATE new_opening_settings SET paused=?1, ordering=?2 WHERE singleton=1",
-        params![preferences.paused, preferences.ordering.as_str()],
+        "UPDATE new_opening_settings SET paused=?1,ordering=?2,opening_limit=?3,tactic_limit=?4 WHERE singleton=1",
+        params![preferences.paused, preferences.ordering.as_str(), preferences.opening_limit, preferences.tactic_limit],
     )?;
     Ok(preferences)
-}
-
-pub fn select(
-    db: &Connection,
-    previous: Option<&str>,
-    now: i64,
-) -> Result<Option<(String, String)>> {
-    let previous = previous.map(card_kind).transpose()?;
-    let chosen = queue::select(
-        previous,
-        || new_opening_settings(db),
-        |kind, candidates| {
-            Ok(match candidates {
-                Candidates::Due if kind == CardKind::Opening => return due_opening(db, now),
-                Candidates::Due => db
-                    .prepare_cached(&format!(
-                        "SELECT card_id {PREPARED_DUE} ORDER BY due_at,card_id LIMIT 1"
-                    ))?
-                    .query_row(params![kind.as_str(), now], |r| r.get(0))
-                    .optional(),
-                Candidates::New => db
-                    .prepare_cached(&format!(
-                        "SELECT card_id {PREPARED_UNSEEN} ORDER BY card_id LIMIT 1"
-                    ))?
-                    .query_row([kind.as_str()], |r| r.get(0))
-                    .optional(),
-                Candidates::NewByRank => {
-                    let bank = crate::opening_rank::active_bank(db)?;
-                    db
-                    .prepare_cached(&format!(
-                        "SELECT card_id {PREPARED_UNSEEN} AND coalesce(rank_{bank},rank) IS NOT NULL ORDER BY coalesce(rank_{bank},rank),card_id LIMIT 1"
-                    ))?
-                    .query_row([kind.as_str()], |r| r.get(0))
-                    .optional()
-                }
-            }?)
-        },
-    )?;
-    Ok(chosen.map(|(id, kind)| (id, kind.as_str().to_owned())))
-}
-
-// The earliest due slot determines which applied forecast, if any, can reorder it.
-fn due_opening(db: &Connection, now: i64) -> Result<Option<String>> {
-    let bank = crate::opening_rank::active_bank(db)?;
-    let head: Option<(String, Option<String>)> = db
-        .prepare_cached(&format!(
-            "SELECT card_id,scope_{bank} {PREPARED_DUE} ORDER BY due_at,card_id LIMIT 1"
-        ))?
-        .query_row(params!["opening", now], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let Some((id, group)) = head else {
-        return Ok(None);
-    };
-    let Some(group) = group else {
-        return Ok(Some(id));
-    };
-    // Four indexed time-range probes per level; six levels span all 3,000 scan nodes.
-    let mut prefix = 0;
-    for shift in [10, 8, 6, 4, 2, 0] {
-        let mut lookup = db.prepare_cached(&format!(
-            "SELECT card_id FROM prepared_queue
-          WHERE scope_{bank}=?1 AND (slot_{bank} >> {shift})=?2
-            AND active=1 AND reserved=0 AND due_at IS NOT NULL AND due_at<=?3 LIMIT 1"
-        ))?;
-        let mut next = None;
-        for child in prefix * 4..prefix * 4 + 4 {
-            let found = lookup
-                .query_row(params![group, child, now], |r| r.get::<_, String>(0))
-                .optional()?;
-            if let Some(card) = found {
-                if shift == 0 {
-                    return Ok(Some(card));
-                }
-                next = Some(child);
-                break;
-            }
-        }
-        prefix = next.ok_or_else(|| anyhow::anyhow!("Prepared forecast slot is missing"))?;
-    }
-    unreachable!("the final level selects a card")
 }
 
 pub fn can_repeat(db: &Connection, card: &str) -> Result<bool> {
@@ -126,62 +54,6 @@ pub fn can_repeat(db: &Connection, card: &str) -> Result<bool> {
         [card],
         |r| r.get(0),
     )?)
-}
-
-/// Count prepared candidates and committed work in the caller's read snapshot.
-/// A missing result means initial membership preparation is still in progress.
-pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Option<Counts>> {
-    if !prepared(db)? {
-        return Ok(None);
-    }
-    let paused = db.query_row(
-        "SELECT paused FROM new_opening_settings WHERE singleton=1",
-        [],
-        |row| row.get(0),
-    )?;
-    let mut counts = Counts::default();
-    // One additional match distinguishes an exact total at the cap from a lower bound.
-    const SCAN_LIMIT: usize = queue::COUNT_CAP + 1;
-    let mut unseen = db.prepare(&format!(
-        "SELECT count(*) FROM (SELECT 1 {PREPARED_UNSEEN} LIMIT {SCAN_LIMIT})"
-    ))?;
-    let mut due = db.prepare(&format!(
-        "SELECT count(*) FROM (SELECT 1 {PREPARED_DUE} LIMIT {SCAN_LIMIT})"
-    ))?;
-    for kind in [CardKind::Opening, CardKind::Tactic] {
-        if queue::admits_uncommitted_new(kind, paused) {
-            counts.new += unseen.query_row([kind.as_str()], |row| row.get::<_, usize>(0))?;
-        }
-        counts.reviews +=
-            due.query_row(params![kind.as_str(), now], |row| row.get::<_, usize>(0))?;
-    }
-    // The physical deck stays bounded. Deferred repeats are counted through a capped read.
-    let exceeds_committed_bound = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM deck LIMIT 1 OFFSET 21)",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
-    anyhow::ensure!(
-        !exceeds_committed_bound,
-        "Committed work exceeds the Study count bound"
-    );
-    // SQLite preserves CROSS JOIN order. Drive the lookups from committed
-    // identities so the optimizer cannot scan the entire prepared queue.
-    let mut committed = db.prepare(
-        "WITH committed(card_id) AS (
-            SELECT card_id FROM deck
-            UNION SELECT card_id FROM (SELECT card_id FROM repeat_order ORDER BY seq LIMIT ?2)
-            UNION SELECT ?1 WHERE ?1 IS NOT NULL
-        )
-        SELECT q.kind,q.due_at,q.reserved FROM committed c
-        CROSS JOIN prepared_queue q ON q.card_id=c.card_id WHERE q.active=1",
-    )?;
-    let mut rows = committed.query(params![unanswered, SCAN_LIMIT])?;
-    while let Some(row) = rows.next()? {
-        let kind: String = row.get(0)?;
-        counts.include_committed(card_kind(&kind)?, row.get(1)?, row.get(2)?, paused, now);
-    }
-    Ok(Some(counts))
 }
 
 pub fn committed_head(db: &Connection) -> Result<Option<(String, String)>> {
@@ -196,7 +68,33 @@ pub fn consume(db: &Connection, card: &str) -> Result<()> {
     Ok(())
 }
 
+/// Preserve the original draw and leave partial reservations untouched when
+/// another lane is still preparing. The caller saves the repeat obligation.
 pub fn place_repeat(
+    db: &Connection,
+    card: &str,
+    previous_kind: Option<&str>,
+    now: i64,
+    draw: u8,
+) -> Result<Option<u8>> {
+    db.execute_batch("SAVEPOINT repeat_placement")?;
+    match fill_repeat(db, card, previous_kind, now, draw) {
+        Ok(offset) => {
+            db.execute_batch("RELEASE repeat_placement")?;
+            Ok(Some(offset))
+        }
+        Err(error) => {
+            db.execute_batch("ROLLBACK TO repeat_placement; RELEASE repeat_placement")?;
+            if error.is::<Preparing>() {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn fill_repeat(
     db: &Connection,
     card: &str,
     previous_kind: Option<&str>,
@@ -228,10 +126,11 @@ pub fn place_repeat(
         false
     };
     while queued.len() < usize::from(draw) {
-        let Some((id, kind)) = select(db, previous.as_deref(), now)? else {
+        let Some((id, kind)) = daily_store::select(db, previous.as_deref(), now)? else {
             break;
         };
         let slot = queued.last().map_or(1, |(slot, _)| slot + 1);
+        daily_store::commit_slot(db, &id, now)?;
         db.execute("INSERT INTO deck VALUES (?1,?2)", params![slot, id])?;
         previous = Some(kind.clone());
         queued.push((slot, kind));
@@ -270,10 +169,12 @@ pub fn seed_batch(db: &mut Connection) -> Result<bool> {
     if ready {
         return Ok(true);
     }
+    // The projection insert and its two version updates use three changes per card.
+    const SEED_LIMIT: usize = 42;
     let ids = {
-        let mut query = tx.prepare("SELECT id FROM cards WHERE id>?1 ORDER BY id LIMIT 127")?;
+        let mut query = tx.prepare("SELECT id FROM cards WHERE id>?1 ORDER BY id LIMIT ?2")?;
         query
-            .query_map([cursor], |row| row.get::<_, String>(0))?
+            .query_map((cursor, SEED_LIMIT), |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut insert = tx.prepare_cached(
@@ -287,7 +188,7 @@ pub fn seed_batch(db: &mut Connection) -> Result<bool> {
         insert.execute([id])?;
     }
     drop(insert);
-    let complete = ids.len() < 127;
+    let complete = ids.len() < SEED_LIMIT;
     tx.execute(
         "UPDATE prepared_queue_state SET ready=?1,cursor=coalesce(?2,cursor) WHERE singleton=1",
         params![complete, ids.last()],
@@ -326,8 +227,9 @@ fn has_repeat_space(db: &Connection) -> Result<bool> {
         |r| r.get(0),
     )?)
 }
-pub fn can_place_now(db: &Connection) -> Result<bool> {
+pub fn can_place_now(db: &Connection, now: i64) -> Result<bool> {
     Ok(prepared(db)?
+        && daily_store::ready_for_repeat(db, now)?
         && has_repeat_space(db)?
         && db.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM repeat_obligation)",
@@ -335,19 +237,20 @@ pub fn can_place_now(db: &Connection) -> Result<bool> {
             |r| r.get::<_, bool>(0),
         )?)
 }
-pub fn place_deferred(db: &Connection) -> Result<()> {
-    if !has_repeat_space(db)? {
+pub fn place_deferred(db: &Connection, now: i64) -> Result<()> {
+    if !has_repeat_space(db)? || !daily_store::ready_for_repeat(db, now)? {
         return Ok(());
     }
     let obligation = db.query_row(
-        "SELECT o.attempt_id,o.card_id,o.previous_kind,o.accepted_at,o.draw FROM repeat_order q JOIN repeat_obligation o USING(attempt_id) ORDER BY q.seq LIMIT 1", [],
-        |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,i64>(3)?,row.get::<_,u8>(4)?)),
+        "SELECT o.attempt_id,o.card_id,o.previous_kind,o.draw FROM repeat_order q JOIN repeat_obligation o USING(attempt_id) ORDER BY q.seq LIMIT 1", [],
+        |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,u8>(3)?)),
     ).optional()?;
-    let Some((attempt, card, previous, now, draw)) = obligation else {
+    let Some((attempt, card, previous, draw)) = obligation else {
         return Ok(());
     };
-    if can_repeat(db, &card)? {
-        place_repeat(db, &card, previous.as_deref(), now, draw)?;
+    if can_repeat(db, &card)? && place_repeat(db, &card, previous.as_deref(), now, draw)?.is_none()
+    {
+        return Ok(());
     }
     db.execute(
         "DELETE FROM repeat_obligation WHERE attempt_id=?1",
@@ -373,21 +276,20 @@ mod tests {
             INSERT INTO learning VALUES ('t22',1,1,1,2),('t23',1,1,1,2);
             INSERT INTO attempts(id,card_id,result) VALUES (2,'t22','saved'),(1,'t23','saved');",
         )?;
-        assert!(seed_batch(&mut db)?);
+        while !seed_batch(&mut db)? {}
+        daily_store::prepare_test_day(&mut db, 3)?;
         let tx = db.transaction()?;
         defer_repeat(&tx, 2, "t22", None, 1, 5)?;
         defer_repeat(&tx, 1, "t23", None, 1, 5)?;
-        place_deferred(&tx)?;
-        assert!(!can_place_now(&tx)?);
+        place_deferred(&tx, 3)?;
+        assert!(!can_place_now(&tx, 3)?);
         assert_eq!(
             tx.query_row("SELECT count(*) FROM repeat_order", [], |r| r
                 .get::<_, i64>(0))?,
             2
         );
-        assert_eq!(select(&tx, None, 3)?, None);
-        assert!(counts(&tx, 3, None)?.is_some());
         consume(&tx, "t01")?;
-        place_deferred(&tx)?;
+        place_deferred(&tx, 3)?;
         assert!(tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM deck WHERE card_id='t22')",
             [],
@@ -399,7 +301,7 @@ mod tests {
             "t23"
         );
         consume(&tx, "t02")?;
-        place_deferred(&tx)?;
+        place_deferred(&tx, 3)?;
         assert!(tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM deck WHERE card_id='t23')",
             [],
@@ -415,204 +317,35 @@ mod tests {
     }
 
     #[test]
-    fn counts_respect_readiness_pause_due_time_and_committed_work() -> Result<()> {
-        let mut db = Connection::open_in_memory()?;
-        for schema in [
-            include_str!("schema.sql"),
-            include_str!("opening_policy.sql"),
-            include_str!("opening_order.sql"),
-            include_str!("game_pipeline.sql"),
-            include_str!("prepared_queue.sql"),
-            include_str!("card_availability.sql"),
-            include_str!("lichess_packs.sql"),
-            include_str!("coverage_order.sql"),
-        ] {
-            db.execute_batch(schema)?;
-        }
-        db.execute_batch(
-            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined) VALUES
-                ('paused','opening','','white','','paused','[]',0),
-                ('queued-new','opening','','white','','queued-new','[]',0),
-                ('issued-new','opening','','white','','issued-new','[]',0),
-                ('inactive','opening','','white','','inactive','[]',1),
-                ('new','tactic','','white','','new','[]',0),
-                ('due','tactic','','white','','due','[]',0),
-                ('future','tactic','','white','','future','[]',0),
-                ('repeat','tactic','','white','','repeat','[]',0),
-                ('deferred','tactic','','white','','deferred','[]',0);
-             INSERT INTO learning VALUES ('due',1,1,1,10), ('future',1,1,1,11),
-                 ('repeat',1,1,1,20), ('deferred',1,1,1,20);
-             INSERT INTO deck VALUES (1,'queued-new'), (2,'repeat'), (3,'due');
-             INSERT INTO attempts(id,card_id,result) VALUES (1,'deferred','saved');
-             INSERT INTO repeat_obligation VALUES (1,'deferred','tactic',1,5);
-             UPDATE new_opening_settings SET paused=1;",
-        )?;
-        assert_eq!(counts(&db, 10, Some("issued-new"))?, None);
-        assert!(seed_batch(&mut db)?);
-        let changes: u64 = db.total_changes();
-        assert_eq!(
-            counts(&db, 10, Some("issued-new"))?,
-            Some(Counts { new: 3, reviews: 3 })
-        );
-        assert_eq!(
-            counts(&db, 11, Some("repeat"))?,
-            Some(Counts { new: 2, reviews: 4 })
-        );
-        assert_eq!(db.total_changes(), changes);
-        db.execute(
-            "UPDATE new_opening_settings SET paused=0,ordering='standard'",
-            [],
-        )?;
-        assert_eq!(
-            counts(&db, 10, Some("issued-new"))?,
-            Some(Counts { new: 4, reviews: 3 })
-        );
-        db.execute("UPDATE new_opening_settings SET ordering='maia'", [])?;
-        assert_eq!(
-            counts(&db, 10, Some("issued-new"))?,
-            Some(Counts { new: 4, reviews: 3 })
-        );
+    fn counts_read_published_work_and_keep_its_cutoff() -> Result<()> {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use serde_json::json;
+
+        let files = tempfile::tempdir()?;
+        let mut db = crate::db::Database::init(&files.path().join("tempo.sqlite3"))?;
+        db.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<25)
+             INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+             SELECT printf('t%02d',i),'tactic','','white','',printf('t%02d',i),'[]' FROM n;
+             INSERT INTO learning VALUES ('t01',1,1,1,10), ('t02',1,1,1,11);",
+        )?;
+        while !seed_batch(&mut db)? {}
+        daily_store::prepare_test_day(&mut db, 10)?;
+        let changes = db.total_changes();
+        db.flush_prepared_statement_cache();
         db.authorizer(Some(|context: AuthContext<'_>| match context.action {
             AuthAction::Read {
                 table_name: "cards" | "learning" | "games" | "opening_order",
                 ..
-            }
-            | AuthAction::Read {
-                table_name: "new_opening_settings",
-                column_name: "ordering",
-            }
-            | AuthAction::Read {
-                table_name: "prepared_queue",
-                column_name: "rank",
             } => Authorization::Deny,
             _ => Authorization::Allow,
         }));
-        assert_eq!(
-            counts(&db, 10, Some("issued-new"))?,
-            Some(Counts { new: 4, reviews: 3 })
-        );
-        db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering::Relaxed},
-        };
-        let measure = || -> Result<usize> {
-            let steps = Arc::new(AtomicUsize::new(0));
-            let counter = Arc::clone(&steps);
-            db.progress_handler(
-                1,
-                Some(move || {
-                    counter.fetch_add(1, Relaxed);
-                    false
-                }),
-            );
-            let result = counts(&db, 10, Some("issued-new"));
-            db.progress_handler(0, None::<fn() -> bool>);
-            assert_eq!(result?, Some(Counts { new: 4, reviews: 3 }));
-            Ok(steps.load(Relaxed))
-        };
-        let baseline = measure()?;
-        db.execute_batch(
-            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
-             INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
-             SELECT 'other-'||i, CASE WHEN i%2=0 THEN 'opening' ELSE 'tactic' END,
-                    '', 'white', '', '', '[]', i%2=0 FROM n;
-             INSERT INTO learning
-             SELECT id,1,1,1,1000 FROM cards WHERE id LIKE 'other-%' AND kind='tactic';",
-        )?;
-        let populated = measure()?;
-        assert!(
-            populated <= baseline + 100,
-            "irrelevant cards grew count work from {baseline} to {populated} SQLite steps"
-        );
-        Ok(())
-    }
-    #[test]
-    fn counts_preserve_the_cap_boundary_and_bound_eligible_work() -> Result<()> {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering::Relaxed},
-        };
-
-        let db = Connection::open_in_memory()?;
-        for schema in [
-            include_str!("schema.sql"),
-            include_str!("opening_policy.sql"),
-            include_str!("opening_order.sql"),
-            include_str!("game_pipeline.sql"),
-            include_str!("prepared_queue.sql"),
-            include_str!("card_availability.sql"),
-            include_str!("lichess_packs.sql"),
-            include_str!("coverage_order.sql"),
-        ] {
-            db.execute_batch(schema)?;
+        for now in [10, 11] {
+            let totals = daily_store::counts(&db, now, None)?.expect("published daily plan");
+            assert_eq!(totals["new"], json!(20));
+            assert_eq!(totals["reviews"], json!(1));
         }
-        db.execute_batch(
-            "UPDATE prepared_queue_state SET ready=1;
-             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<9999)
-             INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
-             SELECT 'n-'||i,'opening','','white','','','[]' FROM n
-             UNION ALL SELECT 'r-'||i,'tactic','','white','','','[]' FROM n;
-             INSERT INTO learning SELECT id,1,1,1,10 FROM cards WHERE kind='tactic';",
-        )?;
-        let display = |now| -> Result<_> {
-            Ok(serde_json::to_value(
-                counts(&db, now, None)?.map(queue::DisplayCounts::from),
-            )?)
-        };
-        assert_eq!(display(9)?, serde_json::json!({"new":9999,"reviews":0}));
-        assert_eq!(display(10)?, serde_json::json!({"new":9999,"reviews":9999}));
-        // A reserved candidate is absent from the bounded base and counted as committed once.
-        db.execute_batch(
-            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers) VALUES
-                 ('committed','opening','','white','','','[]'),
-                 ('review-10000','opening','','white','','','[]');
-             INSERT INTO deck VALUES (1,'committed');
-             INSERT INTO learning VALUES ('review-10000',1,1,1,10);",
-        )?;
-        assert_eq!(
-            display(10)?,
-            serde_json::json!({"new":10000,"reviews":10000})
-        );
-        db.execute_batch(
-            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers) VALUES
-            ('new-10001','tactic','','white','','','[]');",
-        )?;
-        assert_eq!(
-            display(10)?,
-            serde_json::json!({"new":{"at_least":10000},"reviews":10000})
-        );
-        db.execute_batch(
-            "INSERT INTO cards(id,kind,title,color,fen,position_id,answers) VALUES
-                ('review-10001','opening','','white','','','[]');
-             INSERT INTO learning VALUES ('review-10001',1,1,1,10);",
-        )?;
-        let capped = serde_json::json!({"new":{"at_least":10000},"reviews":{"at_least":10000}});
-        assert_eq!(display(10)?, capped);
-        db.execute_batch(
-            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<25000)
-             INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
-             SELECT 'on-'||i,'opening','','white','','','[]' FROM n
-             UNION ALL SELECT 'od-'||i,'opening','','white','','','[]' FROM n
-             UNION ALL SELECT 'tn-'||i,'tactic','','white','','','[]' FROM n
-             UNION ALL SELECT 'td-'||i,'tactic','','white','','','[]' FROM n;
-             INSERT INTO learning SELECT id,1,1,1,10 FROM cards WHERE id GLOB '[ot]d-*';",
-        )?;
-        let steps = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&steps);
-        db.progress_handler(
-            1,
-            Some(move || {
-                counter.fetch_add(1, Relaxed);
-                false
-            }),
-        );
-        assert_eq!(display(10)?, capped);
-        let work = steps.load(Relaxed);
-        eprintln!("Study counts SQL steps with all four ranges saturated: {work}");
-        assert!(work < 500_000, "Study counts used {work} SQLite steps");
+        assert_eq!(db.total_changes(), changes);
         Ok(())
     }
 
@@ -647,111 +380,66 @@ mod tests {
             [],
         )?;
         db.execute("INSERT INTO deck VALUES (1,'0000')", [])?;
-        assert!(seed_batch(&mut db)?);
+        while !seed_batch(&mut db)? {}
         assert_eq!(
             db.query_row("SELECT count(*) FROM prepared_queue", [], |r| r
                 .get::<_, usize>(0))?,
             131
         );
-        assert_eq!(select(&db, None, 8)?.unwrap().0, "0002");
-        assert_eq!(select(&db, None, 9)?.unwrap().0, "0001");
+        assert_eq!(
+            db.query_row(
+                "SELECT due_at FROM prepared_queue WHERE card_id='0001'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            9
+        );
+        let reserved = || {
+            db.query_row(
+                "SELECT reserved FROM prepared_queue WHERE card_id='0000'",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+        };
+        assert!(reserved()?);
         consume(&db, "0000")?;
-        assert_eq!(select(&db, None, 8)?.unwrap().0, "0000");
+        assert!(!reserved()?);
         Ok(())
     }
 
     #[test]
-    fn saved_opening_order_only_prioritizes_unseen_opening_cards() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        db.execute_batch(include_str!("schema.sql"))?;
-        db.execute_batch(include_str!("opening_policy.sql"))?;
-        db.execute_batch(include_str!("opening_order.sql"))?;
-        db.execute_batch(include_str!("prepared_queue.sql"))?;
-        db.execute_batch(include_str!("card_availability.sql"))?;
-        db.execute_batch(include_str!("lichess_packs.sql"))?;
-        db.execute_batch(include_str!("coverage_order.sql"))?;
-        db.execute_batch(
-            "INSERT INTO cards (id,kind,title,color,fen,position_id,answers) VALUES
-                ('a','opening','First by id','white','','a','[]'),
-                ('b','opening','First by rank','white','','b','[]'),
-                ('t','tactic','Tactic','white','','t','[]');
-             INSERT INTO opening_order VALUES (1,'b');",
-        )?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "b");
-        assert_eq!(select(&db, Some("opening"), 10)?.unwrap().0, "t");
-
-        save_new_opening_settings(
+    fn daily_limits_use_the_opening_settings_owner() -> Result<()> {
+        let files = tempfile::tempdir()?;
+        let db = crate::db::Database::init(&files.path().join("tempo.sqlite3"))?;
+        let defaults = new_opening_settings(&db)?;
+        assert_eq!((defaults.opening_limit, defaults.tactic_limit), (20, 20));
+        let saved = save_new_opening_settings(
             &db,
-            NewOpeningSettings {
-                paused: false,
-                ordering: NewOpeningOrder::Standard,
-            },
-        )?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
-        save_new_opening_settings(
-            &db,
-            NewOpeningSettings {
+            UpdateNewOpeningSettings {
                 paused: true,
-                ordering: NewOpeningOrder::SavedRank,
+                ordering: NewOpeningOrder::Standard,
+                opening_limit: Some(7),
+                tactic_limit: Some(0),
             },
         )?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "t");
-        db.execute("INSERT INTO learning VALUES ('a',2,2,0,5)", [])?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
-        db.execute("DELETE FROM learning", [])?;
-        save_new_opening_settings(
-            &db,
-            NewOpeningSettings {
-                paused: false,
-                ordering: NewOpeningOrder::SavedRank,
-            },
-        )?;
-
-        db.execute("UPDATE cards SET quarantined=1 WHERE id='b'", [])?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
-        db.execute("UPDATE cards SET quarantined=0 WHERE id='b'", [])?;
-
-        db.execute("INSERT INTO deck VALUES (0,'b')", [])?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
-        db.execute("DELETE FROM deck", [])?;
-
-        db.execute("INSERT INTO learning VALUES ('a',2,2,0,5)", [])?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "a");
-        db.execute("UPDATE learning SET due_at=20 WHERE card_id='a'", [])?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "b");
-        db.execute("INSERT INTO learning VALUES ('b',2,2,0,20)", [])?;
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "t");
-        Ok(())
-    }
-
-    #[test]
-    fn future_high_ranked_reviews_do_not_expand_due_selection_work() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        for schema in [
-            include_str!("schema.sql"),
-            include_str!("opening_policy.sql"),
-            include_str!("opening_order.sql"),
-            include_str!("prepared_queue.sql"),
-            include_str!("card_availability.sql"),
-            include_str!("lichess_packs.sql"),
-            include_str!("coverage_order.sql"),
-        ] {
-            db.execute_batch(schema)?;
-        }
-        db.execute_batch(
-            "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<4095)
-            INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
-            SELECT printf('%04d',i),'opening','','white','','','[]' FROM n;
-            INSERT INTO learning SELECT id,1,1,0,CASE WHEN id='4095' THEN 10 ELSE 20 END FROM cards;
-            UPDATE prepared_queue SET scope_b='scan',slot_b=CAST(card_id AS INTEGER),
-                rank_b=CAST(card_id AS INTEGER)+1;
-            UPDATE forecast_order_state SET bank=1;
-            ANALYZE;",
-        )?;
-        // Interrupt an accidental scan across the future high-ranked cards.
-        db.progress_handler(2000, Some(|| true));
-        assert_eq!(select(&db, None, 10)?.unwrap().0, "4095");
-        assert_eq!(select(&db, None, 20)?.unwrap().0, "0000");
+        assert_eq!(
+            serde_json::to_value(new_opening_settings(&db)?)?,
+            serde_json::to_value(saved)?
+        );
+        let legacy = serde_json::from_str(r#"{"paused":false,"ordering":"maia"}"#)?;
+        let updated = save_new_opening_settings(&db, legacy)?;
+        assert!(!updated.paused);
+        assert_eq!(updated.ordering.as_str(), "maia");
+        assert_eq!((updated.opening_limit, updated.tactic_limit), (7, 0));
+        let read_back = serde_json::to_value(new_opening_settings(&db)?)?;
+        let rejected = UpdateNewOpeningSettings {
+            paused: true,
+            ordering: NewOpeningOrder::Standard,
+            opening_limit: None,
+            tactic_limit: Some(21),
+        };
+        assert!(save_new_opening_settings(&db, rejected).is_err());
+        assert_eq!(read_back, serde_json::to_value(new_opening_settings(&db)?)?);
         Ok(())
     }
 

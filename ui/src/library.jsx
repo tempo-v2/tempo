@@ -205,7 +205,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
     };
     try {
       await api("openings", request);
-      setNotice("Opening saved. Its responses are ready in Study.");
+      setNotice("Opening saved. New responses enter the next daily queue.");
       setSavedRevision(revision => revision + 1);
       onSaved();
       await list.load();

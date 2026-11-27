@@ -530,7 +530,7 @@ export function Gaps() {
   const saved = saveAcknowledgement || (draft.savedReport && draft.savedReport === reportId);
   const previous = saveAcknowledgement ? saveAcknowledgement.previous : draft.previous;
   const savedMessage = saveAcknowledgement?.replacement ? "Repertoire changes and continuation saved." : "Continuation saved.";
-  const appliedMessage = applyAcknowledgement && "Applied opening order for "+applyAcknowledgement.cards+" reached cards. New cards use this order when Maia is selected in Settings.";
+  const appliedMessage = applyAcknowledgement && "Applied opening order for "+applyAcknowledgement.cards+" reached cards. Due opening reviews use this order.";
   const pendingFeedback = commandFeedback && isPending(commandFeedback.command) ? commandFeedback : null;
   const alert = error || pendingFeedback?.error;
   const status = pendingFeedback?.message || (!draft.pending && saved && savedMessage) || message;
@@ -568,9 +568,9 @@ export function Gaps() {
       <p>From {notation(position(report.scan.route))||"the starting position"} through your move {report.scan.through} · {report.model}</p>
       <p>Authored {range(report.authored,report.unresolved)} · Personally studied {currentSummary?.unavailable ? <button onClick={() => setSummaryRetry(n => n + 1)}>Retry summary</button> : currentSummary ? range(currentSummary.studied,report.unresolved) : "Loading…"}</p>
       <p>Ended early {percent(report.ended)} · Unresolved {percent(report.unresolved)} (conflicting replies {percent(report.conflict)})</p>
-      {report.model_superseded && <p>Rescan with the current model before using these probabilities to set your opening order.</p>}
+      {report.model_superseded && <p>Rescan with the current model before applying this order to due opening reviews.</p>}
       {(report.model_superseded||report.stale||error||saved||previous!=null) && <button disabled={locked} onClick={()=>run(()=>scan(report.scan,report.model_superseded ? null : previous))}>Retry scan</button>}
-      <button disabled={blocked||report.model_superseded} onClick={()=>applyOrder({ report: report.id, command: crypto.randomUUID() })}>Apply to opening order</button>
+      <button disabled={blocked||report.model_superseded} onClick={()=>applyOrder({ report: report.id, command: crypto.randomUUID() })}>Apply to opening order for due reviews</button>
       {report.gaps.length>0 && <button disabled={blockedSelection} onClick={()=>open(0)}>Work on next gap</button>}
       {gap && <section><h3 ref={gapHeading} tabIndex={-1}>Your {report.scan.color} reply</h3><p>{lead(report,gap).text}</p>
         {!saved && <GapReview

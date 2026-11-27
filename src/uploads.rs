@@ -464,6 +464,10 @@ mod tests {
                         })?;
                         crate::catalog::apply_tactic(connection, &plan)?;
                         crate::queue_store::seed_batch(connection)?;
+                        crate::daily_store::prepare_test_day(
+                            connection,
+                            chrono::Utc::now().timestamp(),
+                        )?;
                         let attempt = crate::review::next(
                             connection,
                             crate::study::Next {

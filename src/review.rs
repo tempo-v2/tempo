@@ -1,6 +1,6 @@
 // Coordinate the accepted answer across Study, Chess, Learning and Queue.
 use crate::{
-    chess, db, full_line, full_line_store,
+    chess, daily_store, db, full_line, full_line_store,
     learning::{self, Rating},
     queue, queue_store,
     study::{
@@ -13,13 +13,12 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{Connection, TransactionBehavior::Immediate};
 
-pub fn counts(db: &mut Connection) -> Result<Option<queue::DisplayCounts>> {
+pub use crate::daily_store::Preparing;
+
+pub fn counts(db: &mut Connection) -> Result<Option<serde_json::Value>> {
     let snapshot = db.transaction()?;
     let unanswered = study_store::unanswered_card(&snapshot)?;
-    Ok(
-        queue_store::counts(&snapshot, Utc::now().timestamp(), unanswered.as_deref())?
-            .map(queue::DisplayCounts::from),
-    )
+    daily_store::counts(&snapshot, Utc::now().timestamp(), unanswered.as_deref())
 }
 
 pub fn answer(db: &mut Connection, input: AnswerIntentV1) -> Result<AcceptedView> {
@@ -150,8 +149,9 @@ pub fn record_rating(
     first_due: Option<(i64, String)>,
 ) -> Result<(RepeatDisposition, Option<String>)> {
     let prior = db::prior_review(db, card)?;
+    let first_review = prior.is_none();
     anyhow::ensure!(
-        first_due.is_none() || prior.is_none(),
+        first_due.is_none() || first_review,
         "First review already exists"
     );
     let mut schedule = learning::schedule(rating, prior, now)?;
@@ -160,10 +160,18 @@ pub fn record_rating(
         day
     });
     db::save_review(db, card, now, schedule)?;
+    if first_review {
+        daily_store::refresh_parent(db, card, now)?;
+    }
     let repeat = if matches!(rating, Rating::Again) && queue_store::can_repeat(db, card)? {
         let draw = queue::draw_repeat_offset();
-        if queue_store::can_place_now(db)? {
-            RepeatDisposition::Placed(queue_store::place_repeat(db, card, previous, now, draw)?)
+        let placed = if queue_store::can_place_now(db, now)? {
+            queue_store::place_repeat(db, card, previous, now, draw)?
+        } else {
+            None
+        };
+        if let Some(offset) = placed {
+            RepeatDisposition::Placed(offset)
         } else {
             queue_store::defer_repeat(db, attempt, card, previous, now, draw)?;
             RepeatDisposition::Deferred
@@ -174,26 +182,25 @@ pub fn record_rating(
     Ok((repeat, day))
 }
 
-#[derive(Debug)]
-pub struct Preparing;
-impl std::fmt::Display for Preparing {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Preparing the Study queue. Retry Next.")
-    }
-}
-impl std::error::Error for Preparing {}
-
 pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
     let tx = db.transaction_with_behavior(Immediate)?;
     let NextState::Select { previous_kind } = study_store::begin_next(&tx, &input)? else {
         return study_store::current(&tx);
     };
-    anyhow::ensure!(queue_store::prepared(&tx)?, Preparing);
-    queue_store::place_deferred(&tx)?;
-    let selected = match queue_store::committed_head(&tx)? {
-        Some(card) => Some(card),
-        None => queue_store::select(&tx, previous_kind.as_deref(), Utc::now().timestamp())?,
+    let now = Utc::now().timestamp();
+    let prepared = queue_store::prepared(&tx)?;
+    if prepared {
+        queue_store::place_deferred(&tx, now)?;
+    }
+    let selected = if let Some(card) = queue_store::committed_head(&tx)? {
+        Some(card)
+    } else {
+        anyhow::ensure!(prepared, Preparing);
+        daily_store::select(&tx, previous_kind.as_deref(), now)?
     };
+    if let Some((id, _)) = &selected {
+        daily_store::commit_slot(&tx, id, now)?;
+    }
     study_store::issue(
         &tx,
         selected
@@ -211,6 +218,11 @@ pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_day(db: &mut Connection) -> Result<()> {
+        while !queue_store::seed_batch(db)? {}
+        daily_store::prepare_test_day(db, Utc::now().timestamp())
+    }
 
     #[test]
     fn full_line_and_ordinary_publication_keep_distinct_cards_in_both_orders() -> Result<()> {
@@ -254,7 +266,7 @@ mod tests {
                     source: None,
                 })?,
             )?;
-            while !queue_store::seed_batch(&mut db)? {}
+            test_day(&mut db)?;
             db.execute("INSERT INTO deck(slot,card_id) VALUES (1,?1)", [&ordinary])?;
             let issued = next(
                 &mut db,
@@ -395,7 +407,7 @@ mod tests {
             assert!(full_line_store::publish(&tx, &published(other_route)?).is_err());
             full_line_store::register_card(&tx, &exercise, "Imported exercise")?;
             tx.commit()?;
-            while !queue_store::seed_batch(&mut db)? {}
+            test_day(&mut db)?;
             db.flush_prepared_statement_cache();
             db.authorizer(Some(|context: AuthContext<'_>| match context.action {
                 AuthAction::Read {
@@ -498,20 +510,9 @@ mod tests {
         };
 
         fn measure(noise: usize, first: &str) -> Result<(String, usize, usize)> {
-            let mut db = Connection::open_in_memory()?;
-            for schema in [
-                include_str!("schema.sql"),
-                include_str!("opening_policy.sql"),
-                include_str!("opening_order.sql"),
-                include_str!("game_pipeline.sql"),
-                include_str!("prepared_queue.sql"),
-                include_str!("card_availability.sql"),
-                include_str!("lichess_packs.sql"),
-                include_str!("coverage_order.sql"),
-            ] {
-                db.execute_batch(schema)?;
-            }
-            db.execute_batch("INSERT INTO metadata VALUES ('fixture')")?;
+            let files = tempfile::tempdir()?;
+            let mut db = crate::db::Database::init(&files.path().join("tempo.sqlite3"))?;
+            db.execute_batch("UPDATE metadata SET dataset='fixture'")?;
             let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
             for id in ["a", "b"] {
                 db.execute(
@@ -521,8 +522,8 @@ mod tests {
                 )?;
             }
             db.execute_batch(
-                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
-                 VALUES ('quarantined','opening','','white','unused','unused','[]',1);
+                "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined,repertoire_id)
+                 VALUES ('quarantined','opening','','white','unused','unused','[]',1,'fixture');
                  INSERT INTO deck VALUES (1,'quarantined');
                  UPDATE prepared_queue_state SET ready=1;",
             )?;
@@ -530,10 +531,11 @@ mod tests {
                 "INSERT INTO deck VALUES (2,?1),(3,?2)",
                 (first, if first == "a" { "b" } else { "a" }),
             )?;
+            test_day(&mut db)?;
             db.execute(
                 "WITH RECURSIVE n(i) AS (SELECT 1 WHERE ?1>0 UNION ALL SELECT i+1 FROM n WHERE i<?1)
-                 INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
-                 SELECT printf('unrelated%06d',i),'opening','','white','unused','unused','[]',1 FROM n",
+                 INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined,repertoire_id)
+                 SELECT printf('unrelated%06d',i),'opening','','white','unused','unused','[]',1,'fixture' FROM n",
                 [noise],
             )?;
             let steps = Arc::new(AtomicUsize::new(0));
@@ -588,31 +590,20 @@ mod tests {
     #[test]
     fn studied_commands_do_not_read_games_or_live_rank() -> Result<()> {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-        let mut db = Connection::open_in_memory()?;
-        for schema in [
-            include_str!("schema.sql"),
-            include_str!("opening_policy.sql"),
-            include_str!("opening_order.sql"),
-            include_str!("game_pipeline.sql"),
-            include_str!("prepared_queue.sql"),
-            include_str!("card_availability.sql"),
-            include_str!("lichess_packs.sql"),
-            include_str!("coverage_order.sql"),
-        ] {
-            db.execute_batch(schema)?;
-        }
-        db.execute("INSERT INTO metadata VALUES ('fixture')", [])?;
+        let files = tempfile::tempdir()?;
+        let mut db = crate::db::Database::init(&files.path().join("tempo.sqlite3"))?;
+        db.execute("UPDATE metadata SET dataset='fixture'", [])?;
         db.execute_batch(
             "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2500)
-             INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined)
-             SELECT printf('unavailable%04d',i),'opening','', 'white','unused','unused','[]',1 FROM n",
+             INSERT INTO cards(id,kind,title,color,fen,position_id,answers,quarantined,repertoire_id)
+             SELECT printf('unavailable%04d',i),'opening','', 'white','unused','unused','[]',1,'fixture' FROM n",
         )?;
         db.execute(
             "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
             VALUES ('a','tactic','Title','white',?1,'a','[\"e2e4\"]')",
             ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
         )?;
-        while !queue_store::seed_batch(&mut db)? {}
+        test_day(&mut db)?;
         db.flush_prepared_statement_cache();
         db.authorizer(Some(|context: AuthContext<'_>| match context.action {
             AuthAction::Read {
@@ -649,26 +640,138 @@ mod tests {
     }
 
     #[test]
-    fn accepted_again_survives_an_unprepared_queue_and_places_once() -> Result<()> {
-        let mut db = Connection::open_in_memory()?;
-        for schema in [
-            include_str!("schema.sql"),
-            include_str!("opening_policy.sql"),
-            include_str!("opening_order.sql"),
-            include_str!("game_pipeline.sql"),
-            include_str!("prepared_queue.sql"),
-            include_str!("card_availability.sql"),
-            include_str!("lichess_packs.sql"),
-            include_str!("coverage_order.sql"),
-        ] {
-            db.execute_batch(schema)?;
-        }
-        db.execute("INSERT INTO metadata VALUES ('fixture')", [])?;
+    fn direct_tactic_again_preserves_an_overlapping_study_attempt() -> Result<()> {
+        let files = tempfile::tempdir()?;
+        let mut db = crate::db::Database::init(&files.path().join("tempo.sqlite3"))?;
+        let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        db.execute(
+            r#"INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+               VALUES ('study','tactic','Study','white',?1,'study','["e2e4"]')"#,
+            [fen],
+        )?;
+        study_store::issue(&db, Some(("study", "tactic")))?;
+        let study = study_store::current(&db)?.unwrap();
+        let exercise = full_line::PublishedExercise::from_source(
+            "fixture",
+            "direct",
+            "1".into(),
+            chess::Route {
+                fen: fen.into(),
+                moves: vec!["e2e4".into()],
+            },
+        )?;
+        let tx = db.transaction()?;
+        full_line_store::publish(&tx, &exercise)?;
+        let first = full_line_store::start_published(
+            &tx,
+            "start",
+            exercise.key(),
+            exercise.version(),
+            false,
+            "fixture",
+        )?;
+        tx.commit()?;
+        let deliver = |db: &mut Connection| {
+            move_full_line(
+                db,
+                full_line::Move {
+                    dataset: first.dataset.clone(),
+                    play: first.play,
+                    step: 0,
+                    played: None,
+                },
+                FullLineSurface::Tactics {
+                    first_card: |_| full_line::InitialCard {
+                        id: "direct".into(),
+                        title: "Puzzle".into(),
+                    },
+                },
+            )
+        };
+        let accepted = serde_json::to_value(deliver(&mut db)?.view.result)?;
+        assert_eq!(accepted["rating"], "Again");
+        let (card, draw) = db.query_row("SELECT card_id,draw FROM repeat_obligation", [], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?))
+        })?;
+        assert_eq!(card, "direct");
+        assert!((5..=20).contains(&draw));
+        let changes = db.total_changes();
+        assert_eq!(
+            serde_json::to_value(deliver(&mut db)?.view.result)?,
+            accepted
+        );
+        assert_eq!(db.total_changes(), changes);
+        assert_eq!(study_store::current(&db)?.unwrap().attempt, study.attempt);
+        assert_eq!(study_store::unanswered_card(&db)?.as_deref(), Some("study"));
+        Ok(())
+    }
+
+    #[test]
+    fn committed_order_survives_issue_before_the_daily_builder_claims() -> Result<()> {
+        let files = tempfile::tempdir()?;
+        let mut db = crate::db::Database::init(&files.path().join("tempo.sqlite3"))?;
+        let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        db.execute(
+            r#"INSERT INTO cards(id,kind,title,color,fen,position_id,answers) VALUES
+               ('a','tactic','First','white',?1,'a','["e2e4"]'),
+               ('b','tactic','Second','white',?1,'b','["e2e4"]')"#,
+            [fen],
+        )?;
+        db.execute_batch("INSERT INTO deck VALUES(1,'a'),(2,'b')")?;
+        let open = || Next {
+            after: None,
+            dataset: None,
+        };
+        let first = next(&mut db, open())?.expect("committed attempt");
+        assert_eq!(first.title, "First");
+        assert_eq!(next(&mut db, open())?.unwrap().attempt, first.attempt);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM daily_new WHERE committed=1",
+                [],
+                |r| r.get::<_, u32>(0)
+            )?,
+            2
+        );
+        answer(
+            &mut db,
+            AnswerIntentV1 {
+                attempt: first.attempt,
+                dataset: first.dataset.clone(),
+                action: AnswerAction::Play("e2e4".into()),
+            },
+        )?;
+        let second = next(
+            &mut db,
+            Next {
+                after: Some(first.attempt),
+                dataset: Some(first.dataset),
+            },
+        )?
+        .expect("second committed attempt");
+        assert_eq!(second.title, "Second");
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM daily_new WHERE committed=1",
+                [],
+                |r| r.get::<_, u32>(0)
+            )?,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_again_survives_a_missing_daily_plan_and_places_once() -> Result<()> {
+        let files = tempfile::tempdir()?;
+        let mut db = crate::db::Database::init(&files.path().join("tempo.sqlite3"))?;
+        db.execute("UPDATE metadata SET dataset='fixture'", [])?;
         db.execute(
             "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
              VALUES ('a','tactic','First','white',?1,'a','[\"e2e4\"]')",
             ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
         )?;
+        while !queue_store::seed_batch(&mut db)? {}
         study_store::issue(&db, Some(("a", "tactic")))?;
         let review = next(
             &mut db,
@@ -700,7 +803,7 @@ mod tests {
                 .get::<_, u8>(0))?,
             draw
         );
-        assert!(queue_store::seed_batch(&mut db)?);
+        test_day(&mut db)?;
         let next_attempt = next(&mut db, continuation())?.unwrap().attempt;
         assert_ne!(next_attempt, review.attempt);
         assert_eq!(

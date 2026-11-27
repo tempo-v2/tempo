@@ -1425,7 +1425,7 @@ async function openingPreview(browser, db) {
       const query = sql => execFileSync("sqlite3", ["-readonly", db, sql], { encoding: "utf8" }).trim();
       assert.equal(query("SELECT count(*) FROM openings"), "0");
       await page.getByRole("button", { name: "Save opening" }).click();
-      await page.getByText("Opening saved. Its responses are ready in Study.", { exact: true }).waitFor();
+      await page.getByText("Opening saved. New responses enter the next daily queue.", { exact: true }).waitFor();
       assert.equal(query("SELECT name FROM openings"), "Edited name");
       assert.deepEqual(JSON.parse(query("SELECT route FROM openings")).moves, ["d2d4", "d7d5"]);
       assert.deepEqual(errors, []);

@@ -1,10 +1,12 @@
 """Batch forecast. Input is an immutable Openings snapshot; no Tempo database access."""
 import contextlib
+import fcntl
 import hashlib
 import heapq
 import itertools
 import json
 import math
+import os
 import pathlib
 import signal
 import sqlite3
@@ -15,6 +17,20 @@ import chess
 MODEL = "maia3-5m-1500-history-v1"
 WEIGHTS_SHA256 = "ba14208b2992d85502f5fb501934abf6aaaeb355e9f3fdf90e326911f562524f"
 RATING = 1500
+
+
+@contextlib.contextmanager
+def model_slot(root):
+    """Keep one physical model active across both service processes."""
+    fd = os.open(root / ".model.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(75) from None
+        yield
+    finally:
+        os.close(fd)
 
 
 def key(board):
@@ -125,7 +141,8 @@ def forecast(data, predict, limit=3000):
 if __name__ == "__main__":
     signal.alarm(300)
     root = pathlib.Path(sys.argv[1])
-    with contextlib.redirect_stdout(sys.stderr):
-        report = forecast(json.load(sys.stdin), maia(root))
+    request = json.load(sys.stdin)
+    with model_slot(root), contextlib.redirect_stdout(sys.stderr):
+        report = forecast(request, maia(root))
     report["model"] = MODEL
     print(json.dumps(report, allow_nan=False))
