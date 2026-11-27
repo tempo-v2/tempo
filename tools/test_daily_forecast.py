@@ -1,5 +1,6 @@
 """First encounters along authored routes, with explicit opponent probabilities."""
 
+import json
 import pathlib
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from unittest import mock
 import chess
 
 from coverage import model_slot
-from daily_forecast import forecast
+from daily_forecast import PROFILE, forecast
 
 
 def route(repertoire, color, moves, decisions, fen=chess.STARTING_FEN):
@@ -80,9 +81,10 @@ class DailyForecastTest(unittest.TestCase):
             with model_slot(pathlib.Path(temporary)):
                 for call in ([sys.executable, "-c", coverage, temporary],
                              [sys.executable, "-c", daily, temporary, coverage]):
-                    result = subprocess.run(call, input=b"{}", capture_output=True,
-                                            timeout=3, check=False)
-                    self.assertEqual(result.returncode, 75)
+                    request = dict(profile=PROFILE, basis="test day", routes=[], cards=[])
+                    result = subprocess.run(call, input=json.dumps(request).encode(),
+                                            capture_output=True, timeout=3, check=False)
+                    self.assertEqual(result.returncode, 75, result.stderr.decode())
                     self.assertEqual(result.stdout, b"")
             with model_slot(pathlib.Path(temporary)):
                 pass
