@@ -56,10 +56,11 @@ pub fn can_repeat(db: &Connection, card: &str) -> Result<bool> {
     )?)
 }
 
-pub fn committed_head(db: &Connection) -> Result<Option<(String, String)>> {
+pub fn committed_head(db: &Connection, now: i64) -> Result<Option<(String, String)>> {
     Ok(db.query_row(
-        "SELECT d.card_id,c.kind FROM deck d CROSS JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 1",
-        [], |r| Ok((r.get(0)?,r.get(1)?)),
+        "SELECT d.card_id,p.kind FROM deck d CROSS JOIN prepared_queue p ON p.card_id=d.card_id
+          WHERE p.active=1 AND (?1 OR p.kind<>'opening' OR p.due_at IS NOT NULL) ORDER BY d.slot LIMIT 1",
+        [daily_store::opening_commitments_ready(db,now)?], |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?)
 }
 
@@ -101,6 +102,11 @@ fn fill_repeat(
     now: i64,
     draw: u8,
 ) -> Result<u8> {
+    anyhow::ensure!(
+        !daily_store::has_unseen_opening_commitment(db)?
+            || daily_store::opening_commitments_ready(db, now)?,
+        Preparing,
+    );
     let mut q = db.prepare(
         "SELECT d.slot,c.kind FROM deck d CROSS JOIN active_cards c ON c.id=d.card_id ORDER BY d.slot LIMIT 22",
     )?;
@@ -227,9 +233,8 @@ fn has_repeat_space(db: &Connection) -> Result<bool> {
         |r| r.get(0),
     )?)
 }
-pub fn can_place_now(db: &Connection, now: i64) -> Result<bool> {
+pub fn can_place_now(db: &Connection) -> Result<bool> {
     Ok(prepared(db)?
-        && daily_store::ready_for_repeat(db, now)?
         && has_repeat_space(db)?
         && db.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM repeat_obligation)",
@@ -238,7 +243,7 @@ pub fn can_place_now(db: &Connection, now: i64) -> Result<bool> {
         )?)
 }
 pub fn place_deferred(db: &Connection, now: i64) -> Result<()> {
-    if !has_repeat_space(db)? || !daily_store::ready_for_repeat(db, now)? {
+    if !has_repeat_space(db)? {
         return Ok(());
     }
     let obligation = db.query_row(
@@ -282,7 +287,7 @@ mod tests {
         defer_repeat(&tx, 2, "t22", None, 1, 5)?;
         defer_repeat(&tx, 1, "t23", None, 1, 5)?;
         place_deferred(&tx, 3)?;
-        assert!(!can_place_now(&tx, 3)?);
+        assert!(!can_place_now(&tx)?);
         assert_eq!(
             tx.query_row("SELECT count(*) FROM repeat_order", [], |r| r
                 .get::<_, i64>(0))?,

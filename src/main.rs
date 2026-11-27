@@ -1048,21 +1048,8 @@ async fn main() -> Result<()> {
                 }),
             )
         }
-        [command, db] if command == "opening-rank-input" => {
-            let database = Database::read(Path::new(db))?;
-            let snapshot = database.unchecked_transaction()?;
-            serde_json::to_writer(std::io::stdout().lock(), &opening_rank::read(&snapshot)?)?;
-            Ok(())
-        }
-        [command, db, input] if command == "opening-rank-apply" => {
-            let _lock = lock_database(Path::new(db))?;
-            let mut database = Database::open(Path::new(db))?;
-            let snapshot =
-                serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(input)?))?;
-            opening_rank::replace(&mut database, snapshot)
-        }
         _ => anyhow::bail!(
-            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo daily-queue-worker DIRECTORY | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT | tempo repertoire-similarity | tempo repertoire-similarity-input DB REPERTOIRE COLOR"
+            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo daily-queue-worker DIRECTORY | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo repertoire-similarity | tempo repertoire-similarity-input DB REPERTOIRE COLOR"
         ),
     }
 }

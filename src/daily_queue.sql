@@ -2,13 +2,12 @@ ALTER TABLE new_opening_settings ADD COLUMN opening_limit INTEGER NOT NULL DEFAU
 ALTER TABLE new_opening_settings ADD COLUMN tactic_limit INTEGER NOT NULL DEFAULT 20 CHECK(tactic_limit BETWEEN 0 AND 20);
 ALTER TABLE prepared_queue ADD COLUMN availability_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE prepared_queue ADD COLUMN schedule_version INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE prepared_queue ADD COLUMN first_learning_version INTEGER;
-UPDATE prepared_queue SET first_learning_version=0 WHERE due_at IS NOT NULL;
 
 CREATE TABLE daily_clock (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   sequence INTEGER NOT NULL DEFAULT 0,
   openings INTEGER NOT NULL DEFAULT 0,
+  authoring INTEGER NOT NULL DEFAULT 0,
   tactics INTEGER NOT NULL DEFAULT 0,
   coverage INTEGER NOT NULL DEFAULT 0,
   due_generation INTEGER NOT NULL DEFAULT 0,
@@ -31,6 +30,7 @@ CREATE TABLE daily_day (
   tactics_version INTEGER,
   opening_order TEXT NOT NULL DEFAULT 'standard' CHECK(opening_order IN ('maia','saved','standard')),
   fresh_order INTEGER NOT NULL DEFAULT 0 CHECK(fresh_order IN (0,1)),
+  order_profile TEXT,
   order_staged INTEGER NOT NULL DEFAULT 0,
   forecast_finished INTEGER NOT NULL DEFAULT 0 CHECK(forecast_finished IN (0,1)),
   commitments INTEGER NOT NULL DEFAULT 0
@@ -69,14 +69,15 @@ CREATE TABLE daily_opening_order (
 -- Versions are issued by the Store projection. Original data rows retain their shape.
 CREATE TRIGGER daily_available_insert AFTER INSERT ON prepared_queue BEGIN
   UPDATE daily_clock SET sequence=sequence+1, openings=openings+(new.active=1 AND new.kind='opening'),
+    authoring=authoring+(new.active=1 AND new.kind='opening'),
     tactics=tactics+(new.active=1 AND new.kind='tactic');
-  UPDATE prepared_queue SET availability_version=(SELECT sequence FROM daily_clock),
-    first_learning_version=CASE WHEN new.due_at IS NOT NULL THEN 0 END
+  UPDATE prepared_queue SET availability_version=(SELECT sequence FROM daily_clock)
     WHERE card_id=new.card_id;
 END;
 CREATE TRIGGER daily_available_change AFTER UPDATE OF active ON prepared_queue
 WHEN new.active<>old.active BEGIN
   UPDATE daily_clock SET sequence=sequence+1, openings=openings+(new.kind='opening'),
+    authoring=authoring+(new.kind='opening'),
     tactics=tactics+(new.kind='tactic');
   UPDATE prepared_queue SET availability_version=(SELECT sequence FROM daily_clock)
     WHERE card_id=new.card_id;
@@ -87,6 +88,7 @@ END;
 CREATE TRIGGER daily_definition_change AFTER UPDATE OF answers ON cards
 WHEN new.answers<>old.answers BEGIN
   UPDATE daily_clock SET sequence=sequence+1, openings=openings+(new.kind='opening'),
+    authoring=authoring+(new.kind='opening'),
     tactics=tactics+(new.kind='tactic');
   UPDATE prepared_queue SET availability_version=(SELECT sequence FROM daily_clock)
     WHERE card_id=new.id;
@@ -95,10 +97,10 @@ WHEN new.answers<>old.answers BEGIN
       (SELECT due_head FROM daily_day WHERE day=(SELECT current_day FROM daily_clock)));
 END;
 CREATE TRIGGER daily_routes_insert AFTER INSERT ON opening_line_revision BEGIN
-  UPDATE daily_clock SET openings=openings+1;
+  UPDATE daily_clock SET openings=openings+1,authoring=authoring+1;
 END;
 CREATE TRIGGER daily_routes_change AFTER UPDATE OF revision ON opening_line_revision BEGIN
-  UPDATE daily_clock SET openings=openings+1;
+  UPDATE daily_clock SET openings=openings+1,authoring=authoring+1;
 END;
 CREATE TRIGGER daily_coverage_order AFTER UPDATE OF bank ON forecast_order_state
 WHEN new.bank<>old.bank BEGIN
@@ -110,8 +112,7 @@ DROP TRIGGER prepare_due_update;
 DROP TRIGGER prepare_due_delete;
 CREATE TRIGGER prepare_due_insert AFTER INSERT ON learning BEGIN
   UPDATE daily_clock SET sequence=sequence+1;
-  UPDATE prepared_queue SET due_at=new.due_at,schedule_version=(SELECT sequence FROM daily_clock),
-    first_learning_version=(SELECT sequence FROM daily_clock) WHERE card_id=new.card_id;
+  UPDATE prepared_queue SET due_at=new.due_at,schedule_version=(SELECT sequence FROM daily_clock) WHERE card_id=new.card_id;
 END;
 CREATE TRIGGER prepare_due_update AFTER UPDATE OF last_at,due_at ON learning BEGIN
   UPDATE daily_clock SET sequence=sequence+1;
@@ -122,8 +123,10 @@ CREATE TRIGGER prepare_due_update AFTER UPDATE OF last_at,due_at ON learning BEG
       (SELECT due_head FROM daily_day WHERE day=(SELECT current_day FROM daily_clock)));
 END;
 CREATE TRIGGER prepare_due_delete AFTER DELETE ON learning BEGIN
-  UPDATE daily_clock SET sequence=sequence+1,openings=openings+1,tactics=tactics+1;
-  UPDATE prepared_queue SET due_at=NULL,first_learning_version=NULL,schedule_version=(SELECT sequence FROM daily_clock)
+  UPDATE daily_clock SET sequence=sequence+1,
+    openings=openings+EXISTS(SELECT 1 FROM prepared_queue WHERE card_id=old.card_id AND kind='opening'),
+    tactics=tactics+EXISTS(SELECT 1 FROM prepared_queue WHERE card_id=old.card_id AND kind='tactic');
+  UPDATE prepared_queue SET due_at=NULL,schedule_version=(SELECT sequence FROM daily_clock)
     WHERE card_id=old.card_id;
   DELETE FROM daily_due WHERE card_id=old.card_id AND day=(SELECT current_day FROM daily_clock)
     AND generation IN ((SELECT due_generation FROM daily_clock),

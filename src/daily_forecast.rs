@@ -2,7 +2,7 @@
 
 use crate::daily_openings::ForecastRoute;
 use anyhow::{Context, Result, ensure};
-use chrono::{Local, NaiveDate};
+use chrono::NaiveDate;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -30,6 +30,7 @@ pub const PROFILE: &str = "maia3-5m-1500-authored-history-v1";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
+    pub profile: String,
     pub basis: String,
     pub routes: Vec<ForecastRoute>,
     pub cards: Vec<String>,
@@ -45,6 +46,7 @@ pub enum Score {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
+    pub profile: String,
     pub basis: String,
     pub succeeded: bool,
     pub scores: BTreeMap<String, Score>,
@@ -53,6 +55,7 @@ pub struct Response {
 impl Response {
     fn failed(basis: String) -> Self {
         Self {
+            profile: PROFILE.to_owned(),
             basis,
             succeeded: false,
             scores: BTreeMap::new(),
@@ -60,6 +63,10 @@ impl Response {
     }
 
     pub fn verify(&self, basis: &str, cards: &[String]) -> Result<()> {
+        ensure!(
+            self.profile == PROFILE,
+            "Incompatible daily forecast profile"
+        );
         ensure!(self.basis == basis, "Unexpected daily forecast basis");
         ensure!(self.succeeded, "Daily model did not complete");
         ensure!(
@@ -153,6 +160,15 @@ impl Write for BoundedFile<'_> {
 }
 
 fn publish(directory: &Path, path: &Path, message: &impl Serialize) -> Result<()> {
+    publish_file(directory, path, message, false)
+}
+
+fn publish_file(
+    directory: &Path,
+    path: &Path,
+    message: &impl Serialize,
+    replace: bool,
+) -> Result<()> {
     let mut file = tempfile::Builder::new()
         .prefix(".pending-")
         .tempfile_in(directory)?;
@@ -165,7 +181,12 @@ fn publish(directory: &Path, path: &Path, message: &impl Serialize) -> Result<()
         output.flush()?;
     }
     file.as_file().sync_all()?;
-    match file.persist_noclobber(path) {
+    let persisted = if replace {
+        file.persist(path)
+    } else {
+        file.persist_noclobber(path)
+    };
+    match persisted {
         Ok(_) => File::open(directory)?.sync_all()?,
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
             ensure!(is_private_file(path)?, "Daily forecast file disappeared");
@@ -175,9 +196,19 @@ fn publish(directory: &Path, path: &Path, message: &impl Serialize) -> Result<()
     Ok(())
 }
 
+fn active_day(directory: &Path) -> Result<Option<String>> {
+    let Some(file) = open_private_file(&directory.join("active.json"))? else {
+        return Ok(None);
+    };
+    let day: String = serde_json::from_reader(file.take(64))?;
+    check_day(&day)?;
+    Ok(Some(day))
+}
+
 pub fn request_exists(directory: &Path, day: &str) -> Result<bool> {
     check_day(day)?;
     Ok(safe_directory(directory)?
+        && active_day(directory)?.as_deref() == Some(day)
         && is_private_file(&directory.join(format!("{day}.request.json")))?)
 }
 
@@ -201,11 +232,12 @@ pub fn publish_request(directory: &Path, day: &str, request: &Request) -> Result
             "Daily forecast directory disappeared"
         );
     }
-    publish(
-        directory,
-        &directory.join(format!("{day}.request.json")),
-        request,
-    )
+    let path = directory.join(format!("{day}.request.json"));
+    if !is_private_file(&path)? {
+        publish(directory, &path, request)?;
+    }
+    publish_file(directory, &directory.join("active.json"), &day, true)?;
+    clean_previous(directory, day)
 }
 
 pub fn read_response(directory: &Path, day: &str) -> Result<Option<Response>> {
@@ -307,7 +339,10 @@ async fn complete(directory: &Path, day: &str, stop: &mut watch::Receiver<bool>)
         BUDGET.saturating_sub(file.metadata()?.modified()?.elapsed().unwrap_or_default());
     let deadline = Instant::now() + remaining;
     let (request, bytes): (Request, _) = decode(file)?;
-    let response = if mark_started(directory, day)? && Instant::now() < deadline && !*stop.borrow()
+    let response = if mark_started(directory, day)?
+        && request.profile == PROFILE
+        && Instant::now() < deadline
+        && !*stop.borrow()
     {
         match evaluate(bytes, deadline, stop).await.and_then(|response| {
             response.verify(&request.basis, &request.cards)?;
@@ -327,6 +362,10 @@ async fn complete(directory: &Path, day: &str, stop: &mut watch::Receiver<bool>)
 }
 
 fn clean_previous(directory: &Path, day: &str) -> Result<()> {
+    let earliest = NaiveDate::parse_from_str(day, "%Y-%m-%d")?
+        .pred_opt()
+        .context("Invalid first Study day")?
+        .to_string();
     for entry in fs::read_dir(directory)?.take(32) {
         let entry = entry?;
         let name = entry.file_name();
@@ -335,7 +374,7 @@ fn clean_previous(directory: &Path, day: &str) -> Result<()> {
             .iter()
             .any(|suffix| {
                 name.strip_suffix(suffix)
-                    .is_some_and(|date| date < day && check_day(date).is_ok())
+                    .is_some_and(|date| date < earliest.as_str() && check_day(date).is_ok())
             });
         let abandoned_temp = name.starts_with(".pending-")
             && entry
@@ -366,7 +405,6 @@ pub fn worker(directory: &Path) -> Result<()> {
                 let _ = shutdown.send(true);
             });
             let mut worker_lock = None;
-            let mut cleaned_for = String::new();
             loop {
                 if safe_directory(directory)? {
                     if worker_lock.is_none() {
@@ -382,12 +420,9 @@ pub fn worker(directory: &Path) -> Result<()> {
                             .context("Daily forecast worker already running")?;
                         worker_lock = Some(lock);
                     }
-                    let day = Local::now().date_naive().to_string();
-                    if cleaned_for != day {
-                        clean_previous(directory, &day)?;
-                        cleaned_for.clone_from(&day);
+                    if let Some(day) = active_day(directory)? {
+                        complete(directory, &day, &mut stop).await?;
                     }
-                    complete(directory, &day, &mut stop).await?;
                 }
                 tokio::select! {
                     _ = stop.wait_for(|stopped| *stopped) => return Ok(()),
@@ -407,6 +442,7 @@ mod tests {
         let directory = directory(&temporary.path().join("tempo.sqlite3"));
         let day = "2026-11-27";
         let mut request = Request {
+            profile: PROFILE.to_owned(),
             basis: "original basis".into(),
             routes: Vec::new(),
             cards: vec!["a".into()],
@@ -414,6 +450,7 @@ mod tests {
         assert!(!request_exists(&directory, day)?);
         publish_request(&directory, day, &request)?;
         assert!(request_exists(&directory, day)?);
+        assert_eq!(active_day(&directory)?.as_deref(), Some(day));
         assert!(mark_started(&directory, day)?);
         request.basis = "later basis".into();
         publish_request(&directory, day, &request)?;

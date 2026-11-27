@@ -187,8 +187,8 @@ while Tempo is stopped.
 
 A service backup that must resume queued PGN uploads includes the SQLite
 database and its adjacent `.uploads` directory. Stop the service before
-copying both for a coordinated release or rollback. The `opening-rank-apply`
-and legacy opening import commands also require exclusive database ownership.
+copying both for a coordinated release or rollback. Legacy opening import
+requires exclusive database ownership.
 
 ## Archive conversion and recovery
 

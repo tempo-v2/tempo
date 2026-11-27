@@ -13,6 +13,7 @@ import chess
 
 
 HORIZON = 200
+PROFILE = "maia3-5m-1500-authored-history-v1"
 
 
 @dataclass
@@ -134,7 +135,10 @@ if __name__ == "__main__":
     exec(compile(sys.argv[2], "<embedded coverage model>", "exec"), vars(tools))
     root = pathlib.Path(sys.argv[1])
     request = json.load(sys.stdin)
+    if request["profile"] != PROFILE:
+        raise ValueError("Incompatible daily forecast profile")
     with tools.model_slot(root), contextlib.redirect_stdout(sys.stderr):
         scores = forecast(request, tools.maia(root))
-    print(json.dumps({"basis": request["basis"], "succeeded": True, "scores": scores},
+    print(json.dumps({"profile": PROFILE, "basis": request["basis"],
+                      "succeeded": True, "scores": scores},
                      allow_nan=False))

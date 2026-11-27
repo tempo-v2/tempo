@@ -165,7 +165,7 @@ pub fn record_rating(
     }
     let repeat = if matches!(rating, Rating::Again) && queue_store::can_repeat(db, card)? {
         let draw = queue::draw_repeat_offset();
-        let placed = if queue_store::can_place_now(db, now)? {
+        let placed = if queue_store::can_place_now(db)? {
             queue_store::place_repeat(db, card, previous, now, draw)?
         } else {
             None
@@ -192,7 +192,7 @@ pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
     if prepared {
         queue_store::place_deferred(&tx, now)?;
     }
-    let selected = if let Some(card) = queue_store::committed_head(&tx)? {
+    let selected = if let Some(card) = queue_store::committed_head(&tx, now)? {
         Some(card)
     } else {
         anyhow::ensure!(prepared, Preparing);

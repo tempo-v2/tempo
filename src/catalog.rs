@@ -654,6 +654,15 @@ pub fn save_opening(
     apply_opening(db, &prepare_opening(input)?, inherited_book, false)
 }
 
+/// The published standalone tactic and pack-review card types have no
+/// introduction prerequisites. Pack admission itself occurs before Study.
+pub fn daily_tactic_candidate(card: String) -> crate::daily_plan::Candidate {
+    crate::daily_plan::Candidate {
+        card,
+        prerequisites: crate::daily_plan::Prerequisites::NoneRequired,
+    }
+}
+
 pub fn tactics(db: &Connection, after: &str) -> Result<Vec<Tactic>> {
     let mut q = db.prepare(
         "SELECT id,name,route,game_id,game_ply FROM tactics
