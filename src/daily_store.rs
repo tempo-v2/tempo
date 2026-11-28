@@ -2110,6 +2110,7 @@ mod tests {
         catalog::save_opening(&db, &line, None)?;
         while !queue_store::seed_batch(&mut db)? {}
         prepare_test_day(&mut db, now)?;
+        db.execute("UPDATE new_opening_settings SET paused=1", [])?;
         let previous = review::next(
             &mut db,
             Next {
@@ -2131,7 +2132,6 @@ mod tests {
         })?;
         commit_slot(&db, &card, now)?;
         db.execute("INSERT INTO deck VALUES(1,?1)", [&card])?;
-        db.execute("UPDATE new_opening_settings SET paused=1", [])?;
         // An added authored line invalidates the certificate without retiring the reservation.
         let mut another = line;
         another.name = "Independent authored route".into();
