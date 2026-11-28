@@ -323,7 +323,10 @@ mod tests {
 
             assert!(matches!(
                 study_store::current(&db)?.unwrap().activity,
-                crate::study::Activity::SingleAnswer { result: Some(_) }
+                crate::study::Activity::SingleAnswer {
+                    result: Some(_),
+                    ..
+                }
             ));
             let changes = db.total_changes();
             assert_eq!(serde_json::to_value(answer(&mut db, intent())?)?, accepted);

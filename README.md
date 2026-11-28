@@ -132,6 +132,14 @@ node tools/qualify_answer_ir.cjs --candidate-only target/release/tempo /path/to/
 node tools/qualify_game_feedback.cjs target/release/tempo
 ```
 
+For the opening introduction guide and its Answer recovery checks, use the
+installed schema-20 predecessor binary and a readable retained database. The
+harness copies the database before running either delivery-loss scenario.
+
+```sh
+node tools/qualify_answer_ir.cjs --opening-introduction target/release/tempo /path/to/predecessor/tempo /path/to/retained.sqlite3
+```
+
 Use the qualified pack artifact containing puzzle `03N75` and its pack,
 identified in the Lean assembly manifest. Each Tempo binary must have the
 matching built `ui/dist` in the checkout path used to compile it. Set

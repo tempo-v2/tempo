@@ -141,6 +141,12 @@ function decodeStudyReply(body, dataset) {
   if (fullLine ? body.result !== null : body.puzzle !== undefined) throw new Error(incomplete);
   const puzzle = fullLine ? decodePuzzle(body.puzzle, "study", { dataset: body.dataset }) : null;
   const result = body.result === null ? null : decodeResult(body.result, incomplete, playable);
+  const introduction = body.introduction_move;
+  if (introduction !== undefined &&
+      (fullLine || body.kind !== "opening" || result !== null || !isMove(introduction) ||
+       !body.legal.includes(introduction) || !playable.has(introduction))) {
+    throw new Error(incomplete);
+  }
   if (body.legal.some((move) => !playable.has(move)) || (result === null && body.legal.length === 0)) {
     throw new Error(incomplete);
   }
@@ -390,7 +396,11 @@ export function Study({ openGame, sounds }) {
       playedInGame = play(new Chess(card.fen), gameMove).san;
     } catch { /* Optional context can be unavailable for the issued position. */ }
   }
+  const introduction = !openingPlaying && !card?.result && !awaitingResult && !pending && !error
+    ? card?.introduction_move : undefined;
   const shapes = [...markedMove(previous, "red"), ...markedMove(played, "green")];
+  if (introduction) shapes.push({ orig: introduction.slice(0, 2), dest: introduction.slice(2, 4), brush: "yellow" });
+  const introductionPrompt = introduction && `Play ${play(new Chess(card.fen), introduction).san}`;
   if (boardMove) play(game, boardMove);
   const board = card && <ChessBoard game={game} legal={openingPlaying ? undefined : card.legal} orientation={card.color}
     identity={`study-${card.attempt}-${epoch}`} locked={openingPlaying || pending || Boolean(error) || Boolean(card.result) || Boolean(awaitingResult)}
@@ -406,7 +416,7 @@ export function Study({ openGame, sounds }) {
     {loaded && !card && !error && <><p>No cards are ready in today’s queue.</p>
       <button onClick={() => next()} disabled={pending}>Check deck</button></>}
     {card && <>
-      <h2>{card.result ? card.title : openingPlaying ? "Playing opening moves" : movePrompt}</h2>
+      <h2>{card.result ? card.title : openingPlaying ? "Playing opening moves" : introductionPrompt ?? movePrompt}</h2>
       <div ref={setPromotionTarget} />
       <div className="controls">
         {card.result ? <>

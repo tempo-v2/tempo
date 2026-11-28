@@ -5,7 +5,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub fn current(db: &Connection) -> Result<Option<Review>> {
     let row = db
         .query_row(
-            "SELECT a.id,c.kind,c.title,c.color,c.fen,a.result,a.submission,c.context,c.played_move
+            "SELECT a.id,c.kind,c.title,c.color,c.fen,a.result,a.submission,c.context,c.played_move,
+                CASE WHEN c.kind='opening' AND a.result IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM learning WHERE card_id=a.card_id)
+                    THEN coalesce(a.issued_answers,c.answers) END
         FROM study s JOIN attempts a ON a.id=s.active JOIN cards c ON c.id=a.card_id",
             [],
             |r| {
@@ -19,12 +22,24 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
                     r.get::<_, Option<String>>(6)?,
                     r.get::<_, Option<String>>(7)?,
                     r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(attempt, kind, title, color, fen, result, submission, context, played_in_game)| {
+        |(
+            attempt,
+            kind,
+            title,
+            color,
+            fen,
+            result,
+            submission,
+            context,
+            played_in_game,
+            introduction,
+        )| {
             let legal = chess::legal(&chess::position(&fen)?);
             let activity = if let Some(play) = crate::full_line_store::for_review(db, attempt)? {
                 Activity::FullLine {
@@ -42,7 +57,14 @@ pub fn current(db: &Connection) -> Result<Option<Review>> {
                         )
                     })
                     .transpose()?;
-                Activity::SingleAnswer { result }
+                let introduction_move = introduction
+                    .and_then(|answers| serde_json::from_str::<[String; 1]>(&answers).ok())
+                    .map(|[move_]| move_)
+                    .filter(|move_| legal.contains(move_));
+                Activity::SingleAnswer {
+                    result,
+                    introduction_move,
+                }
             };
             // Opening context contains only authored moves before this issued decision.
             let lead_in = if kind == "opening" {
