@@ -309,7 +309,7 @@ pub fn submit(
     };
     let input = opening_rows(&tx, &day, &clock)?;
     tx.commit()?;
-    let draft = input
+    let mut draft = input
         .compile(|| Instant::now() >= deadline)?
         .draft_with_priority(
             clock.openings,
@@ -322,6 +322,13 @@ pub fn submit(
     if !draft.revoked_openings.is_empty() {
         return Ok(Delivery::Busy);
     }
+    super::replace_with_staging_if_needed(
+        super::Preparation::Forecast,
+        writer,
+        &day,
+        &mut draft,
+        deadline,
+    )?;
     writer.forecast(deadline, move |db| {
         let tx = db.transaction_with_behavior(Immediate)?;
         let Some(ticket) = Ticket::load(&tx, &id)? else {

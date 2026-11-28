@@ -76,13 +76,15 @@ pub struct Basis {
     pub priority: i64,
     pub commitments: i64,
     pub paused: bool,
+    #[serde(default)]
+    pub allowance: usize,
 }
 
 impl Basis {
     pub fn current(db: &Connection) -> Result<Option<Self>> {
         Ok(db
             .query_row(
-                "SELECT m.dataset,d.day,c.openings,c.priority,d.commitments,s.paused,c.authoring,c.introduction_reset
+                "SELECT m.dataset,d.day,c.openings,c.priority,d.commitments,s.paused,c.authoring,c.introduction_reset,d.opening_limit+d.opening_extra
              FROM daily_clock c JOIN daily_day d ON d.day=c.current_day
              CROSS JOIN metadata m CROSS JOIN new_opening_settings s",
                 [],
@@ -94,6 +96,7 @@ impl Basis {
                         priority: r.get(3)?,
                         commitments: r.get(4)?,
                         paused: r.get(5)?,
+                    allowance: r.get(8)?,
                 authoring: r.get(6)?,
                 introduction_reset: r.get(7)?,
                     })
@@ -154,11 +157,17 @@ pub fn preview_status(db: &Connection, card: &str, availability: i64) -> Result<
         return Ok(status(db, goal)?.unwrap_or(Value::Null));
     }
     let facts = db.query_row(
-        "SELECT s.paused,d.opening_limit,
-            (SELECT count(*) FROM daily_new n WHERE n.day=d.day AND n.kind='opening' AND n.committed=1)
+        "SELECT s.paused,d.opening_limit+d.opening_extra,coalesce(d.opening_charged,0)
          FROM new_opening_settings s CROSS JOIN daily_clock c
          LEFT JOIN daily_day d ON d.day=c.current_day",
-        [], |r| Ok((r.get::<_,bool>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,i64>(2)?)),
+        [],
+        |r| {
+            Ok((
+                r.get::<_, bool>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
     )?;
     let reason = match facts {
         (true, _, _) => Some("opening_paused"),
@@ -266,13 +275,14 @@ pub fn published_prefix(db: &Connection, basis: &Basis) -> Result<Option<Vec<Pro
     let prefix: Option<String> = db
         .query_row(
             "SELECT prefix FROM opening_priority_projection
-         WHERE day=?1 AND openings=?2 AND priority=?3 AND commitments=?4 AND paused=?5",
+         WHERE day=?1 AND openings=?2 AND priority=?3 AND commitments=?4 AND paused=?5 AND allowance=?6",
             params![
                 basis.day,
                 basis.openings,
                 basis.priority,
                 basis.commitments,
-                basis.paused
+                basis.paused,
+                basis.allowance,
             ],
             |r| r.get(0),
         )
@@ -284,13 +294,14 @@ pub fn published_through(db: &Connection, basis: &Basis) -> Result<Option<i64>> 
     Ok(db
         .query_row(
             "SELECT processed_through FROM opening_priority_projection
-         WHERE day=?1 AND openings=?2 AND priority=?3 AND commitments=?4 AND paused=?5",
+         WHERE day=?1 AND openings=?2 AND priority=?3 AND commitments=?4 AND paused=?5 AND allowance=?6",
             params![
                 basis.day,
                 basis.openings,
                 basis.priority,
                 basis.commitments,
-                basis.paused
+                basis.paused,
+                basis.allowance,
             ],
             |r| r.get(0),
         )
@@ -304,19 +315,19 @@ pub fn publish_prefix(
     through: i64,
 ) -> Result<()> {
     ensure!(
-        prefix.len() <= 20,
+        prefix.len() <= basis.allowance,
         "opening priority prefix exceeds daily allowance"
     );
     db.execute(
         "INSERT OR REPLACE INTO opening_priority_projection
-        (singleton,day,openings,priority,commitments,paused,prefix,processed_through) VALUES (1,?1,?2,?3,?4,?5,?6,?7)",
+        (singleton,day,openings,priority,commitments,paused,prefix,processed_through,allowance) VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8)",
         params![
             basis.day,
             basis.openings,
             basis.priority,
             basis.commitments,
             basis.paused,
-            serde_json::to_string(prefix)?, through
+            serde_json::to_string(prefix)?, through, basis.allowance
         ],
     )?;
     Ok(())

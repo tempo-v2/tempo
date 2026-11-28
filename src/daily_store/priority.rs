@@ -1,4 +1,7 @@
-use super::{BATCH, Clock, Day, Openings, opening_rows, publish_slots};
+use super::{
+    BATCH, Clock, Day, Draft, Openings, Preparation, opening_rows, publish_slots,
+    replace_with_staging_if_needed,
+};
 use crate::{
     opening_priority::{self as goals, Basis, Goal, Graph, Proof, Resolution, Resolver, Update},
     writer::Writer,
@@ -294,7 +297,7 @@ pub(super) fn turn(
         } else {
             "saved"
         };
-        let Some(draft) = pass.input.draft_until(
+        let Some(mut draft) = pass.input.draft_until(
             clock.openings,
             pass.base_order.as_deref().unwrap(),
             source,
@@ -306,6 +309,13 @@ pub(super) fn turn(
         if Instant::now() >= read_deadline {
             return Ok(true);
         }
+        replace_with_staging_if_needed(
+            Preparation::Required,
+            writer,
+            &day,
+            &mut draft,
+            read_deadline,
+        )?;
         let published_basis = basis.clone();
         let prefix = pass.prefix.clone();
         let through = pass.cursor.max(pass.published_through);
@@ -353,4 +363,47 @@ pub(super) fn turn(
     }
     pass.done = exhausted;
     Ok(true)
+}
+
+/// Resolve the same priority prefix against the proposed ceiling before settling
+/// an explicit addition. Ordinary ordering fills the space left by that prefix.
+pub(super) fn extended_draft(
+    db: &rusqlite::Connection,
+    day: &Day,
+    clock: &Clock,
+    deadline: Instant,
+) -> Result<(Draft, Vec<Proof>, i64)> {
+    let input = opening_rows(db, day, clock)?.compile(|| Instant::now() >= deadline)?;
+    let basis = Basis::current(db)?.context("Missing opening priority basis")?;
+    let mut pass = Pass::new(basis, input, day.fresh, clock.sequence, None, 0);
+    while clock.priority != 0 && pass.prefix.len() < pass.input.limit {
+        ensure!(
+            Instant::now() < deadline,
+            "Opening priority preparation timed out"
+        );
+        pass.roots = goals::roots(db, pass.cursor)?.into();
+        if pass.roots.is_empty() {
+            break;
+        }
+        pass.advance(deadline, false)?;
+        ensure!(
+            pass.roots.is_empty(),
+            "Opening priority preparation timed out"
+        );
+    }
+    let source = if day.fresh {
+        "maia"
+    } else if pass.input.saved_order.is_empty() {
+        "standard"
+    } else {
+        "saved"
+    };
+    let order = pass.input.ordered(None);
+    let draft = pass
+        .input
+        .draft_until(clock.openings, &order, source, &pass.prefix, || {
+            Instant::now() >= deadline
+        })
+        .context("Opening introduction preparation timed out")?;
+    Ok((draft, pass.prefix, pass.cursor))
 }

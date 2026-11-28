@@ -1,3 +1,4 @@
+import { StudyAddNew } from "./study_add_new.jsx";
 import { ExerciseLayout } from "./exercise_layout.jsx";
 import { decodePuzzle, PuzzleBoard, recoverPuzzleActions } from "./puzzle_play.jsx";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -397,6 +398,7 @@ export function Study({ openGame, sounds, overlayOpen = false, allowOpeningEdits
       <p>{formatStudyCount(counts.new)} new · {formatStudyCount(counts.reviews)} {counts.reviews === 1 ? "review" : "reviews"}</p>
       <small>{counts.preparing ? "Preparing today’s queue…" : dailyOpeningOrder[counts.opening_order]}</small>
     </>}
+    <StudyAddNew day={counts?.day} dataset={counts?.dataset} refreshCounts={invalidateCounts} />
   </>;
   if (card?.activity_mode === "full_line") return <PuzzleBoard key={card.puzzle.play} view={card.puzzle} scope="study" sounds={sounds}
     onView={(puzzle) => showCard({ ...card, puzzle })}

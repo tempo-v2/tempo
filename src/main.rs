@@ -815,6 +815,24 @@ async fn study_counts(State(db): State<App>) -> impl IntoResponse {
         .into_response();
     ([(axum::http::header::CACHE_CONTROL, "no-store")], response)
 }
+async fn add_study_new(
+    State(app): State<App>,
+    Json(command): Json<daily_store::add_new::Command>,
+) -> ApiResult {
+    write_db(app, move |db| {
+        daily_store::add_new::submit(db, command, chrono::Utc::now().timestamp())
+    })
+    .await
+}
+async fn study_add_new_status(
+    State(app): State<App>,
+    UrlPath(request): UrlPath<String>,
+) -> ViewResult {
+    optional_view(app, optional_read::Reader::StudyAddition, move |db| {
+        daily_store::add_new::status(db, &request)
+    })
+    .await
+}
 async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> ApiResult {
     write_db(db, move |c| review::next(c, input)).await
 }
@@ -1286,6 +1304,11 @@ fn common_routes(app: &App) -> Router<App> {
         .route("/api/study/puzzle-move", post(study_puzzle_move))
         .route("/api/study", get(current))
         .route("/api/study/counts", get(study_counts))
+        .route(
+            "/api/study/add-new",
+            post(add_study_new).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route("/api/study/add-new/{request}", get(study_add_new_status))
         .route("/api/study/next", post(next_review))
         .route("/api/study/answer", post(answer))
         .route("/api/study/{id}/context", get(context))

@@ -58,7 +58,7 @@ pub struct Candidate {
     pub prerequisites: Prerequisites,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
     pub card: String,
     /// Selected or pinned parents whose durable introductions still need to be
@@ -84,6 +84,27 @@ pub fn pick_until(
     limit: usize,
     expired: impl Fn() -> bool,
 ) -> Option<Vec<Selection>> {
+    if pinned.is_empty()
+        && introduced.is_empty()
+        && ordered
+            .iter()
+            .all(|candidate| candidate.prerequisites == Prerequisites::NoneRequired)
+    {
+        let mut seen = HashSet::new();
+        let mut selected = Vec::new();
+        for candidate in ordered.iter().take_while(|_| !expired()) {
+            if selected.len() == limit {
+                return Some(selected);
+            }
+            if seen.insert(&candidate.card) {
+                selected.push(Selection {
+                    card: candidate.card.clone(),
+                    waiting_on: Vec::new(),
+                });
+            }
+        }
+        return (!expired()).then_some(selected);
+    }
     let mut allocated: HashSet<&str> = pinned.iter().map(String::as_str).collect();
     let mut selected = Vec::new();
     while selected.len() < limit {

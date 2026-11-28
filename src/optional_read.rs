@@ -56,11 +56,12 @@ pub enum Reader {
     OpeningMissPreview,
     OpeningMissReceipt,
     OpeningPriorityStatus,
+    StudyAddition,
 }
 
 impl Reader {
     fn slot(self) -> &'static Semaphore {
-        const LANES: usize = Reader::OpeningPriorityStatus as usize + 1;
+        const LANES: usize = Reader::StudyAddition as usize + 1;
         static SLOTS: [Semaphore; LANES] = [const { Semaphore::const_new(1) }; LANES];
         &SLOTS[self as usize]
     }
