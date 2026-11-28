@@ -155,10 +155,20 @@ async function journey(db, desktop, web, phone) {
       await dialog.getByText("Saved", { exact: true }).waitFor();
     }
     await button(dialog, "Close").click();
+    await local.bringToFront();
     await button(local, "Tactics").click();
+    const libraryLoad = local.waitForResponse(reply => reply.url() === desktop + "/api/tactics");
     await button(local, "Puzzle library").click();
-    assert.ok(await fetch(desktop + "/api/tactics").then(response => response.ok));
-    await button(local, "Chess.com puzzle 2293026").waitFor();
+    const savedPuzzle = button(local, "Chess.com puzzle 2293026");
+    let rows = await (await libraryLoad).json();
+    while (!rows.some(puzzle => puzzle.id === id) && rows.length === 100) {
+      const more = local.waitForResponse(reply => reply.url().includes("/api/tactics?after="));
+      await button(local, "Load more").click();
+      rows = await (await more).json();
+    }
+    assert.ok(rows.some(puzzle => puzzle.id === id));
+    await savedPuzzle.click();
+    await local.getByRole("link", { name: "Open on Chess.com" }).waitFor();
     assert.deepEqual(faults, []);
   } finally {
     await browser.close();
