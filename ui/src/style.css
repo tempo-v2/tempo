@@ -117,3 +117,8 @@ button.gap-recommended:not(:disabled) { background-color: #214d36; border-color:
 
 .gap-review-table { overflow-x: auto; }
 .gap-review-table th, .gap-review-table td { padding: .3rem .65rem; text-align: left; }
+
+.study-move-review { border-top: 1px solid #dbe0d5; margin-block: 1rem; padding-block: .5rem; }
+.study-move-review h2 { margin: 0; }
+.study-move-review > .controls:first-child { justify-content: space-between; }
+.study-move-review .gap-confirmation { margin-block: .8rem; }

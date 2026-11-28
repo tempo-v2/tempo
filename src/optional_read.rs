@@ -51,11 +51,13 @@ pub enum Reader {
     FeedbackRepertoires,
     CaptureContext,
     GameFeedback,
+    StudyMoveReview,
+    StudyMovePreview,
 }
 
 impl Reader {
     fn slot(self) -> &'static Semaphore {
-        const LANES: usize = Reader::GameFeedback as usize + 1;
+        const LANES: usize = Reader::StudyMovePreview as usize + 1;
         static SLOTS: [Semaphore; LANES] = [const { Semaphore::const_new(1) }; LANES];
         &SLOTS[self as usize]
     }
