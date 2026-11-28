@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 20;
+const SCHEMA: i32 = 21;
 
 pub struct Database;
 
@@ -68,6 +68,7 @@ impl Database {
         crate::catalog::migrate_opening_identities(&db)?;
         db.execute_batch(include_str!("game_feedback.sql"))?;
         db.execute_batch(include_str!("daily_queue.sql"))?;
+        db.execute_batch(include_str!("daily_mix.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],
@@ -140,7 +141,10 @@ impl Database {
             if version < 19 {
                 tx.execute_batch(include_str!("game_feedback.sql"))?;
             }
-            upgrade_daily_queue(&tx)?;
+            if version < 20 {
+                upgrade_daily_queue(&tx)?;
+            }
+            tx.execute_batch(include_str!("daily_mix.sql"))?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -184,6 +188,7 @@ impl Database {
         crate::catalog::migrate_opening_identities(&tx)?;
         tx.execute_batch(include_str!("game_feedback.sql"))?;
         upgrade_daily_queue(&tx)?;
+        tx.execute_batch(include_str!("daily_mix.sql"))?;
         let valid: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
             [],

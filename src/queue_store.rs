@@ -144,11 +144,10 @@ fn fill_repeat(
         false
     };
     while queued.len() < usize::from(draw) {
-        let Some((id, kind)) = daily_store::select(db, previous.as_deref(), now)? else {
+        let Some((id, kind)) = daily_store::take_fresh(db, previous.as_deref(), now)? else {
             break;
         };
         let slot = queued.last().map_or(1, |(slot, _, _)| slot + 1);
-        daily_store::commit_slot(db, &id, now)?;
         db.execute("INSERT INTO deck VALUES (?1,?2)", params![slot, id])?;
         previous = Some(kind.clone());
         queued.push((slot, kind, false));
