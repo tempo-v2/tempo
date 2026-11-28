@@ -827,11 +827,13 @@ async fn add_study_new(
 async fn study_add_new_status(
     State(app): State<App>,
     UrlPath(request): UrlPath<String>,
-) -> ViewResult {
-    optional_view(app, optional_read::Reader::StudyAddition, move |db| {
+) -> impl IntoResponse {
+    let response = optional_view(app, optional_read::Reader::StudyAddition, move |db| {
         daily_store::add_new::status(db, &request)
     })
     .await
+    .into_response();
+    ([(axum::http::header::CACHE_CONTROL, "no-store")], response)
 }
 async fn next_review(State(db): State<App>, Json(input): Json<study::Next>) -> ApiResult {
     write_db(db, move |c| review::next(c, input)).await
