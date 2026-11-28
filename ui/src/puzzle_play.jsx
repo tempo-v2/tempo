@@ -4,6 +4,7 @@ import { ExerciseLayout } from "./exercise_layout.jsx";
 import { api } from "./api.js";
 import { ChessBoard, Replay, play, position } from "./board.jsx";
 import { isMove } from "./answer-journal.js";
+import { moveCue } from "./sounds.js";
 import { importPuzzleCommand, nextPuzzleCommand, resolvePuzzleCommand, savePuzzleCommand } from "./puzzle-journal.js";
 
 const endpoint = {
@@ -147,14 +148,26 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
     }
   }
   function move(played) {
+    if (busy.current) return;
     const intent = { dataset: view.dataset, play: view.play, step: view.step, played };
+    if (played) {
+      const board = new Chess(view.fen);
+      sounds.play(moveCue(play(board, played), board));
+    }
     void run(async () => {
       const next = await sendPuzzleAction(scope, { kind: "move", intent, issuedFen: view.fen });
       const current = currentView.current;
       if (!mounted.current || current.dataset !== intent.dataset || current.play !== intent.play ||
           current.step !== intent.step || current.result !== null) return;
       if (next) {
-        if (next.result?.rating === "Again") sounds.play("illegal");
+        if (next.result?.rating === "Again") {
+          if (played) sounds.play("illegal");
+        } else if (next.step === intent.step + 2) {
+          // The reply carries the opponent move only after accepting this step.
+          const afterPlayer = new Chess(view.fen);
+          play(afterPlayer, played);
+          sounds.play(moveCue(play(afterPlayer, next.last_move), afterPlayer, "move-opponent"));
+        }
         onView(next);
       } else {
         // A concurrent tab may already have advanced. Read the authoritative position.
@@ -170,7 +183,7 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
         legal={view.legal} identity={`${scope}/${view.dataset}/${view.play}/${view.step}`}
         lastMove={lastMove} promotionTarget={promotionTarget}
         onRejectedMove={() => sounds.play("illegal")}
-        onMove={finished ? undefined : move} locked={pending || Boolean(issue)} />
+        onMove={finished ? undefined : move} locked={pending || Boolean(issue)} retainMoveOnLock={pending} />
     : <Replay route={view.solution} color={view.color} ply={replay} onPly={setReplay} sounds={sounds}
         controlsTarget={replayTarget} />;
   return <ExerciseLayout label={scope === "study" ? "Study" : "Play puzzle"} board={board}>
