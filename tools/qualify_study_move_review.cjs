@@ -16,6 +16,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const sql = (db, query, readOnly = true) => execFileSync("sqlite3", [
   ...(readOnly ? ["-readonly"] : []), "-cmd", ".timeout 5000", db, query,
 ], { encoding: "utf8" }).trim();
+const backup = (source, target) => execFileSync("sqlite3", ["-readonly", source, ".backup " + target]);
 const literal = value => "'" + value.replaceAll("'", "''") + "'";
 const button = (page, name) => page.getByRole("button", { name, exact: true });
 const study = (page, action) => page.getByRole("status").filter({ hasText: action }).waitFor();
@@ -98,7 +99,7 @@ async function play(page, uci) {
 
 async function studyJourney(browser, { baseline, label, action, phone, native, remove = false }) {
   const db = path.join(root, `journey-${crypto.randomUUID().slice(0, 8)}.db`);
-  fs.copyFileSync(baseline, db);
+  backup(baseline, db);
   sql(db, `UPDATE cards SET title=${literal(label)} WHERE id=(SELECT a.card_id FROM study s
     JOIN attempts a ON a.id=s.active)`, false);
   const page = await browser.newPage({ viewport: phone ? { width: 390, height: 844 } : { width: 1200, height: 850 } });
@@ -207,7 +208,7 @@ async function studyJourney(browser, { baseline, label, action, phone, native, r
 
 async function unmarkedAndNoRoute(browser, baseline) {
   const db = path.join(root, "unmarked.db");
-  fs.copyFileSync(baseline, db);
+  backup(baseline, db);
   const page = await browser.newPage();
   try {
     await server(candidate, db, await port(), async (origin, api) => {
@@ -240,7 +241,7 @@ async function unmarkedAndNoRoute(browser, baseline) {
 
 async function predecessorAnswer(browser, accepted) {
   const db = path.join(root, `prev-${accepted}.db`);
-  execFileSync("sqlite3", ["-readonly", retained, ".backup " + db]);
+  backup(retained, db);
   const card = sql(db, "SELECT id FROM active_cards WHERE kind='opening' LIMIT 1");
   focus(db, card);
   const p = await port();
