@@ -86,19 +86,18 @@ pub async fn read(State(app): State<App>, Json(address): Json<Address>) -> ApiRe
                 &issued.color,
                 BTreeMap::from([(issued.position.clone(), issued.version)]),
             )?;
-            let proved_route = routes
-                .routes
-                .remove(&issued.position)
-                .map(|route| gap_pgn::line_text(&route, &issued.position, &issued.movement))
-                .transpose()?;
+            let proved_route = routes.routes.remove(&issued.position);
             let editing = if proved_route.is_some() {
                 "available"
             } else {
                 "route_unavailable"
             };
+            let route = proved_route
+                .map(|route| gap_pgn::line_text(&route, &issued.position, &issued.movement))
+                .transpose()?;
             Ok(Json(json!({
-                "basis": basis, "fen": issued.fen, "saved_move": issued.movement,
-                "repertoire": repertoire.example_line, "route": proved_route, "editing": editing,
+                "basis": basis, "fen": issued.fen, "issued_move": issued.movement,
+                "repertoire": repertoire.example_line, "route": route, "editing": editing,
             })))
         },
     )
@@ -264,7 +263,7 @@ pub async fn preview(State(app): State<App>, Json(edit): Json<Edit>) -> ApiResul
     )
     .await?;
     optional_read::read_value(
-        Reader::StudyMoveReview,
+        Reader::StudyMovePreview,
         app.database.clone(),
         move |db, _| {
             let tx = db.transaction()?;

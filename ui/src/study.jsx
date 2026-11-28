@@ -1,6 +1,6 @@
 import { ExerciseLayout } from "./exercise_layout.jsx";
 import { decodePuzzle, PuzzleBoard, recoverPuzzleActions } from "./puzzle_play.jsx";
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api, readView } from "./api.js";
 import {
@@ -185,7 +185,8 @@ async function deliverAnswer(intent, fen) {
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
   const [counts, invalidateCounts] = useStudyCounts();
-  const openingEdit = useOpeningEdit(() => invalidateCounts.current?.());
+  const onOpeningSaved = useCallback(() => invalidateCounts.current?.(), [invalidateCounts]);
+  const openingEdit = useOpeningEdit(onOpeningSaved);
   const [reviewMarked, setReviewMarked] = useState(null);
   const [reviewOpen, setReviewOpen] = useState(null);
   const [reviewPosition, setReviewPosition] = useState(null);

@@ -28,10 +28,15 @@ export function useOpeningEdit(onSaved) {
   const [error, setError] = useState(null);
   const inFlight = useRef(false);
   useEffect(() => {
-    const refresh = () => setEntry(storedEdit());
+    const refresh = event => {
+      if (event.key !== journalKey) return;
+      const current = storedEdit();
+      setEntry(current);
+      if (current?.state === "accepted") onSaved();
+    };
     window.addEventListener("storage", refresh);
     return () => window.removeEventListener("storage", refresh);
-  }, []);
+  }, [onSaved]);
 
   async function deliver(payload) {
     if (inFlight.current) return;
@@ -82,7 +87,7 @@ export function useOpeningEdit(onSaved) {
         }
       });
     } catch (failure) {
-      if (!accepted) setError({ basis: payload.edit.basis, failure });
+      if (!accepted) setError({ basis: payload.edit.basis, command: payload.command, failure });
     } finally {
       if (accepted) onSaved();
       inFlight.current = false;
@@ -93,8 +98,18 @@ export function useOpeningEdit(onSaved) {
   return { entry, busy, error, deliver };
 }
 
+function editFailure({ entry, error }, address) {
+  if (!error) return null;
+  if (entry?.state === "pending") {
+    return entry.payload.command === error.command ? error : null;
+  }
+  if (entry?.state === "accepted" && entry.payload.command === error.command) return null;
+  return address && addressKey(error.basis.address) === addressKey(address) ? error : null;
+}
+
 export function OpeningEditStatus({ save, card }) {
-  const { entry, busy, error, deliver } = save;
+  const { entry, busy, deliver } = save;
+  const error = editFailure(save, card);
   const pending = entry?.state === "pending";
   const accepted = entry?.state === "accepted" && card &&
     addressKey(entry.payload.edit.basis.address) === addressKey(card);
@@ -129,8 +144,8 @@ function useReviewRead(path, payload, timeout, decode) {
 
 function decodeReview(value, address, card) {
   if (addressKey(value.basis.address) !== addressKey(address) ||
-      value.fen !== card.fen || !card.result.answers.includes(value.saved_move) ||
-      !card.legal.includes(value.saved_move) ||
+      value.fen !== card.fen || !card.result.answers.includes(value.issued_move) ||
+      !card.legal.includes(value.issued_move) ||
       typeof value.repertoire !== "string" || (value.route !== null && typeof value.route !== "string") ||
       !["available", "route_unavailable"].includes(value.editing)) {
     throw new Error("The saved move reply was incomplete.");
@@ -211,8 +226,9 @@ export function StudyMoveReview({ card, boardPosition, save, onClose }) {
   const accepted = save.entry?.state === "accepted" &&
     addressKey(save.entry.payload.edit.basis.address) === addressKey(address);
   const blocked = save.busy || save.entry?.state === "pending" || accepted;
-  const failedSave = view && save.error && basisKey(save.error.basis) === basisKey(view.basis)
-    ? save.error.failure : null;
+  const error = editFailure(save, address);
+  const failedSave = view && error && basisKey(error.basis) === basisKey(view.basis)
+    ? error.failure : null;
   const stale = [engine?.error, similarity?.error, previewError, failedSave]
     .some(error => error?.code === "stale_study_move");
   const boardFen = example && closest ? closest.example.fen : card.fen;
@@ -272,7 +288,7 @@ export function StudyMoveReview({ card, boardPosition, save, onClose }) {
       <button onClick={retryReview}>Reload saved move</button>
     </>}
     {view && !accepted && <>
-      <p><strong>Saved reply {legal.get(view.saved_move)}</strong> · {view.repertoire}</p>
+      <p><strong>{view.editing === "available" ? "Saved reply" : "Study answer"} {legal.get(view.issued_move)}</strong> · {view.repertoire}</p>
       {view.route ? <p>{view.route}</p> : <p>A current saved route could not be verified.</p>}
       <small>Move authorship unknown</small>
       <EvidenceStatus name="Stockfish" state={engine} retry={retryEngine} />
@@ -280,7 +296,7 @@ export function StudyMoveReview({ card, boardPosition, save, onClose }) {
       {best && <p>Stockfish depth {engine.value.depth} · Best {legal.get(best.first_move)} ({evaluation(best.score)})</p>}
       <label>Compare a legal move
         <select value={selected} onChange={event => pick(event.target.value)}>
-          {moves.map(move => <option key={move} value={move}>{legal.get(move)}{move === view.saved_move ? " (saved)" : ""}</option>)}
+          {moves.map(move => <option key={move} value={move}>{legal.get(move)}{move === view.issued_move ? (view.editing === "available" ? " (saved)" : " (studied)") : ""}</option>)}
         </select>
       </label>
       {score && <p>{legal.get(selected)} · {evaluation(score)} (White){loss !== null && ` · ${loss} CP below best`}</p>}
@@ -292,7 +308,7 @@ export function StudyMoveReview({ card, boardPosition, save, onClose }) {
       </div> : similarity?.value?.status === "ready" && <p>No other saved position for this move.</p>}
       {stale && <p role="status">The saved reply or repertoire changed. Reopen the review to load current evidence.</p>}
       <div className="controls">
-        <button disabled={blocked || stale || view.editing !== "available" || preparing || selected === view.saved_move}
+        <button disabled={blocked || stale || view.editing !== "available" || preparing || selected === view.issued_move}
           onClick={() => preview({ kind: "replace", movement: selected })}>Preview replacement</button>
         <button disabled={blocked || stale || view.editing !== "available" || preparing}
           onClick={() => preview({ kind: "remove" })}>Preview removal</button>
@@ -301,8 +317,8 @@ export function StudyMoveReview({ card, boardPosition, save, onClose }) {
       {previewError && <p className="error" role="alert">{previewError.message}</p>}
       {impact && !stale && <section className="gap-confirmation" aria-label="Saved line changes">
         <h3>{impact.edit.action.kind === "remove"
-          ? `Remove ${legal.get(view.saved_move)}`
-          : `Replace ${legal.get(view.saved_move)} with ${legal.get(impact.edit.action.movement)}`}</h3>
+          ? `Remove ${legal.get(view.issued_move)}`
+          : `Replace ${legal.get(view.issued_move)} with ${legal.get(impact.edit.action.movement)}`}</h3>
         <p>{view.repertoire} · {impact.affected} affected {impact.affected === 1 ? "line" : "lines"}</p>
         <ReplacementImpact impact={impact.impact} />
         {impact.over_budget ? <p>This change exceeds the atomic save limit.</p> :

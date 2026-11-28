@@ -74,8 +74,8 @@ function grade(db) {
   return Number(sql(db, "SELECT count(*) FROM attempts WHERE result IS NOT NULL"));
 }
 
-async function seed(db, api, label) {
-  const { id } = await api("openings", { name: label || "Original", color: "white",
+async function seed(db, api) {
+  const { id } = await api("openings", { name: "Original", color: "white",
     route: { fen: "", moves: ["e2e4", "e7e5", "g1f3"] } });
   await api("openings", { name: "Other context", color: "white", start_at: 2,
     destination: { kind: "existing", repertoire_id: id },
@@ -83,7 +83,6 @@ async function seed(db, api, label) {
   const card = sql(db, `SELECT id FROM cards WHERE repertoire_id=${literal(id)}
     AND fen LIKE 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR %'`);
   assert.ok(card);
-  if (label === "") sql(db, `UPDATE cards SET title='' WHERE id=${literal(card)}`, false);
   focus(db, card);
   return card;
 }
@@ -97,12 +96,15 @@ async function play(page, uci) {
   }
 }
 
-async function studyJourney(browser, { label, action, phone, native }) {
+async function studyJourney(browser, { baseline, label, action, phone, native, remove = false }) {
   const db = path.join(root, `journey-${crypto.randomUUID().slice(0, 8)}.db`);
+  fs.copyFileSync(baseline, db);
+  sql(db, `UPDATE cards SET title=${literal(label)} WHERE id=(SELECT a.card_id FROM study s
+    JOIN attempts a ON a.id=s.active)`, false);
   const page = await browser.newPage({ viewport: phone ? { width: 390, height: 844 } : { width: 1200, height: 850 } });
   try {
     return await server(candidate, db, await port(), async (origin, api, request) => {
-      const cardId = await seed(db, api, label);
+      const cardId = sql(db, "SELECT a.card_id FROM study s JOIN attempts a ON a.id=s.active");
       const card = await api("study");
       const address = { dataset: card.dataset, attempt: card.attempt };
       assert.equal((await request(editPath, address)).status, 409);
@@ -110,6 +112,10 @@ async function studyJourney(browser, { label, action, phone, native }) {
       page.on("request", req => {
         if (req.method() === "POST") commands.push([new URL(req.url()).pathname.slice(5), req.postDataJSON()]);
       });
+      if (remove) {
+        await page.route("**/api/" + editPath + "/evidence", route =>
+          route.request().postDataJSON().source === "similarity" ? route.abort() : route.continue());
+      }
       await page.goto(origin);
       await button(page, "Review after answer").click();
       assert.deepEqual(commands, []);
@@ -118,15 +124,13 @@ async function studyJourney(browser, { label, action, phone, native }) {
       await page.getByRole("heading", { name: "Review repertoire move" }).waitFor();
       await study(page, action === "good" ? "Good" : "Again");
       await page.getByText("Saved reply e4", { exact: true }).waitFor();
-      try {
-        await page.getByText("Closest other saved position", { exact: false }).waitFor({ timeout: 5000 });
-      } catch (error) {
-        const diagnostic = await api(editPath, address).then(view =>
-          request(editPath + "/evidence", { basis: view.basis, source: "similarity" }));
-        throw new Error(await page.locator(".study-move-review").innerText() + "\n" + JSON.stringify(diagnostic), { cause: error });
+      if (remove) {
+        await button(page, "Retry similar saved positions").waitFor();
+      } else {
+        await page.getByText("Closest other saved position", { exact: false }).waitFor({ timeout: 7000 });
+        await button(page, "Show closest saved position").click();
+        await button(page, "Show Study position").click();
       }
-      await button(page, "Show closest saved position").click();
-      await button(page, "Show Study position").click();
       if (native && worker) {
         await page.getByText("Stockfish depth 10", { exact: false }).waitFor();
         assert.equal(await page.getByLabel("Compare a legal move").locator("option").count(), 20);
@@ -138,7 +142,14 @@ async function studyJourney(browser, { label, action, phone, native }) {
       assert.equal((await api("study")).attempt, card.attempt);
       assert.equal(commands.filter(([kind]) => kind === "study/next").length, 0);
       assert.equal(grade(db), 1);
-      if (!native) {
+      if (remove) {
+        await button(page, "Preview removal").click();
+        await page.getByRole("heading", { name: "Remove e4" }).waitFor();
+        await button(page, "Confirm removal").click();
+        await study(page, "Move removed");
+        assert.equal(grade(db), 1);
+        assert.equal(sql(db, `SELECT opening_retired FROM cards WHERE id=${literal(cardId)}`), "1");
+      } else if (!native) {
         await button(page, "Close review").click();
         await button(page, "Review move").click();
         await page.getByText("Saved reply e4", { exact: true }).waitFor();
@@ -168,10 +179,16 @@ async function studyJourney(browser, { label, action, phone, native }) {
         await button(page, "Confirm replacement").click();
         await button(page, "Retry same repertoire save").waitFor();
         assert.ok(sent?.command);
-        await page.reload();
-        const replay = page.waitForRequest(req => req.url().endsWith("/apply"));
-        await button(page, "Retry same repertoire save").click();
+        const other = await page.context().newPage();
+        await other.goto(origin);
+        const replay = other.waitForRequest(req => req.url().endsWith("/apply"));
+        await button(other, "Retry same repertoire save").click();
         assert.deepEqual((await replay).postDataJSON(), sent);
+        await study(other, "Replacement saved");
+        await study(page, "Replacement saved");
+        assert.equal(await page.locator(".study-panel [role=alert]").count(), 0);
+        await other.close();
+        await page.reload();
         await study(page, "Replacement saved");
         assert.equal(sql(db, "SELECT count(*) FROM gap_save_receipt"), "1");
         assert.equal(sql(db, "SELECT result FROM attempts WHERE result IS NOT NULL"), results);
@@ -179,9 +196,45 @@ async function studyJourney(browser, { label, action, phone, native }) {
         assert.equal(sql(db, `SELECT opening_retired FROM cards WHERE id=${literal(cardId)}`), "1");
         assert.equal(sql(db, "SELECT count(*) FROM active_cards WHERE answers='[\"d2d4\"]'"), "1");
       }
-      return sql(db, `SELECT id,card_id,result FROM attempts WHERE result IS NOT NULL;
-        SELECT card_id,stability,difficulty,due_at-last_at FROM learning;`);
+      return {
+        commands: commands.filter(([kind]) => ["study/answer", "study/next"].includes(kind)),
+        effects: sql(db, `SELECT id,card_id,result FROM attempts WHERE result IS NOT NULL;
+          SELECT card_id,stability,difficulty,due_at-last_at FROM learning;`),
+      };
     }, native);
+  } finally { await page.context().close(); }
+}
+
+async function unmarkedAndNoRoute(browser, baseline) {
+  const db = path.join(root, "unmarked.db");
+  fs.copyFileSync(baseline, db);
+  const page = await browser.newPage();
+  try {
+    await server(candidate, db, await port(), async (origin, api) => {
+      const first = await api("study");
+      await page.goto(origin);
+      await button(page, "Review after answer").waitFor();
+      const automatic = page.waitForRequest(req => req.url().endsWith("/api/study/next"));
+      await play(page, "e2e4");
+      assert.deepEqual((await automatic).postDataJSON(), { dataset: first.dataset, after: first.attempt });
+      assert.equal(await page.getByRole("heading", { name: "Review repertoire move" }).count(), 0);
+      assert.equal(grade(db), 1);
+      const rootCard = sql(db, "SELECT card_id FROM attempts WHERE result IS NOT NULL");
+      focus(db, rootCard);
+      // Simulate a retained card whose repertoire no longer has an authored route.
+      sql(db, "UPDATE openings SET archived=1", false);
+      await page.reload();
+      await button(page, "Reveal answer").click();
+      await button(page, "Review move").click();
+      await page.getByText("Study answer e4", { exact: true }).waitFor();
+      assert.equal(await page.getByText("Saved reply e4", { exact: true }).count(), 0);
+      assert.equal(await button(page, "Preview removal").isEnabled(), false);
+      const { id } = await api("tactics", { name: "Tactic fixture", pgn: "1. a3 a6 1-0" });
+      focus(db, id);
+      await page.reload();
+      await button(page, "Reveal answer").waitFor();
+      assert.equal(await button(page, "Review after answer").count(), 0);
+    });
   } finally { await page.context().close(); }
 }
 
@@ -222,14 +275,18 @@ async function predecessorAnswer(browser, accepted) {
 (async () => {
   const browser = await chromium.launch({ executablePath: process.env.TEMPO_QUALIFY_CHROME });
   try {
-    await studyJourney(browser, { label: "Saved line", action: "good", native: true });
+    const baseline = path.join(root, "baseline.db");
+    await server(candidate, baseline, await port(), (_, api) => seed(baseline, api));
+    await studyJourney(browser, { baseline, label: "Saved line", action: "good", native: true });
     const results = [];
     for (const label of ["Original", "Renamed", ""]) {
-      results.push(await studyJourney(browser, { label, action: "reveal", phone: label === "" }));
+      results.push(await studyJourney(browser, { baseline, label, action: "reveal", phone: label === "" }));
     }
-    // Content identities are derived from route semantics even if presentational titles differ.
+    // Cloned dataset, attempt and repertoire identities make the title-only comparison exact.
     assert.deepEqual(results.slice(1), [results[0], results[0]]);
-    await studyJourney(browser, { label: "Wrong answer", action: "wrong", phone: true });
+    await studyJourney(browser, { baseline, label: "Wrong answer", action: "wrong", phone: true });
+    await studyJourney(browser, { baseline, label: "Manual removal", action: "reveal", remove: true });
+    await unmarkedAndNoRoute(browser, baseline);
     if (predecessor && retained) {
       for (const accepted of [true, false]) await predecessorAnswer(browser, accepted);
     }
