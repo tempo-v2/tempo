@@ -140,7 +140,8 @@ pub fn submit(
     let digest = blake3::hash(&serde_json::to_vec(&response)?)
         .to_hex()
         .to_string();
-    let db = capture(path)?;
+    let read_limit = Instant::now() + READ_BUDGET;
+    let db = capture_before(path, read_limit)?;
     let tx = db.unchecked_transaction()?;
     let Some(ticket) = Ticket::load(&tx, &id)? else {
         return Ok(Delivery::Stale);
@@ -163,6 +164,15 @@ pub fn submit(
     {
         return Ok(Delivery::Stale);
     }
+    let remaining = ticket
+        .apply_expires
+        .unwrap_or(ticket.expires)
+        .saturating_sub(now);
+    let read_limit = read_limit.min(Instant::now() + Duration::from_secs(remaining.max(0) as u64));
+    if Instant::now() >= read_limit {
+        return Ok(Delivery::Stale);
+    }
+    limit_capture(&tx, read_limit);
     let Some(today) = day(&tx, &ticket.day)? else {
         return Ok(Delivery::Stale);
     };
@@ -184,6 +194,9 @@ pub fn submit(
     }
     let saved_order = saved_opening_order(&tx, &today, &snapshot_clock)?;
     tx.commit()?;
+    if Instant::now() >= read_limit {
+        return Ok(Delivery::Stale);
+    }
     let basis = format!("{}:{}:{}", ticket.dataset, ticket.day, ticket.authoring);
     if response.profile != ticket.profile
         || response.basis != basis

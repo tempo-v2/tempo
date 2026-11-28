@@ -947,8 +947,12 @@ fn capture_before(path: &Path, limit: Instant) -> Result<Connection> {
     let deadline = limit.min(Instant::now() + READ_BUDGET);
     ensure!(Instant::now() < deadline, crate::writer::Unavailable);
     let db = Database::read_with_busy_timeout(path, Duration::ZERO)?;
-    db.progress_handler(1000, Some(move || Instant::now() >= deadline));
+    limit_capture(&db, deadline);
     Ok(db)
+}
+
+fn limit_capture(db: &Connection, deadline: Instant) {
+    db.progress_handler(1000, Some(move || Instant::now() >= deadline));
 }
 
 #[cfg(test)]
