@@ -399,7 +399,7 @@ async fn preview_opening(request: Request) -> Response {
     };
     let request = match buffer_pgn(request, deadline).await {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let runtime = tokio::runtime::Handle::current();
     let reply = run_preview(permit, deadline, move || {
@@ -860,25 +860,37 @@ async fn receive_pgn(State(slot): State<Arc<Semaphore>>, request: Request, next:
                 .insert(PgnReceiveDeadline(deadline));
             next.run(request).await
         }
-        Err(response) => response,
+        Err(error) => error.into_response(),
     }
 }
 
-async fn buffer_pgn(request: Request, deadline: Instant) -> Result<Request, Response> {
-    fn too_large() -> Response {
-        (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({
-                "code": "pgn_payload_too_large",
-                "error": "The PGN request exceeds the size limit."
-            })),
-        )
-            .into_response()
-    }
+enum PgnBufferError {
+    TooLarge,
+    Transport,
+    Timeout,
+}
 
+impl IntoResponse for PgnBufferError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::TooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "code": "pgn_payload_too_large",
+                    "error": "The PGN request exceeds the size limit."
+                })),
+            )
+                .into_response(),
+            Self::Transport => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            Self::Timeout => StatusCode::REQUEST_TIMEOUT.into_response(),
+        }
+    }
+}
+
+async fn buffer_pgn(request: Request, deadline: Instant) -> Result<Request, PgnBufferError> {
     let (parts, body) = request.into_parts();
     if axum::body::HttpBody::size_hint(&body).lower() > PGN_BODY_LIMIT as u64 {
-        return Err(too_large());
+        return Err(PgnBufferError::TooLarge);
     }
     let bytes =
         match tokio::time::timeout_at(deadline.into(), axum::body::to_bytes(body, PGN_BODY_LIMIT))
@@ -889,10 +901,10 @@ async fn buffer_pgn(request: Request, deadline: Instant) -> Result<Request, Resp
                 if std::error::Error::source(&error)
                     .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
             {
-                return Err(too_large());
+                return Err(PgnBufferError::TooLarge);
             }
-            Ok(Err(_)) => return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response()),
-            Err(_) => return Err(StatusCode::REQUEST_TIMEOUT.into_response()),
+            Ok(Err(_)) => return Err(PgnBufferError::Transport),
+            Err(_) => return Err(PgnBufferError::Timeout),
         };
     Ok(Request::from_parts(parts, axum::body::Body::from(bytes)))
 }
