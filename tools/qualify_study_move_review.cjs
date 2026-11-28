@@ -102,7 +102,8 @@ async function studyJourney(browser, { baseline, label, action, phone, native, r
   backup(baseline, db);
   sql(db, `UPDATE cards SET title=${literal(label)} WHERE id=(SELECT a.card_id FROM study s
     JOIN attempts a ON a.id=s.active)`, false);
-  const page = await browser.newPage({ viewport: phone ? { width: 390, height: 844 } : { width: 1200, height: 850 } });
+  const context = await browser.newContext({ viewport: phone ? { width: 390, height: 844 } : { width: 1200, height: 850 } });
+  const page = await context.newPage();
   try {
     return await server(candidate, db, await port(), async (origin, api, request) => {
       const cardId = sql(db, "SELECT a.card_id FROM study s JOIN attempts a ON a.id=s.active");
@@ -180,7 +181,7 @@ async function studyJourney(browser, { baseline, label, action, phone, native, r
         await button(page, "Confirm replacement").click();
         await button(page, "Retry same repertoire save").waitFor();
         assert.ok(sent?.command);
-        const other = await page.context().newPage();
+        const other = await context.newPage();
         await other.goto(origin);
         const replay = other.waitForRequest(req => req.url().endsWith("/apply"));
         await button(other, "Retry same repertoire save").click();
