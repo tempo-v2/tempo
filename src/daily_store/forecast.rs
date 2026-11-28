@@ -30,12 +30,17 @@ impl Ticket {
     }
 
     fn current(&self, db: &Connection) -> Result<bool> {
-        let clock = clock(db)?;
-        Ok(clock.current_day.as_ref() == Some(&self.day)
-            && day_at(Utc::now().timestamp())? == self.day
-            && clock.authoring == self.authoring
-            && clock.last_order == self.saved_order
-            && db::dataset(db)? == self.dataset)
+        if day_at(Utc::now().timestamp())? != self.day {
+            return Ok(false);
+        }
+        Ok(db
+            .query_row(
+                "SELECT current_day=?1 AND authoring=?2 AND last_order_day IS ?3
+                AND (SELECT dataset FROM metadata)=?4 FROM daily_clock",
+                (&self.day, self.authoring, &self.saved_order, &self.dataset),
+                |r| r.get::<_, Option<bool>>(0),
+            )?
+            .unwrap_or(false))
     }
 
     fn applying(&self, db: &Connection, digest: &str) -> Result<bool> {
@@ -73,36 +78,29 @@ pub fn claim_today(
     let key = day_at(admitted)?;
     let db = capture_before(path, budget)?;
     let tx = db.unchecked_transaction()?;
-    let clock = clock(&tx)?;
-    let Some(day) = day(&tx, &key)? else {
+    let Some((dataset, authoring, saved_order)) = tx
+        .query_row(
+            "SELECT (SELECT dataset FROM metadata), c.authoring, c.last_order_day
+         FROM daily_day d CROSS JOIN daily_clock c
+         WHERE d.day=?1 AND c.current_day=d.day AND d.mode='maia' AND d.fresh_order=0
+           AND d.forecast_finished=0 AND NOT EXISTS(SELECT 1 FROM forecast_claim WHERE day=d.day)",
+            [&key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+    else {
         return Ok(None);
     };
-    if clock.current_day.as_ref() != Some(&key)
-        || day.mode != "maia"
-        || day.fresh
-        || day.forecast_finished
-        || tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM forecast_claim WHERE day=?1)",
-            [&key],
-            |r| r.get::<_, bool>(0),
-        )?
-    {
-        return Ok(None);
-    }
-    let dataset = db::dataset(&tx)?;
-    let snapshot = authored_rows(&tx, &day, &clock, Projection::Forecast)?;
     tx.commit()?;
-    let request = snapshot.compile(|| Instant::now() >= budget)?.request();
-    daily_forecast::check_request_size(&request)?;
     let expires = admitted + daily_forecast::BUDGET.as_secs() as i64;
     let id = format!("{:032x}", rand::random::<u128>());
     let ticket = Ticket {
-        id: id.clone(),
+        id,
         dataset,
         day: key,
-        authoring: clock.authoring,
+        authoring,
         profile: profile.to_owned(),
-        saved_order: clock.last_order,
+        saved_order,
         expires,
         digest: None,
         apply_expires: None,
@@ -111,7 +109,7 @@ pub fn claim_today(
     let claimed = writer.forecast(budget, move |db| {
         let tx = db.transaction_with_behavior(Immediate)?;
         if !ticket.current(&tx)? || Utc::now().timestamp() >= ticket.expires {
-            return Ok(false);
+            return Ok(None);
         }
         let added = tx.execute(
             "INSERT INTO forecast_claim(day,ticket,dataset,authoring,profile,saved_order_day,expires)
@@ -121,11 +119,51 @@ pub fn claim_today(
             params![ticket.day,ticket.id,ticket.dataset,ticket.authoring,ticket.profile,ticket.saved_order,ticket.expires],
         )?;
         tx.commit()?;
-        Ok(added == 1)
+        Ok((added == 1).then_some(ticket))
     })?;
-    Ok(claimed.then_some(Claim {
-        ticket: id,
-        expires,
+    let Some(ticket) = claimed else {
+        return Ok(None);
+    };
+
+    let result = materialize_claim(path, &ticket, budget);
+    if !matches!(result, Ok(Some(_))) {
+        // The day stays claimed even when this optional status write cannot be admitted.
+        let _ = writer.forecast(budget, move |db| {
+            let tx = db.transaction_with_behavior(Immediate)?;
+            ticket.finish(&tx, "without_rank")?;
+            tx.commit()?;
+            Ok(())
+        });
+    }
+    result
+}
+
+fn materialize_claim(path: &Path, ticket: &Ticket, budget: Instant) -> Result<Option<Claim>> {
+    let db = capture_before(path, budget)?;
+    let tx = db.unchecked_transaction()?;
+    let ready = |db: &Connection| {
+        Ok::<_, anyhow::Error>(
+            Instant::now() < budget
+                && Utc::now().timestamp() < ticket.expires
+                && ticket.current(db)?,
+        )
+    };
+    if !ready(&tx)? {
+        return Ok(None);
+    }
+    let Some(day) = day(&tx, &ticket.day)? else {
+        return Ok(None);
+    };
+    let snapshot = authored_rows(&tx, &day, &clock(&tx)?, Projection::Forecast)?;
+    tx.commit()?;
+    let request = snapshot.compile(|| Instant::now() >= budget)?.request();
+    daily_forecast::check_request_size(&request)?;
+    let tx = db.unchecked_transaction()?;
+    let current = ready(&tx)?;
+    tx.commit()?;
+    Ok(current.then(|| Claim {
+        ticket: ticket.id.clone(),
+        expires: ticket.expires,
         request,
     }))
 }
@@ -176,6 +214,9 @@ pub fn submit(
     let Some(today) = day(&tx, &ticket.day)? else {
         return Ok(Delivery::Stale);
     };
+    let Some(staged_offset) = staged_order(&tx, &ticket.day)? else {
+        return Ok(Delivery::Stale);
+    };
     let snapshot_clock = clock(&tx)?;
     let mut keys = Vec::new();
     let mut bytes = 0;
@@ -210,7 +251,10 @@ pub fn submit(
         return Ok(Delivery::Stale);
     }
     let expiry = ticket.apply_expires.unwrap_or(now + 60);
-    let deadline = Instant::now() + Duration::from_secs(expiry.saturating_sub(now) as u64);
+    let Some(remaining) = expiry.checked_sub(now).filter(|remaining| *remaining > 0) else {
+        return Ok(Delivery::Stale);
+    };
+    let deadline = Instant::now() + Duration::from_secs(remaining as u64);
     let no_rank = !response
         .scores
         .values()
@@ -229,7 +273,7 @@ pub fn submit(
 
     let ordered = order_openings(keys, &saved_order, Some(&response));
     let total = ordered.len();
-    let mut offset = today.order_staged;
+    let mut offset = staged_offset;
     ensure!(offset <= total, "Forecast stage exceeds claimed rank");
     for keys in ordered[offset..].chunks(BATCH) {
         let keys = keys.to_vec();
@@ -270,19 +314,50 @@ pub fn submit(
         if !ticket.applying(&tx, &digest)? {
             return Ok(Delivery::Stale);
         }
-        let ready: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM daily_day d CROSS JOIN daily_clock c
-             WHERE d.day=?1 AND d.openings_version=c.openings AND d.mode='maia')",
-            [&ticket.day],
-            |r| r.get(0),
-        )?;
-        if !ready || !publish_slots(&tx, &day, &draft, Some(total))? {
+        if !publish_fresh_order(&tx, &day, &draft, total)? {
             return Ok(Delivery::Busy);
         }
         ticket.finish(&tx, "published")?;
         tx.commit()?;
         Ok(Delivery::Published)
     })
+}
+
+fn staged_order(db: &Connection, key: &str) -> Result<Option<usize>> {
+    Ok(db
+        .query_row(
+            "SELECT order_staged FROM daily_day WHERE day=?1",
+            [key],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub(super) fn publish_fresh_order(
+    tx: &Connection,
+    day: &Day,
+    draft: &Draft,
+    total: usize,
+) -> Result<bool> {
+    let ready: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM daily_day d CROSS JOIN daily_clock c
+         WHERE d.day=?1 AND d.openings_version=c.openings AND d.mode='maia'
+           AND d.fresh_order=0 AND d.order_staged=?2)",
+        (&day.key, total),
+        |r| r.get(0),
+    )?;
+    if !ready || !publish_slots(tx, day, draft)? {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE daily_day SET fresh_order=1,order_profile=?2 WHERE day=?1",
+        (&day.key, daily_forecast::PROFILE),
+    )?;
+    tx.execute(
+        "UPDATE daily_clock SET last_order_day=?1 WHERE last_order_day IS NULL OR last_order_day<=?1",
+        [&day.key],
+    )?;
+    Ok(true)
 }
 
 fn accept_result(
@@ -332,9 +407,7 @@ fn stage(
     let Some(ticket) = Ticket::load(&tx, id)? else {
         return Ok(false);
     };
-    if !ticket.applying(&tx, digest)?
-        || day(&tx, &ticket.day)?.is_none_or(|today| today.order_staged != offset)
-    {
+    if !ticket.applying(&tx, digest)? || staged_order(&tx, &ticket.day)? != Some(offset) {
         return Ok(false);
     }
     write_rank_batch(&tx, &ticket.day, offset, keys)?;
