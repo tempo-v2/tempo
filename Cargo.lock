@@ -1525,6 +1525,7 @@ dependencies = [
  "chrono-tz",
  "fs2",
  "fsrs",
+ "http-body-util",
  "pgn-reader",
  "rand 0.9.5",
  "reqwest",

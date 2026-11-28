@@ -297,52 +297,49 @@ export function Openings({ fromGame, onSaved, sounds }) {
   </section>;
 }
 
-export function Tactics({ openGame, sounds }) {
+export function Tactics({ openGame, sounds, openCapture, captured }) {
   const [page, setPage] = useState("packs");
   return <section aria-label="Tactics">
     <h1>Tactics</h1>
     <div className="controls">
       <button aria-pressed={page === "packs"} onClick={() => setPage("packs")}>Packs</button>
       <button aria-pressed={page === "library"} onClick={() => setPage("library")}>Puzzle library</button>
+      <button className="primary" onClick={openCapture}>Capture</button>
     </div>
-    {page === "packs" ? <TacticPacks sounds={sounds} /> : <TacticLibrary openGame={openGame} sounds={sounds} />}
+    {page === "packs" ? <TacticPacks sounds={sounds} /> : <TacticLibrary openGame={openGame} sounds={sounds} captured={captured} />}
   </section>;
 }
 
-function TacticLibrary({ openGame, sounds }) {
+function TacticLibrary({ openGame, sounds, captured }) {
   const list = useList("tactics");
-  const [name, setName] = useState("");
-  const [pgn, setPgn] = useState("");
-  const [problem, setProblem] = useState(null);
+  const [problem, setProblem] = useState(captured);
   const [ply, setPly] = useState(0);
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  async function save(event) {
-    event.preventDefault();
-    setError("");
-    setBusy(true);
-    try { await api("tactics", { name, pgn }); setPgn(""); setName(""); await list.load(); }
-    catch (error) { setError(error.message); }
-    finally { setBusy(false); }
-  }
+  const load = list.load;
+  useEffect(() => {
+    if (!captured) return;
+    setProblem(captured);
+    setPly(0);
+    void load();
+  }, [captured, load]);
+
   return <section aria-label="Puzzle library">
     <div className="split">
       <div>{problem && <>
         <h2>{problem.name}</h2>
         <Replay sounds={sounds} route={problem.route} color={position(problem.route, 0).turn() === "w" ? "white" : "black"} ply={ply} onPly={setPly} />
+        {problem.source_url && <a href={problem.source_url} target="_blank" rel="noreferrer">
+          {problem.source_url.startsWith("https://lichess.org/") ? "Open on Lichess" : "Open on Chess.com"}
+        </a>}
         {problem.source_game && <button onClick={() => openGame(problem.source_game, problem.source_ply)}>View source game</button>}
       </>}</div>
-      <div><form onSubmit={save}>
-        <label>Puzzle name<input value={name} required maxLength={160} onChange={(e) => setName(e.target.value)} /></label>
-        <label>Puzzle PGN<textarea required placeholder="PGN starting at the solver’s turn" value={pgn} onChange={(e) => setPgn(e.target.value)} /></label>
-        <label>Upload puzzle PGN<input type="file" accept=".pgn,text/plain" onChange={(e) => fileText(e, setPgn, setError)} /></label>
-        <button className="primary" disabled={busy}>Add puzzle</button>
-      </form>
-      {error && <p className="error" role="alert">{error}</p>}
-      <h2>Puzzle library</h2>
-      {!list.rows.length && <p>No puzzles saved yet.</p>}
-      <ul className="items">{list.rows.map((row) => <li key={row.id}><button onClick={() => { setProblem(row); setPly(0); }}>{row.name}</button></li>)}</ul>
-      <More list={list} /></div>
+      <div>
+        <h2>Puzzle library</h2>
+        {!list.rows.length && <p>No puzzles saved yet.</p>}
+        <ul className="items">{list.rows.map((row) => <li key={row.id}>
+          <button onClick={() => { setProblem(row); setPly(0); }}>{row.name}</button>
+        </li>)}</ul>
+        <More list={list} />
+      </div>
     </div>
   </section>;
 }

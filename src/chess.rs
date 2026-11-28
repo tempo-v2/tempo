@@ -183,6 +183,66 @@ struct Parser {
     max_expanded_work: Option<usize>,
 }
 
+fn record_pgn_tag(tags: &mut BTreeMap<String, String>, key: &[u8], value: RawTag<'_>) {
+    if let Ok(key) = std::str::from_utf8(key)
+        && [
+            "White",
+            "Black",
+            "Result",
+            "FEN",
+            "Variant",
+            "UTCDate",
+            "UTCTime",
+            "Date",
+            "Round",
+            "Site",
+            "Link",
+            "Event",
+            "ChapterURL",
+            "ChapterName",
+        ]
+        .contains(&key)
+    {
+        tags.insert(key.to_owned(), value.decode_utf8_lossy().into_owned());
+    }
+}
+
+struct TagsOnly;
+
+impl Visitor for TagsOnly {
+    type Tags = BTreeMap<String, String>;
+    type Movetext = std::convert::Infallible;
+    type Output = Self::Tags;
+
+    fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
+        ControlFlow::Continue(BTreeMap::new())
+    }
+
+    fn tag(
+        &mut self,
+        tags: &mut Self::Tags,
+        key: &[u8],
+        value: RawTag<'_>,
+    ) -> ControlFlow<Self::Output> {
+        record_pgn_tag(tags, key, value);
+        ControlFlow::Continue(())
+    }
+
+    fn begin_movetext(&mut self, tags: Self::Tags) -> ControlFlow<Self::Output, Self::Movetext> {
+        ControlFlow::Break(tags)
+    }
+
+    fn end_game(&mut self, movetext: Self::Movetext) -> Self::Output {
+        match movetext {}
+    }
+}
+
+pub fn read_pgn_tags(input: impl Read) -> Result<BTreeMap<String, String>> {
+    Ok(Reader::new(input)
+        .read_game(&mut TagsOnly)?
+        .unwrap_or_default())
+}
+
 impl Visitor for Parser {
     type Tags = BTreeMap<String, String>;
     type Movetext = Movetext;
@@ -198,15 +258,7 @@ impl Visitor for Parser {
         key: &[u8],
         value: RawTag<'_>,
     ) -> ControlFlow<Self::Output> {
-        if let Ok(key) = std::str::from_utf8(key)
-            && [
-                "White", "Black", "Result", "FEN", "Variant", "UTCDate", "UTCTime", "Date",
-                "Round", "Site", "Link", "Event",
-            ]
-            .contains(&key)
-        {
-            tags.insert(key.to_owned(), value.decode_utf8_lossy().into_owned());
-        }
+        record_pgn_tag(tags, key, value);
         ControlFlow::Continue(())
     }
 

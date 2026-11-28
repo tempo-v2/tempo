@@ -5,7 +5,7 @@ CREATE TABLE openings (
 ) STRICT;
 CREATE TABLE tactics (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, route TEXT NOT NULL,
-  game_id TEXT, game_ply INTEGER
+  game_id TEXT, game_ply INTEGER, source_url TEXT
 ) STRICT;
 CREATE TABLE cards (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('opening','tactic')),
