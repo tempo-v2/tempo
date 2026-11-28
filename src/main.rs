@@ -33,6 +33,7 @@ mod review;
 mod scanner;
 mod study;
 mod study_store;
+mod tactic_capture;
 mod tactic_import;
 mod tactic_qualification;
 mod tactic_worker_protocol;
@@ -98,6 +99,16 @@ type ApiResult = std::result::Result<Json<Value>, ApiError>;
 struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Some(error) = self.0.downcast_ref::<tactic_capture::Rejected>() {
+            use tactic_capture::Rejected::*;
+            let (status, code) = match error {
+                Invalid(_) => (StatusCode::BAD_REQUEST, "capture_invalid"),
+                Lookup(_) => (StatusCode::BAD_GATEWAY, "capture_lookup_failed"),
+                Dataset => (StatusCode::CONFLICT, "capture_dataset_changed"),
+                Conflict => (StatusCode::CONFLICT, "capture_conflict"),
+            };
+            return (status, Json(json!({"code":code,"error":error.to_string()}))).into_response();
+        }
         if let Some(error) = self.0.downcast_ref::<repertoire_similarity::Error>() {
             use repertoire_similarity::Error::*;
             let (status, message) = match error {
@@ -493,6 +504,80 @@ async fn save_tactic(State(db): State<App>, Json(input): Json<tactic_import::Inp
     write_db(db, move |c| {
         let puzzle = apply_puzzle(c, &prepared)?;
         Ok(json!({"id":puzzle.id,"puzzle":puzzle}))
+    })
+    .await
+}
+
+async fn capture_context(State(app): State<App>) -> ViewResult {
+    optional_view(app, optional_read::Reader::CaptureContext, |db| {
+        Ok(json!({"dataset":db::dataset(db)?}))
+    })
+    .await
+}
+
+async fn save_pgn_capture(
+    State(app): State<App>,
+    Json(command): Json<tactic_capture::Command<tactic_import::Input>>,
+) -> ApiResult {
+    let database = app.database.clone();
+    let prepared = prepare(
+        &app.content_preparation,
+        || ApiError(writer::Unavailable.into()),
+        move || {
+            let key = command.key("capture-pgn-v1")?;
+            if let Some(reply) = key.delivered(&database)? {
+                return Ok(Err(reply));
+            }
+            let puzzle = tactic_import::prepare(command.input)
+                .map_err(|error| tactic_capture::Rejected::Invalid(error.to_string()))?;
+            Ok(Ok((key, puzzle)))
+        },
+    )
+    .await?;
+    match prepared {
+        Ok((key, puzzle)) => write_db(app, move |db| key.apply(db, &puzzle)).await,
+        Err(reply) => Ok(Json(reply)),
+    }
+}
+
+static LICHESS_CAPTURE: Semaphore = Semaphore::const_new(1);
+
+async fn save_lichess_capture(
+    State(app): State<App>,
+    Json(command): Json<tactic_capture::Command<tactic_capture::LichessInput>>,
+) -> ApiResult {
+    let permit = LICHESS_CAPTURE
+        .try_acquire()
+        .map_err(|_| ApiError(writer::Unavailable.into()))?;
+    let deadline = Instant::now() + tactic_capture::LOOKUP_DEADLINE;
+    let key = command.key("capture-lichess-id-v1").map_err(ApiError)?;
+    let database = app.database.clone();
+    let (key, reply) = prepare(
+        &app.content_preparation,
+        || ApiError(writer::Unavailable.into()),
+        move || {
+            let reply = key.delivered(&database)?;
+            Ok((key, reply))
+        },
+    )
+    .await?;
+    if let Some(reply) = reply {
+        return Ok(Json(reply));
+    }
+    let puzzle = tokio::time::timeout_at(
+        deadline.into(),
+        tactic_capture::download_lichess(&command.input),
+    )
+    .await
+    .map_err(|_| {
+        ApiError(
+            tactic_capture::Rejected::Lookup("Lichess lookup timed out. Try again.".into()).into(),
+        )
+    })?
+    .map_err(ApiError)?;
+    write_db(app, move |db| {
+        let _permit = permit;
+        key.apply(db, &puzzle)
     })
     .await
 }
@@ -939,9 +1024,15 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             post(preview_opening).layer(pgn_body_limit),
         )
         .route("/api/tactics", get(tactics))
+        .route("/api/tactics/capture-context", get(capture_context))
+        .route(
+            "/api/tactics/capture/lichess",
+            post(save_lichess_capture).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         .merge(
             Router::new()
                 .route("/api/tactics", post(save_tactic))
+                .route("/api/tactics/capture", post(save_pgn_capture))
                 .route("/api/tactics/import-options", post(puzzle_import_options))
                 .layer(pgn_body_limit)
                 .layer(middleware::from_fn_with_state(

@@ -297,149 +297,49 @@ export function Openings({ fromGame, onSaved, sounds }) {
   </section>;
 }
 
-export function Tactics({ openGame, sounds }) {
+export function Tactics({ openGame, sounds, openCapture, captured }) {
   const [page, setPage] = useState("packs");
   return <section aria-label="Tactics">
     <h1>Tactics</h1>
     <div className="controls">
       <button aria-pressed={page === "packs"} onClick={() => setPage("packs")}>Packs</button>
       <button aria-pressed={page === "library"} onClick={() => setPage("library")}>Puzzle library</button>
+      <button className="primary" onClick={openCapture}>Capture</button>
     </div>
-    {page === "packs" ? <TacticPacks sounds={sounds} /> : <TacticLibrary openGame={openGame} sounds={sounds} />}
+    {page === "packs" ? <TacticPacks sounds={sounds} /> : <TacticLibrary openGame={openGame} sounds={sounds} captured={captured} />}
   </section>;
 }
 
-function TacticLibrary({ openGame, sounds }) {
+function TacticLibrary({ openGame, sounds, captured }) {
   const list = useList("tactics");
-  const [name, setName] = useState("");
-  const [pgn, setPgn] = useState("");
-  const [puzzleUrl, setPuzzleUrl] = useState("");
-  const [formatChoice, setFormatChoice] = useState(null);
-  const [setupChoice, setSetupChoice] = useState(null);
-  const [detection, setDetection] = useState(null);
-  const [detectionRetry, setDetectionRetry] = useState(0);
-  const [problem, setProblem] = useState(null);
+  const [problem, setProblem] = useState(captured);
   const [ply, setPly] = useState(0);
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [readingFile, setReadingFile] = useState(false);
-  const fileRead = useRef(null);
-
-  const currentDetection = detection?.pgn === pgn && detection.puzzleUrl === puzzleUrl
-    && detection.retry === detectionRetry ? detection : null;
-  const format = formatChoice ?? currentDetection?.options?.format ?? "generic_pgn";
-  const setup = setupChoice ?? (format === "chess_com_puzzle");
-  const hasSetupChoice = formatChoice !== null || setupChoice !== null;
-  const ready = currentDetection?.options || (currentDetection?.error && hasSetupChoice);
-  const canSave = Boolean(pgn.trim() && ready && !readingFile && !busy);
-  const checking = Boolean((pgn.trim() || puzzleUrl.trim()) && !currentDetection);
-
+  const load = list.load;
   useEffect(() => {
-    if (!pgn.trim() && !puzzleUrl.trim()) return;
-    const controller = new AbortController();
-    const { signal } = controller;
-    const timer = setTimeout(async () => {
-      const request = { pgn, puzzleUrl, retry: detectionRetry };
-      try {
-        const options = await api("tactics/import-options", { pgn, puzzle_url: puzzleUrl }, signal, { requireJson: true });
-        setDetection({ ...request, options });
-      } catch (failure) {
-        if (!signal.aborted) setDetection({ ...request, error: failure.message });
-      }
-    }, 250);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [pgn, puzzleUrl, detectionRetry]);
-
-  useEffect(() => () => fileRead.current?.abort(), []);
-
-  function changePgn(text) {
-    fileRead.current?.abort();
-    setReadingFile(false);
-    setError("");
-    setPgn(text);
-  }
-
-  async function readPuzzleFile(event) {
-    if (!event.target.files?.length) return;
-    fileRead.current?.abort();
-    const controller = new AbortController();
-    fileRead.current = controller;
-    setReadingFile(true);
-    setError("");
-    const read = fileText(event, setPgn, setError, controller.signal);
-    event.target.value = "";
-    try { await read; }
-    finally {
-      if (!controller.signal.aborted) {
-        fileRead.current = null;
-        setReadingFile(false);
-      }
-    }
-  }
-
-  function openPuzzle(row) {
-    setProblem(row);
+    if (!captured) return;
+    setProblem(captured);
     setPly(0);
-  }
-
-  async function save(event) {
-    event.preventDefault();
-    if (!canSave) return;
-    setError("");
-    setBusy(true);
-    try {
-      const saved = await api("tactics", {
-        name, pgn, puzzle_url: puzzleUrl, format: formatChoice, first_move_is_setup: setupChoice,
-      }, undefined, { requireJson: true });
-      openPuzzle(saved.puzzle);
-      setPgn("");
-      setName("");
-      setPuzzleUrl("");
-      setFormatChoice(null);
-      setSetupChoice(null);
-      setDetection(null);
-      await list.load();
-    } catch (failure) {
-      setError(failure.message);
-    } finally {
-      setBusy(false);
-    }
-  }
+    void load();
+  }, [captured, load]);
 
   return <section aria-label="Puzzle library">
     <div className="split">
       <div>{problem && <>
         <h2>{problem.name}</h2>
         <Replay sounds={sounds} route={problem.route} color={position(problem.route, 0).turn() === "w" ? "white" : "black"} ply={ply} onPly={setPly} />
-        {problem.source_url && <a href={problem.source_url} target="_blank" rel="noreferrer">Open on Chess.com</a>}
+        {problem.source_url && <a href={problem.source_url} target="_blank" rel="noreferrer">
+          {problem.source_url.startsWith("https://lichess.org/") ? "Open on Lichess" : "Open on Chess.com"}
+        </a>}
         {problem.source_game && <button onClick={() => openGame(problem.source_game, problem.source_ply)}>View source game</button>}
       </>}</div>
-      <div><form onSubmit={save}>
-        <fieldset className="puzzle-import-fields" disabled={busy}>
-          <label>Puzzle name<input value={name} required maxLength={160} onChange={(e) => setName(e.target.value)} /></label>
-          <label>Puzzle PGN<textarea required value={pgn} onChange={(e) => changePgn(e.target.value)} /></label>
-          <label>Upload puzzle PGN<input type="file" accept=".pgn,text/plain" onChange={readPuzzleFile} /></label>
-          <label>Puzzle URL (optional)<input value={puzzleUrl} inputMode="url" maxLength={2048} onChange={(e) => { setError(""); setPuzzleUrl(e.target.value); }} /></label>
-          <label>Import format<select value={format} onChange={(e) => { setError(""); setFormatChoice(e.target.value); }}>
-            <option value="generic_pgn">Generic PGN</option>
-            <option value="chess_com_puzzle">Chess.com puzzle</option>
-          </select></label>
-          <label className="checkbox-label"><input type="checkbox" checked={setup} onChange={(e) => { setError(""); setSetupChoice(e.target.checked); }} /> First move is setup</label>
-        </fieldset>
-        {checking && <p role="status">Checking import format…</p>}
-        {currentDetection?.error && <p className="error" role="alert">{currentDetection.error}{" "}
-          <button type="button" onClick={() => setDetectionRetry((retry) => retry + 1)}>Retry format check</button>
-        </p>}
-        <button className="primary" disabled={!canSave}>Add puzzle</button>
-      </form>
-      {error && <p className="error" role="alert">{error}</p>}
-      <h2>Puzzle library</h2>
-      {!list.rows.length && <p>No puzzles saved yet.</p>}
-      <ul className="items">{list.rows.map((row) => <li key={row.id}><button onClick={() => openPuzzle(row)}>{row.name}</button></li>)}</ul>
-      <More list={list} /></div>
+      <div>
+        <h2>Puzzle library</h2>
+        {!list.rows.length && <p>No puzzles saved yet.</p>}
+        <ul className="items">{list.rows.map((row) => <li key={row.id}>
+          <button onClick={() => { setProblem(row); setPly(0); }}>{row.name}</button>
+        </li>)}</ul>
+        <More list={list} />
+      </div>
     </div>
   </section>;
 }

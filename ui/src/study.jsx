@@ -181,7 +181,7 @@ async function deliverAnswer(intent, fen) {
   return result;
 }
 
-export function Study({ openGame, sounds }) {
+export function Study({ openGame, sounds, overlayOpen = false }) {
   const [card, setCard] = useState(null);
   const [counts, invalidateCounts] = useStudyCounts();
   const [sourceRead, setSource] = useState(null);
@@ -311,15 +311,15 @@ export function Study({ openGame, sounds }) {
   }, [attemptKey, Boolean(card?.result)]);
 
   useEffect(() => {
-    if (advanceAfter === null) return;
+    if (advanceAfter === null || overlayOpen) return;
     const timer = setTimeout(() => next(advanceAfter), successPauseMs);
     return () => clearTimeout(timer);
-  }, [advanceAfter]);
+  }, [advanceAfter, overlayOpen]);
 
   useEffect(() => {
     function advanceOnSpace(event) {
       const button = nextButton.current;
-      if (!button || button.disabled || event.defaultPrevented || event.isComposing ||
+      if (overlayOpen || !button || button.disabled || event.defaultPrevented || event.isComposing ||
           event.code !== "Space" || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
       const target = event.target;
       if (target instanceof HTMLElement && target !== button &&
@@ -329,7 +329,7 @@ export function Study({ openGame, sounds }) {
     }
     window.addEventListener("keydown", advanceOnSpace);
     return () => window.removeEventListener("keydown", advanceOnSpace);
-  }, []);
+  }, [overlayOpen]);
 
   function answer(played) {
     if (waiting.current) return;

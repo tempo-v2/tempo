@@ -73,12 +73,15 @@ result without advancing. Board sounds are browser-local and can be
 changed in Settings. Game, opening, and puzzle PGN uploads accept up
 to 64 MiB. Games parses archives one game at a time.
 
-In **Tactics → Puzzle library**, paste or upload a Chess.com puzzle PGN.
-Tempo recognizes puzzle URLs in the export or the optional **Puzzle URL**
-field and defaults to applying the first move as setup. Choose
-**Chess.com puzzle** for an export without a link. Uncheck
+Use **Capture** in the header or beside **Puzzle library** to paste a
+Chess.com puzzle PGN, a Lichess puzzle PGN, or a Lichess puzzle ID. A
+successful save clears and refocuses the input. A recognized Chess.com
+puzzle link defaults to applying the first move as setup. For a link-free
+export, choose **Chess.com puzzle** in **Import options**. Uncheck
 **First move is setup** if the PGN already starts on the solver’s turn.
-Saved puzzles with a recognized URL offer **Open on Chess.com**.
+Saved puzzles with a recognized URL offer a backlink. At the next tactic
+order rebuild, unseen captures get first use of available new-tactic slots,
+oldest capture first.
 
 Opening reviews replay the saved lead-in from its first position, then
 stop at the scheduled response. Playback is ungraded, and **Skip to

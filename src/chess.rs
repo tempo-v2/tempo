@@ -186,8 +186,20 @@ struct Parser {
 fn record_pgn_tag(tags: &mut BTreeMap<String, String>, key: &[u8], value: RawTag<'_>) {
     if let Ok(key) = std::str::from_utf8(key)
         && [
-            "White", "Black", "Result", "FEN", "Variant", "UTCDate", "UTCTime", "Date", "Round",
-            "Site", "Link", "Event",
+            "White",
+            "Black",
+            "Result",
+            "FEN",
+            "Variant",
+            "UTCDate",
+            "UTCTime",
+            "Date",
+            "Round",
+            "Site",
+            "Link",
+            "Event",
+            "ChapterURL",
+            "ChapterName",
         ]
         .contains(&key)
     {

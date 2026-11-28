@@ -49,6 +49,7 @@ pub enum Reader {
     RepertoireSimilarity,
     RepertoireChoice,
     FeedbackRepertoires,
+    CaptureContext,
     GameFeedback,
 }
 
