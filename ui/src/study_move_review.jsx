@@ -22,12 +22,13 @@ const terminal = new Set(["stale_study_move", "replacement_over_budget",
   "replacement_preview_unavailable", "opening_reply_conflict"]);
 
 // The saved envelope is separate from Answer recovery and from the review panel.
-export function useOpeningEdit(onSaved) {
-  const [entry, setEntry] = useState(storedEdit);
+export function useOpeningEdit(onSaved, enabled) {
+  const [entry, setEntry] = useState(() => enabled ? storedEdit() : null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const inFlight = useRef(false);
   useEffect(() => {
+    if (!enabled) return;
     const refresh = event => {
       if (event.key !== journalKey) return;
       const current = storedEdit();
@@ -36,7 +37,7 @@ export function useOpeningEdit(onSaved) {
     };
     window.addEventListener("storage", refresh);
     return () => window.removeEventListener("storage", refresh);
-  }, [onSaved]);
+  }, [enabled, onSaved]);
 
   async function deliver(payload) {
     if (inFlight.current) return;

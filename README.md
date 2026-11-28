@@ -289,3 +289,19 @@ piece placement, castling rights and legally available en passant. Zero
 distance means the same chess position. A ranked result can be empty.
 Terminal and opponent-turn results have their own statuses. Errors are JSON
 and exit nonzero. These commands leave the repertoire and Study data untouched.
+
+### Private web access
+
+To use Study, Tactics and Capture from another device, provision the server
+process with `TEMPO_LEAN_WEB_ORIGIN` (the exact Tailscale HTTPS origin with
+a port, for example `https://your-mac.tailname.ts.net:10000`) and
+`TEMPO_LEAN_WEB_TAILSCALE_LOGIN` (the owner's Serve login). Set both in
+the managed server's launch environment. The server opens a separate
+listener on `127.0.0.1:41824` with the same dataset and writer. A
+configuration or binding failure is logged and disables that listener.
+
+On the host, add the dedicated tailnet-only mapping with
+`tailscale serve --bg --https=10000 http://127.0.0.1:41824` and confirm
+the mapping with `tailscale serve status`. To remove this entry, use
+`tailscale serve --https=10000 off`. The Mac and Lean service need to be
+awake. Pending actions are recovered by the browser that sent them.
