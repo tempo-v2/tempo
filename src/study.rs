@@ -188,6 +188,9 @@ pub struct Review {
 pub enum Activity {
     SingleAnswer {
         result: Option<AcceptedView>,
+        /// Authorized authored move for an unanswered first opening exposure.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        introduction_move: Option<String>,
     },
     FullLine {
         // Preserve the top-level null expected by browsers from the prior release.

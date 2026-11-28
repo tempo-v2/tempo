@@ -9,7 +9,10 @@ const path = require("node:path");
 const net = require("node:net");
 
 const [mode, ...args] = process.argv.slice(2);
-const arity = { "--candidate-only": 2, "--predecessor-only": 4, "--legacy-puzzle": 4, "--legacy-packs": 5 };
+const arity = {
+  "--candidate-only": 2, "--predecessor-only": 4, "--legacy-puzzle": 4, "--legacy-packs": 5,
+  "--opening-introduction": 3,
+};
 if (args.length !== arity[mode]) {
   throw new Error("Use --candidate-only CANDIDATE PACK or a predecessor mode documented in README.md");
 }
@@ -1042,6 +1045,127 @@ async function titleInvariance(browser, root) {
   }
   console.log("Mounted Study: original, renamed, blank and omitted titles preserved Good/Again commands, receipts, schedules and continuation.");
 }
+
+async function openingIntroduction(browser, root) {
+  const start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+  const arrow = page => page.locator('svg.cg-shapes line[stroke="#d0a83f"]');
+  const query = (db, sql) => execFileSync("sqlite3", ["-readonly", db, sql], { encoding: "utf8" }).trim();
+  for (const [color, moves, prompt] of [
+    ["white", ["e2e4"], "Play e4"], ["black", ["d2d4", "d7d5"], "Play d5"],
+  ]) {
+    const baseline = path.join(root, color + ".db");
+    const input = baseline + ".json";
+    fs.writeFileSync(input, JSON.stringify({ name: "Original opening", color, route: { fen: start, moves } }));
+    execFileSync(candidate, ["import-content", baseline, "opening", input]);
+    const solution = moves.at(-1);
+    let expected;
+    for (const title of ["Original opening", "Renamed opening", null]) {
+      const db = path.join(root, color + "-" + title + ".db");
+      execFileSync("sqlite3", [baseline, ".backup " + shellArgument(db)]);
+      execFileSync("sqlite3", [db, `UPDATE cards SET title=${quotedSql(title ?? "")}`]);
+      const card = query(db, "SELECT id FROM cards WHERE kind='opening'");
+      assert.ok(card && !card.includes("\n"));
+      const page = await browser.newPage();
+      try {
+        await serve(candidate, db, await unusedPort(), async (origin, api) => {
+          const issued = await api("study/next", { after: null });
+          assert.equal(issued.introduction_move, solution);
+          assert.deepEqual(await api("study"), issued);
+          if (title === null) await page.route("**/api/study", async route => {
+            const response = await route.fetch();
+            const view = await response.json();
+            delete view.title;
+            await route.fulfill({ response, json: view });
+          });
+          const commands = [];
+          page.on("request", request => {
+            if (request.method() === "POST") {
+              commands.push([new URL(request.url()).pathname, request.postDataJSON()]);
+            }
+          });
+          await page.goto(origin);
+          if (color === "black" && title === "Original opening") {
+            const skip = page.getByRole("button", { name: "Skip to your move" });
+            await skip.waitFor();
+            assert.equal(await arrow(page).count(), 0);
+            await skip.click();
+          }
+          await page.getByRole("heading", { name: prompt, exact: true }).waitFor();
+          await arrow(page).waitFor({ state: "attached" });
+          await page.reload();
+          await arrow(page).waitFor({ state: "attached" });
+          assert.equal(grades(db), 0);
+          await page.route(nextPattern, route => route.abort(), { times: 1 });
+          const board = await page.locator("cg-board").boundingBox();
+          for (const square of [solution.slice(0, 2), solution.slice(2, 4)]) {
+            const file = square.charCodeAt(0) - 97;
+            const rank = Number(square[1]) - 1;
+            const [column, row] = color === "white" ? [file, 7 - rank] : [7 - file, rank];
+            await page.mouse.click(board.x + (column + 0.5) * board.width / 8,
+              board.y + (row + 0.5) * board.height / 8);
+          }
+          await retry(page).waitFor();
+          assert.equal(await arrow(page).count(), 0);
+          await page.getByRole("status").filter({ hasText: "Good" }).waitFor();
+          assert.equal((await api("study")).introduction_move, undefined);
+          execFileSync("sqlite3", [db, `INSERT INTO deck VALUES(1,${quotedSql(card)})`]);
+          await retry(page).click();
+          await reveal(page).waitFor();
+          const review = await api("study");
+          assert.notEqual(review.attempt, issued.attempt);
+          assert.equal(review.introduction_move, undefined);
+          assert.equal(await arrow(page).count(), 0);
+          assert.equal(grades(db), 1);
+          assert.deepEqual(commands.map(([route]) => route),
+            ["/api/study/answer", "/api/study/next", "/api/study/next"]);
+          const actual = { commands, effects: query(db, `
+            SELECT id,card_id,submission,result FROM attempts ORDER BY id;
+            SELECT card_id,stability,difficulty,due_at-last_at FROM learning;
+            SELECT active,last_kind FROM study;
+          `) };
+          if (expected) assert.deepEqual(actual, expected);
+          expected = actual;
+        });
+      } finally {
+        await page.context().close();
+      }
+    }
+  }
+
+  const tactic = path.join(root, "tactic.db");
+  seedTactics(candidate, tactic);
+  const page = await browser.newPage();
+  try {
+    await serve(candidate, tactic, await unusedPort(), async (origin, api) => {
+      const issued = await api("study/next", { after: null });
+      assert.equal(issued.kind, "tactic");
+      assert.equal(issued.introduction_move, undefined);
+      assert.equal((await api("study")).introduction_move, undefined);
+      await page.goto(origin);
+      await reveal(page).waitFor();
+      assert.equal(await arrow(page).count(), 0);
+    });
+  } finally {
+    await page.context().close();
+  }
+  for (const accepted of [true, false]) {
+    const db = path.join(root, "opening-predecessor-" + accepted + ".db");
+    execFileSync("sqlite3", ["-readonly", retainedDatabase, ".backup " + shellArgument(db)]);
+    assert.equal(query(db, "PRAGMA user_version"), "20");
+    const card = query(db, `
+      SELECT id FROM active_cards c WHERE kind='opening'
+      AND NOT EXISTS (SELECT 1 FROM learning WHERE card_id=c.id) LIMIT 1
+    `);
+    assert.ok(card, "The retained copy needs an unstudied opening.");
+    execFileSync("sqlite3", [db, `BEGIN;
+      INSERT INTO attempts(card_id) VALUES(${quotedSql(card)});
+      UPDATE study SET active=last_insert_rowid(),last_kind='opening';
+      COMMIT;`]);
+    await predecessorRecovery(browser, db, accepted, { retained: true });
+  }
+  console.log("White and black opening guides, title invariance, blind reviews and tactics, Next-only retry, and both installed-predecessor Answer delivery states passed.");
+}
+
 async function fullLineTitleInvariance(browser, root) {
   const baseline = path.join(root, "line-title-base.db");
   execFileSync(candidate, ["import-lichess-packs", baseline, packArtifact]);
@@ -1470,6 +1594,10 @@ async function openingPreview(browser, db) {
   let browser;
   try {
     browser = await chromium.launch({ executablePath: chrome, headless: true, timeout: 15000 });
+    if (mode === "--opening-introduction") {
+      await openingIntroduction(browser, root);
+      return;
+    }
     if (mode === "--predecessor-only" || mode === "--legacy-puzzle") {
       const legacy = mode === "--legacy-puzzle";
       const pack = legacy ? null : preparePredecessorPack(root);
