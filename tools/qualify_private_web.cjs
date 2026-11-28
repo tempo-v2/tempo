@@ -56,10 +56,11 @@ async function journey(db, desktop, web, phone) {
   const browser = await engine.launch(phone ? {} : { executablePath: process.env.TEMPO_QUALIFY_CHROME });
   try {
     const viewport = phone ? { width: 390, height: 844 } : { width: 1200, height: 850 };
-    const page = await browser.newPage({ viewport, hasTouch: phone });
+    const page = await browser.newPage({ viewport, hasTouch: phone, isMobile: phone });
+    const press = locator => phone ? locator.tap() : locator.click();
     const faults = [];
     page.on("pageerror", error => faults.push(error.message));
-    const local = await browser.newPage();
+    const local = await browser.newPage({ hasTouch: phone });
     await local.goto(desktop);
     assert.deepEqual(await local.locator("header nav button").allTextContents(), ["Study", "Openings", "Tactics", "Games", "Settings"]);
     const initial = await fetch(desktop + "/api/study").then(response => response.json());
@@ -69,36 +70,37 @@ async function journey(db, desktop, web, phone) {
     const first = grades();
 
     const study = page.waitForResponse(reply => reply.url() === web + "/api/study");
+    await page.bringToFront();
     await page.goto(web);
     assert.equal((await (await study).json()).attempt, initial.attempt);
     assert.deepEqual(await page.locator("header nav button").allTextContents(), ["Study", "Tactics"]);
     assert.equal(await button(page, "Review after answer").count(), 0);
-    if (await button(page, "Skip to your move").count()) await button(page, "Skip to your move").click();
-    const answer = await settle(page, "study/answer", () => button(page, "Reveal answer").click(), phone);
+    await button(page, "Reveal answer").waitFor();
+    const answer = await settle(page, "study/answer", () => press(button(page, "Reveal answer")), phone);
     const retry = button(page, "Retry");
     await retry.waitFor();
     assert.equal(grades(), first + Number(phone));
     const replay = page.waitForRequest(req => req.url().endsWith("/api/study/answer"));
-    await retry.click();
+    await press(retry);
     assert.deepEqual((await replay).postDataJSON(), answer());
     await page.getByRole("status").filter({ hasText: "Again" }).waitFor();
     assert.equal(grades(), first + 1);
     assert.equal(await button(page, "Review move").count(), 0);
 
     await page.route("**/api/study/next", route => route.abort(), { times: 1 });
-    await button(page, "Next card").click();
+    await press(button(page, "Next card"));
     await retry.waitFor();
     await page.getByRole("status").filter({ hasText: "Again" }).waitFor();
     const nextWrite = page.waitForRequest(req => req.method() === "POST");
-    await retry.click();
+    await press(retry);
     assert.equal(new URL((await nextWrite).url()).pathname, "/api/study/next");
     await retry.waitFor({ state: "hidden" });
     assert.equal(grades(), first + 1);
 
-    await button(page, "Tactics").click();
-    await page.locator(".pack-header").first().click();
+    await press(button(page, "Tactics"));
+    await press(page.locator(".pack-header").first());
     const start = page.waitForResponse(reply => reply.url().endsWith("/api/tactics/plays") && reply.request().method() === "POST");
-    await page.getByRole("button", { name: /^(Play next|Resume) puzzle$/ }).click();
+    await press(page.getByRole("button", { name: /^(Play next|Resume) puzzle$/ }));
     let view = await (await start).json();
     assert.ok(view.play, JSON.stringify(view));
     const solution = JSON.parse(sql(db, `SELECT v.moves FROM lichess_plays p JOIN lichess_versions v
@@ -111,16 +113,21 @@ async function journey(db, desktop, web, phone) {
     }
     assert.equal(view.result.rating, "Good");
     await page.getByRole("status").filter({ hasText: "Solved" }).waitFor();
-    await button(page, "Show solution").click();
+    if (phone) {
+      const board = await page.locator("cg-board").boundingBox();
+      const controls = await page.locator(".study-panel").boundingBox();
+      assert.ok(board.x + board.width <= viewport.width && board.y + board.height <= controls.y);
+    }
+    await press(button(page, "Show solution"));
     await button(page, "Close solution").or(button(page, "Back to result")).waitFor();
 
-    await page.locator("header").getByRole("button", { name: "Capture", exact: true }).click();
+    await press(page.locator("header").getByRole("button", { name: "Capture", exact: true }));
     const dialog = page.getByRole("dialog", { name: "Capture puzzle" });
     const input = dialog.getByRole("textbox", { name: "Puzzle PGN or Lichess puzzle ID" });
-    const save = () => button(dialog, "Save puzzle").click();
+    const save = () => press(button(dialog, "Save puzzle"));
     const pgn = await fixture("chesscom-2293026.pgn");
     await input.fill(pgn);
-    await dialog.getByText("Import options", { exact: true }).click();
+    await press(dialog.getByText("Import options", { exact: true }));
     await dialog.locator('select:has(option[value="chess_com_puzzle"]:checked)').waitFor();
     assert.equal(await dialog.getByLabel("First move is setup").isChecked(), true);
     const before = Number(sql(db, "SELECT count(*) FROM tactic_capture_receipts"));
@@ -130,7 +137,7 @@ async function journey(db, desktop, web, phone) {
     assert.equal(Number(sql(db, "SELECT count(*) FROM tactic_capture_receipts")), before + Number(!phone));
     assert.equal(await input.inputValue(), pgn);
     const captured = page.waitForResponse(reply => reply.url().endsWith("/api/tactics/capture"));
-    await retryCapture.click();
+    await press(retryCapture);
     const capturedReply = await captured;
     assert.deepEqual(capturedReply.request().postDataJSON(), capture());
     const { id } = await capturedReply.json();
@@ -154,20 +161,20 @@ async function journey(db, desktop, web, phone) {
       assert.equal((await result.json()).puzzle.source_url, "https://lichess.org/training/PSjmf");
       await dialog.getByText("Saved", { exact: true }).waitFor();
     }
-    await button(dialog, "Close").click();
+    await press(button(dialog, "Close"));
     await local.bringToFront();
-    await button(local, "Tactics").click();
+    await press(button(local, "Tactics"));
     const libraryLoad = local.waitForResponse(reply => reply.url() === desktop + "/api/tactics");
-    await button(local, "Puzzle library").click();
+    await press(button(local, "Puzzle library"));
     const savedPuzzle = button(local, "Chess.com puzzle 2293026");
     let rows = await (await libraryLoad).json();
     while (!rows.some(puzzle => puzzle.id === id) && rows.length === 100) {
       const more = local.waitForResponse(reply => reply.url().includes("/api/tactics?after="));
-      await button(local, "Load more").click();
+      await press(button(local, "Load more"));
       rows = await (await more).json();
     }
     assert.ok(rows.some(puzzle => puzzle.id === id));
-    await savedPuzzle.click();
+    await press(savedPuzzle);
     await local.getByRole("link", { name: "Open on Chess.com" }).waitFor();
     assert.deepEqual(faults, []);
   } finally {
