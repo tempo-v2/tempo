@@ -1980,7 +1980,7 @@ mod tests {
         );
         assert_eq!(draft.selected.len(), 1);
         assert_eq!(draft.selected[0].0.card, first);
-        activate_new(&mut db, &current, &draft, None)?;
+        activate_new(&mut db, &current, &draft)?;
         assert_eq!(open_study(&mut db)?.unwrap().attempt, issued.attempt);
         let reserved = answer_and_next(&mut db, issued, "e2e4")?.unwrap();
         assert_eq!(
