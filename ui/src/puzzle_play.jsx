@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useLayoutEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { ExerciseLayout } from "./exercise_layout.jsx";
 import { api } from "./api.js";
@@ -130,7 +130,13 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
   const mounted = useRef(false);
   const currentView = useRef(view);
   currentView.current = view;
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      sounds.cancel();
+    };
+  }, [sounds, view.dataset, view.play]);
   async function run(work) {
     if (busy.current) return;
     busy.current = true;
@@ -195,7 +201,10 @@ export function PuzzleBoard({ view, scope, sounds, onView, onRefresh, continuati
         {view.result.due_day && <span>First Study review {view.result.due_day}</span>}
         {view.result.repeat === "Deferred" && <span>Repeat saved for Study</span>}
         {view.result.repeat?.Placed !== undefined && <span>Repeat after {view.result.repeat.Placed} cards</span>}
-        <button onClick={() => setReplay(replay === null ? view.step : null)}>{replay === null ? "Show solution" : "Back to result"}</button>
+        <button onClick={() => {
+          sounds.cancel();
+          setReplay(replay === null ? view.step : null);
+        }}>{replay === null ? "Show solution" : "Back to result"}</button>
         {continuation}
       </> : <button disabled={pending || Boolean(issue)} onClick={() => move(null)}>Reveal solution</button>}
       {issue && <span role="alert">{issue} <button disabled={pending} onClick={() => run(retry.current)}>Retry</button></span>}

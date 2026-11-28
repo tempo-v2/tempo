@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Board } from "@tempo-v2/core-components";
 import { createPortal } from "react-dom";
 import { Chess } from "chess.js";
@@ -67,6 +67,7 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
 }
 
 export function Replay({ route, color, ply, onPly, sounds, controlsTarget }) {
+  useLayoutEffect(() => sounds.cancel, [sounds, route, color]);
   const timeline = useMemo(() => position(route).history({ verbose: true }), [route]);
   const game = new Chess(timeline[Math.min(ply, timeline.length) - 1]?.after || route.fen || undefined);
   function seek(next) {
@@ -75,7 +76,7 @@ export function Replay({ route, color, ply, onPly, sounds, controlsTarget }) {
       const board = new Chess(move.after);
       const player = color === "white" ? "w" : "b";
       sounds.play(moveCue(move, board, move.color === player ? "move-self" : "move-opponent"));
-    }
+    } else if (next < ply) sounds.cancel();
     onPly(next);
   }
   const board = <ChessBoard game={game} orientation={color} identity="replay" />;

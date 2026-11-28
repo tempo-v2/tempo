@@ -429,7 +429,10 @@ export function Study({ openGame, sounds }) {
           <strong role="status">{card.result.rating}</strong>
           <button ref={nextButton} className="primary" aria-keyshortcuts="Space" title="Next card (Space)" disabled={pending} onClick={() => next(card.attempt)}>Next card</button>
         </> : openingPlaying
-          ? <button onClick={() => setOpeningProgress({ key: attemptKey, ply: lastPly })}>Skip to your move</button>
+          ? <button onClick={() => {
+            sounds.cancel();
+            setOpeningProgress({ key: attemptKey, ply: lastPly });
+          }}>Skip to your move</button>
           : <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>}
       </div>
       {card.result && <div className="feedback">

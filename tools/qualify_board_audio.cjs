@@ -51,7 +51,7 @@ async function qualify() {
     await page.addInitScript(() => {
       const bytes = new WeakMap();
       const clips = new WeakMap();
-      const observations = window.boardAudio = { decoded: [], started: [] };
+      const observations = window.boardAudio = { decoded: [], started: [], stopped: [] };
       window.addEventListener("pointerup", () => { observations.lastInput = performance.now(); }, true);
       const fetchResource = window.fetch;
       window.fetch = async (...args) => {
@@ -81,6 +81,11 @@ async function qualify() {
         observations.started.push(clips.get(this.buffer));
         observations.lastStart = performance.now();
       };
+      const stop = AudioBufferSourceNode.prototype.stop;
+      AudioBufferSourceNode.prototype.stop = function (...args) {
+        stop.apply(this, args);
+        observations.stopped.push(clips.get(this.buffer));
+      };
     });
     let card = opening;
     let cardHeld;
@@ -105,6 +110,11 @@ async function qualify() {
         if (step === 0) await responseHeld.promise;
         return route.fulfill({ json: step === 0 ? afterReply : solved });
       }
+      if (pathname === "/api/tactics") {
+        return route.fulfill({ json: [{ id: "audio-line", name: "Audio replay", route: solved.solution }] });
+      }
+      if (pathname === "/api/tactics/plays") return route.fulfill({ json: [] });
+      if (pathname === "/api/tactics/packs") return route.fulfill({ json: { themes: [] } });
       if (pathname.startsWith("/api/")) return route.fulfill({ json: null });
       const file = pathname === "/" ? "index.html" : pathname.slice(1);
       return route.fulfill({ contentType: mime[path.extname(file)], body: await readFile(path.join(root, file)) });
@@ -173,6 +183,17 @@ async function qualify() {
     cardHeld.resolve();
     await heard(page, ["move-self", "move-opponent"]);
     await page.getByRole("heading", { name: "White to move" }).waitFor();
+    await page.getByRole("button", { name: "Tactics", exact: true }).click();
+    await page.getByRole("button", { name: "Puzzle library", exact: true }).click();
+    await page.getByRole("button", { name: "Audio replay" }).click();
+    // Two clicks in the same browser task keep the recording active until the
+    // nested Tactics navigation unmounts the replay.
+    await page.evaluate(() => {
+      window.boardAudio.stopped.length = 0;
+      document.querySelector('[aria-label="Next move"]').click();
+      [...document.querySelectorAll("button")].find(button => button.textContent === "Packs").click();
+    });
+    await page.waitForFunction(() => window.boardAudio.stopped.includes("move-self"));
     assert.deepEqual(faults, []);
     console.log(`Chromium verified all seven recordings, silent retry, opponent replies, fast replay, opening playback, and saved mute. Drop to Web Audio start: Study ${studyDelay.toFixed(1)} ms, puzzle ${puzzleDelay.toFixed(1)} ms.`);
   } finally {
