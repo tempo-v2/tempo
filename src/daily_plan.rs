@@ -1,6 +1,48 @@
-//! Queue policy for choosing new work from an ordered daily candidate list.
+//! Queue policy for selecting and mixing eligible daily work.
 
 use std::collections::HashSet;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Review,
+    Introduction,
+}
+
+impl Group {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Review => Self::Introduction,
+            Self::Introduction => Self::Review,
+        }
+    }
+}
+
+/// Return the preferred group and the balance to save if its head is taken.
+pub fn mix(day: &str, balance: i64, reviews: i64, introductions: i64) -> (Group, i64) {
+    const UNIT: i64 = 1_000_000;
+    if introductions == 0 {
+        return (Group::Review, 0);
+    }
+    if reviews == 0 {
+        return (Group::Introduction, 0);
+    }
+
+    // Use a different threshold for each remaining introduction count. Keep
+    // the variation small enough to spread introductions between reviews.
+    let mut hash = blake3::Hasher::new();
+    hash.update(day.as_bytes());
+    hash.update(&introductions.to_le_bytes());
+    let bytes = hash.finalize();
+    let sample = u32::from_le_bytes(bytes.as_bytes()[..4].try_into().unwrap());
+    let threshold = 350_000 + i64::from(sample % 300_001);
+    let total = reviews + introductions;
+    let next = balance + (UNIT * introductions + total / 2) / total;
+    if next >= threshold {
+        (Group::Introduction, next - UNIT)
+    } else {
+        (Group::Review, next)
+    }
+}
 
 /// Openings supplies alternative prerequisite routes. A standalone exercise has
 /// no prerequisite, and unresolved content evidence cannot authorize admission.
