@@ -824,16 +824,33 @@ fn stage_order(db: &mut Connection, day: &str, start: usize, keys: &[String]) ->
 }
 
 fn prune(db: &Connection, day: &str) -> Result<()> {
-    // Keep the current day and a day of rollover work, plus the last complete
-    // rank. A subsequent turn reclaims a bounded chunk of any older rows.
+    // Reservation clears interrupted builds before allocating a new generation.
+    // Periodic cleanup can retire generations below the published head.
     db.execute(
-        "DELETE FROM daily_due WHERE rowid IN (SELECT q.rowid FROM daily_due q
-       JOIN daily_day d USING(day) WHERE q.day<date(?1,'-1 day')
-       OR (q.day=?1 AND d.due_head IS NOT NULL AND q.generation<>d.due_head) LIMIT 24)",
+        "DELETE FROM daily_due WHERE rowid IN (
+            SELECT rowid FROM daily_due WHERE day<date(?1,'-1 day')
+            UNION ALL
+            SELECT rowid FROM daily_due WHERE day=?1
+                AND generation<(SELECT due_head FROM daily_day WHERE day=?1)
+            LIMIT 24)",
         [day],
     )?;
-    db.execute("DELETE FROM daily_opening_order WHERE rowid IN (SELECT rowid FROM daily_opening_order
-        WHERE day<date(?1,'-1 day') AND day IS NOT (SELECT last_order_day FROM daily_clock) LIMIT 24)", [day])?;
+
+    let last_order_day: Option<String> = db.query_row(
+        "SELECT last_order_day FROM daily_clock WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    // Exclude the saved fallback from both index ranges before walking rows.
+    db.execute(
+        "DELETE FROM daily_opening_order WHERE rowid IN (
+            SELECT rowid FROM daily_opening_order
+                WHERE day<min(date(?1,'-1 day'),coalesce(?2,date(?1,'-1 day')))
+            UNION ALL
+            SELECT rowid FROM daily_opening_order WHERE day>?2 AND day<date(?1,'-1 day')
+            LIMIT 24)",
+        (day, last_order_day),
+    )?;
     db.execute(
         "DELETE FROM daily_new WHERE rowid IN (SELECT rowid FROM daily_new
        WHERE day<date(?1,'-1 day') LIMIT 24)",
@@ -1066,6 +1083,221 @@ mod tests {
                 (card, due_at),
             )?;
         }
+        Ok(())
+    }
+
+    const CLEANUP_DAY: &str = "2026-11-28";
+
+    fn cleanup_fixture(db: &mut Connection, cards: usize) -> Result<()> {
+        let tx = db.transaction()?;
+        tx.execute(
+            "WITH RECURSIVE card(n) AS (
+                SELECT 1 UNION ALL SELECT n+1 FROM card WHERE n<?1
+             )
+             INSERT INTO cards(id,kind,title,color,fen,position_id,answers,repertoire_id)
+             SELECT printf('card%05d',n),'opening','Fixture','white','fixture',printf('position%05d',n),'[]','fixture'
+             FROM card",
+            [cards],
+        )?;
+        tx.execute_batch(
+            "INSERT INTO daily_day(day,cutoff,high_water,opening_limit,tactic_limit,mode,due_head)
+             VALUES ('2026-11-24',0,0,20,20,'maia',NULL),
+                    ('2026-11-25',0,0,20,20,'maia',NULL),
+                    ('2026-11-26',0,0,20,20,'maia',NULL),
+                    ('2026-11-27',0,0,20,20,'maia',1),
+                    ('2026-11-28',0,0,20,20,'maia',2);
+             UPDATE daily_clock SET current_day='2026-11-28', due_generation=2,
+                 last_order_day='2026-11-25';",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn assert_protected_cleanup_is_bounded(populate: &str) -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+
+        let mut counts = Vec::new();
+        for size in [100, 10_000] {
+            let root = tempfile::tempdir()?;
+            let mut db = Database::init(&root.path().join("prune.sqlite3"))?;
+            cleanup_fixture(&mut db, size)?;
+            // Keep the same day rows in both fixtures so prune has no other work.
+            db.execute(
+                "DELETE FROM daily_day WHERE day IN ('2026-11-24','2026-11-26')",
+                [],
+            )?;
+            db.execute_batch(populate)?;
+            let before = db.total_changes();
+            let steps = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&steps);
+            db.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Relaxed);
+                    false
+                }),
+            );
+            let result = prune(&db, CLEANUP_DAY);
+            db.progress_handler(0, None::<fn() -> bool>);
+            result?;
+            assert_eq!(db.total_changes(), before);
+            counts.push(steps.load(Relaxed));
+        }
+        eprintln!("prune VM steps for 100 and 10,000 protected rows: {counts:?}");
+        assert!(
+            counts[1] <= 1_024 && counts[1] <= counts[0] + 64,
+            "{counts:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prune_seeks_past_published_due_rows() -> Result<()> {
+        assert_protected_cleanup_is_bounded(
+            "INSERT INTO daily_due SELECT '2026-11-28',2,id,kind,rowid,0 FROM cards",
+        )
+    }
+
+    #[test]
+    fn prune_seeks_past_saved_opening_order() -> Result<()> {
+        assert_protected_cleanup_is_bounded(
+            "INSERT INTO daily_opening_order SELECT '2026-11-25',id,rowid FROM cards",
+        )
+    }
+
+    fn retained_cleanup_rows(db: &Connection) -> Result<Vec<String>> {
+        let mut stmt = db.prepare(
+            "SELECT json_array('due',day,generation,card_id,kind,ordinal,schedule_version)
+               FROM daily_due WHERE day='2026-11-27' OR (day='2026-11-28' AND generation=2)
+             UNION ALL
+             SELECT json_array('rank',day,card_id,ordinal) FROM daily_opening_order
+               WHERE day IN ('2026-11-25','2026-11-27','2026-11-28')
+             UNION ALL
+             SELECT json_array('day',day,due_head,due_coverage) FROM daily_day
+               WHERE day IN ('2026-11-25','2026-11-27','2026-11-28')
+             UNION ALL
+             SELECT json_array('clock',current_day,last_order_day,due_generation) FROM daily_clock
+             ORDER BY 1",
+        )?;
+        Ok(stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn cleanup_counts(db: &Connection) -> Result<[u64; 4]> {
+        Ok(db.query_row(
+            "SELECT (SELECT count(*) FROM daily_due),
+                    (SELECT count(*) FROM daily_opening_order),
+                    (SELECT count(*) FROM daily_new),
+                    (SELECT count(*) FROM daily_day)",
+            [],
+            |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?]),
+        )?)
+    }
+
+    #[test]
+    fn prune_reclaims_both_ranges_with_one_budget_per_table() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut db = Database::init(&root.path().join("mixed.sqlite3"))?;
+        cleanup_fixture(&mut db, 30)?;
+        db.execute_batch(
+            "INSERT INTO daily_due
+             SELECT d.day,1,c.id,c.kind,c.rowid,0 FROM daily_day d CROSS JOIN cards c
+             WHERE d.day IN ('2026-11-24','2026-11-27','2026-11-28');
+             INSERT INTO daily_due SELECT '2026-11-28',2,id,kind,rowid,0 FROM cards;
+             INSERT INTO daily_opening_order
+             SELECT d.day,c.id,c.rowid FROM daily_day d CROSS JOIN cards c;
+             INSERT INTO daily_new
+             SELECT '2026-11-26',id,kind,rowid,0,'[]',0,0 FROM cards;",
+        )?;
+
+        let retained = retained_cleanup_rows(&db)?;
+        assert_eq!(cleanup_counts(&db)?, [120, 150, 30, 5]);
+        for expected in [[96, 126], [72, 102], [60, 90], [60, 90]] {
+            let before = cleanup_counts(&db)?;
+            let writes = db.total_changes();
+            prune(&db, CLEANUP_DAY)?;
+            let after = cleanup_counts(&db)?;
+            assert_eq!(&after[..2], &expected);
+            assert!(before.into_iter().zip(after).all(|(a, b)| a - b <= 24));
+            assert!(db.total_changes() - writes <= 128);
+            assert_eq!(retained_cleanup_rows(&db)?, retained);
+        }
+        assert_eq!(cleanup_counts(&db)?, [60, 90, 0, 3]);
+
+        db.execute("UPDATE daily_clock SET last_order_day=NULL", [])?;
+        prune(&db, CLEANUP_DAY)?;
+        assert_eq!(cleanup_counts(&db)?, [60, 66, 0, 3]);
+        prune(&db, CLEANUP_DAY)?;
+        assert_eq!(cleanup_counts(&db)?, [60, 60, 0, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_preserves_due_builds_and_reservation_reclaims_interrupted_work() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("interrupted.sqlite3");
+        let mut db = Database::init(&path)?;
+        let now = 1_795_867_200;
+        for index in 0..=BATCH {
+            tactic(&db, &format!("due-{index}"), Some(now))?;
+        }
+        while !queue_store::seed_batch(&mut db)? {}
+        open_day(&mut db, CLEANUP_DAY, now)?;
+        let draft = day(&db, CLEANUP_DAY)?.unwrap();
+        let rows = due_rows(&db, &draft)?;
+        assert_eq!(rows.len(), BATCH + 1);
+
+        let first = reserve_due_generation(&mut db, CLEANUP_DAY)?.unwrap();
+        stage_due(&mut db, &draft, first, 0, &rows[..BATCH])?;
+        prune(&db, CLEANUP_DAY)?;
+        assert_eq!(cleanup_counts(&db)?[0], BATCH as u64);
+        assert_eq!(day(&db, CLEANUP_DAY)?.unwrap().due_head, None);
+        stage_due(&mut db, &draft, first, BATCH, &rows[BATCH..])?;
+        let coverage = clock(&db)?.coverage;
+        activate_due(&db, CLEANUP_DAY, first, coverage)?;
+
+        // A coverage change starts another build while the first head still serves.
+        db.execute("UPDATE daily_clock SET coverage=coverage+1", [])?;
+        let abandoned = reserve_due_generation(&mut db, CLEANUP_DAY)?.unwrap();
+        stage_due(&mut db, &draft, abandoned, 0, &rows[..BATCH])?;
+        stage_due(&mut db, &draft, abandoned, BATCH, &rows[BATCH..])?;
+        drop(db);
+
+        let mut db = Database::init(&path)?;
+        let generation_count = |db: &Connection, generation| -> Result<usize> {
+            Ok(db.query_row(
+                "SELECT count(*) FROM daily_due WHERE day=?1 AND generation=?2",
+                (CLEANUP_DAY, generation),
+                |row| row.get(0),
+            )?)
+        };
+        prune(&db, CLEANUP_DAY)?;
+        assert_eq!(generation_count(&db, first)?, BATCH + 1);
+        assert_eq!(generation_count(&db, abandoned)?, BATCH + 1);
+        assert_eq!(reserve_due_generation(&mut db, CLEANUP_DAY)?, None);
+        assert_eq!(generation_count(&db, abandoned)?, 1);
+        assert_eq!(reserve_due_generation(&mut db, CLEANUP_DAY)?, None);
+        assert_eq!(generation_count(&db, abandoned)?, 0);
+
+        let replacement = reserve_due_generation(&mut db, CLEANUP_DAY)?.unwrap();
+        assert!(replacement > abandoned);
+        stage_due(&mut db, &draft, replacement, 0, &rows[..BATCH])?;
+        prune(&db, CLEANUP_DAY)?;
+        assert_eq!(generation_count(&db, first)?, BATCH + 1);
+        assert_eq!(generation_count(&db, replacement)?, BATCH);
+        stage_due(&mut db, &draft, replacement, BATCH, &rows[BATCH..])?;
+        activate_due(&db, CLEANUP_DAY, replacement, coverage + 1)?;
+        assert_eq!(day(&db, CLEANUP_DAY)?.unwrap().due_head, Some(replacement));
+        for _ in 0..3 {
+            prune(&db, CLEANUP_DAY)?;
+        }
+        assert_eq!(generation_count(&db, first)?, 0);
+        assert_eq!(generation_count(&db, replacement)?, BATCH + 1);
+        assert_eq!(day(&db, CLEANUP_DAY)?.unwrap().due_head, Some(replacement));
         Ok(())
     }
 
