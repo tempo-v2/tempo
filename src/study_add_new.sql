@@ -79,6 +79,7 @@ CREATE TABLE study_add_new (
 CREATE INDEX study_add_new_pending ON study_add_new(day,expires) WHERE outcome IS NULL;
 CREATE INDEX study_add_new_day ON study_add_new(day);
 
+ALTER TABLE opening_priority ADD COLUMN completion_cards BLOB CHECK(length(completion_cards)<=524288);
 ALTER TABLE opening_priority_projection ADD COLUMN allowance INTEGER NOT NULL DEFAULT 20;
 UPDATE opening_priority_projection SET allowance=coalesce(
   (SELECT opening_limit FROM daily_day WHERE day=opening_priority_projection.day),20);
@@ -101,3 +102,12 @@ CREATE TABLE daily_new_stage (
 ) STRICT;
 CREATE INDEX daily_new_stage_day ON daily_new_stage(day);
 CREATE INDEX daily_new_stage_expiry ON daily_new_stage(expires);
+
+ALTER TABLE opening_priority_projection ADD COLUMN prefix_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE opening_priority_projection ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE daily_new_prefix (
+  generation INTEGER NOT NULL REFERENCES daily_new_stage(generation),
+  ordinal INTEGER NOT NULL,
+  payload BLOB NOT NULL CHECK(length(payload)<=32768),
+  PRIMARY KEY(generation,ordinal)
+) STRICT, WITHOUT ROWID;

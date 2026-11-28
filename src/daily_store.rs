@@ -782,6 +782,7 @@ impl Openings<AuthoredRows> {
     }
 }
 
+#[cfg(test)]
 fn openings(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings> {
     opening_rows(db, day, clock)?.compile(|| false)
 }
@@ -909,10 +910,12 @@ impl Openings {
         order_openings(self.authored.keys.clone(), &self.saved_order, scores)
     }
 
+    #[cfg(test)]
     fn draft(&self, version: i64, ordered: &[String], source: &'static str) -> Draft {
         self.draft_with_priority(version, ordered, source, &[])
     }
 
+    #[cfg(test)]
     fn draft_with_priority(
         &self,
         version: i64,
@@ -1248,9 +1251,11 @@ fn prune_new_stages(db: &mut Connection, day: &str, now: i64) -> Result<()> {
     let tx = db.transaction_with_behavior(Immediate)?;
     let retired = tx
         .query_row(
-            "SELECT generation,day,kind FROM daily_new_stage WHERE expires<=?2
+            "SELECT generation,day,kind FROM daily_new_stage
+           WHERE expires<=?2 AND generation IS NOT (SELECT prefix_generation FROM opening_priority_projection)
          UNION ALL SELECT generation,day,kind FROM daily_new_stage
            WHERE day<date(?1,'-1 day') AND expires IS NULL
+             AND generation IS NOT (SELECT prefix_generation FROM opening_priority_projection)
          LIMIT 1",
             (day, now),
             |row| {
@@ -1268,7 +1273,12 @@ fn prune_new_stages(db: &mut Connection, day: &str, now: i64) -> Result<()> {
              WHERE day=?1 AND kind=?2 AND generation=?3 AND committed=0 LIMIT 32)",
             (&day, &kind, generation),
         )?;
-        if deleted < 32 {
+        let chunks = tx.execute(
+            "DELETE FROM daily_new_prefix WHERE (generation,ordinal) IN
+             (SELECT generation,ordinal FROM daily_new_prefix WHERE generation=?1 LIMIT 16)",
+            [generation],
+        )?;
+        if deleted < 32 && chunks < 16 {
             tx.execute(
                 "DELETE FROM daily_new_size WHERE day=?1 AND kind=?2 AND generation=?3",
                 (&day, &kind, generation),
@@ -1408,7 +1418,8 @@ fn turn(
     }
     if matches!(lane, Lane::Openings) && day.openings != Some(clock.openings) {
         let mut draft = if day.opening_limit > 0 || has_unseen_opening_commitment(&tx)? {
-            let input = openings(&tx, &day, &clock)?;
+            let input =
+                opening_rows(&tx, &day, &clock)?.compile(|| Instant::now() >= read_deadline)?;
             let source = if day.fresh {
                 "maia"
             } else if input.saved_order.is_empty() {
@@ -1416,7 +1427,11 @@ fn turn(
             } else {
                 "saved"
             };
-            input.draft(clock.openings, &input.ordered(None), source)
+            input
+                .draft_until(clock.openings, &input.ordered(None), source, &[], || {
+                    Instant::now() >= read_deadline
+                })
+                .context("Opening introduction preparation timed out")?
         } else {
             Draft {
                 selected: Vec::new(),
@@ -2360,6 +2375,69 @@ mod tests {
             next = answer_and_next(&mut db, card, movement)?;
         }
         assert!(next.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extra_opening_priority_saves_completion_evidence_before_next() -> Result<()> {
+        use crate::opening_priority::{self, Basis};
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("extra-priority.sqlite3");
+        let mut db = Database::init(&path)?;
+        let now = Utc::now().timestamp();
+        let today = day_at(now)?;
+        let dataset = db::dataset(&db)?;
+        db.execute("UPDATE new_opening_settings SET opening_limit=0", [])?;
+        while !queue_store::seed_batch(&mut db)? {}
+        prepare_test_day(&mut db, now)?;
+        opening(
+            &db,
+            "After cutoff",
+            &["d2d4", "d7d5", "c2c4", "e7e6", "b1c3"],
+        )?;
+        let (target, version): (String, i64) = db.query_row(
+            "SELECT id,availability_version FROM cards JOIN prepared_queue ON card_id=id
+             WHERE answers='[\"b1c3\"]'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (goal, _) = opening_priority::join(&db, &target, version)?;
+        let writer = Writer::start(db, None)?;
+        let input = serde_json::from_value::<add_new::Command>(json!({
+            "request":"0123456789abcdef0123456789abcdef","day":today,"dataset":dataset,
+            "kind":"opening","quantity":5
+        }))?;
+        writer
+            .submit(false, move |db| add_new::submit(db, input, now))?
+            .wait()
+            .await?;
+        let worker_path = path.clone();
+        let worker = writer.clone();
+        tokio::task::spawn_blocking(move || {
+            add_new::turn(&Database::read(&worker_path)?, &worker, now)
+        })
+        .await??;
+
+        let mut db = Database::open(&path)?;
+        let basis = Basis::current(&db)?.unwrap();
+        let prefix = opening_priority::published_prefix(&db, &basis)?.unwrap();
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(prefix[2].card, target);
+        assert!(matches!(
+            add_new::status(&db, "0123456789abcdef0123456789abcdef")?,
+            add_new::Reply::Added { added: 3 }
+        ));
+        let mut next = open_study(&mut db)?;
+        for movement in ["d2d4", "c2c4", "b1c3"] {
+            let card = next.unwrap();
+            assert_eq!(serde_json::to_value(&card)?["introduction_move"], movement);
+            next = answer_and_next(&mut db, card, movement)?;
+        }
+        assert!(next.is_none());
+        // Edit before the ordinary priority worker has had its first turn.
+        opening(&db, "Unrelated new route", &["h2h3"])?;
+        let proof = opening_priority::roots(&db, goal - 1)?.pop().unwrap();
+        assert!(proof.witnessed);
         Ok(())
     }
 

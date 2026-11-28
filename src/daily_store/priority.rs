@@ -96,12 +96,14 @@ impl Pass {
                     id: goal.id,
                     state: "fulfilled",
                     summary: json!({"remaining":0,"next":[]}),
+                    completion_cards: None,
                 }
             } else if self.input.lifecycles.get(&goal.target) != Some(&goal.availability) {
                 Update {
                     id: goal.id,
                     state: "invalidated",
                     summary: json!({"reason":"target_lifecycle_changed"}),
+                    completion_cards: None,
                 }
             } else {
                 let graph = Graph {
@@ -115,6 +117,7 @@ impl Pass {
                         id: goal.id,
                         state: "blocked",
                         summary: json!({"reason":reason.code()}),
+                        completion_cards: None,
                     },
                     Resolution::Complete(proof) => {
                         self.observe(goal.id, &goal.target, proof, zero_allowance)?
@@ -141,6 +144,7 @@ impl Pass {
                 id,
                 state: "fulfilled",
                 summary: json!({"remaining":0,"next":[]}),
+                completion_cards: None,
             });
         }
         let mut hash = blake3::Hasher::new();
@@ -165,6 +169,18 @@ impl Pass {
             "awaiting_study"
         };
         let remaining = proof.len();
+        let completion_cards = (remaining > next.len())
+            .then(|| {
+                let cards: Vec<_> = proof.iter().map(|entry| &entry.card).collect();
+                serde_json::to_vec(&cards)
+            })
+            .transpose()?;
+        ensure!(
+            completion_cards
+                .as_ref()
+                .is_none_or(|data| data.len() <= 512 * 1024),
+            "Opening priority witness exceeds its byte budget"
+        );
         for entry in proof {
             if self.prefix.len() == self.input.limit {
                 break;
@@ -186,11 +202,11 @@ impl Pass {
             summary: json!({
                 "remaining":remaining,"next":next,"prefix":remaining>next.len(),
                 "proof_fingerprint":hash.finalize().to_hex().to_string(),"reason":reason,
-                "completion_basis": (remaining<=20).then(||
-                    json!({"authoring":self.basis.authoring,
-                        "introduction_reset":self.basis.introduction_reset,
-                        "schedule_floor":self.schedule_floor})),
+                "completion_basis": {"authoring":self.basis.authoring,
+                    "introduction_reset":self.basis.introduction_reset,
+                    "schedule_floor":self.schedule_floor},
             }),
+            completion_cards,
         })
     }
 }
@@ -260,26 +276,11 @@ pub(super) fn turn(
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     // Save the completion proof before Study can consume newly published slots.
-    if !pass.pending_updates.is_empty() {
-        let updates = pass.pending_updates.clone();
-        ensure!(
-            updates.len() <= BATCH,
-            "too many opening priority updates in a turn"
-        );
-        let status_basis = basis.clone();
-        if !writer.background_until(deadline, move |db| {
-            let tx = db.transaction_with_behavior(Immediate)?;
-            if !goals::publish_updates(&tx, &status_basis, &updates)? {
-                return Ok(false);
-            }
-            tx.commit()?;
-            Ok(true)
-        })? {
-            *active = None;
-            return Ok(true);
-        }
-        pass.pending_updates.clear();
+    if !save_updates(writer, &basis, &pass.pending_updates, deadline)? {
+        *active = None;
+        return Ok(true);
     }
+    pass.pending_updates.clear();
     // Reconstructing after restart or a fresh rank must never replace a valid
     // later-page prefix with a shorter locally recomputed prefix.
     if pass
@@ -318,6 +319,7 @@ pub(super) fn turn(
         )?;
         let published_basis = basis.clone();
         let prefix = pass.prefix.clone();
+        let (inline, generation) = prepare_prefix(writer, &draft, &prefix, read_deadline)?;
         let through = pass.cursor.max(pass.published_through);
         if !writer.background_until(deadline, move |db| {
             let tx = db.transaction_with_behavior(Immediate)?;
@@ -331,7 +333,7 @@ pub(super) fn turn(
             if !publish_slots(&tx, &day, &draft)? {
                 return Ok(false);
             }
-            goals::publish_prefix(&tx, &published_basis, &prefix, through)?;
+            goals::publish_prefix(&tx, &published_basis, &inline, generation, through)?;
             ensure!(
                 tx.total_changes() - before <= 128,
                 "priority opening publication exceeds write bound"
@@ -346,13 +348,12 @@ pub(super) fn turn(
         pass.published_through = through;
     } else if pass.cursor > pass.published_through {
         let through = pass.cursor;
-        let prefix = pass.published.as_deref().unwrap_or_default().to_vec();
         if !writer.background_until(deadline, move |db| {
             let tx = db.transaction_with_behavior(Immediate)?;
             if Basis::current(&tx)?.as_ref() != Some(&basis) {
                 return Ok(false);
             }
-            goals::publish_prefix(&tx, &basis, &prefix, through)?;
+            goals::advance_projection(&tx, through)?;
             tx.commit()?;
             Ok(true)
         })? {
@@ -365,6 +366,81 @@ pub(super) fn turn(
     Ok(true)
 }
 
+pub(super) fn save_updates(
+    writer: &Writer,
+    basis: &Basis,
+    updates: &[Update],
+    deadline: Instant,
+) -> Result<bool> {
+    let mut remaining = updates;
+    while !remaining.is_empty() {
+        let mut bytes = 0;
+        let count = remaining
+            .iter()
+            .take(BATCH)
+            .take_while(|update| {
+                bytes += 15 * 1024 + update.completion_cards.as_ref().map_or(0, Vec::len);
+                bytes <= 544 * 1024
+            })
+            .count();
+        ensure!(
+            count > 0,
+            "Opening priority witness exceeds its transaction budget"
+        );
+        let batch = remaining[..count].to_vec();
+        let basis = basis.clone();
+        if !writer.background_until(deadline, move |db| {
+            let tx = db.transaction_with_behavior(Immediate)?;
+            if super::day_at(chrono::Utc::now().timestamp())? != basis.day
+                || !goals::publish_updates(&tx, &basis, &batch)?
+            {
+                return Ok(false);
+            }
+            tx.commit()?;
+            Ok(true)
+        })? {
+            return Ok(false);
+        }
+        remaining = &remaining[count..];
+    }
+    Ok(true)
+}
+
+pub(super) fn prepare_prefix(
+    writer: &Writer,
+    draft: &Draft,
+    prefix: &[Proof],
+    deadline: Instant,
+) -> Result<(String, i64)> {
+    let payload = serde_json::to_vec(prefix)?;
+    ensure!(
+        payload.len() <= super::CAPTURE_BYTES,
+        "Opening priority prefix exceeds its byte budget"
+    );
+    let Some(generation) = draft.staged else {
+        return Ok((String::from_utf8(payload)?, 0));
+    };
+    for (ordinal, chunk) in payload.chunks(32 * 1024).enumerate() {
+        let chunk = chunk.to_vec();
+        writer.background_until(deadline, move |db| {
+            db.execute(
+                "INSERT INTO daily_new_prefix VALUES(?1,?2,?3)",
+                (generation, ordinal, &chunk),
+            )?;
+            Ok(())
+        })?;
+    }
+    Ok(("[]".into(), generation))
+}
+
+pub(super) struct Extension {
+    pub draft: Draft,
+    pub prefix: Vec<Proof>,
+    pub through: i64,
+    pub basis: Basis,
+    pub updates: Vec<Update>,
+}
+
 /// Resolve the same priority prefix against the proposed ceiling before settling
 /// an explicit addition. Ordinary ordering fills the space left by that prefix.
 pub(super) fn extended_draft(
@@ -372,10 +448,12 @@ pub(super) fn extended_draft(
     day: &Day,
     clock: &Clock,
     deadline: Instant,
-) -> Result<(Draft, Vec<Proof>, i64)> {
+) -> Result<Extension> {
     let input = opening_rows(db, day, clock)?.compile(|| Instant::now() >= deadline)?;
     let basis = Basis::current(db)?.context("Missing opening priority basis")?;
-    let mut pass = Pass::new(basis, input, day.fresh, clock.sequence, None, 0);
+    let mut pass = Pass::new(basis.clone(), input, day.fresh, clock.sequence, None, 0);
+    let mut updates = Vec::new();
+    let mut update_bytes = 0;
     while clock.priority != 0 && pass.prefix.len() < pass.input.limit {
         ensure!(
             Instant::now() < deadline,
@@ -385,7 +463,15 @@ pub(super) fn extended_draft(
         if pass.roots.is_empty() {
             break;
         }
-        pass.advance(deadline, false)?;
+        for update in pass.advance(deadline, false)? {
+            update_bytes += serde_json::to_vec(&update.summary)?.len()
+                + update.completion_cards.as_ref().map_or(0, Vec::len);
+            ensure!(
+                update_bytes <= super::CAPTURE_BYTES,
+                "Opening priority evidence exceeds its byte budget"
+            );
+            updates.push(update);
+        }
         ensure!(
             pass.roots.is_empty(),
             "Opening priority preparation timed out"
@@ -405,5 +491,11 @@ pub(super) fn extended_draft(
             Instant::now() >= deadline
         })
         .context("Opening introduction preparation timed out")?;
-    Ok((draft, pass.prefix, pass.cursor))
+    Ok(Extension {
+        draft,
+        prefix: pass.prefix,
+        through: pass.cursor,
+        basis,
+        updates,
+    })
 }

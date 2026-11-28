@@ -215,16 +215,40 @@ pub(super) fn turn(db: &Connection, writer: &Writer, now: i64) -> Result<bool> {
     let mut proposed = day.clone();
     let (mut draft, overlay) = if opening {
         proposed.opening_limit = ceiling;
-        let (draft, prefix, through) = priority::extended_draft(&tx, &proposed, &clock, deadline)?;
-        (draft, (clock.priority != 0).then_some((prefix, through)))
+        let extension = priority::extended_draft(&tx, &proposed, &clock, deadline)?;
+        (
+            extension.draft,
+            (clock.priority != 0).then_some((
+                extension.prefix,
+                extension.through,
+                extension.basis,
+                extension.updates,
+            )),
+        )
     } else {
         proposed.tactic_limit = ceiling;
         (tactic_draft(&tx, &proposed, clock.tactics)?, None)
     };
     let added = draft.selected.len().saturating_sub(baseline - charged);
     tx.commit()?;
+    let mut prepared_overlay = None;
     if added != 0 {
+        if !draft.revoked_openings.is_empty() {
+            // Ordinary route maintenance owns revocation of reserved fillers.
+            return Ok(false);
+        }
         stage_new(Preparation::Required, writer, &day, &mut draft, deadline)?;
+        if let Some((prefix, through, basis, updates)) = overlay {
+            prepared_overlay = Some((
+                priority::prepare_prefix(writer, &draft, &prefix, deadline)?,
+                through,
+            ));
+            // Keep the completion evidence durable before any of these cards
+            // can be introduced, even when the next priority turn has not run.
+            if !priority::save_updates(writer, &basis, &updates, deadline)? {
+                return Ok(false);
+            }
+        }
     }
 
     let checked = writer.background_until(deadline, move |db| {
@@ -246,10 +270,16 @@ pub(super) fn turn(db: &Connection, writer: &Writer, now: i64) -> Result<bool> {
                  tactic_extra=tactic_extra+CASE WHEN ?2 THEN 0 ELSE ?3 END WHERE day=?1",
                 (&day.key, opening, change),
             )?;
-            if let Some((prefix, through)) = &overlay {
+            if let Some(((inline, generation), through)) = &prepared_overlay {
                 let basis = crate::opening_priority::Basis::current(&tx)?
                     .context("Missing opening priority basis")?;
-                crate::opening_priority::publish_prefix(&tx, &basis, prefix, *through)?;
+                crate::opening_priority::publish_prefix(
+                    &tx,
+                    &basis,
+                    inline,
+                    *generation,
+                    *through,
+                )?;
             }
         }
         finish(&tx, &request.request, "added", Some(added))?;
