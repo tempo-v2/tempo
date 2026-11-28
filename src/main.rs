@@ -32,6 +32,7 @@ mod repertoire_similarity;
 mod review;
 mod scanner;
 mod study;
+mod study_move_review;
 mod study_store;
 mod tactic_qualification;
 mod tactic_worker_protocol;
@@ -117,6 +118,13 @@ impl IntoResponse for ApiError {
             return (status, Json(json!({"code":error,"error":message}))).into_response();
         }
 
+        if self.0.is::<study_move_review::Stale>() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"code":"stale_study_move","error":self.0.to_string()})),
+            )
+                .into_response();
+        }
         if self.0.is::<gap_edit::Stale>() {
             return (
                 StatusCode::CONFLICT,
@@ -903,6 +911,22 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .route(
             "/api/openings/similar-moves",
             post(repertoire_similarity::browse),
+        )
+        .route(
+            "/api/openings/study-review",
+            post(study_move_review::read).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/openings/study-review/evidence",
+            post(study_move_review::evidence).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/openings/study-review/preview",
+            post(study_move_review::preview).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/openings/study-review/apply",
+            post(study_move_review::apply).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/openings/engine-moves", post(opening_engine::browse))
         .route(

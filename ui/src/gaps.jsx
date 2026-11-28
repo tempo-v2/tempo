@@ -3,6 +3,7 @@ import { Chess } from "chess.js";
 import { api, readView, visibleRead } from "./api.js";
 import { play, position } from "./board.jsx";
 import { GapReview } from "./gap_review.jsx";
+import { ReplacementImpact } from "./replacement_impact.jsx";
 import { repertoireKey, useRepertoirePages } from "./repertoire_pages.js";
 
 const storage = "tempo-lean-gap-draft-v1";
@@ -127,16 +128,6 @@ function ConflictDetails({ conflict, disabled, correct }) {
   </li>;
 }
 
-function ReplacementImpact({ impact }) {
-  return <ul className="gap-conflict-list">{impact.map((line, index) => <li key={index}>
-    <strong>{line.name}</strong>
-    <dl>
-      <dt>Before</dt><dd>{line.before}</dd>
-      <dt>After</dt><dd>{line.after ?? "Archived without an active continuation."}</dd>
-    </dl>
-    {line.stopped_at && <p>{line.stopped_at}</p>}
-  </li>)}</ul>;
-}
 
 export function Gaps() {
   const [draft, setDraft] = useState(restore);
