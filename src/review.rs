@@ -192,15 +192,13 @@ pub fn next(db: &mut Connection, input: Next) -> Result<Option<Review>> {
     if prepared {
         queue_store::place_deferred(&tx, now)?;
     }
-    let selected = if let Some(card) = queue_store::committed_head(&tx, now)? {
-        Some(card)
+    let selected = if let Some((id, kind)) = queue_store::committed_head(&tx, now)? {
+        daily_store::commit_slot(&tx, &id, now)?;
+        Some((id, kind))
     } else {
         anyhow::ensure!(prepared, Preparing);
-        daily_store::select(&tx, previous_kind.as_deref(), now)?
+        daily_store::take_fresh(&tx, previous_kind.as_deref(), now)?
     };
-    if let Some((id, _)) = &selected {
-        daily_store::commit_slot(&tx, id, now)?;
-    }
     study_store::issue(
         &tx,
         selected

@@ -1,6 +1,6 @@
 import { SimilarMoves } from "./similar_moves.jsx";
 import { TacticPacks } from "./tactic_packs.jsx";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api, fileText, readView } from "./api.js";
 import { ChessBoard, Replay, play, position } from "./board.jsx";
@@ -125,6 +125,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
   const [busy, setBusy] = useState(false);
   const sourceRequest = useRef(null);
   const [savedRevision, setSavedRevision] = useState(0);
+  useLayoutEffect(() => sounds.cancel, [sounds, opening, color]);
   const game = position(draft);
   const legal = game.moves({ verbose: true }).map(({ from, to, promotion }) => from + to + (promotion ?? ""));
 
@@ -157,6 +158,10 @@ export function Openings({ fromGame, onSaved, sounds }) {
     cancelSource();
     setDraft(next);
   }
+  function resetDraft(next) {
+    sounds.cancel();
+    editDraft(next);
+  }
   function changeStartingText(text) {
     cancelSource();
     setStartingText(text);
@@ -182,6 +187,7 @@ export function Openings({ fromGame, onSaved, sounds }) {
         if (request.signal.aborted) return;
         route = decodeOpeningPreview(body);
       }
+      sounds.cancel();
       setDraft({ ...draft, ...route, start_at: useExistingMoves ? 0 : route.moves.length });
       setOpening(null);
       setNotice("Position loaded. Play your continuation.");
@@ -239,8 +245,8 @@ export function Openings({ fromGame, onSaved, sounds }) {
             onRejectedMove={() => sounds.play("illegal")}
             onMove={appendMove} />
           <div className="controls">
-            <button disabled={draft.moves.length <= draft.start_at} onClick={() => editDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
-            <button onClick={() => { editDraft(initial); setDestination(fromGame ? null : "new"); setNotice(""); }}>Start over</button>
+            <button disabled={draft.moves.length <= draft.start_at} onClick={() => resetDraft({ ...draft, moves: draft.moves.slice(0, -1) })}>Undo</button>
+            <button onClick={() => { resetDraft(initial); setDestination(fromGame ? null : "new"); setNotice(""); }}>Start over</button>
             <span>{draft.moves.length - draft.start_at} continuation plies</span>
           </div>
         </>}

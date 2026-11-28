@@ -1,6 +1,6 @@
 import { ExerciseLayout } from "./exercise_layout.jsx";
 import { decodePuzzle, PuzzleBoard, recoverPuzzleActions } from "./puzzle_play.jsx";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api, readView } from "./api.js";
 import {
@@ -211,6 +211,7 @@ export function Study({ openGame, sounds }) {
   const mounted = useRef(true);
   const [openingProgress, setOpeningProgress] = useState(null);
   const attemptKey = card ? `${card.dataset}/${card.attempt}` : null;
+  useLayoutEffect(() => sounds.cancel, [sounds, attemptKey]);
   const source = sourceRead?.key === attemptKey ? sourceRead.result : null;
   const learner = card?.color?.[0];
   const frames = useMemo(() => openingFrames(card?.lead_in, card?.fen, learner), [card?.lead_in, card?.fen, learner]);

@@ -109,7 +109,10 @@ export function Games({ jump, addOpening, settings, sounds }) {
         </div>
       </>}</div>
       <div>
-        {game && <GameFeedback key={game.id} game={game} ply={ply} onPly={setPly}
+        {game && <GameFeedback key={game.id} game={game} ply={ply} onPly={next => {
+          if (next !== ply) sounds.cancel();
+          setPly(next);
+        }}
           retained={repertoire} onSelect={setRepertoire} />}
         <details open={!game}><summary>Import games</summary>
           {["chesscom", "lichess"].map((provider) => <div key={provider} className="provider">

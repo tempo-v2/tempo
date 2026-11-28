@@ -103,8 +103,12 @@ async function qualify() {
           return route.abort();
         }
         await responseHeld.promise;
-        return route.fulfill({ json: { rating: "Good", answers: ["e2e4"], repeat_after: null } });
+        const { played } = route.request().postDataJSON();
+        return route.fulfill({ json: { rating: "Good", answers: [played], repeat_after: null } });
       }
+      if (pathname === "/api/study/next") return route.fulfill({
+        json: { ...card, attempt: 3, lead_in: undefined, introduction_move: "g1f3" },
+      });
       if (pathname === "/api/study/puzzle-move") {
         const { step } = route.request().postDataJSON();
         if (step === 0) await responseHeld.promise;
@@ -115,6 +119,9 @@ async function qualify() {
       }
       if (pathname === "/api/tactics/plays") return route.fulfill({ json: [] });
       if (pathname === "/api/tactics/packs") return route.fulfill({ json: { themes: [] } });
+      if (pathname === "/api/openings") {
+        return route.fulfill({ json: [{ id: "saved-opening", name: "Saved audio line", color: "white", route: solved.solution }] });
+      }
       if (pathname.startsWith("/api/")) return route.fulfill({ json: null });
       const file = pathname === "/" ? "index.html" : pathname.slice(1);
       return route.fulfill({ contentType: mime[path.extname(file)], body: await readFile(path.join(root, file)) });
@@ -183,6 +190,27 @@ async function qualify() {
     cardHeld.resolve();
     await heard(page, ["move-self", "move-opponent"]);
     await page.getByRole("heading", { name: "White to move" }).waitFor();
+    await page.evaluate(() => {
+      window.boardAudio.stopped.length = 0;
+      const nextCard = new MutationObserver(() => {
+        const button = document.querySelector('button[aria-keyshortcuts="Space"]:not(:disabled)');
+        if (button) { nextCard.disconnect(); button.click(); }
+      });
+      nextCard.observe(document.querySelector("main"), { childList: true, subtree: true, attributes: true });
+    });
+    await move(page, "g1", "f3");
+    await page.getByRole("heading", { name: "Play Nf3" }).waitFor();
+    await page.waitForFunction(() => window.boardAudio.stopped.includes("move-self"));
+
+    await page.getByRole("button", { name: "Openings", exact: true }).click();
+    const saved = page.getByRole("button", { name: "Saved audio line white" });
+    await saved.waitFor();
+    await page.evaluate(() => { window.boardAudio.stopped.length = 0; });
+    await move(page, "e2", "e4");
+    await page.waitForFunction(() => window.boardAudio.started.at(-1) === "move-self");
+    await saved.click();
+    await page.waitForFunction(() => window.boardAudio.stopped.includes("move-self"));
+
     await page.getByRole("button", { name: "Tactics", exact: true }).click();
     await page.getByRole("button", { name: "Puzzle library", exact: true }).click();
     await page.getByRole("button", { name: "Audio replay" }).click();

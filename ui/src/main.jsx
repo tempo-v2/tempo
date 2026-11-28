@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useLayoutEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "@tempo-v2/core-components/styles.css";
 import "./style.css";
@@ -19,7 +19,7 @@ function App() {
   const [game, setGame] = useState(null);
   const [draft, setDraft] = useState(null);
   useEffect(() => { sounds.preload(); }, [sounds]);
-  useEffect(() => sounds.cancel, [sounds, page, openingTab]);
+  useLayoutEffect(() => sounds.cancel, [sounds, page, openingTab]);
   function openGame(id, ply) { setGame({ id, ply }); setPage("Games"); }
   function addOpening(route) { setOpeningTab("Library"); setDraft(route); setPage("Openings"); }
   return <div onPointerDownCapture={sounds.unlock} onPointerUpCapture={sounds.unlock} onKeyDownCapture={sounds.unlock}>
