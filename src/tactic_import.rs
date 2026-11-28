@@ -1,6 +1,6 @@
 //! Authored puzzle intake. Source links select import defaults and are catalog metadata.
 use crate::{catalog, chess};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Read};
@@ -115,6 +115,15 @@ pub fn options(pgn: impl Read, puzzle_url: Option<&str>) -> Result<Options> {
 pub fn ensure_pgn_size(pgn: &str) -> Result<()> {
     ensure!(pgn.len() <= crate::jobs::MAX_PGN, "PGN exceeds 64 MiB");
     Ok(())
+}
+
+/// The existing HTTP authoring and CLI operations accept solver-first PGNs.
+pub fn prepare_authored(mut input: Input) -> Result<Prepared> {
+    catalog::name(input.name.as_deref().context("enter a puzzle name")?)?;
+    if input.format.is_none() {
+        input.format = Some(Format::GenericPgn);
+    }
+    prepare(input)
 }
 
 pub fn prepare(input: Input) -> Result<Prepared> {

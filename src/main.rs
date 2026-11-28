@@ -391,7 +391,7 @@ async fn preview_opening(request: Request) -> Response {
     };
     let request = match buffer_pgn(request, deadline).await {
         Ok(request) => request,
-        Err(status) => return status.into_response(),
+        Err(response) => return response,
     };
     let runtime = tokio::runtime::Handle::current();
     let reply = run_preview(permit, deadline, move || {
@@ -498,7 +498,7 @@ async fn save_tactic(State(db): State<App>, Json(input): Json<tactic_import::Inp
     let prepared = prepare(
         &db.content_preparation,
         || ApiError(writer::Unavailable.into()),
-        move || tactic_import::prepare(input),
+        move || tactic_import::prepare_authored(input),
     )
     .await?;
     write_db(db, move |c| {
@@ -852,19 +852,39 @@ async fn receive_pgn(State(slot): State<Arc<Semaphore>>, request: Request, next:
                 .insert(PgnReceiveDeadline(deadline));
             next.run(request).await
         }
-        Err(status) => status.into_response(),
+        Err(response) => response,
     }
 }
 
-async fn buffer_pgn(request: Request, deadline: Instant) -> Result<Request, StatusCode> {
+async fn buffer_pgn(request: Request, deadline: Instant) -> Result<Request, Response> {
+    fn too_large() -> Response {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "code": "pgn_payload_too_large",
+                "error": "The PGN request exceeds the size limit."
+            })),
+        )
+            .into_response()
+    }
+
     let (parts, body) = request.into_parts();
+    if axum::body::HttpBody::size_hint(&body).lower() > PGN_BODY_LIMIT as u64 {
+        return Err(too_large());
+    }
     let bytes =
         match tokio::time::timeout_at(deadline.into(), axum::body::to_bytes(body, PGN_BODY_LIMIT))
             .await
         {
             Ok(Ok(bytes)) => bytes,
-            Ok(Err(_)) => return Err(StatusCode::PAYLOAD_TOO_LARGE),
-            Err(_) => return Err(StatusCode::REQUEST_TIMEOUT),
+            Ok(Err(error))
+                if std::error::Error::source(&error)
+                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
+            {
+                return Err(too_large());
+            }
+            Ok(Err(_)) => return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response()),
+            Err(_) => return Err(StatusCode::REQUEST_TIMEOUT.into_response()),
         };
     Ok(Request::from_parts(parts, axum::body::Body::from(bytes)))
 }
@@ -1154,7 +1174,7 @@ async fn main() -> Result<()> {
                 "tactic" => {
                     apply_puzzle(
                         &mut database,
-                        &tactic_import::prepare(serde_json::from_reader(input)?)?,
+                        &tactic_import::prepare_authored(serde_json::from_reader(input)?)?,
                     )?
                     .id
                 }
@@ -1185,7 +1205,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -1225,11 +1245,14 @@ mod preview_tests {
             json!({"format":"chess_com_puzzle","source_url":URL})
         );
         drop(writes_busy);
-        let saved: Value = post("tactics", json!({"name":"Chess.com fixture","pgn":PGN}))
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let saved: Value = post(
+            "tactics",
+            json!({"name":"Chess.com fixture","pgn":PGN,"format":"chess_com_puzzle"}),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
         let id = saved["id"].as_str().unwrap();
         let puzzle = &saved["puzzle"];
         assert_eq!(puzzle["id"], id);
@@ -1357,18 +1380,25 @@ mod preview_tests {
             PGN.replace("1... h5", "1... h3"),
             format!("{}\n\n1... h5 *", PGN.split_once("\n\n").unwrap().0),
         ] {
-            let response = post("tactics", json!({"name":"Invalid","pgn":invalid})).await?;
+            let response = post(
+                "tactics",
+                json!({"name":"Invalid","pgn":invalid,"format":"chess_com_puzzle"}),
+            )
+            .await?;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
         let branch_pgn = format!(
             "{}\n\n1... h5 (1... h6 2. Bb4) 2. Rxe4+ (2. Bc5) *",
             PGN.split_once("\n\n").unwrap().0
         );
-        let branch: Value = post("tactics", json!({"name":"Branch fixture","pgn":branch_pgn}))
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let branch: Value = post(
+            "tactics",
+            json!({"name":"Branch fixture","pgn":branch_pgn,"format":"chess_com_puzzle"}),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
         let read = Database::read(&database)?;
         let answers: String = read.query_row(
             "SELECT answers FROM cards WHERE id=?1",
@@ -1379,6 +1409,30 @@ mod preview_tests {
             serde_json::from_str::<Value>(&answers)?,
             json!(["a3c5", "f4e4"])
         );
+        let old_pgn = format!("[Link \"{URL}\"]\n\n1. e4 (1. d4) *");
+        let predecessor: Value = post(
+            "tactics",
+            json!({"name":"Predecessor puzzle","pgn":old_pgn}),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(predecessor["puzzle"]["route"]["moves"], json!(["e2e4"]));
+        assert_eq!(
+            predecessor["puzzle"]["route"]["fen"],
+            chess::fen(&chess::position("")?)
+        );
+        assert_eq!(predecessor["puzzle"]["source_url"], URL);
+        let answers: String = read.query_row(
+            "SELECT answers FROM cards WHERE id=?1",
+            [predecessor["id"].as_str().unwrap()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&answers)?,
+            json!(["d2d4", "e2e4"])
+        );
         let listed: Vec<Value> = client
             .get(format!("{base}/tactics"))
             .send()
@@ -1386,7 +1440,7 @@ mod preview_tests {
             .error_for_status()?
             .json()
             .await?;
-        assert_eq!(listed.len(), 3);
+        assert_eq!(listed.len(), 4);
         assert!(listed.contains(puzzle));
         assert!(listed.contains(&annotated["puzzle"]));
         server.abort();
@@ -1409,6 +1463,22 @@ mod preview_tests {
             axum::serve(listener, router(Path::new("."), port, app.clone())).into_future(),
         );
         let origin = format!("http://127.0.0.1:{port}/api");
+        let mut oversized = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        oversized.write_all(format!(
+            "POST /api/tactics/capture HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            PGN_BODY_LIMIT + 1
+        ).as_bytes()).await?;
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            oversized.read_to_string(&mut response),
+        )
+        .await??;
+        assert!(response.starts_with("HTTP/1.1 413 "), "{response}");
+        assert!(
+            response.contains("\"code\":\"pgn_payload_too_large\""),
+            "{response}"
+        );
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()?;

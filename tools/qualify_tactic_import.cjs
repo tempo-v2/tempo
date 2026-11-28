@@ -22,8 +22,8 @@ async function qualify() {
   let server;
   let browser;
   try {
-    await writeFile(seed, JSON.stringify({ pgn: "1. e4 e5 *", name: "Existing attempt" }));
-    execFileSync(binary, ["import-content", db, "tactic", seed]);
+    await writeFile(seed, JSON.stringify({ pgn: `[Link "${chesscom}"]\n\n1. e4 (1. d4) *`, name: "Existing attempt" }));
+    const seedId = execFileSync(binary, ["import-content", db, "tactic", seed], { encoding: "utf8" }).trim();
     server = spawn(binary, ["serve", db, "0", "--no-worker"]);
     server.stderr.pipe(process.stderr);
     const lines = createInterface({ input: server.stdout });
@@ -38,6 +38,9 @@ async function qualify() {
       });
       return response.json();
     };
+    const seeded = (await api("tactics")).find(puzzle => puzzle.id === seedId);
+    assert.deepEqual(seeded?.route.moves, ["e2e4"]);
+    assert.equal(seeded.source_url, chesscom);
     let issued;
     for (let retries = 0; retries < 40; retries++) {
       issued = await api("study/next", { after: null });
@@ -99,8 +102,23 @@ async function qualify() {
     await page.getByRole("button", { name: "Next card" }).waitFor();
     await headerCapture.click();
     await expectReady();
+    let startedPreview;
+    let finishPreview;
+    const previewStarted = new Promise(resolve => { startedPreview = resolve; });
+    const previewMayFinish = new Promise(resolve => { finishPreview = resolve; });
+    await page.route("**/api/tactics/import-options", async route => {
+      startedPreview();
+      await previewMayFinish;
+      await route.continue();
+    }, { times: 1 });
     await editor.fill(pgn);
     await importOptions();
+    await dialog.getByText("Checking the import format…", { exact: true }).waitFor();
+    await previewStarted;
+    assert.equal(await format.inputValue(), "");
+    assert.equal(await setup.count(), 0, "Unknown setup must not be shown as unchecked");
+    assert.equal(await primary.isDisabled(), true);
+    finishPreview();
     await expectFormat("chess_com_puzzle");
     assert.equal(await setup.isChecked(), true);
 
@@ -168,6 +186,30 @@ async function qualify() {
     await expectFormat("chess_com_puzzle");
     await setup.uncheck();
     assert.equal((await save()).id, replay.id);
+
+    await page.route("**/api/tactics/import-options", route => route.fulfill({
+      status: 503, json: { error: "Fixture preview failure" },
+    }), { times: 1 });
+    await editor.fill(pretrimmed);
+    await dialog.getByText("Could not detect the import format. Choose a format to continue.", { exact: true }).waitFor();
+    assert.equal(await format.inputValue(), "");
+    assert.equal(await setup.count(), 0);
+    assert.equal(await primary.isDisabled(), true);
+    await format.selectOption("generic_pgn");
+    assert.equal(await setup.isChecked(), false);
+    assert.equal((await save()).id, replay.id);
+
+    await page.route(captureRoute, route => route.fulfill({
+      status: 413, json: { code: "pgn_payload_too_large", error: "The PGN request exceeds the size limit." },
+    }), { times: 1 });
+    await editor.fill(pgn);
+    await primary.click();
+    await dialog.getByRole("alert").getByText("The PGN request exceeds the size limit.").waitFor();
+    assert.equal(await retry.count(), 0);
+    assert.equal(await editor.inputValue(), pgn);
+    assert.equal(await editor.isEditable(), true);
+    assert.equal((await save()).id, replay.id);
+
     await close();
     await page.locator("header button:focus").filter({ hasText: "Capture" }).waitFor();
     assert.equal((await api("study")).attempt, issued.attempt);

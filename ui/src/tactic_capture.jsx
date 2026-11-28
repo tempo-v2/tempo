@@ -2,7 +2,12 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, fileText, readView } from "./api.js";
 import { pendingTacticCapture, resolveTacticCapture, saveTacticCapture } from "./puzzle-journal.js";
 
-const rejectedDraft = new Set(["capture_invalid", "capture_lookup_failed"]);
+const rejectedDraft = new Set(["capture_invalid", "capture_lookup_failed", "pgn_payload_too_large"]);
+const importFormats = {
+  generic_pgn: "Generic PGN",
+  chess_com_puzzle: "Chess.com puzzle",
+  lichess_pgn: "Lichess PGN",
+};
 
 export function TacticCapture({ onSaved, onClose }) {
   const dialog = useRef(null);
@@ -30,9 +35,10 @@ export function TacticCapture({ onSaved, onClose }) {
   const [focus, setFocus] = useState(0);
 
   const isId = /^[a-zA-Z0-9]{5}$/.test(input.trim());
-  const detection = detected?.input === input && detected.url === url ? detected.options : null;
-  const format = formatChoice ?? detection?.format ?? "generic_pgn";
-  const setup = setupChoice ?? (format === "chess_com_puzzle");
+  const detection = detected?.input === input && detected.url === url ? detected : null;
+  const format = formatChoice ?? detection?.options?.format ?? null;
+  const setup = setupChoice ?? (format === null ? null : format === "chess_com_puzzle");
+  const waitingForOptions = optionsOpen && !isId && !pending && format === null;
   const settingsLocked = busy || Boolean(pending);
 
   useLayoutEffect(() => {
@@ -80,9 +86,10 @@ export function TacticCapture({ onSaved, onClose }) {
       setChecking(true);
       try {
         const options = await api("tactics/import-options", { pgn: input, puzzle_url: url }, controller.signal, { requireJson: true });
+        if (!Object.hasOwn(importFormats, options?.format)) throw new Error("Unknown import format");
         setDetected({ input, url, options });
       } catch {
-        // The save command validates the current draft with the same defaults.
+        if (!controller.signal.aborted) setDetected({ input, url, failed: true });
       } finally {
         if (previewRunning.current === controller) {
           previewRunning.current = null;
@@ -128,7 +135,7 @@ export function TacticCapture({ onSaved, onClose }) {
 
   async function save(event) {
     event.preventDefault();
-    if (sending.current || previewRunning.current || reading || !dataset || !input.trim()) return;
+    if (sending.current || previewRunning.current || waitingForOptions || reading || !dataset || !input.trim()) return;
     sending.current = true;
     setBusy(true);
     setError("");
@@ -136,7 +143,9 @@ export function TacticCapture({ onSaved, onClose }) {
     const command = pending ?? {
       dataset, request: crypto.randomUUID(),
       input: isId ? { id: input.trim(), name } : {
-        pgn: input, name, puzzle_url: url, format: formatChoice, first_move_is_setup: setupChoice,
+        pgn: input, name, puzzle_url: url,
+        format: optionsOpen ? format : formatChoice,
+        first_move_is_setup: optionsOpen ? setup : setupChoice,
       },
     };
     try {
@@ -199,13 +208,15 @@ export function TacticCapture({ onSaved, onClose }) {
             <label>Puzzle name (optional)<input value={name} maxLength={160} onChange={(event) => setName(event.target.value)} /></label>
             {!isId && <>
               <label>Puzzle URL (optional)<input value={url} inputMode="url" maxLength={2048} onChange={(event) => setUrl(event.target.value)} /></label>
-              <label>Import format<select value={format} onChange={(event) => setFormatChoice(event.target.value)}>
-                <option value="generic_pgn">Generic PGN</option>
-                <option value="chess_com_puzzle">Chess.com puzzle</option>
-                <option value="lichess_pgn">Lichess PGN</option>
+              <label>Import format<select value={format ?? ""} onChange={(event) => setFormatChoice(event.target.value)}>
+                <option value="" disabled>Automatic</option>
+                {Object.entries(importFormats).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select></label>
-              <label className="checkbox-label"><input type="checkbox" checked={setup}
-                onChange={(event) => setSetupChoice(event.target.checked)} /> First move is setup</label>
+              {format === null && (input.trim() || url.trim()) && !pending && <p role="status">
+                {detection?.failed ? "Could not detect the import format. Choose a format to continue." : "Checking the import format…"}
+              </p>}
+              {setup !== null && <label className="checkbox-label"><input type="checkbox" checked={setup}
+                onChange={(event) => setSetupChoice(event.target.checked)} /> First move is setup</label>}
             </>}
           </div>
         </details>
@@ -215,7 +226,7 @@ export function TacticCapture({ onSaved, onClose }) {
       </p>}
       {error && <p className="error" role="alert">{error}</p>}
       <div className="controls">
-        <button className="primary" disabled={busy || checking || reading || !dataset || !input.trim()}>
+        <button className="primary" disabled={busy || checking || waitingForOptions || reading || !dataset || !input.trim()}>
           {busy ? "Saving…" : pending ? "Retry save" : "Save puzzle"}
         </button>
         {notice && <span role="status">{notice}</span>}
