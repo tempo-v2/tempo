@@ -75,5 +75,6 @@ CREATE TABLE opening_priority_projection (
   priority INTEGER NOT NULL,
   commitments INTEGER NOT NULL,
   paused INTEGER NOT NULL CHECK(paused IN (0,1)),
-  prefix TEXT NOT NULL
+  prefix TEXT NOT NULL,
+  processed_through INTEGER NOT NULL
 ) STRICT;

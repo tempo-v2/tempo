@@ -1395,6 +1395,65 @@ mod preview_tests {
     use tokio::sync::oneshot;
 
     #[tokio::test]
+    async fn external_opening_miss_routes_are_absent_from_private_web() -> Result<()> {
+        const HOST: &str = "lean.example.ts.net:10000";
+        const ORIGIN: &str = "https://lean.example.ts.net:10000";
+        const LOGIN: &str = "owner@example.com";
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("private.sqlite3");
+        let app = Arc::new(Runtime::new(
+            database.clone(),
+            writer::Writer::start(Database::init(&database)?, None)?,
+            uploads::Staging::start(&database)?,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let access = private_web::Access::new(ORIGIN, LOGIN)?;
+        let server = tokio::spawn(
+            axum::serve(listener, private_router(root.path(), access, app)).into_future(),
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+        let request = |method, path| {
+            client
+                .request(method, format!("http://{address}{path}"))
+                .header("host", HOST)
+                .header("x-forwarded-host", HOST)
+                .header("x-forwarded-proto", "https")
+                .header("tailscale-user-login", LOGIN)
+                .header("origin", ORIGIN)
+                .send()
+        };
+        assert!(
+            request(reqwest::Method::GET, "/api/health")
+                .await?
+                .status()
+                .is_success()
+        );
+        for (method, path) in [
+            (reqwest::Method::POST, "/api/openings/misses/preview"),
+            (reqwest::Method::POST, "/api/openings/misses"),
+            (
+                reqwest::Method::GET,
+                "/api/openings/misses/receipts/12345678-1234-1234-1234-000000000001",
+            ),
+            (
+                reqwest::Method::GET,
+                "/api/openings/introduction-priorities/1",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/openings/introduction-priorities/1/cancel",
+            ),
+        ] {
+            assert_eq!(request(method, path).await?.status(), StatusCode::NOT_FOUND);
+        }
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn authored_pgn_import_normalizes_then_uses_the_existing_study_card() -> Result<()> {
         const PGN: &str = include_str!("../tests/fixtures/chesscom-2293026.pgn");
         const URL: &str = "https://www.chess.com/puzzles/problem/2293026";

@@ -644,8 +644,9 @@ impl Apply {
 }
 
 pub fn status(db: &Connection, dataset: &str, goal: i64) -> Result<Value> {
-    check_dataset(db, dataset)?;
-    crate::opening_priority::status(db, goal)?.ok_or_else(|| Rejected::Missing.into())
+    let snapshot = db.unchecked_transaction()?;
+    check_dataset(&snapshot, dataset)?;
+    crate::opening_priority::status(&snapshot, goal)?.ok_or_else(|| Rejected::Missing.into())
 }
 
 pub fn cancel(db: &mut Connection, dataset: &str, goal: i64) -> Result<Value> {

@@ -126,7 +126,14 @@ pub fn status(db: &Connection, id: i64) -> Result<Option<Value>> {
             .cloned()
             .map(serde_json::from_value::<Basis>)
             .transpose()?;
-        if current != basis {
+        let projected = state == "blocked"
+            || current
+                .as_ref()
+                .map(|basis| published_through(db, basis))
+                .transpose()?
+                .flatten()
+                .is_some_and(|through| through >= id);
+        if current != basis || !projected {
             state = "preparing".into();
             detail = None;
         }
@@ -273,21 +280,43 @@ pub fn published_prefix(db: &Connection, basis: &Basis) -> Result<Option<Vec<Pro
     prefix.map(|p| Ok(serde_json::from_str(&p)?)).transpose()
 }
 
-pub fn publish_prefix(db: &Connection, basis: &Basis, prefix: &[Proof]) -> Result<()> {
+pub fn published_through(db: &Connection, basis: &Basis) -> Result<Option<i64>> {
+    Ok(db
+        .query_row(
+            "SELECT processed_through FROM opening_priority_projection
+         WHERE day=?1 AND openings=?2 AND priority=?3 AND commitments=?4 AND paused=?5",
+            params![
+                basis.day,
+                basis.openings,
+                basis.priority,
+                basis.commitments,
+                basis.paused
+            ],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub fn publish_prefix(
+    db: &Connection,
+    basis: &Basis,
+    prefix: &[Proof],
+    through: i64,
+) -> Result<()> {
     ensure!(
         prefix.len() <= 20,
         "opening priority prefix exceeds daily allowance"
     );
     db.execute(
         "INSERT OR REPLACE INTO opening_priority_projection
-        (singleton,day,openings,priority,commitments,paused,prefix) VALUES (1,?1,?2,?3,?4,?5,?6)",
+        (singleton,day,openings,priority,commitments,paused,prefix,processed_through) VALUES (1,?1,?2,?3,?4,?5,?6,?7)",
         params![
             basis.day,
             basis.openings,
             basis.priority,
             basis.commitments,
             basis.paused,
-            serde_json::to_string(prefix)?
+            serde_json::to_string(prefix)?, through
         ],
     )?;
     Ok(())

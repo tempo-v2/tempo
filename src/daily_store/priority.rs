@@ -24,6 +24,7 @@ pub(super) struct Pass {
     allocated: HashSet<String>,
     done: bool,
     published: Option<Vec<Proof>>,
+    published_through: i64,
     pending_updates: Vec<Update>,
     fresh_order: bool,
     schedule_floor: i64,
@@ -37,6 +38,7 @@ impl Pass {
         fresh_order: bool,
         schedule_floor: i64,
         published: Option<Vec<Proof>>,
+        published_through: i64,
     ) -> Self {
         let (pinned, _) = input.checked_commitments();
         Self {
@@ -50,6 +52,7 @@ impl Pass {
             prefix: Vec::new(),
             done: false,
             published,
+            published_through,
             pending_updates: Vec::new(),
             fresh_order,
             schedule_floor,
@@ -226,17 +229,19 @@ pub(super) fn turn(
         Some((
             opening_rows(&tx, &day, &clock)?,
             goals::published_prefix(&tx, &basis)?,
+            goals::published_through(&tx, &basis)?.unwrap_or_default(),
         ))
     };
     tx.commit()?;
 
-    if let Some((rows, published)) = capture {
+    if let Some((rows, published, through)) = capture {
         *active = Some(Pass::new(
             basis.clone(),
             rows.compile(|| Instant::now() >= read_deadline)?,
             day.fresh,
             clock.sequence,
             published,
+            through,
         ));
     }
     let pass = active.as_mut().unwrap();
@@ -303,6 +308,7 @@ pub(super) fn turn(
         }
         let published_basis = basis.clone();
         let prefix = pass.prefix.clone();
+        let through = pass.cursor.max(pass.published_through);
         if !writer.background_until(deadline, move |db| {
             let tx = db.transaction_with_behavior(Immediate)?;
             if super::day_at(chrono::Utc::now().timestamp())? != day.key
@@ -315,7 +321,7 @@ pub(super) fn turn(
             if !publish_slots(&tx, &day, &draft)? {
                 return Ok(false);
             }
-            goals::publish_prefix(&tx, &published_basis, &prefix)?;
+            goals::publish_prefix(&tx, &published_basis, &prefix, through)?;
             ensure!(
                 tx.total_changes() - before <= 128,
                 "priority opening publication exceeds write bound"
@@ -327,6 +333,23 @@ pub(super) fn turn(
             return Ok(true);
         }
         pass.published = Some(pass.prefix.clone());
+        pass.published_through = through;
+    } else if pass.cursor > pass.published_through {
+        let through = pass.cursor;
+        let prefix = pass.published.as_deref().unwrap_or_default().to_vec();
+        if !writer.background_until(deadline, move |db| {
+            let tx = db.transaction_with_behavior(Immediate)?;
+            if Basis::current(&tx)?.as_ref() != Some(&basis) {
+                return Ok(false);
+            }
+            goals::publish_prefix(&tx, &basis, &prefix, through)?;
+            tx.commit()?;
+            Ok(true)
+        })? {
+            *active = None;
+            return Ok(true);
+        }
+        pass.published_through = through;
     }
     pass.done = exhausted;
     Ok(true)
