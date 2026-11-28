@@ -77,6 +77,8 @@ async function qualify() {
       };
       const start = AudioBufferSourceNode.prototype.start;
       AudioBufferSourceNode.prototype.start = function (...args) {
+        // Cancellation checks must observe a source that cannot end on its own.
+        if (observations.hold) this.loop = true;
         start.apply(this, args);
         observations.started.push(clips.get(this.buffer));
         observations.lastStart = performance.now();
@@ -191,6 +193,7 @@ async function qualify() {
     await heard(page, ["move-self", "move-opponent"]);
     await page.getByRole("heading", { name: "White to move" }).waitFor();
     await page.evaluate(() => {
+      window.boardAudio.hold = true;
       window.boardAudio.stopped.length = 0;
       const nextCard = new MutationObserver(() => {
         const button = document.querySelector('button[aria-keyshortcuts="Space"]:not(:disabled)');
