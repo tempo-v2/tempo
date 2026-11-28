@@ -581,3 +581,150 @@ pub fn clear_damaged_checkpoint(db: &Connection, job: i64, file: &str) -> Result
 
 #[cfg(test)]
 mod tests;
+
+/// Completed comparison identity and the exact learner scope for external assessment.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MissBasis {
+    pub report_generation: i64,
+    pub comparator_version: i64,
+    pub repertoire_revision: i64,
+}
+
+#[derive(Serialize)]
+pub struct MissDecision {
+    pub position: String,
+    pub expected_uci: String,
+    pub answer_version: String,
+    pub occurrences: Vec<MissOccurrence>,
+}
+
+#[derive(Serialize)]
+pub struct MissOccurrence {
+    pub ply: usize,
+    pub played_uci: String,
+}
+
+#[derive(Debug)]
+pub enum MissError {
+    InvalidScope,
+    StaleReport,
+    InvalidDecision,
+}
+
+impl std::fmt::Display for MissError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidScope => "The game or selected same-color repertoire is unavailable.",
+            Self::StaleReport => {
+                "Prepare with the current completed comparison for this game and repertoire."
+            }
+            Self::InvalidDecision => {
+                "Select a differing learner decision and all its occurrences at that position."
+            }
+        })
+    }
+}
+impl std::error::Error for MissError {}
+
+pub fn check_miss_basis(db: &Connection, pair: &Pair, expected: MissBasis) -> Result<String> {
+    let color = games::archived_learner_color(db, &pair.game)?.ok_or(MissError::InvalidScope)?;
+    ensure!(
+        catalog::repertoire(db, &pair.repertoire, &color)?.is_some(),
+        MissError::InvalidScope
+    );
+    let revision = catalog::authored_reply_revision(db, &pair.repertoire)?;
+    let current = db
+        .query_row(
+            "SELECT completed_generation,repertoire_revision,comparator_version
+         FROM repertoire_feedback WHERE game_id=?1 AND repertoire_id=?2
+         AND completed_generation IS NOT NULL",
+            (&pair.game, &pair.repertoire),
+            |r| {
+                Ok(MissBasis {
+                    report_generation: r.get(0)?,
+                    repertoire_revision: r.get(1)?,
+                    comparator_version: r.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    ensure!(
+        current == Some(expected)
+            && expected.repertoire_revision == revision
+            && expected.comparator_version == REPERTOIRE_VERSION,
+        MissError::StaleReport
+    );
+    Ok(color)
+}
+
+pub fn miss_decision(
+    db: &Connection,
+    pair: &Pair,
+    basis: MissBasis,
+    position: &str,
+    plies: &[usize],
+) -> Result<(String, MissDecision)> {
+    let color = check_miss_basis(db, pair, basis)?;
+    let bytes: Vec<u8> = db
+        .query_row(
+            "SELECT report FROM repertoire_feedback WHERE game_id=?1 AND repertoire_id=?2
+         AND length(CAST(report AS BLOB))<=?3",
+            params![pair.game, pair.repertoire, MAX_REPORT_BYTES],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or(MissError::StaleReport)?;
+    let report: Report = serde_json::from_slice(&bytes)?;
+    ensure!(
+        report.pair.game == pair.game
+            && report.pair.repertoire == pair.repertoire
+            && report.learner_color == color
+            && report.repertoire_revision == basis.repertoire_revision
+            && report.comparator_version == basis.comparator_version
+            && report.decisions.len() <= MAX_DECISIONS,
+        MissError::StaleReport
+    );
+    let mut reply: Option<(String, String)> = None;
+    let mut occurrences = Vec::new();
+    for decision in report
+        .decisions
+        .into_iter()
+        .filter(|d| d.position == position)
+    {
+        if let RepertoireOutcome::Differed {
+            expected,
+            answer_version,
+        } = decision.outcome
+        {
+            let current = (expected.uci, answer_version);
+            ensure!(
+                reply.as_ref().is_none_or(|original| original == &current),
+                MissError::InvalidDecision
+            );
+            reply = Some(current);
+            occurrences.push(MissOccurrence {
+                ply: decision.ply,
+                played_uci: decision.played.uci,
+            });
+        }
+    }
+    let (expected_uci, answer_version) = reply.ok_or(MissError::InvalidDecision)?;
+    occurrences.sort_by_key(|entry| entry.ply);
+    ensure!(
+        occurrences
+            .iter()
+            .map(|entry| entry.ply)
+            .eq(plies.iter().copied()),
+        MissError::InvalidDecision
+    );
+    Ok((
+        color,
+        MissDecision {
+            position: position.to_owned(),
+            expected_uci,
+            answer_version,
+            occurrences,
+        },
+    ))
+}

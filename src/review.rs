@@ -2,7 +2,7 @@
 use crate::{
     chess, daily_store, db, full_line, full_line_store,
     learning::{self, Rating},
-    queue, queue_store,
+    queue_store,
     study::{
         AcceptedView, AnswerAction, AnswerIntentV1, AnswerState, Conflict, Next, NextState,
         RepeatDisposition, Review,
@@ -148,6 +148,42 @@ pub fn record_rating(
     now: i64,
     first_due: Option<(i64, String)>,
 ) -> Result<(RepeatDisposition, Option<String>)> {
+    let (repeat, day) = apply_rating(db, card, attempt, previous, rating, now, first_due, None)?;
+    Ok((repeat.study(), day))
+}
+
+pub fn external_again(
+    db: &Connection,
+    card: &str,
+    attempt: i64,
+    previous: Option<&str>,
+    now: i64,
+    write_budget: u64,
+) -> Result<queue_store::RepeatOutcome> {
+    Ok(apply_rating(
+        db,
+        card,
+        attempt,
+        previous,
+        Rating::Again,
+        now,
+        None,
+        Some(write_budget),
+    )?
+    .0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rating(
+    db: &Connection,
+    card: &str,
+    attempt: i64,
+    previous: Option<&str>,
+    rating: Rating,
+    now: i64,
+    first_due: Option<(i64, String)>,
+    write_budget: Option<u64>,
+) -> Result<(queue_store::RepeatOutcome, Option<String>)> {
     let prior = db::prior_review(db, card)?;
     let first_review = prior.is_none();
     anyhow::ensure!(
@@ -163,21 +199,10 @@ pub fn record_rating(
     if first_review {
         daily_store::refresh_parent(db, card, now)?;
     }
-    let repeat = if matches!(rating, Rating::Again) && queue_store::can_repeat(db, card)? {
-        let draw = queue::draw_repeat_offset();
-        let placed = if queue_store::can_place_now(db)? {
-            queue_store::place_repeat(db, card, previous, now, draw)?
-        } else {
-            None
-        };
-        if let Some(offset) = placed {
-            RepeatDisposition::Placed(offset)
-        } else {
-            queue_store::defer_repeat(db, attempt, card, previous, now, draw)?;
-            RepeatDisposition::Deferred
-        }
+    let repeat = if matches!(rating, Rating::Again) {
+        queue_store::admit_repeat(db, card, attempt, previous, now, write_budget)?
     } else {
-        RepeatDisposition::None
+        queue_store::RepeatOutcome::None
     };
     Ok((repeat, day))
 }

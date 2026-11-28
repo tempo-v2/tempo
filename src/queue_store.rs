@@ -69,6 +69,79 @@ pub fn consume(db: &Connection, card: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepeatOutcome {
+    None,
+    Placed { offset: u8, draw: u8 },
+    Deferred { obligation: i64, draw: u8 },
+    AlreadyQueued { slot: i64 },
+    AlreadyPending { obligation: i64 },
+}
+
+impl RepeatOutcome {
+    pub fn study(&self) -> crate::study::RepeatDisposition {
+        use crate::study::RepeatDisposition;
+        match self {
+            Self::Placed { offset, .. } => RepeatDisposition::Placed(*offset),
+            Self::Deferred { .. } | Self::AlreadyPending { .. } => RepeatDisposition::Deferred,
+            Self::None | Self::AlreadyQueued { .. } => RepeatDisposition::None,
+        }
+    }
+}
+
+pub fn admit_repeat(
+    db: &Connection,
+    card: &str,
+    attempt: i64,
+    previous: Option<&str>,
+    now: i64,
+    write_budget: Option<u64>,
+) -> Result<RepeatOutcome> {
+    if !can_repeat(db, card)? {
+        return Ok(RepeatOutcome::None);
+    }
+    if let Some(slot) = db
+        .query_row("SELECT slot FROM deck WHERE card_id=?1", [card], |r| {
+            r.get(0)
+        })
+        .optional()?
+    {
+        return Ok(RepeatOutcome::AlreadyQueued { slot });
+    }
+    if let Some(obligation) = db
+        .query_row(
+            "SELECT attempt_id FROM repeat_obligation WHERE card_id=?1",
+            [card],
+            |r| r.get(0),
+        )
+        .optional()?
+    {
+        return Ok(RepeatOutcome::AlreadyPending { obligation });
+    }
+    let draw = queue::draw_repeat_offset();
+    if can_place_now(db)?
+        && let Some(offset) = place_repeat_bounded(db, card, previous, now, draw, write_budget)?
+    {
+        return Ok(RepeatOutcome::Placed { offset, draw });
+    }
+    defer_repeat(db, attempt, card, previous, now, draw)?;
+    Ok(RepeatOutcome::Deferred {
+        obligation: attempt,
+        draw,
+    })
+}
+
+// A budget is an absolute SQLite total_changes ceiling for speculative placement.
+// Check before each bounded write group. Rolled-back effects still count.
+fn check_repeat_budget(db: &Connection, budget: Option<u64>, writes: u64) -> Result<()> {
+    anyhow::ensure!(
+        budget.is_none_or(|end| db.total_changes() + writes <= end),
+        Preparing
+    );
+    Ok(())
+}
+
 /// Preserve the original draw and leave partial reservations untouched when
 /// another lane is still preparing. The caller saves the repeat obligation.
 pub fn place_repeat(
@@ -78,13 +151,31 @@ pub fn place_repeat(
     now: i64,
     draw: u8,
 ) -> Result<Option<u8>> {
+    place_repeat_bounded(db, card, previous_kind, now, draw, None)
+}
+
+fn place_repeat_bounded(
+    db: &Connection,
+    card: &str,
+    previous_kind: Option<&str>,
+    now: i64,
+    draw: u8,
+    write_budget: Option<u64>,
+) -> Result<Option<u8>> {
     db.execute_batch("SAVEPOINT repeat_placement")?;
-    match fill_repeat(db, card, previous_kind, now, draw) {
+    match fill_repeat(db, card, previous_kind, now, draw, write_budget) {
         Ok(offset) => {
             db.execute_batch("RELEASE repeat_placement")?;
             Ok(Some(offset))
         }
         Err(error) => {
+            let interrupted = error
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+                == Some(rusqlite::ErrorCode::OperationInterrupted);
+            if db.is_autocommit() || interrupted {
+                return Err(error);
+            }
             db.execute_batch("ROLLBACK TO repeat_placement; RELEASE repeat_placement")?;
             if error.is::<Preparing>() {
                 Ok(None)
@@ -101,6 +192,7 @@ fn fill_repeat(
     previous_kind: Option<&str>,
     now: i64,
     draw: u8,
+    write_budget: Option<u64>,
 ) -> Result<u8> {
     let mut q = db.prepare(
         "SELECT d.slot,p.kind,p.kind='opening' AND p.due_at IS NULL
@@ -136,6 +228,7 @@ fn fill_repeat(
     // Tactics can place a repeat while Study is still waiting on a different card.
     let unanswered = crate::study_store::unanswered_card(db)?;
     let protected = if let Some(id) = &unanswered {
+        check_repeat_budget(db, write_budget, 1)?;
         db.execute(
             "UPDATE prepared_queue SET reserved=1 WHERE card_id=?1 AND reserved=0",
             [id],
@@ -144,6 +237,9 @@ fn fill_repeat(
         false
     };
     while queued.len() < usize::from(draw) {
+        // An existing day has at most two exact due deletions and size triggers,
+        // one commitment, day counters/mix and two deck reservation writes.
+        check_repeat_budget(db, write_budget, 12)?;
         let Some((id, kind)) = daily_store::take_fresh(db, previous.as_deref(), now)? else {
             break;
         };
@@ -153,12 +249,18 @@ fn fill_repeat(
         queued.push((slot, kind, false));
     }
     if protected {
+        check_repeat_budget(db, write_budget, 1)?;
         db.execute(
             "UPDATE prepared_queue SET reserved=0 WHERE card_id=?1",
             [unanswered],
         )?;
     }
     let offset = queue::repeat_offset(draw, queued.len());
+    check_repeat_budget(
+        db,
+        write_budget,
+        (queued.len() - usize::from(offset)) as u64 + 2,
+    )?;
     let slot = if let Some((slot, _, _)) = queued.get(usize::from(offset)) {
         for (position, _, _) in queued[usize::from(offset)..].iter().rev() {
             db.execute(

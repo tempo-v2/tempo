@@ -297,12 +297,28 @@ pub fn submit(
     if day.openings != Some(clock.openings) {
         return Ok(Delivery::Busy);
     }
+    let overlay = if clock.priority == 0 {
+        None
+    } else {
+        let basis = crate::opening_priority::Basis::current(&tx)?
+            .context("Missing opening priority basis")?;
+        let Some(prefix) = crate::opening_priority::published_prefix(&tx, &basis)? else {
+            return Ok(Delivery::Busy);
+        };
+        Some((basis, prefix))
+    };
     let input = opening_rows(&tx, &day, &clock)?;
     tx.commit()?;
-    let draft =
-        input
-            .compile(|| Instant::now() >= deadline)?
-            .draft(clock.openings, &ordered, "maia");
+    let draft = input
+        .compile(|| Instant::now() >= deadline)?
+        .draft_with_priority(
+            clock.openings,
+            &ordered,
+            "maia",
+            overlay
+                .as_ref()
+                .map_or(&[], |(_, prefix)| prefix.as_slice()),
+        );
     if !draft.revoked_openings.is_empty() {
         return Ok(Delivery::Busy);
     }
@@ -313,6 +329,12 @@ pub fn submit(
         };
         if !ticket.applying(&tx, &digest)? {
             return Ok(Delivery::Stale);
+        }
+        if let Some((basis, prefix)) = &overlay
+            && (crate::opening_priority::Basis::current(&tx)?.as_ref() != Some(basis)
+                || crate::opening_priority::published_prefix(&tx, basis)?.as_ref() != Some(prefix))
+        {
+            return Ok(Delivery::Busy);
         }
         if !publish_fresh_order(&tx, &day, &draft, total)? {
             return Ok(Delivery::Busy);

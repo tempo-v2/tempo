@@ -9,6 +9,7 @@ pub enum Conflict {
     PackChanged,
     IllegalMove,
     FullSolution,
+    ExternalAssessment,
 }
 
 impl Conflict {
@@ -20,6 +21,7 @@ impl Conflict {
             Self::PackChanged => "pack_changed",
             Self::IllegalMove => "illegal_move",
             Self::FullSolution => "refresh_required",
+            Self::ExternalAssessment => "wrong_assessment_surface",
         }
     }
 }
@@ -32,6 +34,7 @@ impl std::fmt::Display for Conflict {
             Self::Attempt => "This attempt is no longer available.",
             Self::PackChanged => "The puzzle catalog changed. Reload the pack.",
             Self::IllegalMove => "That move is illegal in this position.",
+            Self::ExternalAssessment => "This assessment belongs to an external missed move.",
             Self::FullSolution => "Reload Tempo to continue the full puzzle.",
         })
     }

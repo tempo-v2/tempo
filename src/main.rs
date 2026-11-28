@@ -22,6 +22,8 @@ mod legacy;
 mod lichess_catalog;
 mod lichess_play;
 mod opening_engine;
+mod opening_miss;
+mod opening_priority;
 mod opening_rank;
 mod opening_replacement;
 mod optional_read;
@@ -100,6 +102,28 @@ type ApiResult = std::result::Result<Json<Value>, ApiError>;
 struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Some(error) = self.0.downcast_ref::<opening_miss::Rejected>() {
+            use opening_miss::Rejected::*;
+            let status = match error {
+                Invalid => StatusCode::BAD_REQUEST,
+                Missing => StatusCode::NOT_FOUND,
+                _ => StatusCode::CONFLICT,
+            };
+            return (
+                status,
+                Json(json!({"code":error.code(),"error":error.to_string()})),
+            )
+                .into_response();
+        }
+        if let Some(error) = self.0.downcast_ref::<game_feedback::MissError>() {
+            use game_feedback::MissError::*;
+            let (status, code) = match error {
+                InvalidScope => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_game_repertoire"),
+                InvalidDecision => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_miss_decision"),
+                StaleReport => (StatusCode::CONFLICT, "stale_comparison"),
+            };
+            return (status, Json(json!({"code":code,"error":error.to_string()}))).into_response();
+        }
         if let Some(error) = self.0.downcast_ref::<tactic_capture::Rejected>() {
             use tactic_capture::Rejected::*;
             let (status, code) = match error {
@@ -519,6 +543,68 @@ async fn save_tactic(State(db): State<App>, Json(input): Json<tactic_import::Inp
 async fn capture_context(State(app): State<App>) -> ViewResult {
     optional_view(app, optional_read::Reader::CaptureContext, |db| {
         Ok(json!({"dataset":db::dataset(db)?}))
+    })
+    .await
+}
+
+async fn preview_opening_miss(
+    State(app): State<App>,
+    Json(input): Json<opening_miss::Preview>,
+) -> ViewResult {
+    optional_view(app, optional_read::Reader::OpeningMissPreview, |db| {
+        opening_miss::preview(db, input)
+    })
+    .await
+}
+
+async fn accept_opening_miss(
+    State(app): State<App>,
+    Json(command): Json<opening_miss::Command>,
+) -> ApiResult {
+    let database = app.database.clone();
+    let prepared = prepare(
+        &app.content_preparation,
+        || ApiError(writer::Unavailable.into()),
+        move || command.prepare(&mut db::Database::read(&database)?),
+    )
+    .await?;
+    match prepared {
+        opening_miss::Prepared::Replay(value) => Ok(Json(value)),
+        opening_miss::Prepared::Apply(apply) => write_db(app, move |db| apply.accept(db)).await,
+    }
+}
+
+async fn opening_miss_receipt(
+    State(app): State<App>,
+    UrlPath(request): UrlPath<String>,
+    Query(query): Query<opening_miss::DatasetQuery>,
+) -> ViewResult {
+    optional_view(app, optional_read::Reader::OpeningMissReceipt, move |db| {
+        opening_miss::receipt(db, &query.dataset, &request)
+    })
+    .await
+}
+
+async fn opening_priority_status(
+    State(app): State<App>,
+    UrlPath(goal): UrlPath<i64>,
+    Query(query): Query<opening_miss::DatasetQuery>,
+) -> ViewResult {
+    optional_view(
+        app,
+        optional_read::Reader::OpeningPriorityStatus,
+        move |db| opening_miss::status(db, &query.dataset, goal),
+    )
+    .await
+}
+
+async fn cancel_opening_priority(
+    State(app): State<App>,
+    UrlPath(goal): UrlPath<i64>,
+    Json(query): Json<opening_miss::DatasetQuery>,
+) -> ApiResult {
+    write_db(app, move |db| {
+        opening_miss::cancel(db, &query.dataset, goal)
     })
     .await
 }
@@ -1081,6 +1167,20 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             post(preview_opening).layer(pgn_body_limit),
         )
         .route("/api/tactics", get(tactics))
+        .route("/api/openings/misses/preview", post(preview_opening_miss))
+        .route("/api/openings/misses", post(accept_opening_miss))
+        .route(
+            "/api/openings/misses/receipts/{request}",
+            get(opening_miss_receipt),
+        )
+        .route(
+            "/api/openings/introduction-priorities/{goal}",
+            get(opening_priority_status),
+        )
+        .route(
+            "/api/openings/introduction-priorities/{goal}/cancel",
+            post(cancel_opening_priority),
+        )
         .route("/api/tactics/capture-context", get(capture_context))
         .route(
             "/api/tactics/capture/lichess",

@@ -74,32 +74,56 @@ pub fn pick(
     pinned: &HashSet<String>,
     limit: usize,
 ) -> Vec<Selection> {
+    pick_until(ordered, introduced, pinned, limit, || false).expect("unbounded planning")
+}
+
+pub fn pick_until(
+    ordered: &[Candidate],
+    introduced: &HashSet<String>,
+    pinned: &HashSet<String>,
+    limit: usize,
+    expired: impl Fn() -> bool,
+) -> Option<Vec<Selection>> {
     let mut allocated: HashSet<&str> = pinned.iter().map(String::as_str).collect();
     let mut selected = Vec::new();
     while selected.len() < limit {
-        let next = ordered.iter().find_map(|candidate| {
-            if introduced.contains(&candidate.card) || allocated.contains(candidate.card.as_str()) {
+        let mut next = None;
+        for candidate in ordered {
+            if expired() {
                 return None;
+            }
+            if introduced.contains(&candidate.card) || allocated.contains(candidate.card.as_str()) {
+                continue;
             }
             let waiting_on = match &candidate.prerequisites {
                 Prerequisites::NoneRequired => Vec::new(),
-                Prerequisites::Routes(routes) => routes
-                    .iter()
-                    .filter_map(|route| {
-                        route
+                Prerequisites::Routes(routes) => {
+                    let mut best: Option<Vec<&String>> = None;
+                    for route in routes {
+                        if expired() {
+                            return None;
+                        }
+                        let waiting = route
                             .iter()
                             .filter(|parent| !introduced.contains(*parent))
                             .map(|parent| allocated.contains(parent.as_str()).then_some(parent))
-                            .collect::<Option<Vec<_>>>()
-                    })
-                    .min_by(|left, right| left.len().cmp(&right.len()).then(left.cmp(right)))?
-                    .into_iter()
-                    .cloned()
-                    .collect(),
-                Prerequisites::Unknown => return None,
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(waiting) = waiting
+                            && best
+                                .as_ref()
+                                .is_none_or(|old| (waiting.len(), &waiting) < (old.len(), old))
+                        {
+                            best = Some(waiting);
+                        }
+                    }
+                    let Some(best) = best else { continue };
+                    best.into_iter().cloned().collect()
+                }
+                Prerequisites::Unknown => continue,
             };
-            Some((candidate.card.as_str(), waiting_on))
-        });
+            next = Some((candidate.card.as_str(), waiting_on));
+            break;
+        }
         let Some((card, waiting_on)) = next else {
             break;
         };
@@ -109,7 +133,7 @@ pub fn pick(
             waiting_on,
         });
     }
-    selected
+    Some(selected)
 }
 
 #[cfg(test)]
