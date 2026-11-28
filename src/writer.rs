@@ -68,6 +68,7 @@ struct Waiting {
     foreground: VecDeque<Proposal>,
     background: VecDeque<Proposal>,
     foreground_turns: usize,
+    forecast: Option<Proposal>,
 }
 type Mailbox = (Mutex<Waiting>, Condvar);
 
@@ -87,7 +88,9 @@ impl Writer {
                     let proposal = {
                         let mut state = ready
                             .wait_while(lock.lock().unwrap(), |state| {
-                                state.foreground.is_empty() && state.background.is_empty()
+                                state.foreground.is_empty()
+                                    && state.background.is_empty()
+                                    && state.forecast.is_none()
                             })
                             .unwrap();
                         if !state.background.is_empty()
@@ -96,10 +99,12 @@ impl Writer {
                         {
                             state.foreground_turns = 0;
                             state.background.pop_front().unwrap()
-                        } else {
+                        } else if !state.foreground.is_empty() {
                             state.foreground_turns =
                                 (state.foreground_turns + 1).min(FOREGROUND_TURNS);
                             state.foreground.pop_front().unwrap()
+                        } else {
+                            state.forecast.take().unwrap()
                         }
                     };
                     let claimed = Instant::now() < proposal.deadline
@@ -176,6 +181,49 @@ impl Writer {
         })
     }
 
+    /// A forecast has one pending proposal and only runs between ordinary turns.
+    pub fn forecast<T: Send + 'static>(
+        &self,
+        deadline: Instant,
+        apply: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let deadline = deadline.min(Instant::now() + WAIT_LIMIT);
+        let claim = Arc::new(AtomicU8::new(WAITING_FOR_CLAIM));
+        let (send, reply) = oneshot::channel();
+        {
+            let (lock, ready) = &*self.0;
+            let mut state = lock.lock().unwrap();
+            ensure!(Instant::now() < deadline, Unavailable);
+            ensure!(
+                state
+                    .forecast
+                    .as_ref()
+                    .is_none_or(|proposal| proposal.claim.load(Ordering::Acquire) == EXPIRED),
+                Unavailable
+            );
+            state.forecast = Some(Proposal {
+                deadline,
+                claim: claim.clone(),
+                apply: Box::new(move |db, timely| {
+                    let _ = send.send(if timely {
+                        apply(db)
+                    } else {
+                        Err(Unavailable.into())
+                    });
+                }),
+            });
+            ready.notify_one();
+        }
+        tokio::runtime::Handle::current().block_on(
+            Admission {
+                deadline,
+                claim,
+                reply,
+            }
+            .wait(),
+        )
+    }
+
     /// The Games worker uses the service timer while waiting for admission.
     /// A claimed transaction resolves before the caller can retry.
     pub fn background_until<T: Send + 'static>(
@@ -230,6 +278,60 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forecast_keeps_ordinary_capacity_and_waits_behind_both_ordinary_queues() -> Result<()>
+    {
+        let writer = Writer::start(Connection::open_in_memory()?, None)?;
+        let (entered, started) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let hold = writer.submit(false, move |_| {
+            entered.send(()).unwrap();
+            gate.recv()?;
+            Ok(())
+        })?;
+        started.await?;
+        let optional_writer = writer.clone();
+        let (event, mut order) = tokio::sync::mpsc::unbounded_channel();
+        let forecast_event = event.clone();
+        let optional = tokio::task::spawn_blocking(move || {
+            optional_writer.forecast(Instant::now() + WAIT_LIMIT, move |_| {
+                forecast_event.send("forecast")?;
+                Ok(())
+            })
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while writer.0.0.lock().unwrap().forecast.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let mut ordinary = Vec::new();
+        for index in 0..WAITING {
+            let event = event.clone();
+            let background = index == WAITING - 1;
+            ordinary.push(writer.submit(background, move |_| {
+                event.send(if background {
+                    "background"
+                } else {
+                    "foreground"
+                })?;
+                Ok(())
+            })?);
+        }
+        release.send(())?;
+        hold.wait().await?;
+        for receipt in ordinary {
+            receipt.wait().await?;
+        }
+        optional.await??;
+        let observed = (0..=WAITING)
+            .map(|_| order.try_recv())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(observed[3], "background");
+        assert_eq!(observed[WAITING], "forecast");
+        Ok(())
+    }
 
     #[test]
     fn provider_deadline_expires_unclaimed_apply() -> Result<()> {
