@@ -111,3 +111,17 @@ CREATE TABLE daily_new_prefix (
   payload BLOB NOT NULL CHECK(length(payload)<=32768),
   PRIMARY KEY(generation,ordinal)
 ) STRICT, WITHOUT ROWID;
+
+-- Staged opening slots carry an indexed reverse dependency for each pending
+-- parent. The active generation is the only one the Study worker can unlock.
+CREATE TABLE daily_new_parent (
+  generation INTEGER NOT NULL REFERENCES daily_new_stage(generation),
+  parent TEXT NOT NULL,
+  child TEXT NOT NULL,
+  PRIMARY KEY(generation,parent,child)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE daily_new_unlock (
+  generation INTEGER NOT NULL REFERENCES daily_new_stage(generation),
+  parent TEXT NOT NULL,
+  PRIMARY KEY(generation,parent)
+) STRICT, WITHOUT ROWID;

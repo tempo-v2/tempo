@@ -240,7 +240,7 @@ pub(super) fn turn(db: &Connection, writer: &Writer, now: i64) -> Result<bool> {
         stage_new(Preparation::Required, writer, &day, &mut draft, deadline)?;
         if let Some((prefix, through, basis, updates)) = overlay {
             prepared_overlay = Some((
-                priority::prepare_prefix(writer, &draft, &prefix, deadline)?,
+                priority::prepare_prefix(writer, &day, draft.staged, &prefix, deadline)?,
                 through,
             ));
             // Keep the completion evidence durable before any of these cards

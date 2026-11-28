@@ -1,5 +1,5 @@
 use super::{
-    BATCH, Clock, Day, Draft, Openings, Preparation, opening_rows, publish_slots,
+    BATCH, Clock, Day, Draft, Openings, Preparation, allocate_stage, opening_rows, publish_slots,
     replace_with_staging_if_needed,
 };
 use crate::{
@@ -7,7 +7,7 @@ use crate::{
     writer::Writer,
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Transaction, TransactionBehavior::Immediate};
+use rusqlite::{Connection, Transaction, TransactionBehavior::Immediate};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -211,7 +211,60 @@ impl Pass {
     }
 }
 
+/// A progress refresh can change the witness without changing any slot in
+/// the current lane. Preserve that lane if its exact ordered dependencies agree.
+fn same_opening_slots(
+    db: &Connection,
+    day: &Day,
+    clock: &Clock,
+    draft: &Draft,
+    introduced: &HashSet<String>,
+    deadline: Instant,
+) -> Result<bool> {
+    if day.opening_head == 0
+        || !day.openings_ready(clock)
+        || draft.source != day.source
+        || !draft.revoked_openings.is_empty()
+    {
+        return Ok(false);
+    }
+    let mut query = db.prepare_cached(
+        "SELECT card_id,availability_version,parents FROM daily_new
+         WHERE day=?1 AND generation=?2 AND kind='opening' AND committed=0 ORDER BY ordinal",
+    )?;
+    let mut existing = query.query((&day.key, day.opening_head))?;
+    for (selected, availability) in &draft.selected {
+        ensure!(
+            Instant::now() < deadline,
+            "Opening priority preparation timed out"
+        );
+        let Some(row) = existing.next()? else {
+            return Ok(false);
+        };
+        let card: String = row.get(0)?;
+        let version: i64 = row.get(1)?;
+        if card != selected.card || version != *availability {
+            return Ok(false);
+        }
+        let parents = serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?)?;
+        let pending: HashSet<_> = parents
+            .iter()
+            .filter(|parent| !introduced.contains(*parent))
+            .collect();
+        if pending.len() != selected.waiting_on.len()
+            || selected
+                .waiting_on
+                .iter()
+                .any(|parent| !pending.contains(parent))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(existing.next()?.is_none())
+}
+
 pub(super) fn turn(
+    db: &Connection,
     tx: Transaction<'_>,
     writer: &Writer,
     day: Day,
@@ -310,27 +363,45 @@ pub(super) fn turn(
         if Instant::now() >= read_deadline {
             return Ok(true);
         }
-        replace_with_staging_if_needed(
-            Preparation::Required,
-            writer,
+        let unchanged = same_opening_slots(
+            db,
             &day,
-            &mut draft,
+            &clock,
+            &draft,
+            &pass.input.introduced,
             read_deadline,
         )?;
+        if !unchanged {
+            replace_with_staging_if_needed(
+                Preparation::Required,
+                writer,
+                &day,
+                &mut draft,
+                read_deadline,
+            )?;
+        }
+        let (inline, generation) =
+            prepare_prefix(writer, &day, draft.staged, &pass.prefix, read_deadline)?;
+        let draft_version = draft.version;
+        let draft = (!unchanged).then_some(draft);
         let published_basis = basis.clone();
-        let prefix = pass.prefix.clone();
-        let (inline, generation) = prepare_prefix(writer, &draft, &prefix, read_deadline)?;
         let through = pass.cursor.max(pass.published_through);
         if !writer.background_until(deadline, move |db| {
             let tx = db.transaction_with_behavior(Immediate)?;
             if super::day_at(chrono::Utc::now().timestamp())? != day.key
                 || Basis::current(&tx)?.as_ref() != Some(&published_basis)
-                || super::day(&tx, &day.key)?.is_none_or(|current| current.fresh != day.fresh)
+                || super::day(&tx, &day.key)?.is_none_or(|current| {
+                    current.fresh != day.fresh
+                        || current.opening_head != day.opening_head
+                        || unchanged && current.openings != Some(draft_version)
+                })
             {
                 return Ok(false);
             }
             let before = tx.total_changes();
-            if !publish_slots(&tx, &day, &draft)? {
+            if let Some(draft) = &draft
+                && !publish_slots(&tx, &day, draft)?
+            {
                 return Ok(false);
             }
             goals::publish_prefix(&tx, &published_basis, &inline, generation, through)?;
@@ -408,7 +479,8 @@ pub(super) fn save_updates(
 
 pub(super) fn prepare_prefix(
     writer: &Writer,
-    draft: &Draft,
+    day: &Day,
+    staged: Option<i64>,
     prefix: &[Proof],
     deadline: Instant,
 ) -> Result<(String, i64)> {
@@ -417,8 +489,12 @@ pub(super) fn prepare_prefix(
         payload.len() <= super::CAPTURE_BYTES,
         "Opening priority prefix exceeds its byte budget"
     );
-    let Some(generation) = draft.staged else {
+    if payload.len() <= 32 * 1024 {
         return Ok((String::from_utf8(payload)?, 0));
+    }
+    let generation = match staged {
+        Some(generation) => generation,
+        None => allocate_stage(Preparation::Required, writer, day, "opening", deadline)?,
     };
     for (ordinal, chunk) in payload.chunks(32 * 1024).enumerate() {
         let chunk = chunk.to_vec();

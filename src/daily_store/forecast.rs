@@ -294,7 +294,7 @@ pub fn submit(
     let Some(day) = day(&tx, &ticket.day)? else {
         return Ok(Delivery::Stale);
     };
-    if day.openings != Some(clock.openings) {
+    if !day.openings_ready(&clock) {
         return Ok(Delivery::Busy);
     }
     let overlay = if clock.priority == 0 {

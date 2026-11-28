@@ -21,6 +21,8 @@ use std::{
 };
 
 const BATCH: usize = 64;
+const ANSWER_UNLOCK_BATCH: usize = 12;
+const WORKER_UNLOCK_BATCH: usize = 32;
 const READ_BUDGET: Duration = Duration::from_secs(15);
 const CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -64,6 +66,10 @@ struct Day {
 }
 
 impl Day {
+    fn openings_ready(&self, clock: &Clock) -> bool {
+        self.openings == Some(clock.openings)
+    }
+
     fn head(&self, kind: &str) -> i64 {
         if kind == "opening" {
             self.opening_head
@@ -190,7 +196,8 @@ fn select(db: &Connection, day: &Day, previous: Option<&str>) -> Result<Option<F
     };
     let clock = clock(db)?;
     let openings_enabled = day.opening_limit != 0 && taking_new(db)?;
-    let opening_ready = day.openings == Some(clock.openings);
+    let opening_ready = day.openings_ready(&clock)
+        && (!openings_enabled || pending_unlock(db, day.opening_head)?.is_none());
     let tactic_ready = day.tactics == Some(clock.tactics);
     let new_openings = openings_enabled && opening_ready;
     let new_tactics = day.tactic_limit != 0 && tactic_ready;
@@ -303,25 +310,87 @@ pub fn refresh_parent(db: &Connection, card: &str, now: i64) -> Result<()> {
         crate::opening_priority::note_introduction(db, card)?;
         let day = day_at(now)?;
         if let Some(today) = self::day(db, &day)? {
-            let (total, ready) = lane_size(db, &today, "opening")?;
-            // Small lanes can unlock children in the accepting transaction.
-            // Larger lanes use ordinary preparation to resolve the new Learning facts.
-            let rebuild = total > i64::from(crate::queue::MAX_DAILY_NEW) && ready < total;
-            if !rebuild && ready < total {
+            if today.opening_head == 0 {
                 db.execute(
                     "UPDATE daily_new SET waiting=waiting-1
-                     WHERE day=?1 AND generation=?3 AND kind='opening' AND committed=0 AND waiting>0
+                     WHERE day=?1 AND generation=0 AND kind='opening' AND committed=0 AND waiting>0
                        AND EXISTS(SELECT 1 FROM json_each(parents) WHERE value=?2)",
-                    (&day, card, today.opening_head),
+                    (&day, card),
                 )?;
+            } else if today.openings_ready(&clock(db)?) {
+                let generation = today.opening_head;
+                if unlock_children(db, &day, generation, card, ANSWER_UNLOCK_BATCH)? {
+                    db.execute(
+                        "INSERT OR IGNORE INTO daily_new_unlock VALUES(?1,?2)",
+                        (generation, card),
+                    )?;
+                }
             }
             db.execute(
-                "UPDATE daily_day SET commitments=commitments+1,
-                   openings_version=CASE WHEN ?2 THEN NULL ELSE openings_version END WHERE day=?1",
-                (&day, rebuild),
+                "UPDATE daily_day SET commitments=commitments+1 WHERE day=?1",
+                [&day],
             )?;
         }
     }
+    Ok(())
+}
+
+fn pending_unlock(db: &Connection, generation: i64) -> Result<Option<String>> {
+    Ok(db
+        .prepare_cached(
+            "SELECT parent FROM daily_new_unlock WHERE generation=?1 ORDER BY parent LIMIT 1",
+        )?
+        .query_row([generation], |row| row.get(0))
+        .optional()?)
+}
+
+/// Apply the accepted parent once to each affected child. Unrelated ready
+/// slots keep their membership and committed route certificates.
+fn unlock_children(
+    db: &Connection,
+    day: &str,
+    generation: i64,
+    parent: &str,
+    batch: usize,
+) -> Result<bool> {
+    let mut query = db.prepare_cached(
+        "SELECT child FROM daily_new_parent WHERE generation=?1 AND parent=?2 ORDER BY child LIMIT ?3",
+    )?;
+    let mut children = query
+        .query_map((generation, parent, batch + 1), |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let more = children.len() > batch;
+    children.truncate(batch);
+    let mut unlock = db.prepare_cached(
+        "UPDATE daily_new SET waiting=waiting-1
+         WHERE day=?1 AND generation=?2 AND card_id=?3 AND committed=0 AND waiting>0",
+    )?;
+    let mut remove = db.prepare_cached(
+        "DELETE FROM daily_new_parent WHERE generation=?1 AND parent=?2 AND child=?3",
+    )?;
+    for child in children {
+        unlock.execute((day, generation, &child))?;
+        remove.execute((generation, parent, &child))?;
+    }
+    Ok(more)
+}
+
+fn drain_unlock(db: &mut Connection, day: &str, generation: i64, parent: &str) -> Result<()> {
+    let tx = db.transaction_with_behavior(Immediate)?;
+    let clock = clock(&tx)?;
+    if clock.current_day.as_deref() == Some(day)
+        && self::day(&tx, day)?
+            .is_some_and(|day| day.opening_head == generation && day.openings_ready(&clock))
+        && !unlock_children(&tx, day, generation, parent, WORKER_UNLOCK_BATCH)?
+    {
+        tx.execute(
+            "DELETE FROM daily_new_unlock WHERE generation=?1 AND parent=?2",
+            (generation, parent),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -348,7 +417,8 @@ fn all_lanes_ready(db: &Connection, day: &Day, clock: &Clock) -> Result<bool> {
     let openings_needed =
         day.opening_limit != 0 && taking_new(db)? || has_unseen_opening_commitment(db)?;
     Ok(day.due_head.is_some()
-        && (!openings_needed || day.openings == Some(clock.openings))
+        && (!openings_needed
+            || day.openings_ready(clock) && pending_unlock(db, day.opening_head)?.is_none())
         && (day.tactic_limit == 0 || day.tactics == Some(clock.tactics)))
 }
 
@@ -357,7 +427,7 @@ pub fn counts(db: &Connection, now: i64, unanswered: Option<&str>) -> Result<Opt
         return Ok(None);
     };
     let clock = clock(db)?;
-    let openings = day.openings == Some(clock.openings) && taking_new(db)?;
+    let openings = day.openings_ready(&clock) && taking_new(db)?;
     let tactics = day.tactics == Some(clock.tactics);
     let mut new = 0;
     if openings {
@@ -1035,16 +1105,15 @@ impl Preparation {
     }
 }
 
-fn stage_new(
+fn allocate_stage(
     preparation: Preparation,
     writer: &Writer,
     day: &Day,
-    draft: &mut Draft,
+    kind: &'static str,
     deadline: Instant,
-) -> Result<()> {
+) -> Result<i64> {
     let day_key = day.key.clone();
-    let kind = draft.kind;
-    let generation = preparation.write(writer, deadline, move |db| {
+    preparation.write(writer, deadline, move |db| {
         let tx = db.transaction_with_behavior(Immediate)?;
         let generation: i64 = tx.query_row(
             "UPDATE daily_clock SET new_generation=new_generation+1 RETURNING new_generation",
@@ -1057,7 +1126,18 @@ fn stage_new(
         )?;
         tx.commit()?;
         Ok(generation)
-    })?;
+    })
+}
+
+fn stage_new(
+    preparation: Preparation,
+    writer: &Writer,
+    day: &Day,
+    draft: &mut Draft,
+    deadline: Instant,
+) -> Result<()> {
+    let kind = draft.kind;
+    let generation = allocate_stage(preparation, writer, day, kind, deadline)?;
     // Each slot also updates its generation's count row.
     for (batch, rows) in draft.selected.chunks(BATCH).enumerate() {
         let rows = rows.to_vec();
@@ -1068,6 +1148,35 @@ fn stage_new(
             tx.commit()?;
             Ok(())
         })?;
+    }
+    if kind == "opening" {
+        let mut dependencies = draft.selected.iter().flat_map(|(child, _)| {
+            child
+                .waiting_on
+                .iter()
+                .map(move |parent| (parent, &child.card))
+        });
+        loop {
+            let batch: Vec<_> = dependencies
+                .by_ref()
+                .take(BATCH)
+                .map(|(parent, child)| (parent.clone(), child.clone()))
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
+            preparation.write(writer, deadline, move |db| {
+                let tx = db.transaction_with_behavior(Immediate)?;
+                let mut insert =
+                    tx.prepare_cached("INSERT INTO daily_new_parent VALUES(?1,?2,?3)")?;
+                for (parent, child) in &batch {
+                    insert.execute((generation, parent, child))?;
+                }
+                drop(insert);
+                tx.commit()?;
+                Ok(())
+            })?;
+        }
     }
     draft.staged = Some(generation);
     Ok(())
@@ -1207,7 +1316,7 @@ fn replace_with_staging_if_needed(
     } else {
         day.tactic_limit
     };
-    if limit > regular_max {
+    if limit > regular_max || draft.kind == "opening" && day.opening_head != 0 {
         stage_new(preparation, writer, day, draft, deadline)?;
     }
     Ok(())
@@ -1278,7 +1387,17 @@ fn prune_new_stages(db: &mut Connection, day: &str, now: i64) -> Result<()> {
              (SELECT generation,ordinal FROM daily_new_prefix WHERE generation=?1 LIMIT 16)",
             [generation],
         )?;
-        if deleted < 32 && chunks < 16 {
+        let dependencies = tx.execute(
+            "DELETE FROM daily_new_parent WHERE (generation,parent,child) IN
+             (SELECT generation,parent,child FROM daily_new_parent WHERE generation=?1 LIMIT 16)",
+            [generation],
+        )?;
+        let unlocks = tx.execute(
+            "DELETE FROM daily_new_unlock WHERE (generation,parent) IN
+             (SELECT generation,parent FROM daily_new_unlock WHERE generation=?1 LIMIT 16)",
+            [generation],
+        )?;
+        if deleted < 32 && chunks < 16 && dependencies < 16 && unlocks < 16 {
             tx.execute(
                 "DELETE FROM daily_new_size WHERE day=?1 AND kind=?2 AND generation=?3",
                 (&day, &kind, generation),
@@ -1413,10 +1532,20 @@ fn turn(
         writer.background_until(deadline, move |db| activate_new(db, &day, &draft))?;
         return Ok(true);
     }
-    if matches!(lane, Lane::Openings) && clock.priority != 0 {
-        return priority::turn(tx, writer, day, clock, priority, read_deadline);
+    if matches!(lane, Lane::Openings)
+        && day.openings_ready(&clock)
+        && let Some(parent) = pending_unlock(&tx, day.opening_head)?
+    {
+        tx.commit()?;
+        writer.background_until(deadline, move |db| {
+            drain_unlock(db, &day.key, day.opening_head, &parent)
+        })?;
+        return Ok(true);
     }
-    if matches!(lane, Lane::Openings) && day.openings != Some(clock.openings) {
+    if matches!(lane, Lane::Openings) && clock.priority != 0 {
+        return priority::turn(&read, tx, writer, day, clock, priority, read_deadline);
+    }
+    if matches!(lane, Lane::Openings) && !day.openings_ready(&clock) {
         let mut draft = if day.opening_limit > 0 || has_unseen_opening_commitment(&tx)? {
             let input =
                 opening_rows(&tx, &day, &clock)?.compile(|| Instant::now() >= read_deadline)?;
@@ -2438,6 +2567,138 @@ mod tests {
         opening(&db, "Unrelated new route", &["h2h3"])?;
         let proof = opening_priority::roots(&db, goal - 1)?.pop().unwrap();
         assert!(proof.witnessed);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expanded_opening_grades_unlock_in_place_and_keep_reserved_work() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("opening-fanout.sqlite3");
+        let mut db = Database::init(&path)?;
+        let now = Utc::now().timestamp();
+        let today = day_at(now)?;
+        db.execute("UPDATE new_opening_settings SET opening_limit=1", [])?;
+        let dataset = db::dataset(&db)?;
+        let first = chess::Route {
+            fen: chess::fen(&chess::position("")?),
+            moves: vec!["e2e4".into()],
+        };
+        let book = catalog::save_opening(
+            &db,
+            &catalog::OpeningInput {
+                name: "Fanout".into(),
+                color: "white".into(),
+                start_at: 0,
+                route: first.clone(),
+            },
+            None,
+        )?;
+        for reply in chess::legal(&chess::board_at(&first, 1)?) {
+            catalog::save_opening(
+                &db,
+                &catalog::OpeningInput {
+                    name: "Branch".into(),
+                    color: "white".into(),
+                    start_at: 0,
+                    route: chess::Route {
+                        fen: first.fen.clone(),
+                        moves: vec!["e2e4".into(), reply, "a2a3".into()],
+                    },
+                },
+                Some(&book),
+            )?;
+        }
+        opening(&db, "Reserved", &["d2d4"])?;
+        while !queue_store::seed_batch(&mut db)? {}
+        prepare_test_day(&mut db, now)?;
+        let card_for = |db: &Connection, movement: &str| -> Result<String> {
+            Ok(db.query_row(
+                "SELECT id FROM cards WHERE answers=json_array(?1) ORDER BY id LIMIT 1",
+                [movement],
+                |row| row.get(0),
+            )?)
+        };
+        let first_card = card_for(&db, "e2e4")?;
+        let reserved = card_for(&db, "d2d4")?;
+        let target = card_for(&db, "a2a3")?;
+        let availability: i64 = db.query_row(
+            "SELECT availability_version FROM prepared_queue WHERE card_id=?1",
+            [&target],
+            |r| r.get(0),
+        )?;
+        crate::opening_priority::join(&db, &target, availability)?;
+        let writer = Writer::start(db, None)?;
+        let command = serde_json::from_value::<add_new::Command>(json!({
+            "request":"0123456789abcdef0123456789abcdef","day":today,"dataset":dataset,
+            "kind":"opening","quantity":40
+        }))?;
+        writer
+            .submit(false, move |db| add_new::submit(db, command, now))?
+            .wait()
+            .await?;
+        tokio::task::block_in_place(|| add_new::turn(&Database::read(&path)?, &writer, now))?;
+
+        let initial = day(&Database::read(&path)?, &today)?.unwrap();
+        let generation = initial.opening_head;
+        assert!(generation > 0);
+        let assert_head = |db: &Connection| -> Result<()> {
+            assert_eq!(day(db, &today)?.unwrap().opening_head, generation);
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM daily_new_stage", [], |r| r
+                    .get::<_, usize>(0))?,
+                1
+            );
+            Ok(())
+        };
+        let after_parent = writer
+            .submit(false, move |db| {
+                for (slot, card) in [(0, &first_card), (1, &reserved)] {
+                    commit_slot(db, card, now)?;
+                    db.execute("INSERT INTO deck(slot,card_id) VALUES(?1,?2)", (slot, card))?;
+                }
+                let parent = open_study(db)?.unwrap();
+                let reserved_view = answer_and_next(db, parent, "e2e4")?.unwrap();
+                assert_eq!(crate::study_store::unanswered_card(db)?, Some(reserved));
+                assert_eq!(
+                    pending_unlock(db, generation)?.as_deref(),
+                    Some(first_card.as_str())
+                );
+                assert_eq!(lane_size(db, &initial, "opening")?, (20, 12));
+                Ok(reserved_view)
+            })?
+            .wait()
+            .await?;
+
+        let mut pass = None;
+        tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut pass))?;
+        let db = Database::read(&path)?;
+        assert_eq!(pending_unlock(&db, generation)?, None);
+        assert_eq!(
+            lane_size(&db, &day(&db, &today)?.unwrap(), "opening")?,
+            (20, 20)
+        );
+        drop(db);
+        tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut pass))?;
+        assert_head(&Database::read(&path)?)?;
+
+        let mut card = writer
+            .submit(false, move |db| {
+                let view = answer_and_next(db, after_parent, "d2d4")?.unwrap();
+                assert_eq!(crate::study_store::unanswered_card(db)?, Some(target));
+                Ok(view)
+            })?
+            .wait()
+            .await?;
+        for _ in 0..4 {
+            card = writer
+                .submit(false, move |db| {
+                    Ok(answer_and_next(db, card, "a2a3")?.unwrap())
+                })?
+                .wait()
+                .await?;
+            tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut pass))?;
+            assert_head(&Database::read(&path)?)?;
+        }
         Ok(())
     }
 
