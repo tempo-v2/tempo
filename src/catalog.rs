@@ -324,6 +324,20 @@ impl std::fmt::Display for OverBudget {
 }
 impl std::error::Error for OverBudget {}
 
+pub const ONLINE_WRITE_LIMIT: usize = 128;
+// Reply, prepared membership, availability stamp, queue revision and Coverage revision.
+pub const OPENING_REPLY_WRITES: usize = 5;
+// Authored line, line revision and daily opening revision.
+pub const OPENING_LINE_WRITES: usize = 3;
+
+pub fn check_opening_write_budget(db: &Connection, before: u64) -> Result<()> {
+    ensure!(
+        db.total_changes() - before <= ONLINE_WRITE_LIMIT as u64,
+        OverBudget
+    );
+    Ok(())
+}
+
 pub struct OpeningPlan {
     pub color: String,
     name: String,
@@ -448,7 +462,6 @@ pub fn migrate_opening_identities(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-// A batch can publish at most 40 learner responses of one prepared route.
 pub enum OpeningBatch {
     More(usize),
     Finished(String),
@@ -464,7 +477,11 @@ pub fn apply_opening_batch(
         offset < plan.cards.len(),
         "Invalid opening batch checkpoint"
     );
-    let end = (offset + 40).min(plan.cards.len());
+    // Reserve rows for the line and possible repertoire choice, and for the
+    // final receipt and deletion of its predecessor's checkpoint.
+    const RESPONSES_PER_TURN: usize =
+        (ONLINE_WRITE_LIMIT - OPENING_LINE_WRITES - 1 - 2) / OPENING_REPLY_WRITES;
+    let end = (offset + RESPONSES_PER_TURN).min(plan.cards.len());
     let next = (end < plan.cards.len()).then_some(end);
     let id = apply_opening_cards(
         db,
@@ -588,13 +605,17 @@ fn apply_opening_cards(
             }
         } else {
             pending.insert(card.position.clone(), (card_id, card));
-            // Each new card writes its prepared entry and repertoire revision.
             ensure!(
-                !online || pending.len() * 3 + 2 + usize::from(new_choice) <= 128,
+                !online
+                    || pending.len() * OPENING_REPLY_WRITES
+                        + OPENING_LINE_WRITES
+                        + usize::from(new_choice)
+                        <= ONLINE_WRITE_LIMIT,
                 OverBudget
             );
         }
     }
+    let before = db.total_changes();
     for (card_id, card) in pending.into_values() {
         db.execute(
             "INSERT INTO cards(id,kind,title,color,fen,position_id,answers,repertoire_id,answer_version,context)
@@ -619,6 +640,9 @@ fn apply_opening_cards(
             ],
         )?;
     }
+    if online {
+        check_opening_write_budget(db, before)?;
+    }
     Ok(id)
 }
 
@@ -628,6 +652,15 @@ pub fn save_opening(
     inherited_book: Option<&str>,
 ) -> Result<String> {
     apply_opening(db, &prepare_opening(input)?, inherited_book, false)
+}
+
+/// The published standalone tactic and pack-review card types have no
+/// introduction prerequisites. Pack admission itself occurs before Study.
+pub fn daily_tactic_candidate(card: String) -> crate::daily_plan::Candidate {
+    crate::daily_plan::Candidate {
+        card,
+        prerequisites: crate::daily_plan::Prerequisites::NoneRequired,
+    }
 }
 
 pub fn tactics(db: &Connection, after: &str) -> Result<Vec<Tactic>> {

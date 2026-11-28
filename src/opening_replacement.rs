@@ -395,11 +395,15 @@ pub fn plan(
         );
         retired.insert(id);
     }
-    let mut writes =
-        1 + 3 * (archived.len() + rewritten.len() + incoming.len()) + 5 * retired.len();
+    // Retirement writes the card, its availability and revision projections,
+    // up to two live due generations, and up to one committed slot and release.
+    const RETIRE_WRITES: usize = 9;
+    let mut writes = 1
+        + catalog::OPENING_LINE_WRITES * (archived.len() + rewritten.len() + incoming.len())
+        + RETIRE_WRITES * retired.len();
     for (position, version) in installed {
         if !active(&position)?.is_some_and(|current| current.version == version) {
-            writes += 3;
+            writes += catalog::OPENING_REPLY_WRITES;
         }
     }
     let retired = retired.into_iter().collect::<Vec<_>>();
@@ -419,12 +423,12 @@ fn fits_budget(db: &Connection, mut writes: usize, retired: &[String]) -> Result
         "SELECT count(*) FROM (SELECT 1 FROM repeat_obligation WHERE card_id=?1 LIMIT 43)",
     )?;
     for card in retired {
-        if writes > 128 {
+        if writes > catalog::ONLINE_WRITE_LIMIT {
             return Ok(false);
         }
         writes += 3 * repeats.query_row([card], |row| row.get::<_, usize>(0))?;
     }
-    Ok(writes <= 128)
+    Ok(writes <= catalog::ONLINE_WRITE_LIMIT)
 }
 
 #[derive(Debug)]

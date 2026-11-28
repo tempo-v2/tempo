@@ -2,6 +2,10 @@ mod capture_publication;
 mod catalog;
 mod chess;
 mod coverage;
+mod daily_forecast;
+mod daily_openings;
+mod daily_plan;
+mod daily_store;
 mod db;
 mod full_line;
 mod full_line_store;
@@ -591,7 +595,7 @@ async fn new_opening_settings(State(db): State<App>) -> ViewResult {
 
 async fn save_new_opening_settings(
     State(db): State<App>,
-    Json(input): Json<queue::NewOpeningSettings>,
+    Json(input): Json<queue::UpdateNewOpeningSettings>,
 ) -> ApiResult {
     write_db(db, |c| queue_store::save_new_opening_settings(c, input)).await
 }
@@ -808,10 +812,14 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
     let connection = Database::init(&db)?;
     let writer = writer::Writer::start(connection, Some(database_lock))?;
     let plan_writer = writer.clone();
+    let plan_db = db.clone();
+    let plan_runtime = tokio::runtime::Handle::current();
+    let (shutdown, plan_shutdown) = tokio::sync::watch::channel(false);
     std::thread::Builder::new()
         .name("tempo-prepare-study".into())
         .spawn(move || {
-            loop {
+            let _runtime = plan_runtime.enter();
+            while !*plan_shutdown.borrow() {
                 match plan_writer.background(queue_store::seed_batch) {
                     Ok(true) => break,
                     Ok(false) => {}
@@ -821,6 +829,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
                     }
                 }
             }
+            daily_store::run(&plan_db, plan_writer, plan_shutdown);
         })?;
     let staging = uploads::Staging::start(&db)?;
     if !without_worker {
@@ -838,6 +847,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
             })?;
     }
     let mut runtime = Runtime::new(db, writer, staging);
+    runtime.shutdown = shutdown;
     match tactic_worker_socket::start(&runtime.database, runtime.writer.clone()) {
         Ok(owner) => {
             runtime.opening_engine = Some(opening_engine::Endpoint::new(&runtime.database, owner));
@@ -972,6 +982,10 @@ async fn main() -> Result<()> {
         [command, db, port, flag] if command == "serve" && flag == "--no-worker" => {
             serve(db.into(), port.parse()?, true).await
         }
+        [command, directory] if command == "daily-queue-worker" => {
+            let directory = PathBuf::from(directory);
+            tokio::task::spawn_blocking(move || daily_forecast::worker(&directory)).await?
+        }
         [command, db] if command == "migrate-games" => {
             let path = Path::new(db);
             let _lock = lock_database(path)?;
@@ -1034,21 +1048,8 @@ async fn main() -> Result<()> {
                 }),
             )
         }
-        [command, db] if command == "opening-rank-input" => {
-            let database = Database::read(Path::new(db))?;
-            let snapshot = database.unchecked_transaction()?;
-            serde_json::to_writer(std::io::stdout().lock(), &opening_rank::read(&snapshot)?)?;
-            Ok(())
-        }
-        [command, db, input] if command == "opening-rank-apply" => {
-            let _lock = lock_database(Path::new(db))?;
-            let mut database = Database::open(Path::new(db))?;
-            let snapshot =
-                serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(input)?))?;
-            opening_rank::replace(&mut database, snapshot)
-        }
         _ => anyhow::bail!(
-            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo opening-rank-input DB | tempo opening-rank-apply DB SNAPSHOT | tempo repertoire-similarity | tempo repertoire-similarity-input DB REPERTOIRE COLOR"
+            "usage: tempo serve NEW_DB [PORT [--no-worker]] | tempo daily-queue-worker DIRECTORY | tempo migrate-games DB | tempo import-lichess-packs DB CATALOG | tempo import-openings OLD_DB NEW_DB | tempo repertoire-similarity | tempo repertoire-similarity-input DB REPERTOIRE COLOR"
         ),
     }
 }
@@ -1216,6 +1217,12 @@ mod preview_tests {
             upload = post("games/uploads", upload_payload).await?;
         }
         upload.error_for_status()?;
+        app.writer
+            .submit(true, |c| {
+                daily_store::prepare_test_day(c, chrono::Utc::now().timestamp())
+            })?
+            .wait()
+            .await?;
         let attempt: Value = post("study/next", json!({"after":null}))
             .await?
             .error_for_status()?

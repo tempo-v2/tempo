@@ -51,6 +51,16 @@ async function serve(binary, db, port, run) {
       if (tries === 149) throw new Error("Tempo fixture did not start");
       await pause(20);
     }
+    // Wait for the fixture's daily plan before injecting failures into Study.
+    const schema = Number(execFileSync("sqlite3", ["-readonly", db, "PRAGMA user_version"]));
+    if (binary === candidate && schema >= 20) {
+      for (let tries = 0; ; tries++) {
+        const counts = await api("study/counts").catch(() => null);
+        if (counts?.preparing === false) break;
+        if (tries === 599) throw new Error("Fixture Study queue did not become ready");
+        await pause(50);
+      }
+    }
     return await run(origin, api);
   } finally {
     if (service.exitCode === null && service.signalCode === null) {
@@ -60,9 +70,17 @@ async function serve(binary, db, port, run) {
   }
 }
 
-async function seed(api) {
-  for (const line of ["1. e4 e5", "1. d4 d5"]) {
-    await api("tactics", { name: line, pgn: line + " 1-0" });
+function seedTactics(binary, db, tactics = ["1. e4 e5", "1. d4 d5"].map(line => ({
+  name: line, pgn: line + " 1-0",
+}))) {
+  const input = db + ".tactic.json";
+  try {
+    for (const tactic of tactics) {
+      fs.writeFileSync(input, JSON.stringify(tactic));
+      execFileSync(binary, ["import-content", db, "tactic", input]);
+    }
+  } finally {
+    fs.rmSync(input, { force: true });
   }
 }
 
@@ -89,9 +107,11 @@ function puzzleCommandCount(db, intent) {
 }
 
 function focusStudyCard(db, card) {
-  // These writes only select the operation under test in a disposable database.
+  // Move exactly the fixture card to the head. If its first direct assessment
+  // deferred a repeat, this setup replaces that pending placement with the slot.
   execFileSync("sqlite3", [db, "PRAGMA busy_timeout=2000; BEGIN IMMEDIATE; " +
     "UPDATE study SET active=NULL; DELETE FROM deck; " +
+    `DELETE FROM repeat_obligation WHERE card_id=${quotedSql(card)}; ` +
     `INSERT INTO deck SELECT 1,id FROM cards WHERE id=${quotedSql(card)}; COMMIT;`]);
 }
 
@@ -611,8 +631,8 @@ async function startRecovery(db) {
 }
 
 async function studyDrop(browser, db, { fen, solution, from, to, piece, promotion, correction, retryLost }) {
-  await serve(candidate, db, await unusedPort(), async (origin, api) => {
-    await api("tactics", { name: "Study drop", pgn: `[SetUp "1"]\n[FEN "${fen}"]\n\n1. ${solution} *` });
+  seedTactics(candidate, db, [{ name: "Study drop", pgn: `[SetUp "1"]\n[FEN "${fen}"]\n\n1. ${solution} *` }]);
+  await serve(candidate, db, await unusedPort(), async (origin) => {
     const page = await browser.newPage();
     const answerHeld = Promise.withResolvers();
     const releaseAnswer = Promise.withResolvers();
@@ -752,9 +772,10 @@ async function predecessorRecovery(browser, db, accepted, { retained = false } =
   let original;
   let previousSchema;
   let priorGrades;
+  let previousReceipt;
   try {
+    if (!retained) seedTactics(candidate, db);
     await serve(retained ? predecessor : candidate, db, port, async (origin, api) => {
-      if (!retained) await seed(api);
       priorGrades = grades(db);
       if (mode === "--predecessor-only") {
         const { id } = await api("tactics", { name: "Replay single-answer fixture", pgn: "1. a3 a6 1-0" });
@@ -766,7 +787,11 @@ async function predecessorRecovery(browser, db, accepted, { retained = false } =
       previousSchema = Number(execFileSync("sqlite3", ["-readonly", db, "PRAGMA user_version"]));
       await page.route(answerPattern, async route => {
         original = route.request().postDataJSON();
-        if (accepted) assert.equal((await route.fetch()).status(), 200);
+        if (accepted) {
+          const response = await route.fetch();
+          assert.equal(response.status(), 200);
+          previousReceipt = await response.json();
+        }
         await route.abort();
       });
       await page.goto(origin);
@@ -792,10 +817,17 @@ async function predecessorRecovery(browser, db, accepted, { retained = false } =
     execFileSync(candidate, ["migrate-games", db]);
     await serve(candidate, db, port, async () => {
       const recovered = page.waitForRequest(request => request.url().endsWith("/api/study/answer"));
+      const acknowledgement = page.waitForResponse(response => response.url().endsWith("/api/study/answer"));
       await page.reload();
       assert.deepEqual((await recovered).postDataJSON(), original);
+      const response = await acknowledgement;
+      assert.equal(response.status(), 200);
+      const receipt = await response.json();
+      assert.equal(receipt.rating, "Again");
+      if (previousReceipt && previousSchema >= 18) assert.deepEqual(receipt, previousReceipt);
       await next(page).waitFor();
       assert.equal(grades(db), priorGrades + 1);
+      assert.deepEqual(await page.evaluate(pendingAnswers), []);
       assert.deepEqual(await page.evaluate(() =>
         JSON.parse(localStorage.getItem("tempo.pending-answer.v2"))), previousSchema < 7 ? original : null);
     });
@@ -806,8 +838,8 @@ async function predecessorRecovery(browser, db, accepted, { retained = false } =
 
 async function twoTabs(browser, db) {
   const port = await unusedPort();
+  seedTactics(candidate, db);
   await serve(candidate, db, port, async (origin, api) => {
-    await seed(api);
     const context = await browser.newContext();
     const older = await context.newPage();
     const newer = await context.newPage();
@@ -883,8 +915,8 @@ async function twoTabs(browser, db) {
 async function incompleteReply(browser, db) {
   const page = await browser.newPage();
   try {
-    await serve(candidate, db, await unusedPort(), async (origin, api) => {
-      await seed(api);
+    seedTactics(candidate, db);
+    await serve(candidate, db, await unusedPort(), async (origin) => {
       let original;
       await page.route(answerPattern, route => {
         original = route.request().postDataJSON();
@@ -908,8 +940,8 @@ async function incompleteReply(browser, db) {
 async function unplayableAnswerReply(browser, db) {
   const page = await browser.newPage();
   try {
-    await serve(candidate, db, await unusedPort(), async (origin, api) => {
-      await seed(api);
+    seedTactics(candidate, db);
+    await serve(candidate, db, await unusedPort(), async (origin) => {
       const commands = [];
       const errors = [];
       page.on("request", request => {
@@ -957,9 +989,7 @@ async function unplayableAnswerReply(browser, db) {
 
 async function titleInvariance(browser, root) {
   const baseline = path.join(root, "title-baseline.db");
-  await serve(candidate, baseline, await unusedPort(), async (_origin, api) => {
-    await api("tactics", { name: "Original", pgn: "1. e4 e5 1-0" });
-  });
+  seedTactics(candidate, baseline, [{ name: "Original", pgn: "1. e4 e5 1-0" }]);
   for (const good of [true, false]) {
     let expected;
     for (const title of ["Original", "Renamed", "", null]) {
@@ -988,7 +1018,7 @@ async function titleInvariance(browser, root) {
             const x = board.x + 4.5 * board.width / 8;
             await page.mouse.click(x, board.y + 6.5 * board.height / 8);
             await page.mouse.click(x, board.y + 4.5 * board.height / 8);
-            await page.getByText("No cards are ready.", { exact: false }).waitFor();
+            await page.getByText(/^No cards are ready\b/).waitFor();
           } else {
             await reveal(page).click();
             await next(page).click();
@@ -1052,7 +1082,7 @@ async function fullLineTitleInvariance(browser, root) {
           }
           await page.getByRole("status").filter({ hasText: solve ? "Solved" : "Again" }).waitFor();
           await page.getByRole("button", { name: "Next", exact: true }).click();
-          if (solve) await page.getByText("No cards are ready.", { exact: false }).waitFor();
+          if (solve) await page.getByText(/^No cards are ready\b/).waitFor();
           else await fullLineReveal(page).waitFor();
           assert.deepEqual(await page.evaluate(pendingAnswers, "tempo-puzzle-command-journal"), []);
 
@@ -1088,8 +1118,8 @@ async function mixedTabs(browser, db) {
   const submitted = Promise.withResolvers();
   const dropCurrent = Promise.withResolvers();
   try {
-    await serve(predecessor, db, port, async (origin, api) => {
-      await seed(api);
+    seedTactics(predecessor, db);
+    await serve(predecessor, db, port, async (origin) => {
       await old.route(answerPattern, async route => {
         const response = await route.fetch();
         assert.equal(response.status(), 200);
@@ -1137,8 +1167,8 @@ async function mixedTabs(browser, db) {
 }
 
 async function invalidCurrentReply(browser, db) {
+  seedTactics(candidate, db);
   await serve(candidate, db, await unusedPort(), async (origin, api) => {
-    await seed(api);
     const page = await browser.newPage();
     const commands = [];
     try {
@@ -1175,8 +1205,8 @@ async function invalidCurrentReply(browser, db) {
 
 async function incompleteNextReply(browser, db, failure) {
   const automatic = failure === "missing-result";
+  seedTactics(candidate, db);
   await serve(candidate, db, await unusedPort(), async (origin, api) => {
-    await seed(api);
     const page = await browser.newPage();
     const commands = [];
     let issued;
@@ -1227,7 +1257,7 @@ async function incompleteNextReply(browser, db, failure) {
       }
       await retry(page).waitFor();
       await page.getByRole("status").getByText(rating, { exact: true }).waitFor();
-      assert.equal(await page.getByText("No cards are ready.", { exact: false }).count(), 0);
+      assert.equal(await page.getByText(/^No cards are ready\b/).count(), 0);
       assert.equal((await api("study")).attempt, issued.attempt);
       const replayed = page.waitForResponse(response => response.url().endsWith("/api/study/next"));
       await retry(page).click();
@@ -1259,9 +1289,9 @@ async function incompleteStartupNext(browser, db) {
       }), { times: 1 });
       await page.goto(origin);
       await retry(page).waitFor();
-      assert.equal(await page.getByText("No cards are ready.", { exact: false }).count(), 0);
+      assert.equal(await page.getByText(/^No cards are ready\b/).count(), 0);
       await retry(page).click();
-      await page.getByText("No cards are ready.", { exact: false }).waitFor();
+      await page.getByText(/^No cards are ready\b/).waitFor();
       assert.deepEqual(calls, [["current"], ["next", { after: null }], ["next", { after: null }]]);
     } finally {
       await page.close();
@@ -1425,7 +1455,7 @@ async function openingPreview(browser, db) {
       const query = sql => execFileSync("sqlite3", ["-readonly", db, sql], { encoding: "utf8" }).trim();
       assert.equal(query("SELECT count(*) FROM openings"), "0");
       await page.getByRole("button", { name: "Save opening" }).click();
-      await page.getByText("Opening saved. Its responses are ready in Study.", { exact: true }).waitFor();
+      await page.getByText("Opening saved. New responses enter the next daily queue.", { exact: true }).waitFor();
       assert.equal(query("SELECT name FROM openings"), "Edited name");
       assert.deepEqual(JSON.parse(query("SELECT route FROM openings")).moves, ["d2d4", "d7d5"]);
       assert.deepEqual(errors, []);
@@ -1460,7 +1490,9 @@ async function openingPreview(browser, db) {
         }
         await mixedTabs(browser, path.join(root, "mixed.db"));
       }
-      console.log("Both predecessor delivery states passed for full-line commands.");
+      console.log(legacy
+        ? "Both predecessor delivery states passed for full-line commands."
+        : "Both predecessor delivery states passed for full-line commands and single-answer Study on retained data.");
       return;
     }
     if (mode === "--legacy-packs") {

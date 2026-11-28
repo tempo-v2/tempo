@@ -140,6 +140,7 @@ pub fn submit(db: &mut Connection, work: &Work, evidence: &Evidence) -> Result<S
     );
     let decision = tactic_qualification::qualify(&work.fen, &candidate.captures, evidence)
         .map_err(InvalidEvidence)?;
+    let before = tx.total_changes();
     let outcome = match decision {
         Decision::Unique(best) if best != candidate.played => catalog::qualify_game_tactic(
             &tx,
@@ -175,6 +176,10 @@ pub fn submit(db: &mut Connection, work: &Work, evidence: &Evidence) -> Result<S
             serde_json::to_string(evidence)?
         ],
     )?;
+    ensure!(
+        tx.total_changes() - before <= catalog::ONLINE_WRITE_LIMIT as u64,
+        "Capture qualification exceeds its transaction row budget"
+    );
     tx.commit()?;
     Ok(outcome.to_owned())
 }
@@ -367,6 +372,7 @@ mod tests {
         let mut db = Database::init(&directory.path().join("db"))?;
         let id = existing(&db, Some(FEN))?;
         assert!(crate::queue_store::seed_batch(&mut db)?);
+        crate::daily_store::prepare_test_day(&mut db, chrono::Utc::now().timestamp())?;
         study_store::issue(&db, Some((&id, "tactic")))?;
         let view = study_store::current(&db)?.unwrap();
         let answer = || AnswerIntentV1 {
@@ -391,6 +397,7 @@ mod tests {
             serde_json::to_value(review::answer(&mut db, answer())?)?,
             receipt
         );
+        crate::daily_store::prepare_test_day(&mut db, chrono::Utc::now().timestamp())?;
         assert!(
             review::next(
                 &mut db,

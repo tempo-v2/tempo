@@ -77,25 +77,43 @@ Opening reviews replay the saved lead-in from its first position, then
 stop at the scheduled response. Playback is ungraded, and **Skip to
 your move** starts the issued decision immediately.
 
-A saved opening order can prioritize new opening cards after the existing
-due work check. This is a static list of card identities. Study never
-runs a model or imports game evidence to decide that order.
+### Daily Study queue
 
-A local ranker can read a consistent catalogue snapshot with
-`tempo opening-rank-input DATABASE`. Return a JSON file with the same
-`dataset` and `revision` and an ordered array of unique opening `card_ids`.
-Run `tempo opening-rank-apply DATABASE SNAPSHOT.json` to replace the saved order.
-The command rejects a changed catalogue, foreign dataset, or unknown card
-before writing. Cards omitted from the snapshot use the ordinary unranked
-queue rules. Snapshots contain repertoire answers and are intended for use
-by local tooling.
+Tempo prepares today's due reviews and up to 20 new opening moves and 20 new
+tactics. Settings owns both limits. Review membership uses the first build's
+cutoff. New catalog entries join the next day's candidate pool, and retained
+attempts and repeats keep their place. For an opening chain, each move takes a
+slot and a child can be issued after its required parents are introduced.
+Explicit Lichess pack study remains available independently.
+
+A separate process estimates opening encounters with the same provisioned
+Maia runtime as Coverage. For a local checkout, run it alongside the serving
+command:
+
+```sh
+target/debug/tempo daily-queue-worker .local/tempo.dq
+```
+
+The worker exchanges bounded forecast files through the private `.dq` directory
+next to the database. If the worker is stopped or Maia is busy, Tempo still
+builds the day from the last complete opening order, or Standard for the first
+day. A late daily result can reorder only uncommitted openings. Applying a
+Coverage report can still reorder the remaining due reviews in its scope.
+
+For a managed macOS release, render `com.tempo-v2.lean.daily-queue.plist` from
+`tools/daily-queue-launch-agent.py` using the exact installed release binary and
+retained database. Register it in the same user LaunchAgent domain as Tempo.
+Keep that label separate from the serving and tactic worker jobs. Stop the old
+worker before switching its release and verify both the running worker and the
+Study fallback with the worker stopped. Schema-19 database migration begins
+new allocations on the first local day after cutover.
 
 ## Verification
 
 Run `tools/check.sh` from a checkout. CI uses the same command with Rust
 1.98.1, Node 26.12.0, uv 0.13.4 and `zstd`. The script runs locked Rust
 workspace tests, builds the UI from `npm ci` and the vendored Core package, and
-runs the Coverage and pack-builder Python tests on locked Python 3.12.12.
+runs the Coverage, daily forecast and pack-builder Python tests on locked Python 3.12.12.
 The native Stockfish test is opt-in as described in
 [Stockfish analysis](stockfish-analysis/README.md).
 
@@ -169,8 +187,8 @@ while Tempo is stopped.
 
 A service backup that must resume queued PGN uploads includes the SQLite
 database and its adjacent `.uploads` directory. Stop the service before
-copying both for a coordinated release or rollback. The `opening-rank-apply`
-and legacy opening import commands also require exclusive database ownership.
+copying both for a coordinated release or rollback. Legacy opening import
+requires exclusive database ownership.
 
 ## Archive conversion and recovery
 

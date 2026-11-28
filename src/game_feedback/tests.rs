@@ -434,6 +434,7 @@ fn report_work_is_addressed_and_study_does_not_read_it() -> Result<()> {
     change_expected_move(&db, &pair.repertoire, "f1c4", "g1f3")?;
     let job = start(&mut db, &pair)?;
     while !crate::queue_store::seed_batch(&mut db)? {}
+    crate::daily_store::prepare_test_day(&mut db, chrono::Utc::now().timestamp())?;
     db.flush_prepared_statement_cache();
     db.authorizer(Some(|event: AuthContext<'_>| match event.action {
         AuthAction::Read {

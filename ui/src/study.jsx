@@ -44,6 +44,12 @@ function formatStudyCount(value) {
   return typeof value === "number" ? String(value) : `${value.at_least.toLocaleString("en-US")}+`;
 }
 
+const dailyOpeningOrder = {
+  maia: "New openings use today’s Maia order.",
+  saved: "New openings use the last saved Maia order.",
+  standard: "New openings use Standard order.",
+};
+
 function useStudyCounts() {
   const [counts, setCounts] = useState(null);
   const invalidate = useRef(null);
@@ -52,7 +58,7 @@ function useStudyCounts() {
     let pending = null;
     let dirty = false;
     async function refresh() {
-      if (!active || pending) return;
+      if (!active || pending || document.visibilityState === "hidden") return;
       const request = new AbortController();
       pending = request;
       dirty = false;
@@ -60,7 +66,10 @@ function useStudyCounts() {
       try {
         const response = await fetch("/api/study/counts", { signal: request.signal });
         const totals = response.ok ? await response.json() : null;
-        const valid = [totals?.new, totals?.reviews].every(validStudyCount);
+        const valid = [totals?.new, totals?.reviews].every(validStudyCount) &&
+          typeof totals.preparing === "boolean" && typeof totals.day === "string" &&
+          /^\d{4}-\d{2}-\d{2}$/.test(totals.day) &&
+          Object.hasOwn(dailyOpeningOrder, totals.opening_order);
         if (active && !dirty) setCounts(valid ? totals : null);
       } catch {
         if (active && !dirty) setCounts(null);
@@ -75,12 +84,17 @@ function useStudyCounts() {
       dirty = true;
       refresh();
     };
+    refresh();
+    const timer = setInterval(refresh, 15_000);
     window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
     return () => {
       active = false;
       invalidate.current = null;
       pending?.abort();
+      clearInterval(timer);
       window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
     };
   }, []);
   return [counts, invalidate];
@@ -341,7 +355,10 @@ export function Study({ openGame, sounds }) {
 
   const heading = <>
     <h1>Study</h1>
-    {counts && <p>{formatStudyCount(counts.new)} new · {formatStudyCount(counts.reviews)} {counts.reviews === 1 ? "review" : "reviews"}</p>}
+    {counts && <>
+      <p>{formatStudyCount(counts.new)} new · {formatStudyCount(counts.reviews)} {counts.reviews === 1 ? "review" : "reviews"}</p>
+      <small>{counts.preparing ? "Preparing today’s queue…" : dailyOpeningOrder[counts.opening_order]}</small>
+    </>}
   </>;
   if (card?.activity_mode === "full_line") return <PuzzleBoard key={card.puzzle.play} view={card.puzzle} scope="study" sounds={sounds}
     onView={(puzzle) => showCard({ ...card, puzzle })}
@@ -386,7 +403,7 @@ export function Study({ openGame, sounds }) {
     {heading}
     {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
     {!loaded && !error && <p>Loading your deck…</p>}
-    {loaded && !card && <><p>No cards are ready. Add an opening or tactic to get started.</p>
+    {loaded && !card && !error && <><p>No cards are ready in today’s queue.</p>
       <button onClick={() => next()} disabled={pending}>Check deck</button></>}
     {card && <>
       <h2>{card.result ? card.title : openingPlaying ? "Playing opening moves" : movePrompt}</h2>
