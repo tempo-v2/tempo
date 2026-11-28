@@ -452,7 +452,9 @@ export function Study({ openGame, sounds, overlayOpen = false, allowOpeningEdits
     {allowOpeningEdits && <OpeningEditStatus save={openingEdit} card={card} />}
     {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
     {!loaded && !error && <p>Loading your deck…</p>}
-    {loaded && !card && !error && <><p>No cards are ready in today’s queue.</p>
+    {loaded && !card && !error && <>
+      {counts && !counts.preparing && counts.new === 0 && counts.reviews === 0 &&
+        <p>No cards are ready in today’s queue.</p>}
       <button onClick={() => next()} disabled={pending}>Check deck</button></>}
     {card && <>
       <h2>{card.result ? card.title : openingPlaying ? "Playing opening moves" : introductionPrompt ?? movePrompt}</h2>
