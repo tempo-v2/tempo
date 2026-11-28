@@ -140,12 +140,25 @@ pub fn issue(db: &Connection, card: Option<(&str, &str)>) -> Result<()> {
     Ok(())
 }
 
+fn reject_external_assessment(db: &Connection, attempt: i64) -> Result<()> {
+    ensure!(
+        !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM opening_miss_receipts WHERE assessment=?1)",
+            [attempt],
+            |r| r.get::<_, bool>(0),
+        )?,
+        Conflict::ExternalAssessment
+    );
+    Ok(())
+}
+
 pub fn begin_answer(db: &Connection, input: &AnswerIntentV1) -> Result<AnswerState> {
     check_dataset(Some(&input.dataset), &crate::db::dataset(db)?)?;
     ensure!(
         crate::full_line_store::for_review(db, input.attempt)?.is_none(),
         Conflict::FullSolution
     );
+    reject_external_assessment(db, input.attempt)?;
     type IssuedRow = (
         String,
         Option<String>,
@@ -246,6 +259,7 @@ type ContextRow = (
 );
 
 pub fn context_source(db: &Connection, attempt: i64) -> Result<ContextSource> {
+    reject_external_assessment(db, attempt)?;
     let row: ContextRow = db.query_row(
         "SELECT c.position_id,c.repertoire_id,c.answer_version,c.context,c.source_game_id,c.source_ply
             FROM attempts a JOIN cards c ON c.id=a.card_id

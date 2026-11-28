@@ -213,6 +213,16 @@ async function accessChecks(db) {
     assert.equal(await status("/api/" + route, serveHeaders), 404);
   }
   assert.equal(await status("/api/openings/study-review/apply", { ...serveHeaders, origin }, "POST"), 404);
+  const missRoutes = [
+    ["POST", "/api/openings/misses/preview"],
+    ["POST", "/api/openings/misses"],
+    ["GET", "/api/openings/misses/receipts/12345678-1234-1234-1234-000000000001?dataset=fixture"],
+    ["GET", "/api/openings/introduction-priorities/1?dataset=fixture"],
+    ["POST", "/api/openings/introduction-priorities/1/cancel"],
+  ];
+  for (const [method, route] of missRoutes) {
+    assert.equal(await status(route, { ...serveHeaders, origin }, method), 404);
+  }
   assert.equal(await status("/api/tactics", { ...serveHeaders, origin }, "POST"), 405);
 }
 

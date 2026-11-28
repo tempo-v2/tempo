@@ -177,6 +177,62 @@ pub fn current_opening_reply(
         .optional()?)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissTarget {
+    pub card_id: String,
+    pub repertoire_id: String,
+    pub color: String,
+    pub position_id: String,
+    pub expected_uci: String,
+    pub answer_version: String,
+}
+
+pub fn active_miss_target(db: &Connection, id: &str) -> Result<Option<MissTarget>> {
+    let row = db
+        .query_row(
+            "SELECT repertoire_id,color,position_id,answers,answer_version FROM active_cards
+         WHERE id=?1 AND kind='opening'",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((repertoire_id, color, position_id, answers, answer_version)) = row else {
+        return Ok(None);
+    };
+    let Ok([expected_uci]) = serde_json::from_str::<[String; 1]>(&answers) else {
+        return Ok(None);
+    };
+    Ok(Some(MissTarget {
+        card_id: id.to_owned(),
+        repertoire_id,
+        color,
+        position_id,
+        expected_uci,
+        answer_version,
+    }))
+}
+
+pub fn active_miss_reply(
+    db: &Connection,
+    repertoire: &str,
+    position: &str,
+) -> Result<Option<MissTarget>> {
+    let found = current_opening_reply(db, repertoire, position)?;
+    match found.filter(|target| !target.quarantined) {
+        Some(target) => active_miss_target(db, &target.id),
+        None => Ok(None),
+    }
+}
+
 /// The route recorded when this reply was created. Its current authorship
 /// must be established separately.
 pub fn recorded_opening_context(db: &Connection, id: &str) -> Result<Option<Route>> {

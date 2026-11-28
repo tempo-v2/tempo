@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 24;
+const SCHEMA: i32 = 25;
 const TACTIC_SOURCE_UPGRADE: &str = "ALTER TABLE tactics ADD COLUMN source_url TEXT;";
 
 pub struct Database;
@@ -72,6 +72,7 @@ impl Database {
         db.execute_batch(include_str!("daily_mix.sql"))?;
         db.execute_batch(include_str!("tactic_capture.sql"))?;
         db.execute_batch(include_str!("forecast_claim.sql"))?;
+        db.execute_batch(include_str!("opening_misses.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],
@@ -156,7 +157,10 @@ impl Database {
             if version < 23 {
                 tx.execute_batch(include_str!("tactic_capture.sql"))?;
             }
-            tx.execute_batch(include_str!("forecast_claim.sql"))?;
+            if version < 24 {
+                tx.execute_batch(include_str!("forecast_claim.sql"))?;
+            }
+            upgrade_opening_misses(&tx)?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -204,6 +208,7 @@ impl Database {
         tx.execute_batch(TACTIC_SOURCE_UPGRADE)?;
         tx.execute_batch(include_str!("tactic_capture.sql"))?;
         tx.execute_batch(include_str!("forecast_claim.sql"))?;
+        upgrade_opening_misses(&tx)?;
         let valid: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
             [],
@@ -270,6 +275,29 @@ pub fn save_review(
         ON CONFLICT(card_id) DO UPDATE SET stability=excluded.stability,difficulty=excluded.difficulty,
         last_at=excluded.last_at,due_at=excluded.due_at",
         rusqlite::params![card,schedule.stability,schedule.difficulty,now,schedule.due_at])?;
+    Ok(())
+}
+
+fn upgrade_opening_misses(db: &Connection) -> Result<()> {
+    let inventory = db
+        .prepare(
+            "SELECT o.card_id, group_concat(o.attempt_id), d.slot
+         FROM repeat_obligation o LEFT JOIN deck d USING(card_id)
+         GROUP BY o.card_id HAVING count(*)>1 OR d.slot IS NOT NULL LIMIT 21",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        inventory.is_empty(),
+        "Ambiguous retained repeats (up to 21 affected cards, attempt IDs, deck slots): {inventory:?}"
+    );
+    db.execute_batch(include_str!("opening_misses.sql"))?;
     Ok(())
 }
 

@@ -53,11 +53,14 @@ pub enum Reader {
     GameFeedback,
     StudyMoveReview,
     StudyMovePreview,
+    OpeningMissPreview,
+    OpeningMissReceipt,
+    OpeningPriorityStatus,
 }
 
 impl Reader {
     fn slot(self) -> &'static Semaphore {
-        const LANES: usize = Reader::StudyMovePreview as usize + 1;
+        const LANES: usize = Reader::OpeningPriorityStatus as usize + 1;
         static SLOTS: [Semaphore; LANES] = [const { Semaphore::const_new(1) }; LANES];
         &SLOTS[self as usize]
     }
@@ -117,7 +120,11 @@ async fn read_projected<T: 'static, U: Send + 'static>(
         limit_query(&db, deadline, VM_BUDGET, cancelled.clone());
         let stopped = || Instant::now() >= deadline || cancelled.load(Ordering::Relaxed);
         let value = work(&mut db, &stopped).map_err(|error| {
-            if reader.hides_read_errors()
+            let wrong_surface = matches!(
+                error.downcast_ref::<crate::study::Conflict>(),
+                Some(crate::study::Conflict::ExternalAssessment)
+            );
+            if (reader.hides_read_errors() && !wrong_surface)
                 || error.chain().any(|cause| {
                     matches!(cause.downcast_ref::<rusqlite::Error>(),
                     Some(rusqlite::Error::SqliteFailure(detail, _)) if matches!(

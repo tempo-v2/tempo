@@ -209,6 +209,69 @@ database and its adjacent `.uploads` directory. Stop the service before
 copying both for a coordinated release or rollback. Legacy opening import
 requires exclusive database ownership.
 
+## Recover opening moves missed outside Study
+
+Use an explicit selection and preview when you want a game decision or a manual
+observation to count as a miss. An introduced card receives the usual FSRS Again
+at acceptance. An unseen card is prioritized with its required parents for
+normal Study, within the existing opening allowance. A known card can also have
+unseen parents. A receipt shows the accepted learning effect and links to the
+goal that tracks later introduction progress.
+
+The Python client uses the local HTTP service. Put one selection per line in
+`selected.jsonl`, in the order you want to apply them. Use real card, game and
+repertoire IDs. Give each new manual observation a stable UUID.
+
+```jsonl
+{"kind":"archived_game","game_id":"GAME_ID","repertoire_id":"REPERTOIRE_ID","plies":[6,12]}
+{"kind":"manual","card_id":"CARD_ID","event_id":"3b523a2d-c06d-4cdd-8c44-c89df954759c"}
+```
+
+Archived selections use an already completed current comparison for that
+repertoire. Omit `plies` to preview all differing positions in that explicitly
+selected game and repertoire. Repeated differing plies at one position share
+one event. Read the summary before applying it. Several distinct events can
+apply Again to the same known card.
+
+```sh
+python3 tools/opening_miss.py --url http://127.0.0.1:41823 prepare selected.jsonl misses.jsonl
+python3 tools/opening_miss.py --url http://127.0.0.1:41823 apply misses.jsonl
+python3 tools/opening_miss.py --url http://127.0.0.1:41823 status --goal 42
+python3 tools/opening_miss.py --url http://127.0.0.1:41823 cancel-priority 42
+```
+
+Resume an interrupted apply with the same manifest and its `.journal`. The
+client resolves the exact pending operation before sending another. Prepare
+definitively stale unresolved items in a new manifest from the same event
+identities. Exit 0 means all items resolved successfully, 2 means some items
+were rejected or require fresh preparation, 3 means delivery remains pending
+or the batch stopped at a dataset or request conflict, and 1 means a client or
+configuration failure. Cancellation withdraws future uncommitted priority.
+Accepted grades and committed work remain in history.
+
+If a backup restore can omit newer opening-miss receipts, stop old manifest
+replays. Reconcile their results against the restored ledger before explicitly
+preparing any unresolved observation again. A dataset match by itself cannot
+establish that a restored copy still contains newer receipts.
+
+The API uses the dataset returned by `GET /api/tactics/capture-context`.
+Send one selection to `POST /api/openings/misses/preview` with `dataset`, a
+UUID `request_id`, and `source`. Manual source uses `kind: manual`,
+`event_id`, and top-level `card_id`. Archived source uses
+`kind: archived_game`, `game_id`, `repertoire_id`, all sorted differing
+`decision_plies` at the top-level `position_id`, and the current
+`report_generation`, `comparator_version`, and `repertoire_revision`. Optional
+bounded `provenance` is retained with the command. Submit the returned
+`command` to `POST /api/openings/misses`. An accepted or previously
+processed preview returns its receipt directly.
+
+Poll `GET /api/openings/misses/receipts/{request_id}?dataset=DATASET` to verify
+delivery, or `GET /api/openings/introduction-priorities/{goal_id}?dataset=DATASET`
+for live status. A missing receipt can still be in flight. Retrying the exact
+apply resolves uncertainty. To withdraw a goal, use
+`POST /api/openings/introduction-priorities/{goal_id}/cancel` with
+`{"dataset":"DATASET"}`. Archives and comparisons remain independent of apply.
+
 ## Archive conversion and recovery
 
 With the service stopped, run `tempo migrate-games DATABASE` on the existing

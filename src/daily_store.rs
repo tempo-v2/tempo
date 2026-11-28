@@ -1,6 +1,7 @@
 //! Persisted daily membership. The serving reader only sees prepared work.
 
 pub(crate) mod forecast;
+mod priority;
 use crate::{
     daily_forecast::{self, Request, Response, Score},
     daily_openings::{self, ForecastReply, Projection, Reply, SavedLine},
@@ -88,6 +89,8 @@ fn day(db: &Connection, key: &str) -> Result<Option<Day>> {
 
 struct Clock {
     openings: i64,
+    priority: i64,
+    sequence: i64,
     authoring: i64,
     tactics: i64,
     coverage: i64,
@@ -96,11 +99,13 @@ struct Clock {
 }
 fn clock(db: &Connection) -> Result<Clock> {
     Ok(db.query_row(
-        "SELECT openings,tactics,coverage,last_order_day,current_day,authoring FROM daily_clock",
+        "SELECT openings,tactics,coverage,last_order_day,current_day,authoring,priority,sequence FROM daily_clock",
         [],
         |r| {
             Ok(Clock {
                 openings: r.get(0)?,
+                priority: r.get(6)?,
+                sequence: r.get(7)?,
                 tactics: r.get(1)?,
                 coverage: r.get(2)?,
                 last_order: r.get(3)?,
@@ -284,6 +289,7 @@ pub fn refresh_parent(db: &Connection, card: &str, now: i64) -> Result<()> {
         |r| r.get(0),
     )?;
     if opening {
+        crate::opening_priority::note_introduction(db, card)?;
         let day = day_at(now)?;
         db.execute(
             "UPDATE daily_new SET waiting=waiting-1
@@ -503,6 +509,7 @@ struct Draft {
     kind: &'static str,
     version: i64,
     source: &'static str,
+    priority: i64,
 }
 
 fn charged(db: &Connection, day: &Day, kind: &str) -> Result<usize> {
@@ -560,6 +567,7 @@ fn tactic_draft(db: &Connection, day: &Day, version: i64) -> Result<Draft> {
         revoked_openings: Vec::new(),
         kind: "tactic",
         version,
+        priority: 0,
         source: "standard",
     })
 }
@@ -590,6 +598,7 @@ struct AuthoredRows {
     forecast_replies: Vec<ForecastReply>,
     keys: Vec<String>,
     projection: Projection,
+    bytes: usize,
 }
 
 impl AuthoredRows {
@@ -699,12 +708,17 @@ fn authored_rows(
         forecast_replies,
         keys,
         projection,
+        bytes,
     })
 }
 
 struct Openings<T = Authored> {
     authored: T,
     available: HashMap<String, i64>,
+    priority_available: HashMap<String, i64>,
+    lifecycles: HashMap<String, i64>,
+    schedule_held: HashSet<String>,
+    priority_generation: i64,
     introduced: HashSet<String>,
     pinned: HashSet<String>,
     reserved: Vec<String>,
@@ -717,6 +731,10 @@ impl Openings<AuthoredRows> {
         Ok(Openings {
             authored: self.authored.compile(stop)?,
             available: self.available,
+            priority_available: self.priority_available,
+            lifecycles: self.lifecycles,
+            schedule_held: self.schedule_held,
+            priority_generation: self.priority_generation,
             introduced: self.introduced,
             pinned: self.pinned,
             reserved: self.reserved,
@@ -733,6 +751,10 @@ fn openings(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings> {
 fn opening_rows(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings<AuthoredRows>> {
     let authored = authored_rows(db, day, clock, Projection::Prerequisites)?;
     let mut available = HashMap::new();
+    let mut priority_available = HashMap::new();
+    let mut lifecycles = HashMap::new();
+    let mut schedule_held = HashSet::new();
+    let mut bytes = authored.bytes;
     let mut introduced = HashSet::new();
     let mut pinned = HashSet::new();
     let mut reserved_openings = Vec::new();
@@ -759,14 +781,24 @@ fn opening_rows(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings<Au
         if !learned && reserved {
             reserved_openings.push(card.clone());
         }
-        if availability <= day.high_water
-            && schedule <= day.high_water
-            && !learned
-            && !reserved
-            && !committed
-            && !active
-        {
-            available.insert(card, availability);
+        if clock.priority != 0 {
+            bytes += 3 * (card.len() + size_of::<String>() + size_of::<i64>());
+            ensure!(
+                bytes <= CAPTURE_BYTES,
+                "Daily opening priority snapshot exceeds its byte budget"
+            );
+            lifecycles.insert(card.clone(), availability);
+            if !learned && schedule > day.high_water {
+                schedule_held.insert(card.clone());
+            }
+        }
+        if schedule <= day.high_water && !learned && !reserved && !committed && !active {
+            if availability <= day.high_water {
+                available.insert(card.clone(), availability);
+            }
+            if clock.priority != 0 {
+                priority_available.insert(card, availability);
+            }
         }
     }
     let saved_order = saved_opening_order(db, day, clock)?;
@@ -776,6 +808,10 @@ fn opening_rows(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings<Au
     Ok(Openings {
         authored,
         available,
+        priority_available,
+        lifecycles,
+        schedule_held,
+        priority_generation: clock.priority,
         introduced,
         pinned,
         reserved: reserved_openings,
@@ -836,11 +872,42 @@ impl Openings {
     }
 
     fn draft(&self, version: i64, ordered: &[String], source: &'static str) -> Draft {
-        let candidates: Vec<_> = ordered
+        self.draft_with_priority(version, ordered, source, &[])
+    }
+
+    fn draft_with_priority(
+        &self,
+        version: i64,
+        ordered: &[String],
+        source: &'static str,
+        prefix: &[crate::opening_priority::Proof],
+    ) -> Draft {
+        self.draft_until(version, ordered, source, prefix, || false)
+            .expect("unbounded draft")
+    }
+
+    fn draft_until(
+        &self,
+        version: i64,
+        ordered: &[String],
+        source: &'static str,
+        prefix: &[crate::opening_priority::Proof],
+        expired: impl Fn() -> bool,
+    ) -> Option<Draft> {
+        let priority_ids: HashSet<_> = prefix.iter().map(|proof| proof.card.as_str()).collect();
+        let mut candidates: Vec<_> = prefix
             .iter()
-            .filter_map(|card| {
-                self.available.get(card)?;
-                Some(Candidate {
+            .map(|proof| Candidate {
+                card: proof.card.clone(),
+                prerequisites: Prerequisites::Routes(vec![proof.parents.clone()]),
+            })
+            .collect();
+        for card in ordered {
+            if expired() {
+                return None;
+            }
+            if self.available.contains_key(card) && !priority_ids.contains(card.as_str()) {
+                candidates.push(Candidate {
                     card: card.clone(),
                     prerequisites: self
                         .authored
@@ -849,9 +916,34 @@ impl Openings {
                         .get(card)
                         .cloned()
                         .unwrap_or(Prerequisites::Unknown),
+                });
+            }
+        }
+        let (pinned, revoked_openings) = self.checked_commitments();
+        let selected =
+            daily_plan::pick_until(&candidates, &self.introduced, &pinned, self.limit, expired)?
+                .into_iter()
+                .map(|selection| {
+                    let availability = self
+                        .available
+                        .get(&selection.card)
+                        .or_else(|| self.priority_available.get(&selection.card))
+                        .copied()
+                        .expect("published opening selection is available");
+                    (selection, availability)
                 })
-            })
-            .collect();
+                .collect();
+        Some(Draft {
+            selected,
+            revoked_openings,
+            kind: "opening",
+            version,
+            source,
+            priority: self.priority_generation,
+        })
+    }
+
+    fn checked_commitments(&self) -> (HashSet<String>, Vec<String>) {
         let mut pinned = self.pinned.clone();
         let mut revoked_openings = Vec::new();
         for card in &self.reserved {
@@ -868,20 +960,7 @@ impl Openings {
                 revoked_openings.push(card.clone());
             }
         }
-        let selected = daily_plan::pick(&candidates, &self.introduced, &pinned, self.limit)
-            .into_iter()
-            .map(|selection| {
-                let availability = self.available[&selection.card];
-                (selection, availability)
-            })
-            .collect();
-        Draft {
-            selected,
-            revoked_openings,
-            kind: "opening",
-            version,
-            source,
-        }
+        (pinned, revoked_openings)
     }
 }
 
@@ -907,7 +986,10 @@ fn publish_slots(tx: &Connection, day: &Day, draft: &Draft) -> Result<bool> {
         (&day.key, day.commitments),
         |r| r.get(0),
     )?;
-    if version != draft.version || !valid {
+    if version != draft.version
+        || !valid
+        || (draft.kind == "opening" && draft.priority != clock.priority)
+    {
         return Ok(false);
     }
     // An authored route repair may revoke a never-issued filler. Its already
@@ -955,10 +1037,6 @@ fn publish_slots(tx: &Connection, day: &Day, draft: &Draft) -> Result<bool> {
         )?;
     }
     Ok(true)
-}
-
-fn capture(path: &Path) -> Result<Connection> {
-    capture_before(path, Instant::now() + READ_BUDGET)
 }
 
 fn capture_before(path: &Path, limit: Instant) -> Result<Connection> {
@@ -1044,10 +1122,17 @@ enum Lane {
     Openings,
 }
 
-fn turn(path: &Path, writer: &Writer, now: i64, lane: Lane) -> Result<bool> {
+fn turn(
+    path: &Path,
+    writer: &Writer,
+    now: i64,
+    lane: Lane,
+    priority: &mut Option<priority::Pass>,
+) -> Result<bool> {
     let key = day_at(now)?;
     let deadline = Instant::now() + Duration::from_secs(60);
-    let read = capture(path)?;
+    let read_deadline = Instant::now() + READ_BUDGET;
+    let read = capture_before(path, read_deadline)?;
     let tx = read.unchecked_transaction()?;
     let clock = clock(&tx)?;
     if matches!(lane, Lane::Day) {
@@ -1095,6 +1180,9 @@ fn turn(path: &Path, writer: &Writer, now: i64, lane: Lane) -> Result<bool> {
         writer.background_until(deadline, move |db| activate_new(db, &day, &draft))?;
         return Ok(true);
     }
+    if matches!(lane, Lane::Openings) && clock.priority != 0 {
+        return priority::turn(tx, writer, day, clock, priority, read_deadline);
+    }
     if matches!(lane, Lane::Openings) && day.openings != Some(clock.openings) {
         let draft = if day.opening_limit > 0 || has_unseen_opening_commitment(&tx)? {
             let input = openings(&tx, &day, &clock)?;
@@ -1112,6 +1200,7 @@ fn turn(path: &Path, writer: &Writer, now: i64, lane: Lane) -> Result<bool> {
                 revoked_openings: Vec::new(),
                 kind: "opening",
                 version: clock.openings,
+                priority: clock.priority,
                 source: "standard",
             }
         };
@@ -1124,6 +1213,7 @@ fn turn(path: &Path, writer: &Writer, now: i64, lane: Lane) -> Result<bool> {
 
 pub fn run(path: &Path, writer: Writer, shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut last_cleanup = Instant::now();
+    let mut priority = None;
     let mut lanes =
         [Lane::Day, Lane::Due, Lane::Tactics, Lane::Openings].map(|lane| (lane, Instant::now()));
     while !*shutdown.borrow() {
@@ -1136,7 +1226,7 @@ pub fn run(path: &Path, writer: Writer, shutdown: tokio::sync::watch::Receiver<b
             if Instant::now() < *retry {
                 continue;
             }
-            match turn(path, &writer, now, *lane) {
+            match turn(path, &writer, now, *lane, &mut priority) {
                 Ok(work) => progressed |= work,
                 Err(error) => {
                     eprintln!("Daily Study {lane:?} preparation: {error:#}");
@@ -1752,6 +1842,104 @@ mod tests {
             },
             None,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn priority_reaches_goal_65_and_does_not_regress_on_worker_restart() -> Result<()> {
+        use crate::opening_priority::{self, Basis};
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("priority-restart.sqlite3");
+        let mut db = Database::init(&path)?;
+        let now = Utc::now().timestamp();
+        opening(&db, "leading ordinary candidate", &["a2a3"])?;
+        while !queue_store::seed_batch(&mut db)? {}
+        prepare_test_day(&mut db, now)?;
+
+        // All route cards arrive after the original availability cutoff.
+        opening(
+            &db,
+            "missed gambit",
+            &["d2d4", "d7d5", "c2c4", "e7e6", "b1c3"],
+        )?;
+        db.execute_batch("WITH RECURSIVE ids(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM ids WHERE i<64)
+            INSERT INTO cards (id,kind,title,color,fen,position_id,answers,repertoire_id,answer_version)
+            SELECT 'unknown-'||i,'opening','Unknown','white','','unknown-'||i,'[\"a2a3\"]',
+                'unknown','version' FROM ids")?;
+        let tx = db.transaction()?;
+        let initial = tx.total_changes();
+        tx.execute(
+            "INSERT INTO opening_priority(target,availability)
+                    SELECT card_id,availability_version FROM prepared_queue
+                    WHERE card_id LIKE 'unknown-%' ORDER BY card_id",
+            [],
+        )?;
+        assert_eq!(tx.total_changes() - initial, 64);
+        let target: String =
+            tx.query_row("SELECT id FROM cards WHERE answers='[\"b1c3\"]'", [], |r| {
+                r.get(0)
+            })?;
+        let availability: i64 = tx.query_row(
+            "SELECT availability_version FROM prepared_queue WHERE card_id=?1",
+            [&target],
+            |r| r.get(0),
+        )?;
+        let (goal, created) = opening_priority::join(&tx, &target, availability)?;
+        assert!(created);
+        assert_eq!(goal, 65);
+        tx.commit()?;
+        let writer = Writer::start(db, None)?;
+        let mut pass = None;
+        tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut pass))?;
+        tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut pass))?;
+        let read = Database::read(&path)?;
+        let basis = Basis::current(&read)?.unwrap();
+        let prefix = opening_priority::published_prefix(&read, &basis)?.unwrap();
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(prefix.last().unwrap().card, target);
+        let state = opening_priority::status(&read, goal)?.unwrap();
+        assert_eq!(state["state"], "pending");
+        assert_eq!(state["progress"]["remaining"], 3);
+        drop(read);
+
+        let mut restarted = None;
+        tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut restarted))?;
+        let read = Database::read(&path)?;
+        assert_eq!(
+            opening_priority::published_prefix(&read, &basis)?,
+            Some(prefix.clone())
+        );
+        let tx_order = read.query_row(
+            "SELECT card_id FROM daily_new WHERE day=?1 AND kind='opening' ORDER BY ordinal LIMIT 1",
+            [&basis.day], |r| r.get::<_,String>(0))?;
+        assert_eq!(tx_order, prefix[0].card);
+        drop(read);
+
+        // Use the actual Next/Answer path. The last introduction completes
+        // this proof even if authoring changes before housekeeping runs.
+        writer
+            .submit(false, |db| {
+                let mut issued = open_study(db)?;
+                for movement in ["d2d4", "c2c4", "b1c3"] {
+                    let current = issued.take().expect("priority Study card");
+                    let actual = serde_json::to_value(&current)?;
+                    assert_eq!(actual["introduction_move"], movement);
+                    issued = answer_and_next(db, current, movement)?;
+                }
+                opening(db, "unrelated authoring before housekeeping", &["h2h3"])?;
+                assert!(opening_priority::roots(db, 64)?[0].witnessed);
+                Ok(())
+            })?
+            .wait()
+            .await?;
+        let mut refreshed = None;
+        tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut refreshed))?;
+        tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut refreshed))?;
+        let read = Database::read(&path)?;
+        assert_eq!(
+            opening_priority::status(&read, goal)?.unwrap()["state"],
+            "fulfilled"
+        );
         Ok(())
     }
 

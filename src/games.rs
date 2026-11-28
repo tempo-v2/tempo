@@ -257,12 +257,61 @@ pub fn read(db: &Connection, id: &str) -> Result<Game> {
     read_fields(db, id, FIELDS)
 }
 
-pub fn learner_color(db: &Connection, id: &str) -> Result<String> {
-    db.query_row("SELECT learner_color FROM games WHERE id=?1", [id], |row| {
-        row.get(0)
+pub fn archived_learner_color(db: &Connection, id: &str) -> Result<Option<String>> {
+    Ok(db
+        .query_row("SELECT learner_color FROM games WHERE id=?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+#[derive(Serialize)]
+pub struct MissOrigin {
+    pub source_url: Option<String>,
+    pub source_date: Option<String>,
+    pub source_time: Option<String>,
+    pub precision: Option<&'static str>,
+    pub origin: &'static str,
+}
+
+/// Read only archived chronology and provenance. The date may be only a PGN date.
+pub fn miss_origin(db: &Connection, id: &str) -> Result<MissOrigin> {
+    let (source_url, played_on, occurrence): (Option<String>, Option<String>, String) = db
+        .query_row(
+            &format!("SELECT {DISPLAY_FIELDS},occurrence FROM games WHERE id=?1"),
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+    let Occurrence([utc, time, date, _]) = serde_json::from_str(&occurrence)?;
+    let (source_date, source_time, origin) = if let Some(utc) = utc {
+        (Some(utc), time, "pgn_utc_date")
+    } else if let Some(date) = date {
+        (Some(date), None, "pgn_date")
+    } else {
+        let parsed = played_on.as_deref().and_then(|value| {
+            NaiveDate::parse_from_str(value, "%Y.%m.%d")
+                .or_else(|_| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+                .ok()
+                .map(|date| date.to_string())
+        });
+        (parsed, None, "archive_display")
+    };
+    let precision = if source_time.is_some() {
+        Some("second")
+    } else {
+        source_date.as_ref().map(|_| "date")
+    };
+    Ok(MissOrigin {
+        source_url,
+        source_date,
+        source_time,
+        precision,
+        origin,
     })
-    .optional()?
-    .context("This game is no longer available.")
+}
+
+pub fn learner_color(db: &Connection, id: &str) -> Result<String> {
+    archived_learner_color(db, id)?.context("This game is no longer available.")
 }
 
 fn read_fields(db: &Connection, id: &str, fields: &str) -> Result<Game> {
