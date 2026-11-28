@@ -33,6 +33,7 @@ mod review;
 mod scanner;
 mod study;
 mod study_store;
+mod tactic_import;
 mod tactic_qualification;
 mod tactic_worker_protocol;
 mod tactic_worker_socket;
@@ -42,7 +43,7 @@ mod writer;
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, FromRequest, Path as UrlPath, Query, Request, State},
+    extract::{DefaultBodyLimit, Extension, FromRequest, Path as UrlPath, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -365,10 +366,10 @@ async fn save_opening(State(db): State<App>, Json(input): Json<SaveOpening>) -> 
 #[derive(Deserialize)]
 struct PgnInput {
     pgn: String,
-    name: Option<String>,
 }
 
 static OPENING_PREVIEW: Semaphore = Semaphore::const_new(1);
+static TACTIC_IMPORT_PREVIEW: Semaphore = Semaphore::const_new(1);
 const PGN_DEADLINE: Duration = Duration::from_secs(10);
 const PGN_BODY_LIMIT: usize = jobs::MAX_PGN * 2 + 4096;
 
@@ -438,40 +439,62 @@ async fn tactics(State(db): State<App>, Query(q): Query<Page>) -> ViewResult {
     })
     .await
 }
-fn prepare_puzzle(input: PgnInput) -> Result<catalog::TacticPlan> {
-    ensure!(input.pgn.len() <= jobs::MAX_PGN, "PGN exceeds 64 MiB");
-    let puzzle = chess::parse_pgn(&input.pgn, true, 1)?.remove(0)?;
-    let name = input.name.as_deref().context("enter a puzzle name")?;
-    let mut answers = vec![puzzle.main.moves[0].clone()];
-    answers.extend(
-        puzzle
-            .variations
-            .iter()
-            .filter_map(|route| route.moves.first().cloned()),
-    );
-    catalog::prepare_tactic(catalog::TacticInput {
-        name,
-        route: &puzzle.main,
-        answers: &answers,
-        source: None,
+#[derive(Clone, Copy)]
+struct PgnReceiveDeadline(Instant);
+
+async fn puzzle_import_options(
+    Extension(PgnReceiveDeadline(deadline)): Extension<PgnReceiveDeadline>,
+    request: Request,
+) -> Response {
+    let Ok(permit) = TACTIC_IMPORT_PREVIEW.try_acquire() else {
+        return ApiError(optional_read::Unavailable.into()).into_response();
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let reply = run_preview(permit, deadline, move || {
+        let Json(input) = match runtime.block_on(Json::<tactic_import::OptionsInput>::from_request(
+            request,
+            &(),
+        )) {
+            Ok(input) => input,
+            Err(error) => return Ok(error.into_response()),
+        };
+        tactic_import::ensure_pgn_size(&input.pgn)?;
+        let options = tactic_import::options(
+            PreviewInput {
+                bytes: input.pgn.as_bytes(),
+                deadline,
+            },
+            input.puzzle_url.as_deref(),
+        )?;
+        Ok(Json(options).into_response())
     })
+    .await;
+    reply.unwrap_or_else(|error| ApiError(error).into_response())
 }
 
-fn apply_puzzle(db: &mut Connection, plan: &catalog::TacticPlan) -> Result<String> {
+fn apply_puzzle(
+    db: &mut Connection,
+    prepared: &tactic_import::Prepared,
+) -> Result<catalog::Tactic> {
     let tx = db.transaction()?;
-    let id = catalog::apply_tactic(&tx, plan)?;
+    let puzzle =
+        catalog::apply_authored_tactic(&tx, &prepared.plan, prepared.source_url.as_deref())?;
     tx.commit()?;
-    Ok(id)
+    Ok(puzzle)
 }
 
-async fn save_tactic(State(db): State<App>, Json(input): Json<PgnInput>) -> ApiResult {
-    let plan = prepare(
+async fn save_tactic(State(db): State<App>, Json(input): Json<tactic_import::Input>) -> ApiResult {
+    let prepared = prepare(
         &db.content_preparation,
         || ApiError(writer::Unavailable.into()),
-        move || prepare_puzzle(input),
+        move || tactic_import::prepare(input),
     )
     .await?;
-    write_db(db, move |c| Ok(json!({"id":apply_puzzle(c,&plan)?}))).await
+    write_db(db, move |c| {
+        let puzzle = apply_puzzle(c, &prepared)?;
+        Ok(json!({"id":puzzle.id,"puzzle":puzzle}))
+    })
+    .await
 }
 
 async fn archives(State(db): State<App>, Query(q): Query<Page>) -> ViewResult {
@@ -736,8 +759,14 @@ async fn receive_pgn(State(slot): State<Arc<Semaphore>>, request: Request, next:
         )
             .into_response();
     };
-    match buffer_pgn(request, Instant::now() + PGN_DEADLINE).await {
-        Ok(request) => next.run(request).await,
+    let deadline = Instant::now() + PGN_DEADLINE;
+    match buffer_pgn(request, deadline).await {
+        Ok(mut request) => {
+            request
+                .extensions_mut()
+                .insert(PgnReceiveDeadline(deadline));
+            next.run(request).await
+        }
         Err(status) => status.into_response(),
     }
 }
@@ -909,11 +938,16 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             "/api/openings/pgn",
             post(preview_opening).layer(pgn_body_limit),
         )
-        .route(
-            "/api/tactics",
-            get(tactics).merge(post(save_tactic).layer(pgn_body_limit).layer(
-                middleware::from_fn_with_state(app.tactics_pgn_receive.clone(), receive_pgn),
-            )),
+        .route("/api/tactics", get(tactics))
+        .merge(
+            Router::new()
+                .route("/api/tactics", post(save_tactic))
+                .route("/api/tactics/import-options", post(puzzle_import_options))
+                .layer(pgn_body_limit)
+                .layer(middleware::from_fn_with_state(
+                    app.tactics_pgn_receive.clone(),
+                    receive_pgn,
+                )),
         )
         .route("/api/games", get(archives))
         .route("/api/games/archive/{id}", get(read_game))
@@ -1026,10 +1060,13 @@ async fn main() -> Result<()> {
                     );
                     return Ok(());
                 }
-                "tactic" => apply_puzzle(
-                    &mut database,
-                    &prepare_puzzle(serde_json::from_reader(input)?)?,
-                )?,
+                "tactic" => {
+                    apply_puzzle(
+                        &mut database,
+                        &tactic_import::prepare(serde_json::from_reader(input)?)?,
+                    )?
+                    .id
+                }
                 _ => anyhow::bail!("choose opening, tactic, or gap"),
             };
             println!("{id}");
@@ -1059,6 +1096,211 @@ mod preview_tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn authored_pgn_import_normalizes_then_uses_the_existing_study_card() -> Result<()> {
+        const PGN: &str = include_str!("../tests/fixtures/chesscom-2293026.pgn");
+        const URL: &str = "https://www.chess.com/puzzles/problem/2293026";
+        const FEN: &str = "r3k2r/3q1p2/8/p6p/P3pRn1/B1P5/3P3P/1N1QK3 w kq - 0 2";
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("fixture.sqlite3");
+        let mut db = Database::init(&database)?;
+        queue_store::seed_batch(&mut db)?;
+        let app = Arc::new(Runtime::new(
+            database.clone(),
+            writer::Writer::start(db, None)?,
+            uploads::Staging::start(&database)?,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(
+            axum::serve(listener, router(Path::new("."), port, app.clone())).into_future(),
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+        let base = format!("http://127.0.0.1:{port}/api");
+        let post =
+            |path: &str, body: Value| client.post(format!("{base}/{path}")).json(&body).send();
+
+        let writes_busy = app.content_preparation.clone().try_acquire_many_owned(2)?;
+        let detected: Value = post("tactics/import-options", json!({"pgn":PGN}))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(
+            detected,
+            json!({"format":"chess_com_puzzle","source_url":URL})
+        );
+        drop(writes_busy);
+        let saved: Value = post("tactics", json!({"name":"Chess.com fixture","pgn":PGN}))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let id = saved["id"].as_str().unwrap();
+        let puzzle = &saved["puzzle"];
+        assert_eq!(puzzle["id"], id);
+        assert_eq!(puzzle["source_url"], URL);
+        assert_eq!(puzzle["route"]["fen"], FEN);
+        assert_eq!(
+            puzzle["route"]["moves"],
+            json!(["f4e4", "e8d8", "e4d4", "h8e8", "e1f1"])
+        );
+
+        app.writer
+            .submit(true, |db| {
+                daily_store::prepare_test_day(db, chrono::Utc::now().timestamp())
+            })?
+            .wait()
+            .await?;
+        let attempt: Value = post("study/next", json!({"after":null}))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(attempt["fen"], FEN);
+        assert_eq!(attempt["color"], "white");
+        let answer =
+            json!({"attempt":attempt["attempt"],"dataset":attempt["dataset"],"played":"f4e4"});
+        let graded: Value = post("study/answer", answer.clone())
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(graded["rating"], "Good");
+
+        let trimmed = format!(
+            "[SetUp \"1\"]\n[FEN \"{FEN}\"]\n[Link \"{URL}\"]\n\n2. Rxe4+ Kd8 3. Rd4 Re8+ 4. Kf1 *"
+        );
+        let reimport: Value = post(
+            "tactics",
+            json!({
+                "name":"Changed name", "pgn":trimmed, "first_move_is_setup":false,
+                "puzzle_url":"https://www.chess.com/puzzles/problem/2"
+            }),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(reimport, saved);
+        let replay: Value = post("study/answer", answer)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(replay, graded);
+
+        for (tag, source) in [
+            ("Link", "https://www.chess.com/game/live/2293026"),
+            ("Link", "https://www.chess.com/"),
+            (
+                "Link",
+                "https://www.chess.com.example.org/puzzles/problem/2293026",
+            ),
+            (
+                "Link",
+                "https://www.chess.com/puzzles/problem/2293026/analysis",
+            ),
+            ("Site", "Chess.com"),
+        ] {
+            let generic: Value = post(
+                "tactics/import-options",
+                json!({
+                    "pgn":format!("[{tag} \"{source}\"]\n\n1. d4 *")
+                }),
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+            assert_eq!(generic, json!({"format":"generic_pgn","source_url":null}));
+        }
+        let field_url = "https://www.chess.com/puzzles/problem/1?share=1#top";
+        let source_options: Value = post(
+            "tactics/import-options",
+            json!({
+                "pgn":PGN,"puzzle_url":field_url
+            }),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(
+            source_options["source_url"],
+            "https://www.chess.com/puzzles/problem/1"
+        );
+        let from_site: Value = post(
+            "tactics/import-options",
+            json!({
+                "pgn":format!("[Site \"{URL}\"]\n\n1. d4 *")
+            }),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(from_site["source_url"], URL);
+
+        let generic: Value = post("tactics", json!({"name":"Generic","pgn":"1. d4 *"}))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(generic["puzzle"]["route"]["moves"], json!(["d2d4"]));
+        assert!(generic["puzzle"].get("source_url").is_none());
+        let annotated: Value = post("tactics", json!({
+            "name":"Renamed generic","pgn":"1. d4 *","puzzle_url":field_url,"first_move_is_setup":false
+        })).await?.error_for_status()?.json().await?;
+        assert_eq!(annotated["id"], generic["id"]);
+        assert_eq!(annotated["puzzle"]["name"], "Generic");
+        assert_eq!(
+            annotated["puzzle"]["source_url"],
+            "https://www.chess.com/puzzles/problem/1"
+        );
+
+        for invalid in [
+            PGN.replace("1... h5", "1... h3"),
+            format!("{}\n\n1... h5 *", PGN.split_once("\n\n").unwrap().0),
+        ] {
+            let response = post("tactics", json!({"name":"Invalid","pgn":invalid})).await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let branch_pgn = format!(
+            "{}\n\n1... h5 (1... h6 2. Bb4) 2. Rxe4+ (2. Bc5) *",
+            PGN.split_once("\n\n").unwrap().0
+        );
+        let branch: Value = post("tactics", json!({"name":"Branch fixture","pgn":branch_pgn}))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let read = Database::read(&database)?;
+        let answers: String = read.query_row(
+            "SELECT answers FROM cards WHERE id=?1",
+            [branch["id"].as_str().unwrap()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&answers)?,
+            json!(["a3c5", "f4e4"])
+        );
+        let listed: Vec<Value> = client
+            .get(format!("{base}/tactics"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(listed.len(), 3);
+        assert!(listed.contains(puzzle));
+        assert!(listed.contains(&annotated["puzzle"]));
+        server.abort();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn incomplete_pgn_receive_uses_only_its_route_slot() -> Result<()> {
@@ -1113,6 +1355,11 @@ mod preview_tests {
             let refused = post(path, blocked).await?;
             assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(refused.json::<Value>().await?["code"], "pgn_receive_busy");
+            if path == "tactics" {
+                let preview = post("tactics/import-options", &tactic).await?;
+                assert_eq!(preview.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(preview.json::<Value>().await?["code"], "pgn_receive_busy");
+            }
             client
                 .get(format!("{origin}/health"))
                 .send()

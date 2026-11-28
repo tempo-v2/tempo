@@ -1,0 +1,12 @@
+[Event "?"]
+[Site "?"]
+[Date "????.??.??"]
+[Round "?"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+[SetUp "1"]
+[FEN "r3k2r/3q1p1p/8/p7/P3pRn1/B1P5/3P3P/1N1QK3 b kq - 0 1"]
+[Link "https://www.chess.com/puzzles/problem/2293026"]
+
+1... h5 2. Rxe4+ Kd8 3. Rd4 Re8+ 4. Kf1 *

@@ -2,7 +2,8 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 21;
+const SCHEMA: i32 = 22;
+const TACTIC_SOURCE_UPGRADE: &str = "ALTER TABLE tactics ADD COLUMN source_url TEXT;";
 
 pub struct Database;
 
@@ -144,7 +145,10 @@ impl Database {
             if version < 20 {
                 upgrade_daily_queue(&tx)?;
             }
-            tx.execute_batch(include_str!("daily_mix.sql"))?;
+            if version < 21 {
+                tx.execute_batch(include_str!("daily_mix.sql"))?;
+            }
+            tx.execute_batch(TACTIC_SOURCE_UPGRADE)?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -189,6 +193,7 @@ impl Database {
         tx.execute_batch(include_str!("game_feedback.sql"))?;
         upgrade_daily_queue(&tx)?;
         tx.execute_batch(include_str!("daily_mix.sql"))?;
+        tx.execute_batch(TACTIC_SOURCE_UPGRADE)?;
         let valid: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
             [],

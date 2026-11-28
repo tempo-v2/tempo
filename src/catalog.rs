@@ -34,6 +34,8 @@ pub struct Tactic {
     pub route: Route,
     pub source_game: Option<String>,
     pub source_ply: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 pub fn name(value: &str) -> Result<&str> {
@@ -663,31 +665,48 @@ pub fn daily_tactic_candidate(card: String) -> crate::daily_plan::Candidate {
     }
 }
 
-pub fn tactics(db: &Connection, after: &str) -> Result<Vec<Tactic>> {
-    let mut q = db.prepare(
-        "SELECT id,name,route,game_id,game_ply FROM tactics
-         WHERE id>?1 AND retired=0 ORDER BY id LIMIT 100",
-    )?;
-    let rows = q.query_map([after], |r| {
-        Ok((
-            r.get(0)?,
-            r.get(1)?,
-            r.get::<_, String>(2)?,
-            r.get(3)?,
-            r.get(4)?,
-        ))
-    })?;
-    rows.map(|r| {
-        let (id, name, route, source_game, source_ply) = r?;
-        Ok(Tactic {
-            id,
-            name,
-            route: serde_json::from_str(&route)?,
-            source_game,
-            source_ply,
-        })
+const TACTIC_FIELDS: &str = "id,name,route,game_id,game_ply,source_url";
+
+fn tactic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tactic> {
+    let route: String = row.get(2)?;
+    Ok(Tactic {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        route: serde_json::from_str(&route).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, error.into())
+        })?,
+        source_game: row.get(3)?,
+        source_ply: row.get(4)?,
+        source_url: row.get(5)?,
     })
-    .collect()
+}
+
+pub fn tactics(db: &Connection, after: &str) -> Result<Vec<Tactic>> {
+    let mut q = db.prepare(&format!(
+        "SELECT {TACTIC_FIELDS} FROM tactics WHERE id>?1 AND retired=0 ORDER BY id LIMIT 100"
+    ))?;
+    Ok(q.query_map([after], tactic_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Save a validated authored import and return the catalog row in the same transaction.
+pub fn apply_authored_tactic(
+    db: &rusqlite::Transaction<'_>,
+    plan: &TacticPlan,
+    source_url: Option<&str>,
+) -> Result<Tactic> {
+    let id = apply_tactic(db, plan)?;
+    if let Some(source_url) = source_url {
+        db.execute(
+            "UPDATE tactics SET source_url=?2 WHERE id=?1 AND source_url IS NULL",
+            params![id, source_url],
+        )?;
+    }
+    Ok(db.query_row(
+        &format!("SELECT {TACTIC_FIELDS} FROM tactics WHERE id=?1"),
+        [id],
+        tactic_row,
+    )?)
 }
 
 pub struct TacticInput<'a> {
