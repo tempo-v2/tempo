@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Board } from "@tempo-v2/core-components";
 import { createPortal } from "react-dom";
 import { Chess } from "chess.js";
@@ -21,7 +21,7 @@ export function position(route, ply = route.moves.length) {
   return game;
 }
 
-export function ChessBoard({ game, legal = [], orientation, identity, onMove, onRejectedMove, lastMove, shapes, promotionTarget, locked = false }) {
+export function ChessBoard({ game, legal = [], orientation, identity, onMove, onRejectedMove, lastMove, shapes, promotionTarget, locked = false, retainMoveOnLock = false }) {
   const [promotion, setPromotion] = useState(null);
   const ref = useRef(null);
   const fen = game.fen();
@@ -53,7 +53,7 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
     <Board ref={ref} positionIdentity={key} positionRevision={0} fen={fen}
       orientation={orientation} turn={turn} check={game.isCheck() ? turn : false} lastMove={lastMove} shapes={shapes}
       mode="legal" readOnly={!onMove} locked={locked || Boolean(choices)}
-      retainMoveOnLock={Boolean(choices)} coordinates="edges" maxSize={570}
+      retainMoveOnLock={Boolean(choices) || retainMoveOnLock} coordinates="edges" maxSize={570}
       destinations={destinations}
       onRejectedMove={onRejectedMove}
       onMove={onMove ? ({ from, to, positionIdentity }) => {
@@ -67,14 +67,29 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
 }
 
 export function Replay({ route, color, ply, onPly, sounds, controlsTarget }) {
-  const game = position(route, ply);
-  const timeline = position(route).history({ verbose: true });
+  const forward = useRef(null);
+  useLayoutEffect(() => sounds.cancel, [sounds]);
+  useLayoutEffect(() => {
+    const requested = forward.current;
+    forward.current = null;
+    // List and feedback controls can replace the displayed ply directly.
+    if (requested?.route === route && requested.color === color && requested.ply === ply) {
+      sounds.play(requested.cue);
+    } else {
+      sounds.cancel();
+    }
+  }, [sounds, route, color, ply]);
+  const timeline = useMemo(() => position(route).history({ verbose: true }), [route]);
+  const game = new Chess(timeline[Math.min(ply, timeline.length) - 1]?.after || route.fen || undefined);
   function seek(next) {
     if (next > ply) {
-      const board = position(route, next - 1);
-      const move = play(board, route.moves[next - 1]);
+      const move = timeline[next - 1];
+      const board = new Chess(move.after);
       const player = color === "white" ? "w" : "b";
-      sounds.play(moveCue(move, board, move.color === player ? "move-self" : "move-opponent"));
+      forward.current = { route, color, ply: next,
+        cue: moveCue(move, board, move.color === player ? "move-self" : "move-opponent") };
+    } else {
+      forward.current = null;
     }
     onPly(next);
   }

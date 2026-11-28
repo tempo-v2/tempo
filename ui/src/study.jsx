@@ -1,6 +1,6 @@
 import { ExerciseLayout } from "./exercise_layout.jsx";
 import { decodePuzzle, PuzzleBoard, recoverPuzzleActions } from "./puzzle_play.jsx";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { api, readView } from "./api.js";
 import {
@@ -12,14 +12,15 @@ import { moveCue } from "./sounds.js";
 const successPauseMs = 800;
 const openingPlyMs = 260;
 
-function openingFrames(route, targetFen) {
+function openingFrames(route, targetFen, learner) {
   if (!route?.moves?.length) return null;
   try {
     const game = new Chess(route.fen);
     const frames = [{ fen: game.fen() }];
     for (const uci of route.moves) {
-      const { from, to, color } = play(game, uci);
-      frames.push({ fen: game.fen(), lastMove: [from, to], movedBy: color });
+      const move = play(game, uci);
+      frames.push({ fen: game.fen(), lastMove: [move.from, move.to], movedBy: move.color,
+        cue: moveCue(move, game, move.color === learner ? "move-self" : "move-opponent") });
     }
     // Display context may be missing in older content or invalid. The issued
     // position remains the sole input and grading position.
@@ -210,8 +211,10 @@ export function Study({ openGame, sounds }) {
   const mounted = useRef(true);
   const [openingProgress, setOpeningProgress] = useState(null);
   const attemptKey = card ? `${card.dataset}/${card.attempt}` : null;
+  useLayoutEffect(() => sounds.cancel, [sounds, attemptKey]);
   const source = sourceRead?.key === attemptKey ? sourceRead.result : null;
-  const frames = useMemo(() => openingFrames(card?.lead_in, card?.fen), [card?.lead_in, card?.fen]);
+  const learner = card?.color?.[0];
+  const frames = useMemo(() => openingFrames(card?.lead_in, card?.fen, learner), [card?.lead_in, card?.fen, learner]);
   const openingPly = openingProgress?.key === attemptKey ? openingProgress.ply : 0;
   const lastPly = frames ? frames.length - 1 : 0;
   const openingPlaying = Boolean(frames && !card?.result && openingPly < lastPly);
@@ -219,11 +222,12 @@ export function Study({ openGame, sounds }) {
   useEffect(() => {
     if (!openingPlaying) return;
     const timer = setTimeout(() => {
+      sounds.play(frames[openingPly + 1].cue);
       setOpeningProgress((current) => current?.key === attemptKey && current.ply > openingPly
         ? current : { key: attemptKey, ply: openingPly + 1 });
     }, openingPlyMs);
     return () => clearTimeout(timer);
-  }, [attemptKey, openingPlaying, openingPly]);
+  }, [attemptKey, frames, openingPlaying, openingPly, sounds]);
   async function run(op) {
     if (waiting.current) return;
     waiting.current = true;
@@ -277,7 +281,6 @@ export function Study({ openGame, sounds }) {
     return () => {
       mounted.current = false;
       currentRead.current?.abort();
-      sounds.cancel();
     };
   }, []);
   useEffect(() => {
@@ -329,7 +332,12 @@ export function Study({ openGame, sounds }) {
   }, []);
 
   function answer(played) {
+    if (waiting.current) return;
     const intent = answerIntent({ attempt: card.attempt, dataset: card.dataset, played });
+    if (played) {
+      const board = new Chess(card.fen);
+      sounds.play(moveCue(play(board, played), board));
+    }
     run(async () => {
       // Render the drop in the same update that locks the board.
       if (played) setSubmitted({ key: attemptKey, move: played });
@@ -350,7 +358,7 @@ export function Study({ openGame, sounds }) {
       }
       setCard((old) => ({ ...old, result }));
       invalidateCounts.current?.();
-      if (result.display_move) {
+      if (result.display_move && result.display_move !== played) {
         const board = new Chess(card.fen);
         const move = play(board, result.display_move);
         sounds.play(moveCue(move, board));
@@ -385,7 +393,6 @@ export function Study({ openGame, sounds }) {
   const boardMove = displayed ?? awaitingResult;
   const played = displayed ? [displayed.slice(0, 2), displayed.slice(2, 4)] : undefined;
   const lastMove = boardMove ? [boardMove.slice(0, 2), boardMove.slice(2, 4)] : frame?.lastMove;
-  const learner = card?.color === "white" ? "w" : "b";
   const previous = card?.kind === "opening"
     ? (frame?.movedBy !== learner ? frame?.lastMove : undefined)
     : (opponent?.key === attemptKey ? opponent?.move : undefined);
@@ -423,7 +430,10 @@ export function Study({ openGame, sounds }) {
           <strong role="status">{card.result.rating}</strong>
           <button ref={nextButton} className="primary" aria-keyshortcuts="Space" title="Next card (Space)" disabled={pending} onClick={() => next(card.attempt)}>Next card</button>
         </> : openingPlaying
-          ? <button onClick={() => setOpeningProgress({ key: attemptKey, ply: lastPly })}>Skip to your move</button>
+          ? <button onClick={() => {
+            sounds.cancel();
+            setOpeningProgress({ key: attemptKey, ply: lastPly });
+          }}>Skip to your move</button>
           : <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>}
       </div>
       {card.result && <div className="feedback">
