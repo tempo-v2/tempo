@@ -179,7 +179,7 @@ pub fn analyze_until(
     if !(1..=10).contains(&options.count) {
         return Err(Error::InvalidRequest);
     }
-    let mut analysis = analyze_all(position, repertoire, cancelled)?;
+    let mut analysis = analyze_all(position, repertoire, None, cancelled)?;
     if let Outcome::Ranked { moves } = &mut analysis.outcome {
         moves.truncate(options.count);
     }
@@ -191,7 +191,20 @@ pub fn all_candidates(
     repertoire: RepertoireIr,
     cancelled: impl Fn() -> bool,
 ) -> Result<Vec<Candidate>, Error> {
-    match analyze_all(position, repertoire, cancelled)?.outcome {
+    match analyze_all(position, repertoire, None, cancelled)?.outcome {
+        Outcome::Ranked { moves } => Ok(moves),
+        Outcome::OpponentToMove | Outcome::Terminal { .. } => Ok(Vec::new()),
+    }
+}
+
+/// Find the closest other authored position for each legal reply.
+pub fn other_position_candidates(
+    position: PositionIr,
+    repertoire: RepertoireIr,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<Candidate>, Error> {
+    let excluded = chess::position_id(&position.0);
+    match analyze_all(position, repertoire, Some(&excluded), cancelled)?.outcome {
         Outcome::Ranked { moves } => Ok(moves),
         Outcome::OpponentToMove | Outcome::Terminal { .. } => Ok(Vec::new()),
     }
@@ -200,6 +213,7 @@ pub fn all_candidates(
 fn analyze_all(
     PositionIr(board): PositionIr,
     repertoire: RepertoireIr,
+    excluded_position: Option<&str>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Analysis, Error> {
     if repertoire.schema_version != 1
@@ -242,7 +256,7 @@ fn analyze_all(
         {
             return Err(Error::InvalidSnapshot);
         }
-        if board.turn() != example.turn() {
+        if board.turn() != example.turn() || excluded_position == Some(&position_id) {
             continue;
         }
         let Some(&movement) = legal.get(&reply.movement) else {

@@ -1,8 +1,11 @@
 //! Forward optional one-position analysis to the local Stockfish companion.
 use crate::{
-    ApiError, App, ViewResult, repertoire_similarity::PositionIr, tactic_worker_protocol as wire,
+    ApiError, App, ViewResult, chess, repertoire_similarity::PositionIr,
+    tactic_worker_protocol as wire,
 };
+use anyhow::{Result, ensure};
 use axum::{Json, extract::State, response::IntoResponse};
+use pgn_reader::shakmaty::{Chess, Color, Position};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -23,6 +26,30 @@ impl wire::Score {
             Self::Mate { moves, .. } => (-1, i64::from(moves)),
         }
     }
+}
+
+/// Require one valid score for every legal root before comparing evaluations.
+pub fn rank_roots(board: &Chess, mut lines: Vec<wire::Root>) -> Result<Vec<wire::Root>> {
+    let mut legal: std::collections::HashSet<_> = chess::legal(board).into_iter().collect();
+    ensure!(
+        !legal.is_empty()
+            && lines.len() == legal.len()
+            && lines.iter().all(|root| legal.remove(&root.first_move)
+                && !matches!(root.score, wire::Score::Mate { moves: 0, .. })),
+        "Incomplete position evaluation"
+    );
+    let side = if board.turn() == Color::White {
+        wire::Side::White
+    } else {
+        wire::Side::Black
+    };
+    lines.sort_by(|a, b| {
+        b.score
+            .order(side)
+            .cmp(&a.score.order(side))
+            .then(a.first_move.cmp(&b.first_move))
+    });
+    Ok(lines)
 }
 
 static SLOT: Semaphore = Semaphore::const_new(1);
