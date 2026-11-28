@@ -182,11 +182,11 @@ async function deliverAnswer(intent, fen) {
   return result;
 }
 
-export function Study({ openGame, sounds, overlayOpen = false }) {
+export function Study({ openGame, sounds, overlayOpen = false, allowOpeningEdits = true }) {
   const [card, setCard] = useState(null);
   const [counts, invalidateCounts] = useStudyCounts();
   const onOpeningSaved = useCallback(() => invalidateCounts.current?.(), [invalidateCounts]);
-  const openingEdit = useOpeningEdit(onOpeningSaved);
+  const openingEdit = useOpeningEdit(onOpeningSaved, allowOpeningEdits);
   const [reviewMarked, setReviewMarked] = useState(null);
   const [reviewOpen, setReviewOpen] = useState(null);
   const [reviewPosition, setReviewPosition] = useState(null);
@@ -220,7 +220,7 @@ export function Study({ openGame, sounds, overlayOpen = false }) {
   const attemptKey = card ? `${card.dataset}/${card.attempt}` : null;
   useLayoutEffect(() => sounds.cancel, [sounds, attemptKey]);
   const reviewing = Boolean(card?.result && reviewOpen === attemptKey);
-  const canReview = card?.kind === "opening" && card.activity_mode === "single_answer";
+  const canReview = allowOpeningEdits && card?.kind === "opening" && card.activity_mode === "single_answer";
 
   function openReview() {
     setAdvanceAfter(null);
@@ -406,7 +406,7 @@ export function Study({ openGame, sounds, overlayOpen = false }) {
     }}
     heading={heading}
     continuation={<button ref={nextButton} disabled={pending} onClick={() => next(card.attempt)}>Next</button>}>
-    <OpeningEditStatus save={openingEdit} card={card} />
+    {allowOpeningEdits && <OpeningEditStatus save={openingEdit} card={card} />}
     {error && <div role="alert">{error.message} <button disabled={pending} onClick={() => run(retry.current)}>Retry</button></div>}
   </PuzzleBoard>;
 
@@ -447,7 +447,7 @@ export function Study({ openGame, sounds, overlayOpen = false }) {
     onMove={openingPlaying || card.result || awaitingResult ? undefined : answer} />;
   return <ExerciseLayout label="Study" board={reviewBoard || board}>
     {heading}
-    <OpeningEditStatus save={openingEdit} card={card} />
+    {allowOpeningEdits && <OpeningEditStatus save={openingEdit} card={card} />}
     {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
     {!loaded && !error && <p>Loading your deck…</p>}
     {loaded && !card && !error && <><p>No cards are ready in today’s queue.</p>
@@ -478,7 +478,7 @@ export function Study({ openGame, sounds, overlayOpen = false }) {
       {card.result && !reviewing && <div className="feedback">
         <p>Answer: {card.result.answers.map((move) => play(new Chess(card.fen), move).san).join(" or ")}</p>
         {playedInGame && <p>In the game you played {playedInGame}.</p>}
-        {source?.game_id && <button onClick={() => openGame(source.game_id, source.ply)}>View source game</button>}
+        {openGame && source?.game_id && <button onClick={() => openGame(source.game_id, source.ply)}>View source game</button>}
       </div>}
     </>}
   </ExerciseLayout>;

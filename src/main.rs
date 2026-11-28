@@ -25,6 +25,7 @@ mod opening_engine;
 mod opening_rank;
 mod opening_replacement;
 mod optional_read;
+mod private_web;
 mod providers;
 mod queue;
 mod queue_store;
@@ -950,6 +951,13 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     let port = listener.local_addr()?.port();
+    let private = match private_web::listen(&path).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("Lean private web unavailable: {error:#}");
+            None
+        }
+    };
     let db = if db.exists() {
         db.canonicalize()?
     } else {
@@ -1011,24 +1019,40 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
     }
     let shutdown = runtime.shutdown.clone();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let app = router(&path, port, Arc::new(runtime));
+    let runtime = Arc::new(runtime);
+    let desktop_stop = shutdown.subscribe();
+    let private_stop = shutdown.subscribe();
+    let desktop = axum::serve(listener, router(&path, port, runtime.clone()))
+        .with_graceful_shutdown(wait_for_shutdown(desktop_stop));
     println!("Tempo at http://127.0.0.1:{port}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
+    tokio::try_join!(
+        async { desktop.await },
+        async {
+            if let Some((listener, access)) = private
+                && let Err(error) = axum::serve(listener, private_router(&path, access, runtime))
+                    .with_graceful_shutdown(wait_for_shutdown(private_stop))
+                    .await
+            {
+                eprintln!("Lean private web listener stopped: {error}");
+            }
+            Ok::<_, io::Error>(())
+        },
+        async {
             tokio::select! { _ = term.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
             shutdown.send_replace(true);
-        })
-        .await?;
+            Ok::<_, io::Error>(())
+        }
+    )?;
     Ok(())
+}
+
+async fn wait_for_shutdown(mut signal: tokio::sync::watch::Receiver<bool>) {
+    let _ = signal.wait_for(|stopping| *stopping).await;
 }
 
 fn router(path: &Path, port: u16, app: App) -> Router {
     let pgn_body_limit = DefaultBodyLimit::max(PGN_BODY_LIMIT);
-    Router::new()
-        .route(
-            "/api/health",
-            get(|| async { Json(json!({"status":"ready","profile":"lean"})) }),
-        )
+    common_routes(&app)
         .route("/api/coverage", post(coverage::start))
         .route("/api/coverage/{id}", get(coverage::read))
         .route("/api/coverage/{id}/gaps", get(coverage::gaps))
@@ -1080,17 +1104,9 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             "/api/openings/pgn",
             post(preview_opening).layer(pgn_body_limit),
         )
-        .route("/api/tactics", get(tactics))
-        .route("/api/tactics/capture-context", get(capture_context))
-        .route(
-            "/api/tactics/capture/lichess",
-            post(save_lichess_capture).layer(DefaultBodyLimit::max(16 * 1024)),
-        )
         .merge(
             Router::new()
                 .route("/api/tactics", post(save_tactic))
-                .route("/api/tactics/capture", post(save_pgn_capture))
-                .route("/api/tactics/import-options", post(puzzle_import_options))
                 .layer(pgn_body_limit)
                 .layer(middleware::from_fn_with_state(
                     app.tactics_pgn_receive.clone(),
@@ -1123,6 +1139,44 @@ fn router(path: &Path, port: u16, app: App) -> Router {
             "/api/settings/new-openings",
             get(new_opening_settings).post(save_new_opening_settings),
         )
+        .route_service("/", ServeFile::new(path.join("index.html")))
+        .nest_service("/assets", ServeDir::new(path.join("assets")))
+        .layer(middleware::from_fn_with_state(port, loopback))
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .with_state(app)
+}
+
+fn private_router(path: &Path, access: private_web::Access, app: App) -> Router {
+    common_routes(&app)
+        .route_service("/", ServeFile::new(path.join("private.html")))
+        .nest_service("/assets", ServeDir::new(path.join("assets")))
+        .layer(middleware::from_fn_with_state(access, private_web::admit))
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .with_state(app)
+}
+
+fn common_routes(app: &App) -> Router<App> {
+    Router::new()
+        .route(
+            "/api/health",
+            get(|| async { Json(json!({"status":"ready","profile":"lean"})) }),
+        )
+        .route("/api/tactics", get(tactics))
+        .route("/api/tactics/capture-context", get(capture_context))
+        .route(
+            "/api/tactics/capture/lichess",
+            post(save_lichess_capture).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .merge(
+            Router::new()
+                .route("/api/tactics/capture", post(save_pgn_capture))
+                .route("/api/tactics/import-options", post(puzzle_import_options))
+                .layer(DefaultBodyLimit::max(PGN_BODY_LIMIT))
+                .layer(middleware::from_fn_with_state(
+                    app.tactics_pgn_receive.clone(),
+                    receive_pgn,
+                )),
+        )
         .route("/api/tactics/packs", get(pack_index))
         .route("/api/tactics/packs/{theme}", get(pack_theme))
         .route("/api/tactics/packs/{theme}/{band}", get(pack_members))
@@ -1136,11 +1190,6 @@ fn router(path: &Path, port: u16, app: App) -> Router {
         .route("/api/study/answer", post(answer))
         .route("/api/study/{id}/context", get(context))
         .route("/api/study/{id}/opponent-move", get(opponent_move))
-        .route_service("/", ServeFile::new(path.join("index.html")))
-        .nest_service("/assets", ServeDir::new(path.join("assets")))
-        .layer(middleware::from_fn_with_state(port, loopback))
-        .layer(DefaultBodyLimit::max(16 * 1024))
-        .with_state(app)
 }
 
 fn print_similarity(result: Result<impl Serialize, repertoire_similarity::Error>) -> Result<()> {
