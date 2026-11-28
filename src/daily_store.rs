@@ -2231,6 +2231,7 @@ mod tests {
         let path = root.path().join("priority-restart.sqlite3");
         let mut db = Database::init(&path)?;
         let now = Utc::now().timestamp();
+        db.execute("UPDATE new_opening_settings SET opening_limit=3", [])?;
         opening(&db, "leading ordinary candidate", &["a2a3"])?;
         while !queue_store::seed_batch(&mut db)? {}
         prepare_test_day(&mut db, now)?;
@@ -2294,23 +2295,75 @@ mod tests {
         assert_eq!(tx_order, prefix[0].card);
         drop(read);
 
-        // Use the actual Next/Answer path. The last introduction completes
-        // this proof even if authoring changes before housekeeping runs.
+        let dataset = db::dataset(&Database::read(&path)?)?;
+        let command = serde_json::from_value::<add_new::Command>(json!({
+            "request":"0123456789abcdef0123456789abcdef","day":basis.day,"dataset":dataset,
+            "kind":"opening","quantity":1
+        }))?;
         writer
+            .submit(false, move |db| add_new::submit(db, command, now))?
+            .wait()
+            .await?;
+        tokio::task::block_in_place(|| add_new::turn(&Database::read(&path)?, &writer, now))?;
+        let read = Database::read(&path)?;
+        let generation = day(&read, &basis.day)?.unwrap().opening_head;
+        assert!(generation > 0);
+        drop(read);
+
+        let first = writer
             .submit(false, |db| {
-                let mut issued = open_study(db)?;
-                for movement in ["d2d4", "c2c4", "b1c3"] {
+                let first = open_study(db)?.expect("priority opening");
+                assert_eq!(serde_json::to_value(&first)?["introduction_move"], "d2d4");
+                review::answer(
+                    db,
+                    AnswerIntentV1 {
+                        attempt: first.attempt,
+                        dataset: first.dataset.clone(),
+                        action: AnswerAction::Play("d2d4".to_owned()),
+                    },
+                )?;
+                Ok(first)
+            })?
+            .wait()
+            .await?;
+        // Only the blocked first page is visited between Answer and Next.
+        let mut interleaved = None;
+        tokio::task::block_in_place(|| {
+            turn(&path, &writer, now, Lane::Openings, &mut interleaved)
+        })?;
+        writer
+            .submit(false, move |db| {
+                let mut issued = review::next(
+                    db,
+                    Next {
+                        after: Some(first.attempt),
+                        dataset: Some(first.dataset),
+                    },
+                )?;
+                for movement in ["c2c4", "b1c3"] {
                     let current = issued.take().expect("priority Study card");
-                    let actual = serde_json::to_value(&current)?;
-                    assert_eq!(actual["introduction_move"], movement);
+                    assert_eq!(
+                        serde_json::to_value(&current)?["introduction_move"],
+                        movement
+                    );
                     issued = answer_and_next(db, current, movement)?;
                 }
+                assert_eq!(
+                    serde_json::to_value(issued.unwrap())?["introduction_move"],
+                    "a2a3"
+                );
                 opening(db, "unrelated authoring before housekeeping", &["h2h3"])?;
                 assert!(opening_priority::roots(db, 64)?[0].witnessed);
                 Ok(())
             })?
             .wait()
             .await?;
+        assert_eq!(
+            day(&Database::read(&path)?, &basis.day)?
+                .unwrap()
+                .opening_head,
+            generation
+        );
         let mut refreshed = None;
         tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut refreshed))?;
         tokio::task::block_in_place(|| turn(&path, &writer, now, Lane::Openings, &mut refreshed))?;

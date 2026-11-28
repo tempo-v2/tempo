@@ -338,6 +338,25 @@ pub fn published_through(db: &Connection, basis: &Basis) -> Result<Option<i64>> 
         .optional()?)
 }
 
+/// The previous lane's proof remains a publication frontier when a grade
+/// changes commitments without changing the inputs that determine its order.
+pub fn compatible_frontier(db: &Connection, basis: &Basis) -> Result<Option<i64>> {
+    Ok(db
+        .query_row(
+            "SELECT processed_through FROM opening_priority_projection
+         WHERE day=?1 AND openings=?2 AND priority=?3 AND paused=?4 AND allowance=?5",
+            (
+                &basis.day,
+                basis.openings,
+                basis.priority,
+                basis.paused,
+                basis.allowance,
+            ),
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 pub fn advance_projection(db: &Connection, through: i64) -> Result<()> {
     db.execute(
         "UPDATE opening_priority_projection SET processed_through=?1 WHERE singleton=1",

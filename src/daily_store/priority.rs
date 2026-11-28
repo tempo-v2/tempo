@@ -301,7 +301,7 @@ pub(super) fn turn(
         Some((
             opening_rows(&tx, &day, &clock)?,
             goals::published_prefix(&tx, &basis)?,
-            goals::published_through(&tx, &basis)?.unwrap_or_default(),
+            goals::compatible_frontier(&tx, &basis)?.unwrap_or_default(),
         ))
     };
     tx.commit()?;
@@ -334,6 +334,12 @@ pub(super) fn turn(
         return Ok(true);
     }
     pass.pending_updates.clear();
+    // A newer commitment snapshot can lose the exact proof stamp without
+    // invalidating the lane's order. Revisit the covered goals before a
+    // partial reconstruction is allowed to replace their selected slots.
+    if pass.published.is_none() && pass.cursor < pass.published_through && !exhausted {
+        return Ok(true);
+    }
     // Reconstructing after restart or a fresh rank must never replace a valid
     // later-page prefix with a shorter locally recomputed prefix.
     if pass
