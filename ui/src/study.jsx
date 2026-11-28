@@ -1,3 +1,4 @@
+import { StudyAddNew } from "./study_add_new.jsx";
 import { ExerciseLayout } from "./exercise_layout.jsx";
 import { decodePuzzle, PuzzleBoard, recoverPuzzleActions } from "./puzzle_play.jsx";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -397,6 +398,7 @@ export function Study({ openGame, sounds, overlayOpen = false, allowOpeningEdits
       <p>{formatStudyCount(counts.new)} new · {formatStudyCount(counts.reviews)} {counts.reviews === 1 ? "review" : "reviews"}</p>
       <small>{counts.preparing ? "Preparing today’s queue…" : dailyOpeningOrder[counts.opening_order]}</small>
     </>}
+    <StudyAddNew day={counts?.day} dataset={counts?.dataset} refreshCounts={invalidateCounts} />
   </>;
   if (card?.activity_mode === "full_line") return <PuzzleBoard key={card.puzzle.play} view={card.puzzle} scope="study" sounds={sounds}
     onView={(puzzle) => showCard({ ...card, puzzle })}
@@ -450,7 +452,9 @@ export function Study({ openGame, sounds, overlayOpen = false, allowOpeningEdits
     {allowOpeningEdits && <OpeningEditStatus save={openingEdit} card={card} />}
     {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
     {!loaded && !error && <p>Loading your deck…</p>}
-    {loaded && !card && !error && <><p>No cards are ready in today’s queue.</p>
+    {loaded && !card && !error && <>
+      {counts && !counts.preparing && counts.new === 0 && counts.reviews === 0 &&
+        <p>No cards are ready in today’s queue.</p>}
       <button onClick={() => next()} disabled={pending}>Check deck</button></>}
     {card && <>
       <h2>{card.result ? card.title : openingPlaying ? "Playing opening moves" : introductionPrompt ?? movePrompt}</h2>

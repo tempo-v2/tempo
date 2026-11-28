@@ -294,7 +294,7 @@ pub fn submit(
     let Some(day) = day(&tx, &ticket.day)? else {
         return Ok(Delivery::Stale);
     };
-    if day.openings != Some(clock.openings) {
+    if !day.openings_ready(&clock) {
         return Ok(Delivery::Busy);
     }
     let overlay = if clock.priority == 0 {
@@ -305,23 +305,35 @@ pub fn submit(
         let Some(prefix) = crate::opening_priority::published_prefix(&tx, &basis)? else {
             return Ok(Delivery::Busy);
         };
-        Some((basis, prefix))
+        let revision = crate::opening_priority::published_revision(&tx, &basis)?
+            .context("Missing opening priority revision")?;
+        Some((basis, prefix, revision))
     };
     let input = opening_rows(&tx, &day, &clock)?;
     tx.commit()?;
-    let draft = input
-        .compile(|| Instant::now() >= deadline)?
-        .draft_with_priority(
-            clock.openings,
-            &ordered,
-            "maia",
-            overlay
-                .as_ref()
-                .map_or(&[], |(_, prefix)| prefix.as_slice()),
-        );
+    let draft = input.compile(|| Instant::now() >= deadline)?.draft_until(
+        clock.openings,
+        &ordered,
+        "maia",
+        overlay
+            .as_ref()
+            .map_or(&[], |(_, prefix, _)| prefix.as_slice()),
+        || Instant::now() >= deadline,
+    );
+    let Some(mut draft) = draft else {
+        return Ok(Delivery::Busy);
+    };
     if !draft.revoked_openings.is_empty() {
         return Ok(Delivery::Busy);
     }
+    super::replace_with_staging_if_needed(
+        super::Preparation::Forecast,
+        writer,
+        &day,
+        &mut draft,
+        deadline,
+    )?;
+    let overlay = overlay.map(|(basis, _, revision)| (basis, revision));
     writer.forecast(deadline, move |db| {
         let tx = db.transaction_with_behavior(Immediate)?;
         let Some(ticket) = Ticket::load(&tx, &id)? else {
@@ -330,9 +342,9 @@ pub fn submit(
         if !ticket.applying(&tx, &digest)? {
             return Ok(Delivery::Stale);
         }
-        if let Some((basis, prefix)) = &overlay
+        if let Some((basis, revision)) = &overlay
             && (crate::opening_priority::Basis::current(&tx)?.as_ref() != Some(basis)
-                || crate::opening_priority::published_prefix(&tx, basis)?.as_ref() != Some(prefix))
+                || crate::opening_priority::published_revision(&tx, basis)? != Some(*revision))
         {
             return Ok(Delivery::Busy);
         }

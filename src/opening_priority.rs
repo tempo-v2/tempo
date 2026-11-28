@@ -76,13 +76,15 @@ pub struct Basis {
     pub priority: i64,
     pub commitments: i64,
     pub paused: bool,
+    #[serde(default)]
+    pub allowance: usize,
 }
 
 impl Basis {
     pub fn current(db: &Connection) -> Result<Option<Self>> {
         Ok(db
             .query_row(
-                "SELECT m.dataset,d.day,c.openings,c.priority,d.commitments,s.paused,c.authoring,c.introduction_reset
+                "SELECT m.dataset,d.day,c.openings,c.priority,d.commitments,s.paused,c.authoring,c.introduction_reset,d.opening_limit+d.opening_extra
              FROM daily_clock c JOIN daily_day d ON d.day=c.current_day
              CROSS JOIN metadata m CROSS JOIN new_opening_settings s",
                 [],
@@ -94,6 +96,7 @@ impl Basis {
                         priority: r.get(3)?,
                         commitments: r.get(4)?,
                         paused: r.get(5)?,
+                    allowance: r.get(8)?,
                 authoring: r.get(6)?,
                 introduction_reset: r.get(7)?,
                     })
@@ -154,11 +157,17 @@ pub fn preview_status(db: &Connection, card: &str, availability: i64) -> Result<
         return Ok(status(db, goal)?.unwrap_or(Value::Null));
     }
     let facts = db.query_row(
-        "SELECT s.paused,d.opening_limit,
-            (SELECT count(*) FROM daily_new n WHERE n.day=d.day AND n.kind='opening' AND n.committed=1)
+        "SELECT s.paused,d.opening_limit+d.opening_extra,coalesce(d.opening_charged,0)
          FROM new_opening_settings s CROSS JOIN daily_clock c
          LEFT JOIN daily_day d ON d.day=c.current_day",
-        [], |r| Ok((r.get::<_,bool>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,i64>(2)?)),
+        [],
+        |r| {
+            Ok((
+                r.get::<_, bool>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
     )?;
     let reason = match facts {
         (true, _, _) => Some("opening_paused"),
@@ -212,7 +221,7 @@ struct WitnessCard {
 
 pub fn roots(db: &Connection, after: i64) -> Result<Vec<Goal>> {
     let mut query = db.prepare(&format!(
-        "SELECT id,target,availability,summary FROM opening_priority
+        "SELECT id,target,availability,summary,completion_cards FROM opening_priority
          WHERE id>?1 AND state IN {ACTIVE} ORDER BY id LIMIT ?2"
     ))?;
     let mut rows = query.query((after, ROOTS))?;
@@ -227,11 +236,16 @@ pub fn roots(db: &Connection, after: i64) -> Result<Vec<Goal>> {
         if let Some(summary) = summary {
             let proof: PendingProof = serde_json::from_str(&summary)?;
             if let Some(basis) = proof.completion_basis {
-                witnessed = !proof.next.is_empty();
-                for card in proof.next {
+                let stored: Option<Vec<u8>> = row.get(4)?;
+                let cards: Vec<String> = match stored {
+                    Some(data) => serde_json::from_slice(&data)?,
+                    None => proof.next.into_iter().map(|card| card.card_id).collect(),
+                };
+                witnessed = !cards.is_empty();
+                for card in cards {
                     let found: bool = introduced.query_row(
                         (
-                            card.card_id,
+                            card,
                             basis.authoring,
                             basis.introduction_reset,
                             basis.schedule_floor,
@@ -262,61 +276,113 @@ pub struct Proof {
     pub parents: Vec<String>,
 }
 
+const PROJECTION_MATCH: &str =
+    "day=?1 AND openings=?2 AND priority=?3 AND commitments=?4 AND paused=?5 AND allowance=?6";
+
+fn projection_params(basis: &Basis) -> impl rusqlite::Params {
+    (
+        &basis.day,
+        basis.openings,
+        basis.priority,
+        basis.commitments,
+        basis.paused,
+        basis.allowance,
+    )
+}
+
 pub fn published_prefix(db: &Connection, basis: &Basis) -> Result<Option<Vec<Proof>>> {
-    let prefix: Option<String> = db
+    let head = db.query_row(
+        &format!("SELECT prefix,prefix_generation FROM opening_priority_projection WHERE {PROJECTION_MATCH}"),
+        projection_params(basis), |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    ).optional()?;
+    let Some((inline, generation)) = head else {
+        return Ok(None);
+    };
+    if generation == 0 {
+        return Ok(Some(serde_json::from_str(&inline)?));
+    }
+    let mut payload = Vec::new();
+    let mut query = db.prepare_cached(
+        "SELECT payload FROM daily_new_prefix WHERE generation=?1 ORDER BY ordinal",
+    )?;
+    for chunk in query.query_map([generation], |row| row.get::<_, Vec<u8>>(0))? {
+        let chunk = chunk?;
+        ensure!(
+            payload.len() + chunk.len() <= 32 * 1024 * 1024,
+            "Opening priority prefix exceeds its byte budget"
+        );
+        payload.extend(chunk);
+    }
+    Ok(Some(serde_json::from_slice(&payload)?))
+}
+
+pub fn published_revision(db: &Connection, basis: &Basis) -> Result<Option<i64>> {
+    Ok(db
         .query_row(
-            "SELECT prefix FROM opening_priority_projection
-         WHERE day=?1 AND openings=?2 AND priority=?3 AND commitments=?4 AND paused=?5",
-            params![
-                basis.day,
-                basis.openings,
-                basis.priority,
-                basis.commitments,
-                basis.paused
-            ],
-            |r| r.get(0),
+            &format!("SELECT revision FROM opening_priority_projection WHERE {PROJECTION_MATCH}"),
+            projection_params(basis),
+            |row| row.get(0),
         )
-        .optional()?;
-    prefix.map(|p| Ok(serde_json::from_str(&p)?)).transpose()
+        .optional()?)
 }
 
 pub fn published_through(db: &Connection, basis: &Basis) -> Result<Option<i64>> {
     Ok(db
         .query_row(
-            "SELECT processed_through FROM opening_priority_projection
-         WHERE day=?1 AND openings=?2 AND priority=?3 AND commitments=?4 AND paused=?5",
-            params![
-                basis.day,
-                basis.openings,
-                basis.priority,
-                basis.commitments,
-                basis.paused
-            ],
-            |r| r.get(0),
+            &format!(
+                "SELECT processed_through FROM opening_priority_projection WHERE {PROJECTION_MATCH}"
+            ),
+            projection_params(basis),
+            |row| row.get(0),
         )
         .optional()?)
+}
+
+/// The previous lane's proof remains a publication frontier when a grade
+/// changes commitments without changing the inputs that determine its order.
+pub fn compatible_frontier(db: &Connection, basis: &Basis) -> Result<Option<i64>> {
+    Ok(db
+        .query_row(
+            "SELECT processed_through FROM opening_priority_projection
+         WHERE day=?1 AND openings=?2 AND priority=?3 AND paused=?4 AND allowance=?5",
+            (
+                &basis.day,
+                basis.openings,
+                basis.priority,
+                basis.paused,
+                basis.allowance,
+            ),
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub fn advance_projection(db: &Connection, through: i64) -> Result<()> {
+    db.execute(
+        "UPDATE opening_priority_projection SET processed_through=?1 WHERE singleton=1",
+        [through],
+    )?;
+    Ok(())
 }
 
 pub fn publish_prefix(
     db: &Connection,
     basis: &Basis,
-    prefix: &[Proof],
+    inline: &str,
+    generation: i64,
     through: i64,
 ) -> Result<()> {
-    ensure!(
-        prefix.len() <= 20,
-        "opening priority prefix exceeds daily allowance"
-    );
     db.execute(
-        "INSERT OR REPLACE INTO opening_priority_projection
-        (singleton,day,openings,priority,commitments,paused,prefix,processed_through) VALUES (1,?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT INTO opening_priority_projection
+        (singleton,day,openings,priority,commitments,paused,prefix,processed_through,allowance,prefix_generation)
+        VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9)
+        ON CONFLICT(singleton) DO UPDATE SET day=excluded.day,openings=excluded.openings,
+          priority=excluded.priority,commitments=excluded.commitments,paused=excluded.paused,
+          prefix=excluded.prefix,processed_through=excluded.processed_through,allowance=excluded.allowance,
+          prefix_generation=excluded.prefix_generation,revision=revision+1",
         params![
-            basis.day,
-            basis.openings,
-            basis.priority,
-            basis.commitments,
-            basis.paused,
-            serde_json::to_string(prefix)?, through
+            basis.day, basis.openings, basis.priority, basis.commitments, basis.paused, inline,
+            through, basis.allowance, generation,
         ],
     )?;
     Ok(())
@@ -522,6 +588,7 @@ pub struct Update {
     pub id: i64,
     pub state: &'static str,
     pub summary: Value,
+    pub completion_cards: Option<Vec<u8>>,
 }
 
 pub fn publish_updates(db: &Connection, basis: &Basis, entries: &[Update]) -> Result<bool> {
@@ -529,7 +596,7 @@ pub fn publish_updates(db: &Connection, basis: &Basis, entries: &[Update]) -> Re
         return Ok(false);
     }
     let mut q = db.prepare_cached(&format!(
-        "UPDATE opening_priority SET state=?2,summary=?3 WHERE id=?1 AND state IN {ACTIVE}"
+        "UPDATE opening_priority SET state=?2,summary=?3,completion_cards=?4 WHERE id=?1 AND state IN {ACTIVE}"
     ))?;
     for entry in entries {
         let mut summary = entry.summary.clone();
@@ -539,7 +606,7 @@ pub fn publish_updates(db: &Connection, basis: &Basis, entries: &[Update]) -> Re
             text.len() <= 15 * 1024,
             "opening priority status exceeds its bound"
         );
-        q.execute(params![entry.id, entry.state, text])?;
+        q.execute(params![entry.id, entry.state, text, entry.completion_cards])?;
     }
     Ok(true)
 }

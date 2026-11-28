@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
 
-const SCHEMA: i32 = 25;
+const SCHEMA: i32 = 26;
 const TACTIC_SOURCE_UPGRADE: &str = "ALTER TABLE tactics ADD COLUMN source_url TEXT;";
 
 pub struct Database;
@@ -73,6 +73,7 @@ impl Database {
         db.execute_batch(include_str!("tactic_capture.sql"))?;
         db.execute_batch(include_str!("forecast_claim.sql"))?;
         db.execute_batch(include_str!("opening_misses.sql"))?;
+        db.execute_batch(include_str!("study_add_new.sql"))?;
         db.execute(
             "INSERT INTO metadata VALUES (?1)",
             [format!("{:032x}", rand::random::<u128>())],
@@ -160,7 +161,10 @@ impl Database {
             if version < 24 {
                 tx.execute_batch(include_str!("forecast_claim.sql"))?;
             }
-            upgrade_opening_misses(&tx)?;
+            if version < 25 {
+                upgrade_opening_misses(&tx)?;
+            }
+            tx.execute_batch(include_str!("study_add_new.sql"))?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
             tx.commit()?;
             return Ok(());
@@ -209,6 +213,7 @@ impl Database {
         tx.execute_batch(include_str!("tactic_capture.sql"))?;
         tx.execute_batch(include_str!("forecast_claim.sql"))?;
         upgrade_opening_misses(&tx)?;
+        tx.execute_batch(include_str!("study_add_new.sql"))?;
         let valid: bool = tx.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
             [],
