@@ -985,6 +985,7 @@ async fn serve(db: PathBuf, port: u16, without_worker: bool) -> Result<()> {
             }
             daily_store::run(&plan_db, plan_writer, plan_shutdown);
         })?;
+    daily_forecast::start(db.clone(), writer.clone(), shutdown.subscribe());
     let staging = uploads::Staging::start(&db)?;
     if !without_worker {
         let worker_db = db.clone();

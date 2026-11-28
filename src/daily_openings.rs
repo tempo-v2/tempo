@@ -54,12 +54,29 @@ pub struct ForecastDecision {
     pub card: String,
 }
 
+#[derive(Clone, Copy)]
+pub enum Projection {
+    Prerequisites,
+    Forecast,
+    #[cfg(test)]
+    Both,
+}
+
 /// Compile prerequisite alternatives and forecast histories from the same
 /// coherent authored snapshot. A card with no proved route remains unresolved.
-pub fn compile_openings(lines: &[SavedLine], replies: &[Reply]) -> Result<OpeningProjection> {
+pub fn compile_openings(
+    lines: &[SavedLine],
+    replies: &[Reply],
+    projection: Projection,
+    stop: impl Fn() -> bool,
+) -> Result<OpeningProjection> {
+    let include_forecast = !matches!(projection, Projection::Prerequisites);
+    let include_prerequisites = !matches!(projection, Projection::Forecast);
     let mut current = HashMap::new();
     let mut alternatives = HashMap::new();
+    let mut cards = HashSet::new();
     for reply in replies {
+        ensure!(!stop(), "Opening projection expired");
         ensure!(
             current
                 .insert(
@@ -70,15 +87,17 @@ pub fn compile_openings(lines: &[SavedLine], replies: &[Reply]) -> Result<Openin
             "More than one current reply for a position in the same repertoire"
         );
         ensure!(
-            alternatives
-                .insert(reply.card.clone(), BTreeSet::<Vec<String>>::new())
-                .is_none(),
+            cards.insert(reply.card.as_str()),
             "Duplicate current opening card identity"
         );
+        if include_prerequisites {
+            alternatives.insert(reply.card.clone(), BTreeSet::<Vec<String>>::new());
+        }
     }
 
     let mut routes = Vec::new();
     for line in lines {
+        ensure!(!stop(), "Opening projection expired");
         ensure!(
             matches!(line.color.as_str(), "white" | "black")
                 && line.start_at < line.route.moves.len()
@@ -86,13 +105,13 @@ pub fn compile_openings(lines: &[SavedLine], replies: &[Reply]) -> Result<Openin
             "Invalid saved opening route scope"
         );
         let mut board = chess::position(&line.route.fen)?;
-        let mut route = ForecastRoute {
+        let mut route = include_forecast.then(|| ForecastRoute {
             repertoire: line.repertoire.clone(),
             color: line.color.clone(),
             fen: chess::fen(&board),
             moves: Vec::with_capacity(line.route.moves.len()),
             decisions: Vec::new(),
-        };
+        });
         let mut parents = BTreeSet::<&str>::new();
         let mut recorded = HashSet::new();
         let mut complete = true;
@@ -103,21 +122,26 @@ pub fn compile_openings(lines: &[SavedLine], replies: &[Reply]) -> Result<Openin
                 let position = chess::position_id(&board);
                 let reply = current.get(&(line.repertoire.as_str(), position.as_str()));
                 if let Some(reply) = reply.filter(|reply| reply.answer == canonical) {
-                    route.decisions.push(ForecastDecision {
-                        ply,
-                        card: reply.card.clone(),
-                    });
-                    if complete && ply >= line.start_at && recorded.insert(reply.card.as_str()) {
-                        alternatives.get_mut(&reply.card).unwrap().insert(
-                            parents
-                                .iter()
-                                .copied()
-                                .filter(|parent| *parent != reply.card)
-                                .map(str::to_owned)
-                                .collect(),
-                        );
+                    if let Some(route) = &mut route {
+                        route.decisions.push(ForecastDecision {
+                            ply,
+                            card: reply.card.clone(),
+                        });
                     }
-                    parents.insert(reply.card.as_str());
+                    if include_prerequisites {
+                        if complete && ply >= line.start_at && recorded.insert(reply.card.as_str())
+                        {
+                            alternatives.get_mut(&reply.card).unwrap().insert(
+                                parents
+                                    .iter()
+                                    .copied()
+                                    .filter(|parent| *parent != reply.card)
+                                    .map(str::to_owned)
+                                    .collect(),
+                            );
+                        }
+                        parents.insert(reply.card.as_str());
+                    }
                 } else if ply >= line.start_at || reply.is_some() {
                     // A missing owned reply or incompatible saved learner move
                     // prevents this prefix from proving a prerequisite route.
@@ -127,11 +151,16 @@ pub fn compile_openings(lines: &[SavedLine], replies: &[Reply]) -> Result<Openin
                 }
             }
             board.play_unchecked(movement);
-            route.moves.push(canonical);
+            if let Some(route) = &mut route {
+                route.moves.push(canonical);
+            }
         }
-        routes.push(route);
+        if let Some(route) = route {
+            routes.push(route);
+        }
     }
 
+    ensure!(!stop(), "Opening projection expired");
     let prerequisites = alternatives
         .into_iter()
         .map(|(card, routes)| {
@@ -195,7 +224,12 @@ mod tests {
             replies[3].position_id,
             reply(&second, 4, "same").position_id
         );
-        let compiled = compile_openings(&[first, second, elsewhere], &replies)?;
+        let compiled = compile_openings(
+            &[first, second, elsewhere],
+            &replies,
+            Projection::Both,
+            || false,
+        )?;
         assert_eq!(compiled.prerequisites["root"], Prerequisites::NoneRequired);
         assert_eq!(compiled.prerequisites["other"], Prerequisites::NoneRequired);
         assert_eq!(
@@ -215,7 +249,7 @@ mod tests {
     fn absent_active_parent_cannot_turn_an_owned_prefix_into_a_root() -> Result<()> {
         let first = line("white", &["d2d4", "d7d5", "g1f3"], 0);
         let replies = [reply(&first, 2, "child")];
-        let compiled = compile_openings(&[first], &replies)?;
+        let compiled = compile_openings(&[first], &replies, Projection::Both, || false)?;
         assert_eq!(compiled.prerequisites["child"], Prerequisites::Unknown);
         assert_eq!(compiled.routes[0].decisions[0].card, "child");
         Ok(())
@@ -229,7 +263,10 @@ mod tests {
             reply(&current, 0, "new-reply"),
             reply(&continuation, 2, "descendant"),
         ];
-        let compiled = compile_openings(&[current, continuation], &replies)?;
+        let compiled =
+            compile_openings(&[current, continuation], &replies, Projection::Both, || {
+                false
+            })?;
         assert_eq!(compiled.prerequisites["descendant"], Prerequisites::Unknown);
         assert_eq!(compiled.routes[1].decisions[0].ply, 2);
         Ok(())
@@ -239,7 +276,7 @@ mod tests {
     fn repetition_never_creates_a_self_prerequisite() -> Result<()> {
         let first = line("white", &["g1f3", "g8f6", "f3g1", "f6g8", "g1f3"], 0);
         let replies = [reply(&first, 0, "root"), reply(&first, 2, "middle")];
-        let compiled = compile_openings(&[first], &replies)?;
+        let compiled = compile_openings(&[first], &replies, Projection::Both, || false)?;
         assert_eq!(compiled.prerequisites["root"], Prerequisites::NoneRequired);
         assert_eq!(
             compiled.prerequisites["middle"],

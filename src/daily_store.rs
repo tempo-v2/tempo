@@ -1,7 +1,9 @@
 //! Persisted daily membership. The serving reader only sees prepared work.
+
+pub(crate) mod forecast;
 use crate::{
     daily_forecast::{self, Request, Response, Score},
-    daily_openings::{self, ForecastReply, Reply, SavedLine},
+    daily_openings::{self, ForecastReply, Projection, Reply, SavedLine},
     daily_plan::{self, Candidate, Group, Prerequisites, Selection},
     db::{self, Database},
     writer::Writer,
@@ -51,25 +53,37 @@ struct Day {
     tactics: Option<i64>,
     source: String,
     fresh: bool,
-    forecast_finished: bool,
-    order_staged: usize,
     commitments: i64,
     mix_balance: i64,
 }
 
 fn day(db: &Connection, key: &str) -> Result<Option<Day>> {
-    Ok(db.query_row(
-        "SELECT cutoff,high_water,opening_limit,tactic_limit,mode,due_head,due_coverage,
-                openings_version,tactics_version,opening_order,fresh_order,commitments,forecast_finished,order_staged,mix_balance
+    Ok(db
+        .query_row(
+            "SELECT cutoff,high_water,opening_limit,tactic_limit,mode,due_head,due_coverage,
+                openings_version,tactics_version,opening_order,fresh_order,commitments,mix_balance
          FROM daily_day WHERE day=?1",
-        [key],
-        |r| Ok(Day {
-            key: key.to_owned(), cutoff: r.get(0)?, high_water: r.get(1)?,
-            opening_limit: r.get(2)?, tactic_limit: r.get(3)?, mode: r.get(4)?,
-            due_head: r.get(5)?, due_coverage: r.get(6)?, openings: r.get(7)?,
-            tactics: r.get(8)?, source: r.get(9)?, fresh: r.get(10)?, commitments: r.get(11)?, forecast_finished: r.get(12)?, order_staged: r.get(13)?, mix_balance: r.get(14)?,
-        }),
-    ).optional()?)
+            [key],
+            |r| {
+                Ok(Day {
+                    key: key.to_owned(),
+                    cutoff: r.get(0)?,
+                    high_water: r.get(1)?,
+                    opening_limit: r.get(2)?,
+                    tactic_limit: r.get(3)?,
+                    mode: r.get(4)?,
+                    due_head: r.get(5)?,
+                    due_coverage: r.get(6)?,
+                    openings: r.get(7)?,
+                    tactics: r.get(8)?,
+                    source: r.get(9)?,
+                    fresh: r.get(10)?,
+                    commitments: r.get(11)?,
+                    mix_balance: r.get(12)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 struct Clock {
@@ -569,7 +583,40 @@ impl Authored {
     }
 }
 
-fn authored(db: &Connection, day: &Day, clock: &Clock) -> Result<Authored> {
+struct AuthoredRows {
+    basis: String,
+    lines: Vec<SavedLine>,
+    replies: Vec<Reply>,
+    forecast_replies: Vec<ForecastReply>,
+    keys: Vec<String>,
+    projection: Projection,
+}
+
+impl AuthoredRows {
+    fn compile(self, stop: impl Fn() -> bool) -> Result<Authored> {
+        let projection =
+            daily_openings::compile_openings(&self.lines, &self.replies, self.projection, stop)?;
+        Ok(Authored {
+            basis: self.basis,
+            projection,
+            replies: self.forecast_replies,
+            keys: self.keys,
+        })
+    }
+}
+
+#[cfg(test)]
+fn authored(db: &Connection, day: &Day, clock: &Clock, projection: Projection) -> Result<Authored> {
+    authored_rows(db, day, clock, projection)?.compile(|| false)
+}
+
+fn authored_rows(
+    db: &Connection,
+    day: &Day,
+    clock: &Clock,
+    projection: Projection,
+) -> Result<AuthoredRows> {
+    let include_forecast = matches!(projection, Projection::Forecast);
     let basis = format!("{}:{}:{}", db::dataset(db)?, day.key, clock.authoring);
     let mut bytes = 0;
     let mut lines = Vec::new();
@@ -593,21 +640,30 @@ fn authored(db: &Connection, day: &Day, clock: &Clock) -> Result<Authored> {
     let mut replies = Vec::new();
     let mut forecast_replies = Vec::new();
     let mut keys = Vec::new();
-    let mut stmt = db.prepare(
-        "SELECT id,repertoire_id,position_id,answers,color,fen
-        FROM active_cards WHERE kind='opening' ORDER BY id",
-    )?;
+    let columns = if include_forecast {
+        "color,fen"
+    } else {
+        "NULL,NULL"
+    };
+    let mut stmt = db.prepare(&format!(
+        "SELECT id,repertoire_id,position_id,answers,{columns}
+         FROM active_cards WHERE kind='opening' ORDER BY id"
+    ))?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         let card: String = r.get(0)?;
         let repertoire: String = r.get(1)?;
         let position_id: String = r.get(2)?;
         let answers: String = r.get(3)?;
-        let color: String = r.get(4)?;
-        let fen: String = r.get(5)?;
-        bytes += color.len()
-            + fen.len()
-            + std::mem::size_of::<ForecastReply>()
+        let color: Option<String> = r.get(4)?;
+        let fen: Option<String> = r.get(5)?;
+        bytes += color.as_ref().map_or(0, String::len)
+            + fen.as_ref().map_or(0, String::len)
+            + if include_forecast {
+                std::mem::size_of::<ForecastReply>()
+            } else {
+                0
+            }
             + card.len()
             + repertoire.len()
             + position_id.len()
@@ -618,13 +674,15 @@ fn authored(db: &Connection, day: &Day, clock: &Clock) -> Result<Authored> {
             "Daily opening snapshot exceeds its byte budget"
         );
         if let Ok([answer]) = serde_json::from_str::<[String; 1]>(&answers) {
-            forecast_replies.push(ForecastReply {
-                repertoire: repertoire.clone(),
-                color,
-                fen,
-                movement: answer.clone(),
-                card: card.clone(),
-            });
+            if let (Some(color), Some(fen)) = (color, fen) {
+                forecast_replies.push(ForecastReply {
+                    repertoire: repertoire.clone(),
+                    color,
+                    fen,
+                    movement: answer.clone(),
+                    card: card.clone(),
+                });
+            }
             replies.push(Reply {
                 card: card.clone(),
                 repertoire,
@@ -634,17 +692,18 @@ fn authored(db: &Connection, day: &Day, clock: &Clock) -> Result<Authored> {
         }
         keys.push(card);
     }
-    let projection = daily_openings::compile_openings(&lines, &replies)?;
-    Ok(Authored {
+    Ok(AuthoredRows {
         basis,
-        projection,
-        replies: forecast_replies,
+        lines,
+        replies,
+        forecast_replies,
         keys,
+        projection,
     })
 }
 
-struct Openings {
-    authored: Authored,
+struct Openings<T = Authored> {
+    authored: T,
     available: HashMap<String, i64>,
     introduced: HashSet<String>,
     pinned: HashSet<String>,
@@ -653,8 +712,26 @@ struct Openings {
     saved_order: HashMap<String, usize>,
 }
 
+impl Openings<AuthoredRows> {
+    fn compile(self, stop: impl Fn() -> bool) -> Result<Openings> {
+        Ok(Openings {
+            authored: self.authored.compile(stop)?,
+            available: self.available,
+            introduced: self.introduced,
+            pinned: self.pinned,
+            reserved: self.reserved,
+            limit: self.limit,
+            saved_order: self.saved_order,
+        })
+    }
+}
+
 fn openings(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings> {
-    let authored = authored(db, day, clock)?;
+    opening_rows(db, day, clock)?.compile(|| false)
+}
+
+fn opening_rows(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings<AuthoredRows>> {
+    let authored = authored_rows(db, day, clock, Projection::Prerequisites)?;
     let mut available = HashMap::new();
     let mut introduced = HashSet::new();
     let mut pinned = HashSet::new();
@@ -692,6 +769,26 @@ fn openings(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings> {
             available.insert(card, availability);
         }
     }
+    let saved_order = saved_opening_order(db, day, clock)?;
+    let limit = day
+        .opening_limit
+        .saturating_sub(charged(db, day, "opening")?);
+    Ok(Openings {
+        authored,
+        available,
+        introduced,
+        pinned,
+        reserved: reserved_openings,
+        limit,
+        saved_order,
+    })
+}
+
+fn saved_opening_order(
+    db: &Connection,
+    day: &Day,
+    clock: &Clock,
+) -> Result<HashMap<String, usize>> {
     let mut saved_order = HashMap::new();
     if day.mode == "maia"
         && let Some(previous) = &clock.last_order
@@ -707,39 +804,35 @@ fn openings(db: &Connection, day: &Day, clock: &Clock) -> Result<Openings> {
             saved_order.insert(key, order);
         }
     }
-    let limit = day
-        .opening_limit
-        .saturating_sub(charged(db, day, "opening")?);
-    Ok(Openings {
-        authored,
-        available,
-        introduced,
-        pinned,
-        reserved: reserved_openings,
-        limit,
-        saved_order,
-    })
+    Ok(saved_order)
+}
+
+fn order_openings(
+    mut ordered: Vec<String>,
+    saved_order: &HashMap<String, usize>,
+    scores: Option<&Response>,
+) -> Vec<String> {
+    ordered.sort_unstable_by(|a, b| {
+        let score = |key: &str| match scores.and_then(|batch| batch.scores.get(key)) {
+            Some(Score::Estimated { probability }) => *probability,
+            _ => -1.0,
+        };
+        score(b)
+            .total_cmp(&score(a))
+            .then_with(|| {
+                saved_order
+                    .get(a)
+                    .unwrap_or(&usize::MAX)
+                    .cmp(saved_order.get(b).unwrap_or(&usize::MAX))
+            })
+            .then_with(|| a.cmp(b))
+    });
+    ordered
 }
 
 impl Openings {
     fn ordered(&self, scores: Option<&Response>) -> Vec<String> {
-        let mut ordered = self.authored.keys.clone();
-        ordered.sort_unstable_by(|a, b| {
-            let score = |key: &str| match scores.and_then(|batch| batch.scores.get(key)) {
-                Some(Score::Estimated { probability }) => *probability,
-                _ => -1.0,
-            };
-            score(b)
-                .total_cmp(&score(a))
-                .then_with(|| {
-                    self.saved_order
-                        .get(a)
-                        .unwrap_or(&usize::MAX)
-                        .cmp(self.saved_order.get(b).unwrap_or(&usize::MAX))
-                })
-                .then_with(|| a.cmp(b))
-        });
-        ordered
+        order_openings(self.authored.keys.clone(), &self.saved_order, scores)
     }
 
     fn draft(&self, version: i64, ordered: &[String], source: &'static str) -> Draft {
@@ -794,24 +887,28 @@ impl Openings {
 
 /// Small lane replacement (at most 20 old + 20 new rows). A reservation or
 /// accepted parent during preparation wins and the local planner tries again.
-fn activate_new(
-    db: &mut Connection,
-    day: &Day,
-    draft: &Draft,
-    fresh_order: Option<usize>,
-) -> Result<()> {
+fn activate_new(db: &mut Connection, day: &Day, draft: &Draft) -> Result<()> {
     let tx = db.transaction_with_behavior(Immediate)?;
-    let clock = clock(&tx)?;
+    publish_slots(&tx, day, draft)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn publish_slots(tx: &Connection, day: &Day, draft: &Draft) -> Result<bool> {
+    let clock = clock(tx)?;
     let version = if draft.kind == "opening" {
         clock.openings
     } else {
         clock.tactics
     };
-    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM daily_day d CROSS JOIN daily_clock c
-        WHERE d.day=?1 AND c.current_day=d.day AND d.commitments=?2 AND (?3 IS NULL OR (d.fresh_order=0 AND d.order_staged=?3)))",
-        (&day.key,day.commitments,fresh_order), |r| r.get(0))?;
+    let valid: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM daily_day d CROSS JOIN daily_clock c
+        WHERE d.day=?1 AND c.current_day=d.day AND d.commitments=?2)",
+        (&day.key, day.commitments),
+        |r| r.get(0),
+    )?;
     if version != draft.version || !valid {
-        return Ok(());
+        return Ok(false);
     }
     // An authored route repair may revoke a never-issued filler. Its already
     // charged slot stays recorded for this day. Placed Again cards and issued
@@ -848,38 +945,44 @@ fn activate_new(
     drop(stmt);
     if draft.kind == "opening" {
         tx.execute(
-            "UPDATE daily_day SET openings_version=?2,opening_order=?3,
-          fresh_order=max(fresh_order,?4) WHERE day=?1",
-            (&day.key, draft.version, draft.source, fresh_order.is_some()),
+            "UPDATE daily_day SET openings_version=?2,opening_order=?3 WHERE day=?1",
+            (&day.key, draft.version, draft.source),
         )?;
-        if fresh_order.is_some() {
-            tx.execute(
-                "UPDATE daily_day SET order_profile=?2 WHERE day=?1",
-                (&day.key, daily_forecast::PROFILE),
-            )?;
-            tx.execute("UPDATE daily_clock SET last_order_day=?1 WHERE last_order_day IS NULL OR last_order_day<=?1", [&day.key])?;
-        }
     } else {
         tx.execute(
             "UPDATE daily_day SET tactics_version=?2 WHERE day=?1",
             (&day.key, draft.version),
         )?;
     }
+    Ok(true)
+}
+
+fn capture(path: &Path) -> Result<Connection> {
+    capture_before(path, Instant::now() + READ_BUDGET)
+}
+
+fn capture_before(path: &Path, limit: Instant) -> Result<Connection> {
+    let deadline = limit.min(Instant::now() + READ_BUDGET);
+    ensure!(Instant::now() < deadline, crate::writer::Unavailable);
+    let db = Database::read_with_busy_timeout(path, Duration::ZERO)?;
+    limit_capture(&db, deadline);
+    Ok(db)
+}
+
+fn limit_capture(db: &Connection, deadline: Instant) {
+    db.progress_handler(1000, Some(move || Instant::now() >= deadline));
+}
+
+#[cfg(test)]
+fn stage_order(db: &mut Connection, day: &str, start: usize, keys: &[String]) -> Result<()> {
+    let tx = db.transaction_with_behavior(Immediate)?;
+    write_rank_batch(&tx, day, start, keys)?;
     tx.commit()?;
     Ok(())
 }
 
-fn capture(path: &Path) -> Result<Connection> {
-    let db = Database::read_with_busy_timeout(path, Duration::ZERO)?;
-    let deadline = Instant::now() + READ_BUDGET;
-    db.progress_handler(1000, Some(move || Instant::now() >= deadline));
-    Ok(db)
-}
-
-fn stage_order(db: &mut Connection, day: &str, start: usize, keys: &[String]) -> Result<()> {
-    let tx = db.transaction_with_behavior(Immediate)?;
-    let mut stmt =
-        tx.prepare_cached("INSERT OR IGNORE INTO daily_opening_order VALUES(?1,?2,?3)")?;
+fn write_rank_batch(tx: &Connection, day: &str, start: usize, keys: &[String]) -> Result<()> {
+    let mut stmt = tx.prepare_cached("INSERT INTO daily_opening_order VALUES(?1,?2,?3)")?;
     let mut added = 0;
     for (offset, key) in keys.iter().enumerate() {
         added += stmt.execute((day, key, start + offset))?;
@@ -889,7 +992,6 @@ fn stage_order(db: &mut Connection, day: &str, start: usize, keys: &[String]) ->
         "UPDATE daily_day SET order_staged=order_staged+?2 WHERE day=?1",
         (day, added),
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -930,7 +1032,7 @@ fn prune(db: &Connection, day: &str) -> Result<()> {
        AND day IS NOT (SELECT last_order_day FROM daily_clock)
        AND NOT EXISTS(SELECT 1 FROM daily_new WHERE day=d.day)
        AND NOT EXISTS(SELECT 1 FROM daily_due WHERE day=d.day)
-       AND NOT EXISTS(SELECT 1 FROM daily_opening_order WHERE day=d.day) LIMIT 24)", [day])?;
+       AND NOT EXISTS(SELECT 1 FROM daily_opening_order WHERE day=d.day) LIMIT 16)", [day])?;
     Ok(())
 }
 
@@ -940,7 +1042,6 @@ enum Lane {
     Due,
     Tactics,
     Openings,
-    Forecast,
 }
 
 fn turn(path: &Path, writer: &Writer, now: i64, lane: Lane) -> Result<bool> {
@@ -991,10 +1092,9 @@ fn turn(path: &Path, writer: &Writer, now: i64, lane: Lane) -> Result<bool> {
     if matches!(lane, Lane::Tactics) && day.tactics != Some(clock.tactics) {
         let draft = tactic_draft(&tx, &day, clock.tactics)?;
         tx.commit()?;
-        writer.background_until(deadline, move |db| activate_new(db, &day, &draft, None))?;
+        writer.background_until(deadline, move |db| activate_new(db, &day, &draft))?;
         return Ok(true);
     }
-    let directory = daily_forecast::directory(path);
     if matches!(lane, Lane::Openings) && day.openings != Some(clock.openings) {
         let draft = if day.opening_limit > 0 || has_unseen_opening_commitment(&tx)? {
             let input = openings(&tx, &day, &clock)?;
@@ -1016,68 +1116,16 @@ fn turn(path: &Path, writer: &Writer, now: i64, lane: Lane) -> Result<bool> {
             }
         };
         tx.commit()?;
-        writer.background_until(deadline, move |db| activate_new(db, &day, &draft, None))?;
+        writer.background_until(deadline, move |db| activate_new(db, &day, &draft))?;
         return Ok(true);
-    }
-    if matches!(lane, Lane::Forecast) && day.mode == "maia" && !day.fresh && !day.forecast_finished
-    {
-        if let Some(response) = daily_forecast::read_response(&directory, &key)? {
-            let input = openings(&tx, &day, &clock)?;
-            let usable = response
-                .verify(&input.authored.basis, &input.authored.keys)
-                .is_ok()
-                && response
-                    .scores
-                    .values()
-                    .any(|score| matches!(score, Score::Estimated { .. }));
-            if usable {
-                let keys = input.ordered(Some(&response));
-                let draft = input.draft(clock.openings, &keys, "maia");
-                tx.commit()?;
-                let staged = day.order_staged.min(keys.len());
-                for (batch, keys) in keys[staged..].chunks(BATCH).enumerate() {
-                    let day = key.clone();
-                    let keys = keys.to_vec();
-                    writer.background_until(deadline, move |db| {
-                        stage_order(db, &day, staged + batch * BATCH, &keys)
-                    })?;
-                }
-                let total = keys.len();
-                writer.background_until(deadline, move |db| {
-                    activate_new(db, &day, &draft, Some(total))
-                })?;
-                return Ok(true);
-            }
-            tx.commit()?;
-            writer.background_until(deadline, move |db| {
-                db.execute(
-                    "UPDATE daily_day SET forecast_finished=1 WHERE day=?1",
-                    [&key],
-                )?;
-                Ok(())
-            })?;
-            return Ok(true);
-        }
-        if !daily_forecast::request_exists(&directory, &key)? {
-            let request = authored(&tx, &day, &clock)?.request();
-            tx.commit()?;
-            daily_forecast::publish_request(&directory, &key, &request)?;
-            return Ok(true);
-        }
     }
     Ok(false)
 }
 
 pub fn run(path: &Path, writer: Writer, shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut last_cleanup = Instant::now();
-    let mut lanes = [
-        Lane::Day,
-        Lane::Due,
-        Lane::Tactics,
-        Lane::Openings,
-        Lane::Forecast,
-    ]
-    .map(|lane| (lane, Instant::now()));
+    let mut lanes =
+        [Lane::Day, Lane::Due, Lane::Tactics, Lane::Openings].map(|lane| (lane, Instant::now()));
     while !*shutdown.borrow() {
         let now = Utc::now().timestamp();
         let mut progressed = false;
@@ -1126,10 +1174,10 @@ pub fn prepare_test_day(db: &mut Connection, now: i64) -> Result<()> {
     }
     activate_due(db, &key, generation, clock.coverage)?;
     let tactics = tactic_draft(db, &day, clock.tactics)?;
-    activate_new(db, &day, &tactics, None)?;
+    activate_new(db, &day, &tactics)?;
     let input = openings(db, &day, &clock)?;
     let draft = input.draft(clock.openings, &input.ordered(None), "standard");
-    activate_new(db, &day, &draft, None)
+    activate_new(db, &day, &draft)
 }
 
 #[cfg(test)]
@@ -1159,6 +1207,317 @@ mod tests {
             )?;
         }
         Ok(())
+    }
+
+    fn save_test_opening(db: &Connection, name: &str, movement: &str) -> Result<()> {
+        let opening = catalog::prepare_opening(&catalog::OpeningInput {
+            name: name.into(),
+            color: "white".into(),
+            start_at: 0,
+            route: chess::Route {
+                fen: chess::fen(&chess::position("")?),
+                moves: vec![movement.into()],
+            },
+        })?;
+        catalog::apply_opening(db, &opening, None, false)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_forecast_socket_leaves_required_preparation_and_http_study_available()
+    -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("held.sqlite3");
+        let mut db = Database::init(&database)?;
+        let now = Utc::now().timestamp();
+        tactic(&db, "review", Some(now - 1))?;
+        tactic(&db, "introduction", None)?;
+        save_test_opening(&db, "initial opening", "e2e4")?;
+        while !queue_store::seed_batch(&mut db)? {}
+        prepare_test_day(&mut db, now - 86_400)?;
+        let writer = Writer::start(db, None)?;
+        let (shutdown, stop) = tokio::sync::watch::channel(false);
+        daily_forecast::start(database.clone(), writer.clone(), stop.clone());
+        let socket = database.with_extension("dq").join("forecast.sock");
+        let mut held = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await {
+                    break stream;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        // An incomplete message holds the optional physical slot.
+        held.write_u32(200).await?;
+        held.write_all(b"{").await?;
+        let planner_path = database.clone();
+        let planner_writer = writer.clone();
+        let planner = tokio::task::spawn_blocking(move || run(&planner_path, planner_writer, stop));
+        let app = std::sync::Arc::new(crate::Runtime::new(
+            database.clone(),
+            writer.clone(),
+            crate::uploads::Staging::start(&database)?,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let router = crate::router(Path::new("."), port, app);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        let base = format!("http://127.0.0.1:{port}/api/study");
+        let verify = async {
+            let ready = || async {
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    loop {
+                        let response = client.get(format!("{base}/counts")).send().await?;
+                        if response.status().is_success() {
+                            let view: Value = response.json().await?;
+                            if view["day"] == day_at(now)? && view["preparing"] == false {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                })
+                .await?
+            };
+            ready().await?;
+            writer
+                .submit(false, |db| {
+                    save_test_opening(db, "authored during hold", "d2d4")
+                })?
+                .wait()
+                .await?;
+            ready().await?;
+            let read = Database::read(&database)?;
+            let clock = clock(&read)?;
+            ensure!(
+                day(&read, &day_at(now)?)?.is_some_and(|day| day.openings == Some(clock.openings)),
+                "Required openings did not observe the edit"
+            );
+            let mut next = json!({"after":null});
+            let mut seen = HashSet::new();
+            for _ in 0..3 {
+                let card: Value = client
+                    .post(format!("{base}/next"))
+                    .json(&next)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                ensure!(card["attempt"].is_number(), "{card}");
+                let title = card["title"]
+                    .as_str()
+                    .context("Missing Study title")?
+                    .to_owned();
+                let move_ = if title == "authored during hold" {
+                    "d2d4"
+                } else {
+                    "e2e4"
+                };
+                let answer =
+                    json!({"attempt":card["attempt"],"dataset":card["dataset"],"played":move_});
+                let deliver = || async {
+                    let reply: Value = client
+                        .post(format!("{base}/answer"))
+                        .json(&answer)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    Ok::<_, anyhow::Error>(reply)
+                };
+                let accepted = deliver().await?;
+                ensure!(accepted["rating"] == "Good", "{title} {accepted}");
+                ensure!(
+                    deliver().await? == accepted,
+                    "Answer replay changed the result"
+                );
+                seen.insert(if card["kind"] == "opening" {
+                    "opening".to_owned()
+                } else {
+                    title
+                });
+                next = json!({"after":card["attempt"],"dataset":card["dataset"]});
+            }
+            ensure!(
+                seen == ["opening", "review", "introduction"]
+                    .map(String::from)
+                    .into(),
+                "Prepared work differed: {seen:?}"
+            );
+            ensure!(
+                tokio::time::timeout(Duration::from_millis(30), held.read_u8())
+                    .await
+                    .is_err(),
+                "Forecast handoff did not stay held"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(held);
+        shutdown.send_replace(true);
+        server.abort();
+        planner.await?;
+        verify
+    }
+
+    #[tokio::test]
+    async fn forecast_ticket_publishes_and_replays_exact_evidence() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("ticket.sqlite3");
+        let mut db = Database::init(&database)?;
+        db.execute("UPDATE new_opening_settings SET opening_limit=1", [])?;
+        save_test_opening(&db, "first", "e2e4")?;
+        save_test_opening(&db, "second", "d2d4")?;
+        while !queue_store::seed_batch(&mut db)? {}
+        let now = Utc::now().timestamp();
+        prepare_test_day(&mut db, now)?;
+        let fallback = peek(&db, now)?.unwrap().0;
+        let writer = Writer::start(db, None)?;
+        tokio::task::spawn_blocking(move || {
+            use crate::daily_forecast::Delivery;
+            let claim = || {
+                forecast::claim_today(
+                    &database,
+                    &writer,
+                    daily_forecast::PROFILE,
+                    Instant::now() + Duration::from_secs(2),
+                )
+            };
+            let work = claim()?.expect("work");
+            assert!(claim()?.is_none());
+            let better = work
+                .request
+                .cards
+                .iter()
+                .find(|id| **id != fallback)
+                .unwrap()
+                .to_owned();
+            let scores = [
+                (fallback, Score::Unscored),
+                (better.clone(), Score::Estimated { probability: 1.0 }),
+            ]
+            .into();
+            let result = Response {
+                profile: work.request.profile,
+                basis: work.request.basis,
+                scores,
+                succeeded: true,
+            };
+            // A redelivery resumes the persisted cursor after a partial apply.
+            let ticket = work.ticket.clone();
+            let staged_outcome = result.clone();
+            let staged_first = better.clone();
+            writer.forecast(Instant::now() + Duration::from_secs(2), move |db| {
+                forecast::stage_first_rank(db, &ticket, &staged_outcome, staged_first)
+            })?;
+            let read = Database::read(&database)?;
+            assert!(clock(&read)?.last_order.is_none());
+            assert_ne!(peek(&read, now)?.unwrap().0, better);
+            drop(read);
+            let submit =
+                |result| forecast::submit(&database, &writer, work.ticket.clone(), result, now);
+            assert_eq!(submit(result.clone())?, Delivery::Published);
+            let read = Database::read(&database)?;
+            assert_eq!(peek(&read, now)?.unwrap().0, better);
+            assert_eq!(submit(result.clone())?, Delivery::Published);
+            let different = Response {
+                succeeded: false,
+                scores: BTreeMap::new(),
+                ..result
+            };
+            assert_eq!(submit(different)?, Delivery::Invalid);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
+
+    #[test]
+    fn ordinary_opening_publication_cannot_read_private_forecast_progress() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut db = Database::init(&root.path().join("ordinary-opening.sqlite3"))?;
+        save_test_opening(&db, "opening", "e2e4")?;
+        while !queue_store::seed_batch(&mut db)? {}
+        let now = Utc::now().timestamp();
+        let key = day_at(now)?;
+        open_day(&mut db, &key, now)?;
+        let clock = clock(&db)?;
+        let day = day(&db, &key)?.unwrap();
+        let input = openings(&db, &day, &clock)?;
+        let draft = input.draft(clock.openings, &input.ordered(None), "standard");
+        db.flush_prepared_statement_cache();
+        db.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "forecast_claim",
+                ..
+            }
+            | AuthAction::Read {
+                table_name: "daily_day",
+                column_name: "forecast_finished" | "order_staged",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }));
+        activate_new(&mut db, &day, &draft)?;
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM daily_new", [], |row| row
+                .get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_forecast_capture_consumes_only_the_optional_daily_claim() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("failed-forecast.sqlite3");
+        let mut db = Database::init(&database)?;
+        save_test_opening(&db, "opening", "e2e4")?;
+        while !queue_store::seed_batch(&mut db)? {}
+        let now = Utc::now().timestamp();
+        prepare_test_day(&mut db, now)?;
+        let fallback = peek(&db, now)?.unwrap().0;
+        // Keep the failure active across repeated claims. The prepared opening
+        // has already been published and never reads this authored view.
+        db.execute_batch(
+            "DROP VIEW authored_openings;
+             CREATE VIEW authored_openings AS
+             SELECT id,repertoire_id,color,json('invalid fixture') AS route,start_at FROM openings;",
+        )?;
+        let writer = Writer::start(db, None)?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let claim = || {
+                forecast::claim_today(
+                    &database,
+                    &writer,
+                    daily_forecast::PROFILE,
+                    Instant::now() + Duration::from_secs(2),
+                )
+            };
+            let failure = claim()
+                .err()
+                .context("Forecast unexpectedly materialized")?;
+            assert!(failure.to_string().contains("malformed JSON"), "{failure}");
+            assert!(
+                claim()?.is_none(),
+                "The failed capture must consume today's forecast"
+            );
+            let read = Database::read(&database)?;
+            assert_eq!(
+                read.query_row("SELECT outcome FROM forecast_claim", [], |row| row
+                    .get::<_, String>(0))?,
+                "without_rank"
+            );
+            assert_eq!(peek(&read, now)?.unwrap().0, fallback);
+            Ok(())
+        })
+        .await?
     }
 
     const CLEANUP_DAY: &str = "2026-11-28";
@@ -1621,7 +1980,7 @@ mod tests {
         );
         assert_eq!(draft.selected.len(), 1);
         assert_eq!(draft.selected[0].0.card, first);
-        activate_new(&mut db, &current, &draft, None)?;
+        activate_new(&mut db, &current, &draft)?;
         assert_eq!(open_study(&mut db)?.unwrap().attempt, issued.attempt);
         let reserved = answer_and_next(&mut db, issued, "e2e4")?.unwrap();
         assert_eq!(
@@ -1777,7 +2136,7 @@ mod tests {
         };
         db.execute("INSERT INTO learning VALUES('a',1,1,?1,?1)", [now + 600])?;
         assert_eq!(remaining(&db)?, ["b", "c"]);
-        activate_new(&mut db, &current_day, &draft, None)?;
+        activate_new(&mut db, &current_day, &draft)?;
         assert_eq!(remaining(&db)?, ["b", "c"]);
         db.execute("INSERT INTO learning VALUES('b',1,1,?1,?1)", [now + 600])?;
         assert_eq!(remaining(&db)?, ["c"]);
@@ -1883,7 +2242,13 @@ mod tests {
         db.flush_prepared_statement_cache();
         db.authorizer(Some(|context: AuthContext<'_>| match context.action {
             AuthAction::Read {
-                table_name: "openings" | "coverage_report" | "games" | "daily_opening_order",
+                table_name:
+                    "openings" | "coverage_report" | "games" | "daily_opening_order" | "forecast_claim",
+                ..
+            }
+            | AuthAction::Read {
+                table_name: "daily_day",
+                column_name: "forecast_finished" | "order_staged",
                 ..
             } => Authorization::Deny,
             _ => Authorization::Allow,
@@ -1972,12 +2337,16 @@ mod tests {
         stage_order(&mut db, &key, 0, &ordered)?;
         commit_slot(&db, &first, now)?;
         // A result prepared before the issued slot cannot replace it.
-        activate_new(&mut db, &original, &ranked, Some(2))?;
+        let tx = db.transaction_with_behavior(Immediate)?;
+        forecast::publish_fresh_order(&tx, &original, &ranked, 2)?;
+        tx.commit()?;
         assert!(clock(&db)?.last_order.is_none());
         let latest = day(&db, &key)?.unwrap();
         let input = openings(&db, &latest, &clock_snapshot)?;
         let ranked = input.draft(clock_snapshot.openings, &ordered, "maia");
-        activate_new(&mut db, &latest, &ranked, Some(2))?;
+        let tx = db.transaction_with_behavior(Immediate)?;
+        forecast::publish_fresh_order(&tx, &latest, &ranked, 2)?;
+        tx.commit()?;
         assert!(peek(&db, now)?.is_none());
         let next_day = now + 86_400;
         prepare_test_day(&mut db, next_day)?;
@@ -2004,10 +2373,14 @@ mod tests {
         let key = day_at(now)?;
         open_day(&mut db, &key, now)?;
         let today = day(&db, &key)?.unwrap();
-        let prior = serde_json::to_value(authored(&db, &today, &clock(&db)?)?.request())?;
+        let prior = serde_json::to_value(
+            authored(&db, &today, &clock(&db)?, Projection::Forecast)?.request(),
+        )?;
         db.execute("INSERT INTO learning SELECT id,1,1,1,2 FROM cards", [])?;
         db.execute("UPDATE openings SET name='Display title'", [])?;
-        let after = serde_json::to_value(authored(&db, &today, &clock(&db)?)?.request())?;
+        let after = serde_json::to_value(
+            authored(&db, &today, &clock(&db)?, Projection::Forecast)?.request(),
+        )?;
         assert_eq!(prior, after);
         Ok(())
     }

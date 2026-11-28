@@ -104,11 +104,12 @@ command:
 target/debug/tempo daily-queue-worker .local/tempo.dq
 ```
 
-The worker exchanges bounded forecast files through the private `.dq` directory
-next to the database. If the worker is stopped or Maia is busy, Tempo still
-builds the day from the last complete opening order, or Standard for the first
-day. A late daily result can reorder only uncommitted openings. Applying a
-Coverage report can still reorder the remaining due reviews in its scope.
+The worker uses a private, versioned Unix socket in the `.dq` directory
+next to the database. Run matching server and worker builds. If the worker is
+stopped, the socket is unavailable, or Maia is busy, Tempo prepares the day
+using the last complete opening order or Standard. A valid daily result can
+reorder only uncommitted openings. Applying a Coverage report can still
+reorder the remaining due reviews in its scope.
 
 For a managed macOS release, render `com.tempo-v2.lean.daily-queue.plist` from
 `tools/daily-queue-launch-agent.py` using the exact installed release binary and
