@@ -67,7 +67,18 @@ export function ChessBoard({ game, legal = [], orientation, identity, onMove, on
 }
 
 export function Replay({ route, color, ply, onPly, sounds, controlsTarget }) {
-  useLayoutEffect(() => sounds.cancel, [sounds, route, color]);
+  const forward = useRef(null);
+  useLayoutEffect(() => sounds.cancel, [sounds]);
+  useLayoutEffect(() => {
+    const requested = forward.current;
+    forward.current = null;
+    // List and feedback controls can replace the displayed ply directly.
+    if (requested?.route === route && requested.color === color && requested.ply === ply) {
+      sounds.play(requested.cue);
+    } else {
+      sounds.cancel();
+    }
+  }, [sounds, route, color, ply]);
   const timeline = useMemo(() => position(route).history({ verbose: true }), [route]);
   const game = new Chess(timeline[Math.min(ply, timeline.length) - 1]?.after || route.fen || undefined);
   function seek(next) {
@@ -75,8 +86,11 @@ export function Replay({ route, color, ply, onPly, sounds, controlsTarget }) {
       const move = timeline[next - 1];
       const board = new Chess(move.after);
       const player = color === "white" ? "w" : "b";
-      sounds.play(moveCue(move, board, move.color === player ? "move-self" : "move-opponent"));
-    } else if (next < ply) sounds.cancel();
+      forward.current = { route, color, ply: next,
+        cue: moveCue(move, board, move.color === player ? "move-self" : "move-opponent") };
+    } else {
+      forward.current = null;
+    }
     onPly(next);
   }
   const board = <ChessBoard game={game} orientation={color} identity="replay" />;
