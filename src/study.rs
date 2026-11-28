@@ -117,6 +117,13 @@ pub enum AnswerReceipt {
 }
 
 impl AnswerReceipt {
+    pub(crate) fn answers(&self) -> &[String] {
+        match self {
+            Self::Versioned { v1 } => &v1.answers,
+            Self::Legacy(result) => &result.answers,
+        }
+    }
+
     pub fn view(
         self,
         fen: &str,

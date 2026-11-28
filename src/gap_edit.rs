@@ -1,3 +1,4 @@
+use crate::opening_replacement::receipt;
 use crate::{
     ApiError, ApiResult, App, Database, catalog, chess, coverage, gap_pgn, opening_replacement,
     prepare, write_db, writer,
@@ -547,10 +548,7 @@ fn commit_replacement(
         .map(|plan| catalog::apply_opening(&tx, plan, Some(&edit.repertoire), true))
         .collect::<Result<Vec<_>>>()?;
     let reply = json!({"command":edit.command,"lines":lines});
-    tx.execute(
-        "INSERT INTO gap_save_receipt VALUES(?1,?2)",
-        (&edit.command, reply.to_string()),
-    )?;
+    opening_replacement::record_receipt(&tx, &edit.command, &reply)?;
     ensure!(
         tx.total_changes() - before <= catalog::ONLINE_WRITE_LIMIT as u64,
         opening_replacement::OverBudget
@@ -711,10 +709,7 @@ fn commit(c: &mut Connection, edit: Edit, online: bool) -> Result<Value> {
         )?);
     }
     let reply = json!({"command":edit.command,"lines":lines});
-    tx.execute(
-        "INSERT INTO gap_save_receipt VALUES(?1,?2)",
-        (&edit.command, reply.to_string()),
-    )?;
+    opening_replacement::record_receipt(&tx, &edit.command, &reply)?;
     if online {
         catalog::check_opening_write_budget(&tx, before)?;
     }
@@ -912,17 +907,6 @@ pub async fn progress(
         .optional()?)
     })
     .await
-}
-
-fn receipt(c: &Connection, id: &str) -> Result<Option<Value>> {
-    let prior: Option<String> = c
-        .query_row(
-            "SELECT reply FROM gap_save_receipt WHERE command=?1",
-            [id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(prior.map(|s| serde_json::from_str(&s)).transpose()?)
 }
 
 #[cfg(test)]

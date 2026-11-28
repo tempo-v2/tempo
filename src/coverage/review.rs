@@ -8,11 +8,7 @@ use anyhow::{Result, ensure};
 use axum::{Json, extract::State};
 use pgn_reader::shakmaty::{Chess, Color, Position, san::SanPlus};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    time::Duration,
-};
+use std::{collections::HashMap, path::Path, time::Duration};
 use tokio::sync::Semaphore;
 
 static SLOT: Semaphore = Semaphore::const_new(1);
@@ -196,26 +192,12 @@ fn san(board: &Chess, movement: &str) -> Result<String> {
 }
 
 fn rank(board: &Chess, candidates: Option<Vec<Candidate>>, lines: Vec<Root>) -> Result<Review> {
-    let mut legal: HashSet<_> = chess::legal(board).into_iter().collect();
-    ensure!(
-        !legal.is_empty()
-            && lines.len() == legal.len()
-            && lines.iter().all(|root| legal.remove(&root.first_move)
-                && !matches!(root.score, Score::Mate { moves: 0, .. })),
-        "Incomplete gap evaluation"
-    );
     let side = if board.turn() == Color::White {
         Side::White
     } else {
         Side::Black
     };
-    let mut lines = lines;
-    lines.sort_by(|a, b| {
-        b.score
-            .order(side)
-            .cmp(&a.score.order(side))
-            .then(a.first_move.cmp(&b.first_move))
-    });
+    let lines = opening_engine::rank_roots(board, lines)?;
     let best = &lines[0];
     let best_view = EvaluatedMove {
         san: san(board, &best.first_move)?,

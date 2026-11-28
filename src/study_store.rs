@@ -275,3 +275,52 @@ pub fn context_source(db: &Connection, attempt: i64) -> Result<ContextSource> {
         },
     })
 }
+
+/// The accepted, currently displayed opening decision, independent of its label.
+pub(crate) struct CompletedOpening {
+    pub card: String,
+    pub repertoire: String,
+    pub position: String,
+    pub version: String,
+    pub color: String,
+    pub fen: String,
+    pub movement: String,
+}
+
+pub(crate) fn completed_opening(db: &Connection, attempt: i64) -> Result<Option<CompletedOpening>> {
+    let row = db
+        .query_row(
+            "SELECT c.id,c.repertoire_id,c.position_id,c.answer_version,c.color,c.fen,a.result
+         FROM study s JOIN attempts a ON a.id=s.active JOIN cards c ON c.id=a.card_id
+         WHERE a.id=?1 AND a.result IS NOT NULL AND c.kind='opening'",
+            [attempt],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((card, repertoire, position, version, color, fen, saved)) = row else {
+        return Ok(None);
+    };
+    let receipt = serde_json::from_str::<AnswerReceipt>(&saved)?;
+    let [movement] = receipt.answers() else {
+        return Ok(None);
+    };
+    Ok(Some(CompletedOpening {
+        card,
+        repertoire,
+        position,
+        version,
+        color,
+        fen,
+        movement: movement.clone(),
+    }))
+}

@@ -8,6 +8,7 @@ import {
 } from "./answer-journal.js";
 import { ChessBoard, play } from "./board.jsx";
 import { moveCue } from "./sounds.js";
+import { OpeningEditStatus, StudyMoveReview, useOpeningEdit } from "./study_move_review.jsx";
 
 const successPauseMs = 800;
 const openingPlyMs = 260;
@@ -184,6 +185,11 @@ async function deliverAnswer(intent, fen) {
 export function Study({ openGame, sounds }) {
   const [card, setCard] = useState(null);
   const [counts, invalidateCounts] = useStudyCounts();
+  const openingEdit = useOpeningEdit(() => invalidateCounts.current?.());
+  const [reviewMarked, setReviewMarked] = useState(null);
+  const [reviewOpen, setReviewOpen] = useState(null);
+  const [reviewPosition, setReviewPosition] = useState(null);
+  const reviewButton = useRef(null);
   const [sourceRead, setSource] = useState(null);
   const [opponent, setOpponent] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -212,6 +218,22 @@ export function Study({ openGame, sounds }) {
   const [openingProgress, setOpeningProgress] = useState(null);
   const attemptKey = card ? `${card.dataset}/${card.attempt}` : null;
   useLayoutEffect(() => sounds.cancel, [sounds, attemptKey]);
+  const reviewing = Boolean(card?.result && reviewOpen === attemptKey);
+  const canReview = card?.kind === "opening" && card.activity_mode === "single_answer";
+
+  function openReview() {
+    setAdvanceAfter(null);
+    setReviewPosition(null);
+    setReviewOpen(attemptKey);
+  }
+
+  function closeReview() {
+    setReviewOpen(null);
+    setReviewPosition(null);
+    // Focus after React re-enables the trigger.
+    requestAnimationFrame(() => reviewButton.current?.focus());
+  }
+
   const source = sourceRead?.key === attemptKey ? sourceRead.result : null;
   const learner = card?.color?.[0];
   const frames = useMemo(() => openingFrames(card?.lead_in, card?.fen, learner), [card?.lead_in, card?.fen, learner]);
@@ -363,7 +385,8 @@ export function Study({ openGame, sounds }) {
         const move = play(board, result.display_move);
         sounds.play(moveCue(move, board));
       }
-      if (result.rating === "Good") setAdvanceAfter(card.attempt);
+      if (canReview && reviewMarked === attemptKey) openReview();
+      else if (result.rating === "Good") setAdvanceAfter(card.attempt);
     });
   }
 
@@ -382,6 +405,7 @@ export function Study({ openGame, sounds }) {
     }}
     heading={heading}
     continuation={<button ref={nextButton} disabled={pending} onClick={() => next(card.attempt)}>Next</button>}>
+    <OpeningEditStatus save={openingEdit} card={card} />
     {error && <div role="alert">{error.message} <button disabled={pending} onClick={() => run(retry.current)}>Retry</button></div>}
   </PuzzleBoard>;
 
@@ -409,6 +433,10 @@ export function Study({ openGame, sounds }) {
   if (introduction) shapes.push({ orig: introduction.slice(0, 2), dest: introduction.slice(2, 4), brush: "yellow" });
   const introductionPrompt = introduction && `Play ${play(new Chess(card.fen), introduction).san}`;
   if (boardMove) play(game, boardMove);
+  const reviewBoard = reviewing && <ChessBoard game={new Chess(reviewPosition?.fen ?? card.fen)}
+    orientation={card.color} identity={`review-${attemptKey}-${reviewPosition?.fen ?? card.fen}`}
+    shapes={reviewPosition?.move ? markedMove(
+      [reviewPosition.move.slice(0, 2), reviewPosition.move.slice(2, 4)], "green") : []} />;
   const board = card && <ChessBoard game={game} legal={openingPlaying ? undefined : card.legal} orientation={card.color}
     identity={`study-${card.attempt}-${epoch}`} locked={openingPlaying || pending || Boolean(error) || Boolean(card.result) || Boolean(awaitingResult)}
     lastMove={lastMove}
@@ -416,8 +444,9 @@ export function Study({ openGame, sounds }) {
     promotionTarget={promotionTarget}
     onRejectedMove={() => sounds.play("illegal")}
     onMove={openingPlaying || card.result || awaitingResult ? undefined : answer} />;
-  return <ExerciseLayout label="Study" board={board}>
+  return <ExerciseLayout label="Study" board={reviewBoard || board}>
     {heading}
+    <OpeningEditStatus save={openingEdit} card={card} />
     {error && <div className="error" role={error.code === "study_preparing" ? "status" : "alert"}>{error.message} <button onClick={() => run(retry.current)}>Retry</button></div>}
     {!loaded && !error && <p>Loading your deck…</p>}
     {loaded && !card && !error && <><p>No cards are ready in today’s queue.</p>
@@ -428,15 +457,24 @@ export function Study({ openGame, sounds }) {
       <div className="controls">
         {card.result ? <>
           <strong role="status">{card.result.rating}</strong>
+          {canReview && <button ref={reviewButton} aria-expanded={reviewing} disabled={pending || reviewing}
+            onClick={openReview}>Review move</button>}
           <button ref={nextButton} className="primary" aria-keyshortcuts="Space" title="Next card (Space)" disabled={pending} onClick={() => next(card.attempt)}>Next card</button>
         </> : openingPlaying
           ? <button onClick={() => {
             sounds.cancel();
             setOpeningProgress({ key: attemptKey, ply: lastPly });
           }}>Skip to your move</button>
-          : <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>}
+          : <>
+            <button disabled={pending || Boolean(error)} onClick={() => answer(null)}>Reveal answer</button>
+            {canReview && <button className={reviewMarked === attemptKey ? "selected" : undefined}
+              disabled={pending || Boolean(error)} aria-pressed={reviewMarked === attemptKey}
+              onClick={() => setReviewMarked(reviewMarked === attemptKey ? null : attemptKey)}>Review after answer</button>}
+          </>}
       </div>
-      {card.result && <div className="feedback">
+      {reviewing && <StudyMoveReview key={attemptKey} card={card} boardPosition={setReviewPosition}
+        save={openingEdit} onClose={closeReview} />}
+      {card.result && !reviewing && <div className="feedback">
         <p>Answer: {card.result.answers.map((move) => play(new Chess(card.fen), move).san).join(" or ")}</p>
         {playedInGame && <p>In the game you played {playedInGame}.</p>}
         {source?.game_id && <button onClick={() => openGame(source.game_id, source.ply)}>View source game</button>}

@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use pgn_reader::shakmaty::Position;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type Choices = BTreeMap<String, String>;
@@ -129,7 +130,11 @@ impl Rewritten {
     }
 }
 
-fn replay(input: &catalog::OpeningInput, selected: &Choices) -> Result<Rewritten> {
+fn replay(
+    input: &catalog::OpeningInput,
+    selected: &Choices,
+    removal: Option<(&str, &str)>,
+) -> Result<Rewritten> {
     let mut result = Rewritten::default();
     let mut board = chess::position(&input.route.fen)?;
     let mut original_board = board.clone();
@@ -138,6 +143,18 @@ fn replay(input: &catalog::OpeningInput, selected: &Choices) -> Result<Rewritten
         let position = chess::position_id(&board);
         let original_move = chess::parse_move(&board, original).ok();
         let owned = ply >= input.start_at && chess::color_name(board.turn()) == input.color;
+        if owned
+            && removal.is_some_and(|(target, reply)| {
+                position == target
+                    && original_move.is_some_and(|movement| chess::uci(movement) == reply)
+            })
+        {
+            result.stopped_at = Some(format!(
+                "{} is removed.",
+                gap_pgn::reply_text(&original_board, original)?
+            ));
+            break;
+        }
         let movement = match selected.get(&position).filter(|_| owned) {
             Some(selected) => chess::parse_move(&board, selected).ok(),
             None => original_move,
@@ -293,10 +310,51 @@ pub fn plan(
             ))
         })
         .collect::<Result<Choices>>()?;
+    ensure!(
+        selected
+            .iter()
+            .all(|(position, movement)| proposed.get(position) == Some(movement)),
+        "The selected replacement is no longer in the PGN."
+    );
+    plan_changes(db, repertoire, color, selected, incoming, &proposed, None)
+}
+
+pub fn plan_study_reply(
+    db: &Connection,
+    repertoire: &str,
+    color: &str,
+    position: &str,
+    current: &str,
+    replacement: Option<&str>,
+) -> Result<Replacement> {
+    let selected = replacement
+        .map(|movement| Choices::from([(position.into(), movement.into())]))
+        .unwrap_or_default();
+    let removal = replacement.is_none().then_some((position, current));
+    plan_changes(
+        db,
+        repertoire,
+        color,
+        &selected,
+        &[],
+        &Choices::new(),
+        removal,
+    )
+}
+
+fn plan_changes(
+    db: &Connection,
+    repertoire: &str,
+    color: &str,
+    selected: &Choices,
+    incoming: &[catalog::OpeningPlan],
+    proposed: &Choices,
+    removal: Option<(&str, &str)>,
+) -> Result<Replacement> {
     let lines = saved_lines(db, repertoire, color)?;
     let mut continuations = lines
         .iter()
-        .map(|line| replay(&line.input, selected))
+        .map(|line| replay(&line.input, selected, removal))
         .collect::<Result<Vec<_>>>()?;
 
     let addressed = continuations
@@ -317,7 +375,7 @@ pub fn plan(
     }
 
     for line in &mut continuations {
-        stop_at_known_conflict(line, selected, &proposed, &current);
+        stop_at_known_conflict(line, selected, proposed, &current);
     }
     stop_at_reachable_conflicts(&mut continuations, |reply| {
         !proposed.contains_key(&reply.position) && !current.contains_key(&reply.position)
@@ -390,10 +448,17 @@ pub fn plan(
             .context("The saved reply is no longer available.")?
             .id;
         ensure!(
-            proposed.get(position) == Some(movement),
-            "The selected replacement is no longer in the PGN."
+            installed.contains(&(position.clone(), chess::id(&["answer-v1", movement]))),
+            "The replacement has no surviving authored route."
         );
         retired.insert(id);
+    }
+    if let Some((position, _)) = removal {
+        let reply = active(position)?.context("The saved reply is no longer available.")?;
+        ensure!(
+            retired.contains(&reply.id),
+            "The removal still has an authored route."
+        );
     }
     // Retirement writes the card, its availability and revision projections,
     // up to two live due generations, and up to one committed slot and release.
@@ -463,6 +528,27 @@ pub fn apply(db: &Connection, repertoire: &str, replacement: &Replacement) -> Re
         .iter()
         .map(|line| catalog::apply_opening(db, line, Some(repertoire), true))
         .collect()
+}
+
+// Opening edits share the predecessor receipt store. Each command family owns
+// its versioned identity and replay format.
+pub fn receipt(db: &Connection, command: &str) -> Result<Option<Value>> {
+    let saved: Option<String> = db
+        .query_row(
+            "SELECT reply FROM gap_save_receipt WHERE command=?1",
+            [command],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(saved.map(|body| serde_json::from_str(&body)).transpose()?)
+}
+
+pub fn record_receipt(db: &Connection, command: &str, reply: &Value) -> Result<()> {
+    db.execute(
+        "INSERT INTO gap_save_receipt VALUES(?1,?2)",
+        (command, reply.to_string()),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -539,6 +625,7 @@ mod tests {
                 start_at: 0,
             },
             &selected,
+            None,
         )?;
         stop_at_known_conflict(&mut rewrite, &selected, &proposed, &BTreeMap::new());
         assert!(rewrite.stopped_at.is_none());
