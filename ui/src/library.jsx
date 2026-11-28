@@ -330,7 +330,7 @@ function TacticLibrary({ openGame, sounds, captured }) {
         {problem.source_url && <a href={problem.source_url} target="_blank" rel="noreferrer">
           {problem.source_url.startsWith("https://lichess.org/") ? "Open on Lichess" : "Open on Chess.com"}
         </a>}
-        {problem.source_game && <button onClick={() => openGame(problem.source_game, problem.source_ply)}>View source game</button>}
+        {openGame && problem.source_game && <button onClick={() => openGame(problem.source_game, problem.source_ply)}>View source game</button>}
       </>}</div>
       <div>
         <h2>Puzzle library</h2>

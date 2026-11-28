@@ -181,7 +181,9 @@ impl Pass {
                 "remaining":remaining,"next":next,"prefix":remaining>next.len(),
                 "proof_fingerprint":hash.finalize().to_hex().to_string(),"reason":reason,
                 "completion_basis": (remaining<=20).then(||
-                    json!({"openings":self.basis.openings,"schedule_floor":self.schedule_floor})),
+                    json!({"authoring":self.basis.authoring,
+                        "introduction_reset":self.basis.introduction_reset,
+                        "schedule_floor":self.schedule_floor})),
             }),
         })
     }
@@ -249,6 +251,27 @@ pub(super) fn turn(
         return Ok(true);
     }
     let deadline = Instant::now() + Duration::from_secs(2);
+    // Save the completion proof before Study can consume newly published slots.
+    if !pass.pending_updates.is_empty() {
+        let updates = pass.pending_updates.clone();
+        ensure!(
+            updates.len() <= BATCH,
+            "too many opening priority updates in a turn"
+        );
+        let status_basis = basis.clone();
+        if !writer.background_until(deadline, move |db| {
+            let tx = db.transaction_with_behavior(Immediate)?;
+            if !goals::publish_updates(&tx, &status_basis, &updates)? {
+                return Ok(false);
+            }
+            tx.commit()?;
+            Ok(true)
+        })? {
+            *active = None;
+            return Ok(true);
+        }
+        pass.pending_updates.clear();
+    }
     // Reconstructing after restart or a fresh rank must never replace a valid
     // later-page prefix with a shorter locally recomputed prefix.
     if pass
@@ -304,20 +327,6 @@ pub(super) fn turn(
             return Ok(true);
         }
         pass.published = Some(pass.prefix.clone());
-    }
-    if !pass.pending_updates.is_empty() {
-        let updates = pass.pending_updates.clone();
-        ensure!(
-            updates.len() <= BATCH,
-            "too many opening priority updates in a turn"
-        );
-        writer.background_until(deadline, move |db| {
-            let tx = db.transaction_with_behavior(Immediate)?;
-            goals::publish_updates(&tx, &basis, &updates)?;
-            tx.commit()?;
-            Ok(())
-        })?;
-        pass.pending_updates.clear();
     }
     pass.done = exhausted;
     Ok(true)

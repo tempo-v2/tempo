@@ -39,9 +39,10 @@ CREATE INDEX opening_priority_sequence ON opening_priority(id)
 -- the worker wakes. Preserve its proof generation across a subsequent edit.
 CREATE TABLE opening_priority_introduction (
   card_id TEXT NOT NULL REFERENCES cards(id),
-  openings INTEGER NOT NULL,
+  authoring INTEGER NOT NULL,
+  introduction_reset INTEGER NOT NULL,
   schedule_version INTEGER NOT NULL,
-  PRIMARY KEY(card_id,openings)
+  PRIMARY KEY(card_id,authoring,introduction_reset)
 ) STRICT;
 
 CREATE TABLE opening_miss_receipts (
@@ -59,6 +60,12 @@ CREATE TABLE opening_miss_requests (
 ) STRICT;
 
 ALTER TABLE daily_clock ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE daily_clock ADD COLUMN introduction_reset INTEGER NOT NULL DEFAULT 0;
+
+CREATE TRIGGER opening_priority_learning_reset AFTER DELETE ON learning
+WHEN EXISTS(SELECT 1 FROM prepared_queue WHERE card_id=old.card_id AND kind='opening') BEGIN
+  UPDATE daily_clock SET introduction_reset=introduction_reset+1;
+END;
 
 -- The latest compatible daily proof prefix is disposable. Only the goals above are authority.
 CREATE TABLE opening_priority_projection (

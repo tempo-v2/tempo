@@ -71,6 +71,8 @@ pub struct Basis {
     pub dataset: String,
     pub day: String,
     pub openings: i64,
+    pub authoring: i64,
+    pub introduction_reset: i64,
     pub priority: i64,
     pub commitments: i64,
     pub paused: bool,
@@ -80,7 +82,7 @@ impl Basis {
     pub fn current(db: &Connection) -> Result<Option<Self>> {
         Ok(db
             .query_row(
-                "SELECT m.dataset,d.day,c.openings,c.priority,d.commitments,s.paused
+                "SELECT m.dataset,d.day,c.openings,c.priority,d.commitments,s.paused,c.authoring,c.introduction_reset
              FROM daily_clock c JOIN daily_day d ON d.day=c.current_day
              CROSS JOIN metadata m CROSS JOIN new_opening_settings s",
                 [],
@@ -92,6 +94,8 @@ impl Basis {
                         priority: r.get(3)?,
                         commitments: r.get(4)?,
                         paused: r.get(5)?,
+                authoring: r.get(6)?,
+                introduction_reset: r.get(7)?,
                     })
                 },
             )
@@ -160,9 +164,12 @@ pub fn preview_status(db: &Connection, card: &str, availability: i64) -> Result<
 
 pub fn note_introduction(db: &Connection, card: &str) -> Result<()> {
     db.execute(
-        &format!("INSERT OR IGNORE INTO opening_priority_introduction
-         SELECT p.card_id,c.openings,p.schedule_version FROM prepared_queue p CROSS JOIN daily_clock c
-         WHERE p.card_id=?1 AND EXISTS(SELECT id FROM opening_priority WHERE state IN {ACTIVE})"),
+        &format!(
+            "INSERT OR IGNORE INTO opening_priority_introduction
+         SELECT p.card_id,c.authoring,c.introduction_reset,p.schedule_version
+         FROM prepared_queue p CROSS JOIN daily_clock c
+         WHERE p.card_id=?1 AND EXISTS(SELECT id FROM opening_priority WHERE state IN {ACTIVE})"
+        ),
         [card],
     )?;
     Ok(())
@@ -178,7 +185,8 @@ pub struct Goal {
 
 #[derive(Deserialize)]
 struct Witness {
-    openings: i64,
+    authoring: i64,
+    introduction_reset: i64,
     schedule_floor: i64,
 }
 
@@ -204,7 +212,7 @@ pub fn roots(db: &Connection, after: i64) -> Result<Vec<Goal>> {
     let mut result = Vec::new();
     let mut introduced = db.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM opening_priority_introduction
-         WHERE card_id=?1 AND openings=?2 AND schedule_version>?3)",
+         WHERE card_id=?1 AND authoring=?2 AND introduction_reset=?3 AND schedule_version>?4)",
     )?;
     while let Some(row) = rows.next()? {
         let summary: Option<String> = row.get(3)?;
@@ -214,10 +222,15 @@ pub fn roots(db: &Connection, after: i64) -> Result<Vec<Goal>> {
             if let Some(basis) = proof.completion_basis {
                 witnessed = !proof.next.is_empty();
                 for card in proof.next {
-                    let found: bool = introduced
-                        .query_row((card.card_id, basis.openings, basis.schedule_floor), |r| {
-                            r.get(0)
-                        })?;
+                    let found: bool = introduced.query_row(
+                        (
+                            card.card_id,
+                            basis.authoring,
+                            basis.introduction_reset,
+                            basis.schedule_floor,
+                        ),
+                        |r| r.get(0),
+                    )?;
                     if !found {
                         witnessed = false;
                         break;
@@ -482,9 +495,9 @@ pub struct Update {
     pub summary: Value,
 }
 
-pub fn publish_updates(db: &Connection, basis: &Basis, entries: &[Update]) -> Result<()> {
+pub fn publish_updates(db: &Connection, basis: &Basis, entries: &[Update]) -> Result<bool> {
     if Basis::current(db)?.as_ref() != Some(basis) {
-        return Ok(());
+        return Ok(false);
     }
     let mut q = db.prepare_cached(&format!(
         "UPDATE opening_priority SET state=?2,summary=?3 WHERE id=?1 AND state IN {ACTIVE}"
@@ -499,5 +512,5 @@ pub fn publish_updates(db: &Connection, basis: &Basis, entries: &[Update]) -> Re
         );
         q.execute(params![entry.id, entry.state, text])?;
     }
-    Ok(())
+    Ok(true)
 }

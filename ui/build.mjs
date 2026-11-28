@@ -22,4 +22,6 @@ const revision = createHash("sha256")
   .update(await readFile("dist/assets/app.js"))
   .update(await readFile("dist/assets/app.css"))
   .digest("hex");
-await writeFile("dist/index.html", `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tempo</title><link rel="stylesheet" href="/assets/app.css?v=${revision}"></head><body><div id="root"></div><script type="module" src="/assets/app.js?v=${revision}"></script></body></html>`);
+for (const [file, profile] of [["index.html", "local"], ["private.html", "private"]]) {
+  await writeFile(`dist/${file}`, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tempo</title><link rel="stylesheet" href="/assets/app.css?v=${revision}"></head><body><div id="root" data-profile="${profile}"></div><script type="module" src="/assets/app.js?v=${revision}"></script></body></html>`);
+}
