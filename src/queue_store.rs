@@ -195,8 +195,8 @@ pub fn seed_batch(db: &mut Connection) -> Result<bool> {
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut insert = tx.prepare_cached(
-        "INSERT OR IGNORE INTO prepared_queue(card_id,kind,active,due_at,rank,reserved)
-         SELECT c.id,c.kind,active.id IS NOT NULL,l.due_at,o.rank,d.card_id IS NOT NULL OR EXISTS(SELECT 1 FROM repeat_obligation r WHERE r.card_id=c.id)
+        "INSERT OR IGNORE INTO prepared_queue(card_id,kind,active,due_at,rank,reserved,capture_order)
+         SELECT c.id,c.kind,active.id IS NOT NULL,l.due_at,o.rank,d.card_id IS NOT NULL OR EXISTS(SELECT 1 FROM repeat_obligation r WHERE r.card_id=c.id),c.capture_order
          FROM cards c LEFT JOIN active_cards active ON active.id=c.id
          LEFT JOIN learning l ON l.card_id=c.id LEFT JOIN opening_order o ON o.card_id=c.id LEFT JOIN deck d ON d.card_id=c.id
          WHERE c.id=?1",
@@ -367,15 +367,8 @@ mod tests {
 
     #[test]
     fn seed_progress_observes_interleaved_changes_even_behind_the_cursor() -> Result<()> {
-        let mut db = Connection::open_in_memory()?;
-        for schema in [
-            include_str!("schema.sql"),
-            include_str!("opening_policy.sql"),
-            include_str!("opening_order.sql"),
-            include_str!("game_pipeline.sql"),
-        ] {
-            db.execute_batch(schema)?;
-        }
+        let files = tempfile::tempdir()?;
+        let mut db = crate::db::Database::init(&files.path().join("seed.sqlite3"))?;
         for id in 1..=130 {
             db.execute(
                 "INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
@@ -383,10 +376,8 @@ mod tests {
                 [format!("{id:04}")],
             )?;
         }
-        db.execute_batch(include_str!("prepared_queue.sql"))?;
-        db.execute_batch(include_str!("card_availability.sql"))?;
-        db.execute_batch(include_str!("lichess_packs.sql"))?;
-        db.execute_batch(include_str!("coverage_order.sql"))?;
+        // Simulate retained cards awaiting prepared projection population.
+        db.execute("DELETE FROM prepared_queue", [])?;
         assert!(!seed_batch(&mut db)?);
         assert!(!prepared(&db)?);
         db.execute("INSERT INTO learning VALUES ('0001',1,1,1,9)", [])?;
@@ -396,6 +387,10 @@ mod tests {
             [],
         )?;
         db.execute("INSERT INTO deck VALUES (1,'0000')", [])?;
+        db.execute(
+            "UPDATE cards SET capture_order=(SELECT sequence+1 FROM daily_clock) WHERE id='0130'",
+            [],
+        )?;
         while !seed_batch(&mut db)? {}
         assert_eq!(
             db.query_row("SELECT count(*) FROM prepared_queue", [], |r| r
@@ -410,6 +405,12 @@ mod tests {
             )?,
             9
         );
+        assert!(db.query_row(
+            "SELECT p.capture_order=c.capture_order FROM prepared_queue p JOIN cards c ON c.id=p.card_id
+             WHERE p.card_id='0130'",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?);
         let reserved = || {
             db.query_row(
                 "SELECT reserved FROM prepared_queue WHERE card_id='0000'",

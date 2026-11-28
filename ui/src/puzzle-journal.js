@@ -86,3 +86,28 @@ export async function importPuzzleCommand(scope) {
   await savePuzzleCommand(scope, JSON.parse(previous));
   if (sessionStorage.getItem(key) === previous) sessionStorage.removeItem(key);
 }
+
+export function pendingTacticCapture(dataset) {
+  return pending("readonly", (store) => store.get(["capture", dataset]));
+}
+
+export function saveTacticCapture(command) {
+  const key = ["capture", command.dataset];
+  return pending("readwrite", (store, transaction) => {
+    const prior = store.get(key);
+    prior.onsuccess = () => {
+      if (!prior.result) store.add(command, key);
+      else if (prior.result.request !== command.request) transaction.abort();
+    };
+  });
+}
+
+export function resolveTacticCapture(command) {
+  const key = ["capture", command.dataset];
+  return pending("readwrite", (store) => {
+    const prior = store.get(key);
+    prior.onsuccess = () => {
+      if (prior.result?.request === command.request) store.delete(key);
+    };
+  });
+}

@@ -515,20 +515,41 @@ fn charged(db: &Connection, day: &Day, kind: &str) -> Result<usize> {
 
 fn tactic_draft(db: &Connection, day: &Day, version: i64) -> Result<Draft> {
     let limit = day.tactic_limit.saturating_sub(charged(db, day, "tactic")?);
-    let mut query = db.prepare("SELECT p.card_id,p.availability_version FROM prepared_queue p
-      WHERE p.kind='tactic' AND p.active=1 AND p.reserved=0 AND p.due_at IS NULL
-        AND p.availability_version<=?1 AND p.schedule_version<=?1
+    // Only explicit captures can enter after the day's availability cutoff.
+    let eligible = "p.kind='tactic' AND p.active=1 AND p.reserved=0 AND p.due_at IS NULL
+        AND p.schedule_version<=?1
         AND NOT EXISTS(SELECT 1 FROM daily_new n WHERE n.day=?2 AND n.card_id=p.card_id AND n.committed=1)
-        AND p.card_id IS NOT (SELECT a.card_id FROM study s JOIN attempts a ON a.id=s.active WHERE a.result IS NULL)
-      ORDER BY p.card_id LIMIT ?3")?;
-    let rows = query
-        .query_map(params![day.high_water, day.key, limit], |r| {
+        AND p.card_id IS NOT (SELECT a.card_id FROM study s JOIN attempts a ON a.id=s.active WHERE a.result IS NULL)";
+    let mut rows = Vec::new();
+    for (index, restriction, order) in [
+        (
+            "prepared_capture_order",
+            "p.capture_order IS NOT NULL",
+            "p.capture_order,p.card_id",
+        ),
+        (
+            "prepared_ordinary_tactic",
+            "p.capture_order IS NULL AND p.availability_version<=?1",
+            "p.card_id",
+        ),
+    ] {
+        let remaining = limit - rows.len();
+        if remaining == 0 {
+            break;
+        }
+        let mut query = db.prepare(&format!(
+            "SELECT p.card_id,p.availability_version FROM prepared_queue p INDEXED BY {index}
+             WHERE {eligible} AND {restriction} ORDER BY {order} LIMIT ?3"
+        ))?;
+        for row in query.query_map(params![day.high_water, day.key, remaining], |r| {
             Ok((
                 crate::catalog::daily_tactic_candidate(r.get(0)?),
                 r.get::<_, i64>(1)?,
             ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        })? {
+            rows.push(row?);
+        }
+    }
     let (candidates, versions): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
     let selected = daily_plan::pick(&candidates, &HashSet::new(), &HashSet::new(), limit)
         .into_iter()
@@ -1883,6 +1904,115 @@ mod tests {
             next = answer_and_next(&mut restarted, resumed, "e2e4")?;
         }
         assert!(next.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn captures_lead_the_next_tactic_build_within_uncommitted_allowance() -> Result<()> {
+        use crate::{tactic_capture, tactic_import};
+        use serde_json::json;
+
+        let root = tempfile::tempdir()?;
+        let mut db = Database::init(&root.path().join("capture-order.sqlite3"))?;
+        let now = Utc::now().timestamp();
+        let key = day_at(now)?;
+        db.execute("UPDATE new_opening_settings SET tactic_limit=3", [])?;
+        for card in ["ordinary-a", "ordinary-b", "ordinary-c"] {
+            tactic(&db, card, None)?;
+        }
+        while !queue_store::seed_batch(&mut db)? {}
+        prepare_test_day(&mut db, now)?;
+        let issued = open_study(&mut db)?.unwrap();
+        assert_eq!(
+            crate::study_store::unanswered_card(&db)?.as_deref(),
+            Some("ordinary-a")
+        );
+        commit_slot(&db, "ordinary-b", now)?;
+        db.execute("INSERT INTO deck(slot,card_id) VALUES(1,'ordinary-b')", [])?;
+
+        let capture = |db: &mut Connection, ordinal: i32, pgn: &str| -> Result<String> {
+            let command = tactic_capture::Command::<tactic_import::Input> {
+                dataset: crate::db::dataset(db)?,
+                request: format!("00000000-0000-4000-8000-{ordinal:012}"),
+                input: serde_json::from_value(json!({"pgn":pgn}))?,
+            };
+            let key = command.key("capture-pgn-v1")?;
+            let plan = tactic_import::prepare(command.input)?;
+            let accepted = key.apply(db, &plan)?;
+            assert_eq!(key.apply(db, &plan)?, accepted);
+            Ok(accepted["id"].as_str().unwrap().to_owned())
+        };
+        let first = capture(&mut db, 1, "1. h4 *")?;
+        let second = capture(&mut db, 2, "1. a4 *")?;
+        let current = day(&db, &key)?.unwrap();
+        let measure = |db: &Connection| -> Result<(Draft, usize)> {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+            let steps = Arc::new(AtomicUsize::new(0));
+            let counter = steps.clone();
+            let version = clock(db)?.tactics;
+            assert_ne!(current.tactics, Some(version));
+            db.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let draft = tactic_draft(db, &current, version);
+            db.progress_handler(0, None::<fn() -> bool>);
+            Ok((draft?, steps.load(Ordering::Relaxed)))
+        };
+        let (_, before) = measure(&db)?;
+        db.execute(
+            "WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<10000)
+             INSERT INTO cards(id,kind,title,color,fen,position_id,answers)
+             SELECT printf('zz-unseen-%05d',n),'tactic','Ordinary','white',?1,'fixture','[\"e2e4\"]'
+             FROM rows",
+            [chess::fen(&chess::position("")?)],
+        )?;
+        let (draft, after) = measure(&db)?;
+        assert!(
+            after <= before + 50,
+            "tactic rebuild grew from {before} to {after} VM steps"
+        );
+        assert_eq!(draft.selected.len(), 1);
+        assert_eq!(draft.selected[0].0.card, first);
+        activate_new(&mut db, &current, &draft, None)?;
+        assert_eq!(open_study(&mut db)?.unwrap().attempt, issued.attempt);
+        let reserved = answer_and_next(&mut db, issued, "e2e4")?.unwrap();
+        assert_eq!(
+            crate::study_store::unanswered_card(&db)?.as_deref(),
+            Some("ordinary-b")
+        );
+        let captured = answer_and_next(&mut db, reserved, "e2e4")?.unwrap();
+        assert_eq!(
+            crate::study_store::unanswered_card(&db)?.as_deref(),
+            Some(first.as_str())
+        );
+        assert!(answer_and_next(&mut db, captured, "h2h4")?.is_none());
+        let version = clock(&db)?.tactics;
+        assert_eq!(capture(&mut db, 3, "1. h4 *")?, first);
+        assert_eq!(clock(&db)?.tactics, version);
+        let extra = capture(&mut db, 4, "1. c4 *")?;
+        let current = day(&db, &key)?.unwrap();
+        let draft = tactic_draft(&db, &current, clock(&db)?.tactics)?;
+        assert!(draft.selected.is_empty());
+        let tomorrow = now + 86_400;
+        open_day(&mut db, &day_at(tomorrow)?, tomorrow)?;
+        let draft = tactic_draft(
+            &db,
+            &day(&db, &day_at(tomorrow)?)?.unwrap(),
+            clock(&db)?.tactics,
+        )?;
+        let order: Vec<_> = draft
+            .selected
+            .iter()
+            .map(|(choice, _)| choice.card.as_str())
+            .collect();
+        assert_eq!(order, [second.as_str(), extra.as_str(), "ordinary-c"]);
         Ok(())
     }
 
